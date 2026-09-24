@@ -11,6 +11,25 @@ pub fn migrate(c: &Connection) -> Result<()> {
     Ok(())
 }
 impl Db {
+    pub fn edit_queued_message(&self, chat: &str, seq: i64, expected: &str, text: &str) -> Result<()> {
+        ensure!(!text.trim().is_empty() && text.len() <= 64000, "Message must be 1..64000 bytes");
+        let mut c=self.0.lock().unwrap();let tx=c.transaction()?;
+        ensure!(!crate::workspace_transfer::frozen(&tx)?, "This workspace is being moved");
+        let original:Option<String>=tx.query_row("SELECT body FROM chat_messages WHERE seq=? AND chat_id=? AND sender='user' AND kind='message' AND suppressed=0",params![seq,chat],|r|r.get(0)).optional()?;
+        ensure!(original.as_deref()==Some(expected), "This message changed. Reopen the editor to see its latest text.");
+        let runs:Vec<(String,String)>=tx.prepare("SELECT r.id,r.status FROM runs r JOIN run_message_sources s ON s.run_id=r.id WHERE s.message_seq=?")?.query_map([seq],|r|Ok((r.get(0)?,r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+        ensure!(!runs.is_empty() && runs.iter().all(|(_,status)|status=="queued"), "This message has already started sending and can no longer be edited.");
+        let command=crate::commands::resolve(&tx,text)?;
+        let prompt=command.as_ref().map(|c|c.prompt.as_str()).unwrap_or(crate::commands::literal(text));
+        for (id,_) in &runs {
+            tx.execute("UPDATE runs SET prompt=? WHERE id=?",params![prompt,id])?;
+            tx.execute("DELETE FROM run_commands WHERE run_id=?",[id])?;
+            if let Some(command)=&command {tx.execute("INSERT INTO run_commands(run_id,receipt) VALUES(?,?)",params![id,command.receipt.to_string()])?;}
+        }
+        tx.execute("UPDATE chat_messages SET body=? WHERE seq=?",params![text,seq])?;
+        tx.commit()?;Ok(())
+    }
+
     pub fn request_steering(&self, source: &str, target: &str) -> Result<Value> {
         let mut c = self.0.lock().unwrap();
         let tx = c.transaction()?;
@@ -100,6 +119,40 @@ impl Db {
 mod tests {
     use super::*;
     use crate::{runtime, tests};
+
+    #[test]
+    fn queued_message_edits_group_recipients_are_all_or_nothing() {
+        let app=tests::app();let first=tests::bot(&app.db,"codex");let second=tests::bot(&app.db,"codex");
+        let chat:crate::chats::Chat=serde_json::from_value(json!({"id":"edit-team","name":"Team","members":[first.id,second.id]})).unwrap();app.db.save_chat(&chat).unwrap();
+        let ids=app.db.chat_send(&chat.id,"Original",&[first.id.clone(),second.id.clone()]).unwrap();
+        let seq=app.db.chat_messages(&chat.id).unwrap().into_iter().find(|m|m["sender"]=="user").unwrap()["seq"].as_i64().unwrap();
+        app.db.edit_queued_message(&chat.id,seq,"Original","Edited").unwrap();
+        for id in &ids {assert_eq!(app.db.run(id).unwrap().prompt,"Edited");}
+        app.db.claim_bot(&first.id).unwrap().unwrap();
+        assert!(app.db.edit_queued_message(&chat.id,seq,"Edited","Too late for one recipient").is_err());
+        for id in &ids {assert_eq!(app.db.run(id).unwrap().prompt,"Edited");}
+    }
+
+    #[tokio::test]
+    async fn queued_message_edits_update_the_prompt_atomically_and_close_on_claim() {
+        use std::future::IntoFuture;
+        let app=tests::app();let bot=tests::bot(&app.db,"codex");let chat=format!("dm-{}",bot.id);
+        let ids=vec![app.db.queue(&bot.id,"Original",0).unwrap()];
+        let message=app.db.chat_messages(&chat).unwrap().into_iter().find(|m|m["sender"]=="user").unwrap();let seq=message["seq"].as_i64().unwrap();
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let url=format!("http://{}/api/chats/{chat}/messages/{seq}",listener.local_addr().unwrap());
+        let server=tokio::spawn(axum::serve(listener,crate::web::router(app.clone())).into_future());
+        let client=reqwest::Client::new();let patch=json!({"expected_text":"Original","text":"Edited before sending"});
+        assert_eq!(client.patch(&url).json(&patch).send().await.unwrap().status(),401);
+        assert!(client.patch(&url).bearer_auth(&app.token).json(&patch).send().await.unwrap().status().is_success());
+        assert_eq!(app.db.run(&ids[0]).unwrap().prompt,"Edited before sending");
+        assert!(app.db.edit_queued_message(&chat,seq,"Original","Stale").is_err());
+        assert!(app.db.edit_queued_message("another-chat",seq,"Edited before sending","Wrong chat").is_err());
+        assert!(app.db.edit_queued_message(&chat,seq,"Edited before sending"," ").is_err());
+        let claimed=app.db.claim_bot(&bot.id).unwrap().unwrap();assert_eq!(claimed.prompt,"Edited before sending");
+        assert!(!client.patch(&url).bearer_auth(&app.token).json(&json!({"expected_text":"Edited before sending","text":"Too late"})).send().await.unwrap().status().is_success());
+        let after=app.db.chat_messages(&chat).unwrap().into_iter().find(|m|m["seq"]==seq).unwrap();assert_eq!(after["text"],"Edited before sending");assert_eq!(after["created"],message["created"]);assert_eq!(app.db.runs(None).unwrap().len(),1);
+        server.abort();
+    }
 
     #[tokio::test]
     async fn steering_is_explicit_authenticated_scoped_and_keeps_missed_messages_queued() {

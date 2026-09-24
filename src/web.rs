@@ -75,6 +75,7 @@ pub fn router(app: Shared) -> Router {
             axum::routing::patch(crate::plans::reminder_route),
         )
         .route("/chats/{id}/messages/{seq}/reaction", put(message_reaction))
+        .route("/chats/{id}/messages/{seq}", axum::routing::patch(edit_queued_message))
         .route("/chats/{id}/pin", put(pin_chat))
         .route("/bots/{id}/pin", put(pin_bot))
         .route("/computer/resources", get(resources))
@@ -570,6 +571,11 @@ async fn cancel(State(app): State<Shared>, Path(id): Path<String>) -> Result<Jso
     app.db.cancel(&id)?;
     Ok(Json(json!({"ok":true})))
 }
+async fn edit_queued_message(State(app): State<Shared>, Path((chat,seq)): Path<(String,i64)>, Json(input): Json<Value>) -> Result<Json<Value>> {
+    app.db.edit_queued_message(&chat,seq,crate::runtime::string(&input,"expected_text")?,crate::runtime::string(&input,"text")?)?;
+    Ok(Json(json!({"ok":true})))
+}
+
 async fn steer_run(
     State(app): State<Shared>,
     Path(id): Path<String>,
