@@ -117,7 +117,7 @@ fn text_editors_preserve_new_memory_and_reject_conflicting_saves() {
     assert_eq!(app.db.bot(&b.id).unwrap().memory, "Fresh model memory");
     assert!(
         app.db
-            .save_bot_text(&b.id, "memory", "🦀".repeat(4001).as_str(), None)
+            .save_bot_text(&b.id, "memory", "🦀".repeat(crate::db::BOT_MEMORY_MAX_BYTES / 4 + 1).as_str(), None)
             .is_err()
     );
     assert!(app.db.save_bot_text(&b.id, "name", "Bad", None).is_err());
