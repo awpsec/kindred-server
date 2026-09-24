@@ -311,16 +311,59 @@ def connection_status(root):
         return phase if phase in ('ready','failed','installing','runtime_failed') else 'starting'
     except (subprocess.CalledProcessError,subprocess.TimeoutExpired): return 'starting'
 
+RESOURCE_LIMITS = {'cpus': (1, 32), 'memory_mb': (1024, 262144), 'disk_gb': (8, 2048)}
+
+def resource_settings(root, profile):
+    if not (root/'computer.json').exists():
+        return {'state':'shut off','provisioned':False,'resources':{'cpus':number('KINDRED_VM_CPUS',2,1,32),'memory_mb':number('KINDRED_VM_MEMORY_MB',6144,1024,262144),'disk_gb':number('KINDRED_VM_DISK_GB',30,8,2048)},'limits':RESOURCE_LIMITS}
+    settings = json.loads((root/'computer.json').read_text())
+    disk = root/'disk.qcow2'
+    if disk.exists() and not running(root):
+        actual = json.loads(run(['qemu-img', 'info', '--output=json', disk]).stdout)['virtual-size']
+        # Reconcile an interrupted save after the disk expansion succeeded.
+        size = (actual + 1024**3 - 1)//1024**3
+        if size > settings['disk_gb']:
+            settings['disk_gb'] = size
+            atomic(root/'computer.json', settings)
+    return {'state': 'running' if running(root) else 'shut off',
+            'resources': {k: settings[k] for k in RESOURCE_LIMITS},
+            'limits': RESOURCE_LIMITS}
+
+def resize_resources(root, profile, values):
+    if not isinstance(values, dict) or set(values) != set(RESOURCE_LIMITS):
+        raise ValueError('Specify CPU count, memory and disk size.')
+    for key, (low, high) in RESOURCE_LIMITS.items():
+        if type(values[key]) is not int or not low <= values[key] <= high:
+            raise ValueError(f'{key} must be a whole number between {low} and {high}.')
+    if running(root):
+        raise ValueError('Shut down this computer before changing its resources.')
+    current = resource_settings(root, profile)['resources']
+    if values['disk_gb'] < current['disk_gb']:
+        raise ValueError('Disk size can only be increased.')
+    if not (root/'computer.json').exists():
+        raise ValueError('Start the computer once before changing its resources.')
+    settings = json.loads((root/'computer.json').read_text())
+    disk = root/'disk.qcow2'
+    if disk.exists() and values['disk_gb'] > current['disk_gb']:
+        run(['qemu-img', 'resize', disk, str(values['disk_gb'])+'G'])
+    settings.update(values)
+    atomic(root/'computer.json', settings)
+    return resource_settings(root, profile)
+
 def main():
     os.umask(0o077)
     if len(sys.argv)!=3: raise ValueError('Expected action and profile ID')
     action,profile=sys.argv[1:];root=directory(profile)
-    if action not in ('ensure','start','domstate','connection-status','shutdown','reboot'): raise ValueError('Unknown computer action')
+    if action not in ('ensure','start','domstate','connection-status','shutdown','reboot','resource-settings','resize-resources'): raise ValueError('Unknown computer action')
     if action=='connection-status':
         print(json.dumps({'setup':connection_status(root)}));return
     if action=='domstate':
         print(json.dumps({'state':'running' if running(root) else 'shut off','provisioned':(root/'computer.json').exists()}));return
     with locked(root/'operation.lock'):
+        if action == 'resource-settings':
+            print(json.dumps(resource_settings(root, profile)));return
+        if action == 'resize-resources':
+            print(json.dumps(resize_resources(root, profile, json.loads(sys.stdin.read(4096)))));return
         if action in ('ensure','start'):
             settings=start(root,profile)
             if action=='ensure':

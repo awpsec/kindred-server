@@ -367,6 +367,7 @@ pub fn router(portal: Portal) -> Router {
         .route("/identity/directory", post(directory))
         .route("/identity/password", post(change_password))
         .route("/identity/admin", get(admin).post(admin_update))
+        .route("/identity/computer-settings", get(computer_settings).post(save_computer_settings))
         .route("/device/claim", post(claim_device))
         .route("/api/devices/link", post(link_device))
         .route(
@@ -854,6 +855,39 @@ async fn claim_device(
             .into(),
     )
 }
+async fn computer_settings(State(p): State<Portal>, headers: HeaderMap) -> ApiResult {
+    p.origin(&headers)?;
+    let id = p.identity(bearer(&headers))?;
+    ensure!(id.admin, "Administrator access required");
+    let app = p.app(&id.profile)?;
+    if app.config.vm.managed_id.is_empty() {
+        return Ok(Json(json!({"supported":false})));
+    }
+    Ok(Json(
+        crate::vm::managed(&app.config.vm, "resource-settings", 20).await?,
+    ))
+}
+async fn save_computer_settings(
+    State(p): State<Portal>,
+    headers: HeaderMap,
+    Json(v): Json<Value>,
+) -> ApiResult {
+    p.origin(&headers)?;
+    let id = p.identity(bearer(&headers))?;
+    ensure!(id.admin, "Administrator access required");
+    let app = p.app(&id.profile)?;
+    web::computer_ready(&app)?;
+    let mut leases = Vec::new();
+    for slot in 1..=32 {
+        leases.push(
+            app.screen_lock(slot)
+                .try_lock_owned()
+                .map_err(|_| anyhow::anyhow!("A screen is in use. Stop active tasks first."))?,
+        );
+    }
+    Ok(Json(crate::vm::resize_resources(&app.config.vm, v).await?))
+}
+
 async fn admin(State(p): State<Portal>, headers: HeaderMap) -> ApiResult {
     p.origin(&headers)?;
     let id = p.identity(bearer(&headers))?;

@@ -197,4 +197,43 @@ class ProviderBridgeUpgrade(unittest.TestCase):
             self.assertNotEqual(update({'source':broken,'sha256':hashlib.sha256(broken.encode()).hexdigest()}).returncode,0)
             self.assertEqual(target.read_text(),source)
 
-if __name__=='__main__':unittest.main()
+
+
+class ResourceChanges(unittest.TestCase):
+    @unittest.skipUnless(shutil.which('qemu-img'), 'qemu-img required')
+    def test_real_disk_growth_and_integrity(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary)
+            subprocess.run(['qemu-img','create','-f','qcow2',str(root/'disk.qcow2'),'8G'],check=True,capture_output=True)
+            (root/'computer.json').write_text(json.dumps({'cpus':2,'memory_mb':2048,'disk_gb':8,'id':'fixture','port':22000}))
+            with patch.object(manager,'running',return_value=False):
+                result=manager.resize_resources(root,'fixture',{'cpus':3,'memory_mb':4096,'disk_gb':10})
+                self.assertEqual(result['resources']['disk_gb'],10)
+            subprocess.run(['qemu-img','check',str(root/'disk.qcow2')],check=True,capture_output=True)
+
+    def test_stopped_vm_expansion_preserves_identity_and_disk(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary);disk=root/'disk.qcow2';disk.write_bytes(b'existing disk')
+            original={'cpus':2,'memory_mb':6144,'disk_gb':30,'port':22000,'id':'fixture'}
+            (root/'computer.json').write_text(json.dumps(original));size=30
+            def command(args):
+                nonlocal size
+                if args[1]=='resize': size=int(args[-1][:-1])
+                return Mock(stdout=json.dumps({'virtual-size':size*1024**3}).encode())
+            with patch.object(manager,'running',return_value=False),patch.object(manager,'run',side_effect=command):
+                result=manager.resize_resources(root,'fixture',{'cpus':4,'memory_mb':8192,'disk_gb':40})
+                self.assertEqual(result['resources'],{'cpus':4,'memory_mb':8192,'disk_gb':40})
+                saved=json.loads((root/'computer.json').read_text());self.assertEqual(saved['port'],22000);self.assertEqual(saved['id'],'fixture')
+                self.assertEqual(disk.read_bytes(),b'existing disk')
+                for invalid in [{'cpus':True,'memory_mb':8192,'disk_gb':40},{'cpus':4,'memory_mb':8192,'disk_gb':29},{'cpus':33,'memory_mb':8192,'disk_gb':40}]:
+                    with self.assertRaises(ValueError): manager.resize_resources(root,'fixture',invalid)
+                # An interrupted metadata write must never allow a disk shrink.
+                size=45
+                with self.assertRaisesRegex(ValueError,'only be increased'): manager.resize_resources(root,'fixture',{'cpus':4,'memory_mb':8192,'disk_gb':40})
+                self.assertEqual(json.loads((root/'computer.json').read_text())['disk_gb'],45)
+            with patch.object(manager,'running',return_value=True),patch.object(manager,'run') as run:
+                with self.assertRaisesRegex(ValueError,'Shut down'):manager.resize_resources(root,'fixture',{'cpus':4,'memory_mb':8192,'disk_gb':50})
+                run.assert_not_called()
+
+if __name__ == "__main__":
+    unittest.main()

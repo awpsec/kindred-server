@@ -169,6 +169,17 @@ pub async fn managed(config: &Vm, action: &str, timeout: u64) -> Result<Value> {
     Ok(serde_json::from_slice(&bytes).context("Invalid computer manager response")?)
 }
 
+pub async fn resize_resources(config: &Vm, values: Value) -> Result<Value> {
+    ensure!(
+        uuid::Uuid::parse_str(&config.managed_id).is_ok(),
+        "This computer is managed outside Kindred"
+    );
+    let mut command = Command::new("python3");
+    command.args([&config.manager, "resize-resources", &config.managed_id]);
+    let bytes = capture(command, Some(serde_json::to_vec(&values)?), 60, 65536).await?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
 pub async fn ensure_running(config: &Vm) -> Result<()> {
     if !config.managed_id.is_empty() {
         managed(config, "ensure", 2400).await?;

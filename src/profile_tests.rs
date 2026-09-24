@@ -905,3 +905,34 @@ async fn transfer_rejects_active_work_overwrite_and_corrupt_rows_and_can_cancel(
     assert!(app.db.queue(&bot.id, "Source resumed", 0).is_ok());
     assert!(app.db.transfer_status().unwrap().is_null());
 }
+
+#[tokio::test]
+async fn computer_resource_controls_require_admin_and_use_current_profile() {
+    let f = Fixture::new(false);
+    let owner = f.register("owner").await;
+    let member = f.register("member").await;
+    let token = owner["token"].as_str().unwrap();
+    let profile = f.p.identity(token).unwrap().profile;
+    std::fs::write(f.root.join("fixture-manager.py"), "import json,sys\nprint(json.dumps({'profile':sys.argv[2],'state':'shut off','resources':{'cpus':2,'memory_mb':6144,'disk_gb':30}}))\n").unwrap();
+    for method in ["GET", "POST"] {
+        let (status, _) = f
+            .request(
+                method,
+                "/identity/computer-settings",
+                member["token"].as_str().unwrap(),
+                json!({"cpus":4,"memory_mb":8192,"disk_gb":40}),
+            )
+            .await;
+        assert!(!status.is_success());
+        let (status, value) = f
+            .request(
+                method,
+                "/identity/computer-settings",
+                token,
+                json!({"cpus":4,"memory_mb":8192,"disk_gb":40}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        assert_eq!(value["profile"], profile);
+    }
+}

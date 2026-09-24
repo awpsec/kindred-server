@@ -981,7 +981,7 @@ fn screen_ready(app: &Shared, slot: i64) -> Result<()> {
     );
     Ok(())
 }
-fn computer_ready(app: &Shared) -> Result<()> {
+pub(crate) fn computer_ready(app: &Shared) -> Result<()> {
     crate::vm_maintenance::available(&app.db)?;
     require!(
         !app.db.runs(None)?.iter().any(|r| matches!(
