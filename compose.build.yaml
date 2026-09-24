@@ -1,0 +1,5 @@
+services:
+  server:
+    image: kindred-server:local
+    build: .
+    pull_policy: build

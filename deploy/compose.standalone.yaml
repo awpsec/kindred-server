@@ -1,7 +1,7 @@
 name: kindred
 services:
   server:
-    image: ghcr.io/awpsec/kindred-server:${KINDRED_VERSION:-latest}
+    build: .
     platform: linux/amd64
     restart: unless-stopped
     init: true

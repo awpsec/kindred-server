@@ -30,8 +30,6 @@ for local Standalone use.
 
 ## Get started
 
-Public packages will appear with the first public release. Self-hosting from source is available below.
-
 Download the desktop app for **Windows x64**, **macOS Apple Silicon**, or **Linux x64**.
 Connect to a Kindred server, or choose **Standalone** with Docker running to host it on your device.
 Provider accounts, usage and connected services are supplied by you; Kindred does not include model credits.
@@ -41,7 +39,7 @@ Prefer to self-host?
 ```sh
 git clone https://github.com/awpsec/kindred-server.git
 cd kindred-server
-docker compose up -d --build
+docker compose up -d
 ```
 
 Open **http://127.0.0.1:9444**, create your account, connect a provider, and make your first bot.

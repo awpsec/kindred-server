@@ -1,0 +1,76 @@
+name: Publish verified server image (manual only)
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Approved stable release version.'
+        required: true
+        type: string
+      source_commit:
+        description: 'Exact server commit included in the verified image.'
+        required: true
+        type: string
+      input_release:
+        description: 'Private image-inputs draft holding server-image.tar.gz.'
+        required: true
+        type: string
+      image_sha256:
+        description: 'SHA-256 of the verified compressed image archive.'
+        required: true
+        type: string
+      approve_publication:
+        description: 'Publish this verified image and promote latest for this approved release.'
+        required: true
+        default: false
+        type: boolean
+permissions:
+  contents: read
+concurrency:
+  group: server-image-publication
+  cancel-in-progress: false
+jobs:
+  publish:
+    if: ${{ inputs.approve_publication }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      packages: write
+    env:
+      VERSION: ${{ inputs.version }}
+      SOURCE: ${{ inputs.source_commit }}
+      INPUT_RELEASE: ${{ inputs.input_release }}
+      IMAGE_SHA256: ${{ inputs.image_sha256 }}
+      IMAGE: ghcr.io/awpsec/kindred-server
+    steps:
+      - name: Download and verify the prepared image
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          python3 - <<'PY'
+          import os,re,json,subprocess,hashlib
+          assert re.fullmatch(r'\d+\.\d+\.\d+',os.environ['VERSION'])
+          assert re.fullmatch(r'[0-9a-f]{40}',os.environ['SOURCE'])
+          assert re.fullmatch(r'[0-9a-f]{64}',os.environ['IMAGE_SHA256'])
+          assert re.fullmatch(r'image-inputs-[0-9A-Za-z.-]+',os.environ['INPUT_RELEASE'])
+          assert json.loads(subprocess.check_output(['gh','release','view',os.environ['INPUT_RELEASE'],'--json','isDraft']))['isDraft']
+          subprocess.run(['gh','release','download',os.environ['INPUT_RELEASE'],'--pattern','server-image.tar.gz'],check=True)
+          with open('server-image.tar.gz','rb') as f: assert hashlib.file_digest(f,'sha256').hexdigest()==os.environ['IMAGE_SHA256']
+          PY
+          docker load -i server-image.tar.gz
+          test "$(docker image inspect "$IMAGE:$VERSION" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$SOURCE"
+          test "$(docker run --rm --entrypoint /usr/local/bin/kindred "$IMAGE:$VERSION" --version)" = "kindred $VERSION"
+      - name: Publish immutable version and stable tag
+        env:
+          REGISTRY_TOKEN: ${{ github.token }}
+        run: |
+          printf '%s' "$REGISTRY_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          if docker manifest inspect "$IMAGE:$VERSION" >/dev/null 2>&1; then
+            echo 'This version already exists; refusing to overwrite it.' >&2
+            exit 1
+          fi
+          docker push "$IMAGE:$VERSION"
+          docker tag "$IMAGE:$VERSION" "$IMAGE:latest"
+          docker push "$IMAGE:latest"
+          docker logout ghcr.io

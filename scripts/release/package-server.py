@@ -40,6 +40,7 @@ def package(binary, output):
                  "ui/fonts/Liberation-LICENSE.txt", "ui/fonts/Liberation-SOURCE.json",
                  "docs/PROVIDER_MARKS.md", "docs/PROVIDER_MARKS_LICENSE.txt"]:
         files[name] = ROOT / name
+    files["compose.yaml"] = ROOT / "deploy/compose.standalone.yaml"
     files["Dockerfile"] = ROOT / "deploy/Dockerfile.standalone"
     files["third-party/artifact-vendor.js.LEGAL.txt"] = ROOT / "ui/artifact-vendor.js.LEGAL.txt"
     files["kindred"] = binary
