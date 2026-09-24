@@ -94,7 +94,7 @@ try:
   home=temp/'home';home.mkdir();env.update(HOME=str(home),CFFIXED_USER_HOME=str(home))
   with (out/'onboarding-process.log').open('w') as log:
    child=subprocess.Popen([str(executable),'--profiles'],env=env,stdout=log,stderr=subprocess.STDOUT,start_new_session=True)
-   time.sleep(12);capture(child,'onboarding',['Accounts','Add account','Standalone'])
+   time.sleep(12);capture(child,'onboarding',(['Welcome to Kindred','On this computer','Connect to a server'] if tuple(map(int,a.version.split('.'))) >= (0,80,0) else ['Accounts','Add account','Standalone']))
    stop(child);child=None
   data=home/'Library/Application Support/Kindred';data.mkdir(parents=True,exist_ok=True)
   test_env={**os.environ,'KINDRED_TEST_MAC_APP':str(app),'KINDRED_TEST_MAC_DMG':str(dmg),'KINDRED_TEST_MAC_DATA':str(data)}
@@ -203,6 +203,16 @@ try:
    with urllib.request.urlopen(request) as response:response.read()
    wait_report(fixture,'accounts',child);time.sleep(3)
    capture(child,'accounts',['Accounts','Add account'])
+   stop(child);child=None
+   request=urllib.request.Request(url+'/fixture/phase',data=b'{"phase":"native-dictation"}',headers={'Content-Type':'application/json'},method='POST')
+   with urllib.request.urlopen(request) as response:response.read()
+   child=subprocess.Popen([str(executable)],env=env,stdout=app_log,stderr=subprocess.STDOUT,start_new_session=True)
+   proof['native_system_dictation_bridge']=wait_report(fixture,'native-dictation',child)
+   stop(child);child=None
+   command(['node',a.source.resolve()/'tools/frontend/test-native-workspace-artifacts.cjs'],'native-artifact-rendering.log',env={**env,'KINDRED_NATIVE_EXE':str(executable),'KINDRED_NATIVE_WINDOW_PROBE':str(out/'window-proof')},timeout=90)
+   proof['native_sandboxed_artifact_rendering']=True
+
+
    stop(child);child=None;stop(server);server=None
   proof.update(passed=True,onboarding_rendered=True,hosted_chat_rendered=True,native_account_ipc=True,bundled_accounts_window_rendered=True,external_accounts_used=False,standalone_server_started=False)
 except Exception:
