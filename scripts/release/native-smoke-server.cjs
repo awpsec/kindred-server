@@ -60,6 +60,16 @@ try {
    await report({phase:data.phase,passed:true});
   }
   if(data.phase==='updater'&&!updaterTested){window.open('kindred-update://check','_blank');updaterTested=true;await report({phase:'updater',passed:true});}
+  if(data.phase==='native-dictation'){
+   if(!window.__KINDRED_NATIVE_DICTATION)throw Error('Native macOS dictation capability is missing');
+   const editor=document.querySelector('#prompt');editor.focus();
+   if(document.activeElement!==editor)throw Error('Composer was not focused before native dictation');
+   let accepted=false,unavailable='';
+   try{await window.__TAURI__.core.invoke('start_native_dictation');accepted=true;}
+   catch(e){unavailable=String(e);if(!unavailable.includes('Enable Dictation in macOS System Settings'))throw e;}
+   await report({phase:'native-dictation',passed:true,accepted,unavailable,physicalSpeechVerified:false});
+   break;
+  }
   if(data.phase==='accounts'){
    if(notchTested)await window.__TAURI__.core.invoke('set_notch_notifications',{enabled:false});
    await window.__TAURI__.core.invoke('open_profile_home',{bounds:null,theme:'dark'});
@@ -69,9 +79,15 @@ try {
  }
 }catch(e){await report({passed:false,error:String(e),chat:chatState(),errors});}
 </script>`;
+// Block external HTTPS update discovery only for the test app’s proxy.
+server.on('connect',(_req,socket)=>socket.end('HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n'));
 server.on('request',async(req,res)=>{
  const route=new URL(req.url,'http://localhost').pathname;
  const send=data=>{res.writeHead(200,{'Content-Type':'application/json','Cache-Control':'no-store'});res.end(JSON.stringify(data));};
+ if(route==='/updates/client-stable.json'||route==='/updates/client-linux.json'){
+  fs.writeFileSync(path.join(folder,'signed-feed.json'),JSON.stringify({served:true}));
+  return send(JSON.parse(fs.readFileSync(path.join(__dirname,'native-client-feed-fixture.json'),'utf8')));
+ }
  if(route==='/fixture/report'){
   let body='';for await(const chunk of req)body+=chunk;
   reports.push(JSON.parse(body));fs.writeFileSync(path.join(folder,'reports.json'),JSON.stringify(reports,null,2));return send({ok:true});
