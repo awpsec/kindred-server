@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Browser
+Exec=/usr/local/lib/kindred/desktop-launch browser
+Icon=/usr/local/share/kindred/desktop/browser.png
+Terminal=false
+StartupNotify=false

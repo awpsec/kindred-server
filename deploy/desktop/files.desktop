@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Files
+Exec=/usr/local/lib/kindred/desktop-launch files
+Icon=/usr/local/share/kindred/desktop/files.png
+Terminal=false
+StartupNotify=false

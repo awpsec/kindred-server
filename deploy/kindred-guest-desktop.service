@@ -1,0 +1,17 @@
+[Unit]
+Description=Kindred shared bot desktop
+After=network-online.target
+
+[Service]
+User=bot
+Group=bot
+Environment=DISPLAY=:1
+Environment=HOME=/home/bot
+Environment=KINDRED_GUEST=1
+ExecStart=/usr/local/lib/kindred/start-desktop.sh
+Restart=on-failure
+RestartSec=3
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target

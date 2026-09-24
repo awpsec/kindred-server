@@ -1,0 +1,15 @@
+#!/bin/sh
+set -eu
+screen=${1:-1}
+case "$screen" in ''|*[!0-9]*) exit 2;; esac
+[ "$screen" -ge 1 ] && [ "$screen" -le 32 ] || exit 2
+if [ "$screen" -gt 1 ]; then
+    export XDG_RUNTIME_DIR=/run/user/$(id -u)
+    export DBUS_SESSION_BUS_ADDRESS=unix:path=$XDG_RUNTIME_DIR/bus
+    systemctl --user start "kindred-screen@$screen.service"
+fi
+i=0
+until xdpyinfo -display ":$screen" >/dev/null 2>&1; do
+    i=$((i+1)); [ "$i" -lt 100 ] || { echo 'The bot screen did not start.' >&2; exit 1; }
+    sleep 0.2
+done

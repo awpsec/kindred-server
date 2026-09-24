@@ -1,0 +1,11 @@
+.git
+target
+dist
+desktop
+data
+test-results
+node_modules
+**/__pycache__
+*.db*
+*.credentials*
+.env

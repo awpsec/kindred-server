@@ -1,0 +1,45 @@
+# A compact native launcher dock, visible in both VNC and bot screenshots.
+# 1: dock — dark glass matching the wallpaper; 2: tooltips.
+rounded = 18
+border_width = 1
+background_color = #15171a 76
+border_color = #ffffff 12
+
+rounded = 8
+border_width = 0
+background_color = #2a2e33 96
+
+panel_items = L
+# Sit flush with the desktop edge, reserving only the dock's own height.
+panel_size = 204 56
+panel_margin = 0 0
+panel_padding = 12 6 12
+panel_background_id = 1
+panel_position = bottom center horizontal
+# Keep application content above the dock; maximized windows use its reserved area.
+panel_layer = bottom
+panel_monitor = 1
+panel_shrink = 1
+panel_dock = 0
+panel_window_name = Kindred Dock
+strut_policy = follow_size
+autohide = 0
+disable_transparency = 0
+mouse_effects = 1
+mouse_hover_icon_asb = 100 0 12
+mouse_pressed_icon_asb = 100 0 -10
+launcher_padding = 4 0 12
+launcher_background_id = 0
+launcher_icon_background_id = 0
+launcher_icon_size = 40
+launcher_icon_asb = 100 0 0
+launcher_tooltip = 1
+startup_notifications = 0
+launcher_item_app = /usr/local/share/kindred/desktop/browser.desktop
+launcher_item_app = /usr/local/share/kindred/desktop/files.desktop
+launcher_item_app = /usr/local/share/kindred/desktop/terminal.desktop
+tooltip_show_timeout = 0.35
+tooltip_hide_timeout = 0.1
+tooltip_padding = 10 6
+tooltip_background_id = 2
+tooltip_font_color = #ffffff 100

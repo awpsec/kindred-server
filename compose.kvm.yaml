@@ -1,0 +1,7 @@
+# Optional Linux acceleration: set KINDRED_KVM_GID to `stat -c %g /dev/kvm`.
+services:
+  server:
+    devices: [/dev/kvm:/dev/kvm]
+    group_add: ["${KINDRED_KVM_GID:-108}"]
+    environment:
+      KINDRED_VM_ACCEL: kvm

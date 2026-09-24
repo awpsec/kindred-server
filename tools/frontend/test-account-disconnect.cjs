@@ -1,0 +1,22 @@
+const {webkit}=require(process.env.KINDRED_PLAYWRIGHT_MODULE||'playwright');
+const {server,token}=require('./fixtures/desktop.cjs'),assert=require('node:assert/strict');
+(async()=>{await new Promise(r=>server.listen(0,'127.0.0.1',r));const origin='http://127.0.0.1:'+server.address().port,browser=await webkit.launch();try{
+ const p=await browser.newPage({viewport:{width:1100,height:900}});let removed=false,fail=true,calls=0;
+ await p.addInitScript(t=>sessionStorage.setItem('kindred-token',t),token);
+ await p.route(origin+'/api/composio',r=>r.fulfill({json:{configured:true,apps:[{id:'gmail',accounts:removed?[]:[{id:'ca_house',name:'Household',status:'INITIATED',permission:'ask'}]}]}}));
+ await p.route(origin+'/api/composio/gmail/disconnect',async r=>{calls++;assert.equal(r.request().postDataJSON().account_id,'ca_house');await new Promise(r=>setTimeout(r,150));if(fail)return r.fulfill({status:502,json:{error:'Provider unavailable. Try again.'}});removed=true;return r.fulfill({json:{ok:true}});});
+ p.on('dialog',()=>{throw Error('Native confirmation must not be used');});
+ await p.route('**/app.js*',async r=>{const response=await r.fetch();await r.fulfill({response,body:(await response.text())+'\nwindow.openAppDetails=openAppDetails;window.onboardApp=onboardApp;'});});
+ await p.goto(origin);await p.waitForFunction(()=>!!window.openAppDetails);await p.evaluate(()=>onboardApp({id:'gmail',name:'Gmail'}));
+ await p.locator('.gmail-auth-disclosure').waitFor();assert((await p.locator('.gmail-auth-disclosure').innerText()).includes('full Gmail access'));assert((await p.locator('.account-connect-form').innerText()).includes('Bot access'));assert.equal(await p.getByLabel('Access',{exact:true}).inputValue(),'read');await p.evaluate(()=>document.querySelector('.connector-dialog').close());
+ await p.evaluate(()=>openAppDetails({id:'gmail',name:'Gmail',description:'Email',tools_count:60}));
+ await p.getByRole('button',{name:'Options for Household'}).click();
+ const disconnect=p.getByRole('button',{name:'Disconnect',exact:true});
+ const check=p.getByRole('button',{name:'Check connection',exact:true});
+ const a=await disconnect.boundingBox(),b=await check.boundingBox();assert(Math.abs(a.y-b.y)<2);
+ const before=await p.locator('.account-row').boundingBox();await disconnect.click();assert.equal((await p.locator('.account-row').boundingBox()).height,before.height);await p.getByRole('button',{name:'Cancel',exact:true}).click();assert.equal(calls,0);
+ await disconnect.click();const confirm=p.getByRole('button',{name:'Disconnect account',exact:true});await confirm.click();assert(await confirm.isDisabled());
+ await p.locator('.disconnect-account-dialog [role=status]').filter({hasText:'Provider unavailable'}).waitFor();assert(await confirm.isEnabled());
+ fail=false;await confirm.click();await p.waitForFunction(()=>!document.querySelector('.account-row'));assert.equal(calls,2);
+ console.log('Account actions: alignment, popup confirmation/cancel without row expansion, pending guard, visible failure, retry and removal passed');
+}finally{await browser.close();server.closeAllConnections();await new Promise(r=>server.close(r));}})().catch(e=>{console.error(e);process.exitCode=1;server.close();});

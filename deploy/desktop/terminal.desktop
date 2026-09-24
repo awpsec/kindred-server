@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Terminal
+Exec=/usr/local/lib/kindred/desktop-launch terminal
+Icon=/usr/local/share/kindred/desktop/terminal.png
+Terminal=false
+StartupNotify=false

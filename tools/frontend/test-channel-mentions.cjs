@@ -1,0 +1,28 @@
+const {server,token}=require('./fixtures/desktop.cjs');
+const fs=require('node:fs'),path=require('node:path'),assert=require('node:assert/strict');
+const {chromium,webkit}=require(process.env.KINDRED_PLAYWRIGHT_MODULE||'playwright');
+(async()=>{await new Promise(r=>server.listen(0,'127.0.0.1',r));const origin='http://127.0.0.1:'+server.address().port;
+const browser=await(process.env.WEBKIT?webkit:chromium).launch({headless:true,args:process.env.WEBKIT?[]:['--no-sandbox']});const page=await browser.newPage({viewport:{width:1000,height:720}});
+try{
+await page.route(origin+'/app.js',r=>r.fulfill({contentType:'text/javascript',body:fs.readFileSync(path.resolve(__dirname,'../../ui/app.js'),'utf8')+'\nexport {state,markdown,updateMentions,channelCandidates};'}));
+const group={id:'group-test',name:'Team General',members:['piper'],archived:false};
+await page.route(origin+'/api/chats',r=>r.fulfill({json:[{id:'dm-piper',name:'Piper',members:['piper'],archived:false},group]}));
+await page.route(origin+'/api/chats/group-test**',r=>r.fulfill({json:{chat:group,messages:[]}}));
+await page.addInitScript(t=>sessionStorage.setItem('kindred-token',t),token);await page.goto(origin);await page.locator('#prompt').waitFor();
+await page.evaluate(async()=>{const m=await import('/app.js');const box=document.createElement('section');box.id='reference-test';box.style='position:fixed;top:120px;left:290px;right:30px;z-index:900;background:var(--bg);padding:25px';const row=document.createElement('div');row.className='message-row';const normal=m.markdown('See @Piper in #team-general.',true),handoff=m.markdown('@Piper please check #team-general.',true);normal.id='normal';handoff.id='handoff';handoff.classList.add('handoff-bubble');row.append(normal);box.append(row,handoff);document.body.append(box);});
+assert.equal(await page.locator('#reference-test [data-channel]').count(),2);
+assert.equal(await page.locator('#reference-test [role=link]').count(),4);
+assert(await page.evaluate(()=>getComputedStyle(document.querySelector('#normal')).fontSize===getComputedStyle(document.querySelector('#handoff')).fontSize));
+await page.locator('#prompt').fill('Discuss #tea');await page.locator('#prompt').press('End');await page.evaluate(async()=>{(await import('/app.js')).updateMentions();});
+await page.locator('#mention-options button').filter({hasText:'team-general'}).click();
+assert.equal(await page.locator('#prompt [data-channel]').count(),1);
+assert.equal(await page.locator('#prompt').evaluate(n=>n.value),'Discuss #team-general ');
+assert.equal(await page.locator('#prompt [data-mention]:not([data-channel])').count(),0);
+fs.mkdirSync('/tmp/kindred-channel-mentions',{recursive:true});await page.locator('#reference-test').screenshot({path:'/tmp/kindred-channel-mentions/preview.png'});
+await page.locator('#normal [data-mention="piper"]').click();assert.equal(await page.evaluate(async()=>(await import('/app.js')).state.bot.id),'piper');
+await page.locator('#normal [data-channel]').click();assert.equal(await page.evaluate(async()=>(await import('/app.js')).state.chat.id),'group-test');
+assert.equal(await page.locator('#heading').textContent(),'#team-general');
+const codeSafe=await page.evaluate(async()=>{const m=await import('/app.js');return m.markdown('`#team-general @Piper`',true).querySelectorAll('[data-mention]').length;});assert.equal(codeSafe,0);
+const aliases=await page.evaluate(async()=>{const m=await import('/app.js');m.state.chats.push({id:'group-another',name:'Team General',members:['piper'],archived:false});return m.channelCandidates().filter(c=>c.name.startsWith('team-general')).map(c=>c.name);});assert.equal(new Set(aliases).size,2);
+console.log('Channel suggestions, serialization, clickable badges and handoff font passed');
+}finally{await browser.close();server.closeAllConnections();server.close();}})().catch(e=>{console.error(e);process.exitCode=1;server.close();});

@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="800" viewBox="0 0 1280 800">
+  <!-- Calm, low-detail backdrop in Kindred's dark neutral with soft palette light.
+       Kept dim and textless so windows, screenshots and OCR stay clear. -->
+  <defs>
+    <linearGradient id="base" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#1b1e22"/><stop offset=".55" stop-color="#15171a"/><stop offset="1" stop-color="#101113"/></linearGradient>
+    <radialGradient id="blue" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(250 170) scale(620 460)"><stop stop-color="#2475ff" stop-opacity=".26"/><stop offset="1" stop-color="#2475ff" stop-opacity="0"/></radialGradient>
+    <radialGradient id="lilac" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(1080 600) scale(640 480)"><stop stop-color="#7960ff" stop-opacity=".22"/><stop offset="1" stop-color="#7960ff" stop-opacity="0"/></radialGradient>
+    <radialGradient id="teal" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(700 820) scale(520 300)"><stop stop-color="#14bfc7" stop-opacity=".12"/><stop offset="1" stop-color="#14bfc7" stop-opacity="0"/></radialGradient>
+    <linearGradient id="form" x1="0" y1="0" x2="0" y2="1"><stop stop-color="#ffffff" stop-opacity=".03"/><stop offset=".75" stop-color="#ffffff" stop-opacity="0"/></linearGradient>
+  </defs>
+  <rect width="1280" height="800" fill="url(#base)"/>
+  <rect width="1280" height="800" fill="url(#blue)"/>
+  <rect width="1280" height="800" fill="url(#lilac)"/>
+  <rect width="1280" height="800" fill="url(#teal)"/>
+  <!-- Two large, faint forms echo the bots' round and capsule bodies. -->
+  <circle cx="1010" cy="250" r="230" fill="url(#form)"/>
+  <rect x="120" y="470" width="560" height="236" rx="118" fill="url(#form)" transform="rotate(-8 400 588)"/>
+</svg>

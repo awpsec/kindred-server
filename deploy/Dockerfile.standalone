@@ -1,0 +1,9 @@
+FROM debian:trixie-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl python3 openssh-client qemu-system-x86 qemu-utils genisoimage xz-utils util-linux && rm -rf /var/lib/apt/lists/* && useradd --uid 1000 --create-home kindred
+COPY kindred /usr/local/bin/kindred
+COPY harness /opt/kindred/source/harness
+COPY deploy /opt/kindred/source/deploy
+RUN chmod 755 /usr/local/bin/kindred && sh /opt/kindred/source/deploy/install-pi.sh && mkdir -p /opt/kindred/guest /usr/local/lib/kindred && cp -a /opt/kindred/source/deploy/. /opt/kindred/guest/ && cp /usr/local/bin/kindred /opt/kindred/guest/kindred && python3 /opt/kindred/source/deploy/download-codex.py /opt/kindred/guest/codex && install -m 755 /opt/kindred/source/deploy/vm-manager.py /usr/local/lib/kindred/vm-manager.py
+ENV KINDRED_PROFILES_DIR=/data/profiles KINDRED_GUEST_SOFTWARE=/opt/kindred/guest
+EXPOSE 9444
+ENTRYPOINT ["python3","/opt/kindred/source/deploy/container-entry.py"]

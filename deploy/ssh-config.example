@@ -1,0 +1,11 @@
+# Install as /var/lib/kindred/.ssh/config, owned by kindred, mode 600.
+Host kindred-guest
+    HostName 192.168.122.100
+    User bot
+    IdentityFile /var/lib/kindred/.ssh/id_ed25519
+    IdentitiesOnly yes
+    StrictHostKeyChecking yes
+    UserKnownHostsFile /var/lib/kindred/.ssh/known_hosts
+    ForwardAgent no
+    ForwardX11 no
+    RequestTTY no

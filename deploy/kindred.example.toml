@@ -1,0 +1,28 @@
+listen = "127.0.0.1:7340"
+public_url = "http://127.0.0.1:7340"
+# For a Tailscale HTTPS origin, set public_url to that origin and retain localhost here.
+allowed_origins = []
+database = "/var/lib/kindred/kindred.db"
+token_env = "KINDRED_TOKEN"
+max_steps = 0 # Unlimited tool calls; set 1..100 for an explicit limit.
+max_parallel_runs = 4
+run_timeout_seconds = 1800
+
+[vm]
+control_helper = "/usr/local/libexec/kindred-virsh"
+uri = "qemu:///system"
+domain = "kindred-bots"
+ssh_alias = "kindred-guest"
+guest_binary = "/usr/local/bin/kindred"
+codex_binary = "/usr/local/bin/codex"
+vnc_port = 5900
+vnc_view_port = 5901
+
+[openrouter]
+api_key_env = "OPENROUTER_API_KEY"
+require_zdr = true
+
+[pi]
+# Install with deploy/install-pi.sh before using OpenRouter.
+node_binary = "/opt/kindred/pi/current/node/bin/node"
+worker_script = "/opt/kindred/pi/current/worker.mjs"

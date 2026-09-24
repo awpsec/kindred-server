@@ -1,0 +1,14 @@
+#!/bin/sh
+set -eu
+screen=${DISPLAY#:}; screen=${screen%%.*}
+case "$screen" in ''|*[!0-9]*) exit 2;; esac
+[ "$screen" -ge 1 ] && [ "$screen" -le 32 ] || exit 2
+profile=/home/bot/.local/share/kindred/browser
+[ "$screen" -eq 1 ] || profile=$profile-$screen
+cd /workspace
+case "${1:-}" in
+  browser) exec chromium --user-data-dir="$profile" --no-first-run --window-size=1120,680 --restore-last-session;;
+  files) exec pcmanfm --profile="kindred-$screen" --new-win /workspace;;
+  terminal) exec konsole --separate --hide-menubar --hide-tabbar --profile /usr/local/share/kindred/desktop/Kindred.profile --workdir /workspace;;
+  *) exit 2;;
+esac

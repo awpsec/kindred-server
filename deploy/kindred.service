@@ -1,0 +1,24 @@
+[Unit]
+Description=Kindred personal AI teammates
+After=network-online.target libvirtd.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=kindred
+Group=kindred
+WorkingDirectory=/var/lib/kindred
+EnvironmentFile=/etc/kindred/kindred.env
+ExecStart=/usr/local/bin/kindred --config /etc/kindred/kindred.toml serve
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/kindred
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

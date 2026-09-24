@@ -1,0 +1,21 @@
+#!/bin/sh
+# Fresh computers are ready at the dock. Restored browser sessions must own a
+# window before navigation can race to become that profile's first process.
+set -eu
+screen=${1:-1}
+case "$screen" in ''|*[!0-9]*) exit 2;; esac
+[ "$screen" -ge 1 ] && [ "$screen" -le 32 ] || exit 2
+export DISPLAY=:$screen
+profile=/home/bot/.local/share/kindred/browser
+[ "$screen" -eq 1 ] || profile=$profile-$screen
+ready() {
+    xdpyinfo -display "$DISPLAY" >/dev/null 2>&1 || return 1
+    xdotool search --onlyvisible --name '^Kindred Dock$' >/dev/null 2>&1 || return 1
+    [ ! -f "$profile/Local State" ] || xdotool search --onlyvisible --class chromium >/dev/null 2>&1
+}
+i=0
+until ready; do
+    i=$((i+1))
+    [ "$i" -lt 100 ] || { echo 'The bot desktop did not become ready.' >&2; exit 1; }
+    sleep 0.2
+done

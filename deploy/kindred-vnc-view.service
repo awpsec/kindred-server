@@ -1,0 +1,16 @@
+[Unit]
+Description=Kindred view-only VNC desktop (guest loopback only)
+After=kindred-guest-desktop.service
+Requires=kindred-guest-desktop.service
+
+[Service]
+User=bot
+Group=bot
+Environment=DISPLAY=:1
+ExecStart=/usr/bin/x11vnc -display :1 -rfbport 5901 -localhost -nopw -forever -shared -viewonly -noxdamage -quiet
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

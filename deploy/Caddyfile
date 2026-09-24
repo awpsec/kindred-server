@@ -1,0 +1,3 @@
+{$KINDRED_DOMAIN:localhost} {
+    reverse_proxy server:9444
+}

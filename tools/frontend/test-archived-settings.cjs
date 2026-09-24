@@ -1,0 +1,22 @@
+const {server,token}=require('./fixtures/desktop.cjs');
+const fs=require('node:fs'),path=require('node:path'),assert=require('node:assert/strict');
+const {chromium,webkit}=require(process.env.KINDRED_PLAYWRIGHT_MODULE||'playwright');
+(async()=>{await new Promise(r=>server.listen(0,'127.0.0.1',r));const origin='http://127.0.0.1:'+server.address().port;
+const browser=await(process.env.WEBKIT?webkit:chromium).launch({headless:true,args:process.env.WEBKIT?[]:['--no-sandbox']});const page=await browser.newPage({viewport:{width:1100,height:800}}),errors=[];page.on('pageerror',e=>errors.push(e.message));
+let bots=['Piper','Rowan'].map((name,i)=>({id:name.toLowerCase(),name,provider:'codex',instructions:'Keep these instructions',memory:'Keep this memory',profile:{archived:true,shape:'round',color:i?'#ffb800':'#2475ff',label:i?'Research assistant':'Project assistant'}})),writes=[];
+try{
+await page.route(origin+'/app.js',r=>r.fulfill({contentType:'text/javascript',body:fs.readFileSync(path.resolve(__dirname,'../../ui/app.js'),'utf8')+'\nexport {openSettings};'}));
+await page.route(origin+'/api/**',r=>{const req=r.request(),p=new URL(req.url()).pathname;
+if(p==='/api/bots')return r.fulfill({json:bots});if(p==='/api/runs'||p==='/api/chats')return r.fulfill({json:[]});
+if(p.startsWith('/api/bots/')&&['PUT','DELETE'].includes(req.method())){const body=req.postDataJSON();writes.push({method:req.method(),body});if(req.method()==='DELETE')bots=bots.filter(b=>b.id!==p.split('/').pop());else bots=bots.map(b=>b.id===body.id?body:b);return r.fulfill({json:body});}return r.continue();});
+await page.addInitScript(t=>sessionStorage.setItem('kindred-token',t),token);await page.goto(origin);
+await page.evaluate(async()=>{await (await import('/app.js')).openSettings('archived');});
+const rows=page.locator('.archived-bot-row');await rows.first().waitFor();assert.equal(await rows.count(),2);
+fs.mkdirSync('/tmp/kindred-archived-settings',{recursive:true});await page.locator('#settings-dialog').screenshot({path:'/tmp/kindred-archived-settings/archived.png'});
+await rows.filter({hasText:'Piper'}).getByRole('button',{name:'Restore',exact:true}).click();await rows.filter({hasText:'Piper'}).waitFor({state:'detached'});
+assert.equal(writes[0].body.preserve_text,true);assert.equal(writes[0].body.memory,'Keep this memory');assert.equal(writes[0].body.profile.archived,false);
+await rows.filter({hasText:'Rowan'}).getByRole('button',{name:'Delete permanently',exact:true}).click();
+let dialog=page.getByRole('dialog',{name:'Permanently delete Rowan?'}),remove=dialog.getByRole('button',{name:'Delete permanently',exact:true});assert(await remove.isDisabled());await dialog.getByLabel('Type Rowan to confirm').fill('Wrong');assert(await remove.isDisabled());await dialog.getByRole('button',{name:'Cancel',exact:true}).click();assert.equal(writes.length,1);
+await rows.filter({hasText:'Rowan'}).getByRole('button',{name:'Delete permanently',exact:true}).click();dialog=page.getByRole('dialog',{name:'Permanently delete Rowan?'});await dialog.getByLabel('Type Rowan to confirm').fill('Rowan');await dialog.getByRole('button',{name:'Delete permanently',exact:true}).click();await page.getByText('No archived bots.',{exact:true}).waitFor();assert.equal(writes[1].method,'DELETE');assert.equal(writes[1].body.confirmed,true);assert.equal(writes[1].body.name,'Rowan');assert.deepEqual(errors,[]);
+console.log('Archived settings: discoverability, restore, cancel, typed confirmation, delete and empty state passed');
+}finally{await browser.close();server.closeAllConnections();server.close();}})().catch(e=>{console.error(e);process.exitCode=1;server.close();});

@@ -1,0 +1,46 @@
+name: kindred
+services:
+  server:
+    build: .
+    platform: linux/amd64
+    restart: unless-stopped
+    init: true
+    ports:
+      - "${KINDRED_BIND:-127.0.0.1}:${KINDRED_PORT:-9444}:9444"
+    environment:
+      KINDRED_PUBLIC_URL: "${KINDRED_PUBLIC_URL:-http://127.0.0.1:9444}"
+      KINDRED_OPEN_REGISTRATION: "${KINDRED_OPEN_REGISTRATION:-true}"
+      KINDRED_MAX_USERS: "${KINDRED_MAX_USERS:-128}"
+      KINDRED_MAX_PROFILES_PER_USER: "${KINDRED_MAX_PROFILES_PER_USER:-8}"
+      KINDRED_VM_CPUS: "${KINDRED_VM_CPUS:-2}"
+      KINDRED_VM_MEMORY_MB: "${KINDRED_VM_MEMORY_MB:-6144}"
+      KINDRED_VM_DISK_GB: "${KINDRED_VM_DISK_GB:-30}"
+      KINDRED_VM_MAX_RUNNING: "${KINDRED_VM_MAX_RUNNING:-4}"
+      KINDRED_VM_ACCEL: "${KINDRED_VM_ACCEL:-auto}"
+    volumes:
+      - kindred-data:/data
+    cap_drop: [ALL]
+    cap_add: [CHOWN, SETUID, SETGID]
+    security_opt: [no-new-privileges:true]
+    stop_grace_period: 90s
+    healthcheck:
+      test: [CMD, python3, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9444/health',timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 6
+  https:
+    image: caddy:2
+    profiles: [public]
+    restart: unless-stopped
+    ports: ["80:80", "443:443"]
+    environment:
+      KINDRED_DOMAIN: "${KINDRED_DOMAIN:-localhost}"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+    depends_on:
+      server:
+        condition: service_healthy
+volumes:
+  kindred-data:
+  caddy-data:
