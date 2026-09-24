@@ -162,6 +162,7 @@ table inet kindred {
  chain output {
   type filter hook output priority 0; policy accept;
   oifname "lo" accept
+  oifname "tailscale0" accept comment "kindred-tailnet"
   ct state established,related accept
   ip daddr 10.0.2.3 udp dport 53 accept
   ip daddr 10.0.2.3 tcp dport 53 accept

@@ -1,4 +1,5 @@
 pub const BOT_INSTRUCTIONS_MAX_BYTES: usize = 32_000;
+pub const BOT_MEMORY_MAX_BYTES: usize = 64_000;
 use anyhow::{Result, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -356,7 +357,7 @@ impl Db {
             matches!(field, "instructions" | "memory"),
             "Unknown text field"
         );
-        let limit = if field == "instructions" { BOT_INSTRUCTIONS_MAX_BYTES } else { 16_000 };
+        let limit = if field == "instructions" { BOT_INSTRUCTIONS_MAX_BYTES } else { BOT_MEMORY_MAX_BYTES };
         ensure!(value.len() <= limit, "Text is limited to {limit} UTF-8 bytes");
         let changed = self.0.lock().unwrap().execute(
             &format!("UPDATE bots SET {field}=?1 WHERE id=?2 AND (?3 IS NULL OR {field}=?3)"),
@@ -928,8 +929,8 @@ pub(crate) fn validate_bot(b: &Bot) -> Result<()> {
         "name must have 1..80 characters"
     );
     ensure!(
-        b.instructions.len() <= BOT_INSTRUCTIONS_MAX_BYTES && b.memory.len() <= 16000,
-        "Instructions are limited to 32,000 UTF-8 bytes; memory to 16,000 UTF-8 bytes"
+        b.instructions.len() <= BOT_INSTRUCTIONS_MAX_BYTES && b.memory.len() <= BOT_MEMORY_MAX_BYTES,
+        "Instructions are limited to 32,000 UTF-8 bytes; memory to 64,000 UTF-8 bytes"
     );
     ensure!(
         crate::provider_accounts::valid_id(&b.provider),

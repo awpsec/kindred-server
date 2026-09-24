@@ -614,13 +614,13 @@ fn normalize_draft(v: &Value, input: &Value) -> Result<Value> {
         v["name"].as_str().unwrap()
     };
     let instructions = text(input, "instructions", db::BOT_INSTRUCTIONS_MAX_BYTES, true)?;
-    let memory = text(input, "memory", 16000, false)?
+    let memory = text(input, "memory", db::BOT_MEMORY_MAX_BYTES, false)?
         .split("\n\n[Kindred workspace origin]")
         .next()
         .unwrap_or("");
     ensure!(
-        memory.len() <= 14000,
-        "Keep imported memories within 14 KB to leave room for origin information"
+        memory.len() <= db::BOT_MEMORY_MAX_BYTES - 2000,
+        "Keep imported memories within 62 KB to leave room for origin information"
     );
     let origin_path = v["source"]["path"]
         .as_str()
@@ -636,7 +636,7 @@ fn normalize_draft(v: &Value, input: &Value) -> Result<Value> {
             .filter(|s| !s.is_empty())
             .unwrap_or("a manually selected folder")
     );
-    ensure!(memory.len() <= 16000, "Memory and origin must fit in 16 KB");
+    ensure!(memory.len() <= db::BOT_MEMORY_MAX_BYTES, "Memory and origin must fit in 64 KB");
     let workflows = input["workflows"]
         .as_array()
         .context("Supply workflows, including explicitly skipped entries")?;

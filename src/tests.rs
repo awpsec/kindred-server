@@ -929,7 +929,7 @@ fn action_scope_is_required_for_effectful_vm_tools() {
 }
 
 #[test]
-fn bot_instructions_accept_32000_bytes_without_expanding_memory_limit() {
+fn bot_text_limits_preserve_memory_on_failed_write() {
     let app = app();
     let mut b = bot(&app.db, "codex");
     b.instructions = "é".repeat(16_000);
@@ -940,7 +940,14 @@ fn bot_instructions_accept_32000_bytes_without_expanding_memory_limit() {
     app.db.save_bot_text(&b.id, "instructions", &"x".repeat(32_000), Some(&expected)).unwrap();
     b.instructions.push('x');
     assert!(app.db.save_bot(&b).is_err());
-    assert!(app.db.save_bot_text(&b.id, "memory", &"x".repeat(16_001), None).is_err());
+    let memory = "é".repeat(32_000);
+    app.db.save_bot_text(&b.id, "memory", &memory, None).unwrap();
+    assert!(app.db.save_bot_text(&b.id, "memory", &(memory.clone()+"x"), None).is_err());
+    let mut saved = app.db.bot(&b.id).unwrap();
+    assert_eq!(saved.memory, memory);
+    app.db.save_bot(&saved).unwrap();
+    saved.memory.push('x');
+    assert!(app.db.save_bot(&saved).is_err());
 }
 
 #[test]

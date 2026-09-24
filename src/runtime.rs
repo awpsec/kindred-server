@@ -254,7 +254,7 @@ pub fn tool_specs() -> Vec<Value> {
         ),
         (
             "remember",
-            "Save durable memory across your chats. Required before acknowledging an ongoing role, responsibility or preference assigned specifically to YOU, including assignments relayed by a teammate. Merge new facts into the existing memory; this replaces its full contents. A fact about another named teammate must retain that person's name, never become your first-person role. Do not store passwords.",
+            "Save durable memory across your chats. Required before acknowledging an ongoing role, responsibility or preference assigned specifically to YOU, including assignments relayed by a teammate. Merge new facts into the existing memory; this replaces its full contents (64,000 UTF-8 bytes maximum). Keep detailed historical records in their existing sources and retrieve prior conversations with chat_read. A rejected save preserves previous memory and chat history. A fact about another named teammate must retain that person's name, never become your first-person role. Do not store passwords.",
             json!({"text":{"type":"string"}}),
             vec!["text"],
         ),
@@ -334,7 +334,7 @@ pub fn tool_specs() -> Vec<Value> {
         (
             "workspace_import_draft",
             "Submit a reviewable workspace conversion or origin sync. Read all source documents/workflows first; merge previous source, previously applied text and current Kindred edits. Supply full instructions/memory and every discovered workflow, include=false to skip one. Workflows are profile-wide: namespace new names/commands, preserve existing sync names. Supporting files are retained automatically. Only use removals for previously imported workflows absent from the new source; otherwise they are retained. Explain unresolved tool/path dependencies and merges in notes. This only saves a draft; never claim it is installed.",
-            json!({"import_id":{"type":"string"},"name":{"type":"string"},"instructions":{"type":"string","maxLength":crate::db::BOT_INSTRUCTIONS_MAX_BYTES},"memory":{"type":"string","maxLength":14000},"role":{"type":"string"},"description":{"type":"string"},"notes":{"type":"string"},"workflows":{"type":"array","maxItems":256,"items":{"type":"object","properties":{"key":{"type":"string"},"include":{"type":"boolean"},"name":{"type":"string"},"command":{"type":"string"},"description":{"type":"string"},"body":{"type":"string"}},"required":["key","include"]}},"removals":{"type":"array","items":{"type":"string"}}}),
+            json!({"import_id":{"type":"string"},"name":{"type":"string"},"instructions":{"type":"string","maxLength":crate::db::BOT_INSTRUCTIONS_MAX_BYTES},"memory":{"type":"string","maxLength":crate::db::BOT_MEMORY_MAX_BYTES-2000},"role":{"type":"string"},"description":{"type":"string"},"notes":{"type":"string"},"workflows":{"type":"array","maxItems":256,"items":{"type":"object","properties":{"key":{"type":"string"},"include":{"type":"boolean"},"name":{"type":"string"},"command":{"type":"string"},"description":{"type":"string"},"body":{"type":"string"}},"required":["key","include"]}},"removals":{"type":"array","items":{"type":"string"}}}),
             vec!["import_id", "name", "instructions", "memory", "workflows"],
         ),
         (

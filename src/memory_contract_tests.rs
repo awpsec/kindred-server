@@ -23,7 +23,8 @@ async fn codex_memory_receipts_match_disk_state_after_restart() {
                 "CREATE TEMP TRIGGER reject_memory BEFORE UPDATE OF memory ON bots BEGIN SELECT RAISE(ABORT,'fixture storage failure'); END;"
             ).unwrap();
         }
-        let saved = "Existing preference. My ongoing responsibility is inbox management.";
+        let saved_payload = format!("Existing preference. My ongoing responsibility is inbox management. {}", "Retained context. ".repeat(2000));
+        let saved = saved_payload.as_str();
         let script = r#"
 import sys,json
 failure,saved=sys.argv[1:]
@@ -42,7 +43,7 @@ for line in sys.stdin:
         send({'id':v['id'],'result':{'thread':{'id':'memory-contract'}}})
     elif m=='turn/start':
         send({'id':v['id'],'result':{}})
-        send({'id':'save-memory','method':'item/tool/call','params':{'tool':'remember','arguments':{'text':'x'*16001 if failure=='oversized' else saved}}})
+        send({'id':'save-memory','method':'item/tool/call','params':{'tool':'remember','arguments':{'text':'x'*64001 if failure=='oversized' else saved}}})
     elif v.get('id')=='save-memory':
         assert v['result']['success']==(failure=='none'),v
         receipt=v['result']['contentItems'][0]['text']
