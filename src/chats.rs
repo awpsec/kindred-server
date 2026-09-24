@@ -359,7 +359,11 @@ impl Db {
                 row["planning"] = planning;
             }
             if row["kind"] == "workspace_artifact" {
-                let artifact=self.workspace_artifact_read(row["text"].as_str().unwrap_or(""))?;
+                let id=row["text"].as_str().unwrap_or("");
+                let first:i64=self.0.lock().unwrap().query_row("SELECT MIN(seq) FROM chat_messages WHERE kind='workspace_artifact' AND body=?",[id],|r|r.get(0))?;
+                row["artifact_action"]=json!(if row["seq"].as_i64()==Some(first){"created"}else{"updated"});
+                let mut artifact=self.workspace_artifact_read(row["text"].as_str().unwrap_or(""))?;
+                if row["artifact_action"]=="updated" {if let Some(value)=artifact.as_object_mut(){value.remove("source");value.remove("state");}}
                 row["text"]=artifact["title"].clone();row["workspace_artifact"]=artifact;
             }
             if row["kind"] == "visual_panel" {

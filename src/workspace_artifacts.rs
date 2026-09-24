@@ -6,6 +6,7 @@ use serde_json::{Value,json};
 use axum::{Json,extract::{State,Path}};
 const IDLE:i64=14*24*60*60;
 pub fn migrate(c:&Connection)->Result<()> {
+ c.execute_batch("CREATE INDEX IF NOT EXISTS chat_workspace_artifact_events ON chat_messages(body,seq) WHERE kind='workspace_artifact';")?;
  c.execute_batch("CREATE TABLE IF NOT EXISTS workspace_artifacts(id TEXT PRIMARY KEY,chat_id TEXT NOT NULL REFERENCES chats(id),bot_id TEXT NOT NULL REFERENCES bots(id),artifact_key TEXT NOT NULL,body TEXT NOT NULL,revision INTEGER NOT NULL,updated INTEGER NOT NULL,archived INTEGER NOT NULL DEFAULT 0,UNIQUE(chat_id,artifact_key)); CREATE TABLE IF NOT EXISTS workspace_artifact_versions(artifact_id TEXT NOT NULL REFERENCES workspace_artifacts(id) ON DELETE CASCADE,revision INTEGER NOT NULL,body TEXT NOT NULL,updated INTEGER NOT NULL,PRIMARY KEY(artifact_id,revision));")?;
  c.execute_batch("CREATE TABLE IF NOT EXISTS workspace_artifact_folders(name TEXT PRIMARY KEY,position INTEGER NOT NULL);")?;
  let mut query=c.prepare("SELECT json_extract(body,'$.folder') FROM workspace_artifacts WHERE COALESCE(json_extract(body,'$.folder'),'')!='' GROUP BY json_extract(body,'$.folder') ORDER BY MAX(updated) DESC,1")?;
@@ -42,7 +43,8 @@ fn writable(c:&Connection,chat:&str)->Result<()> {
 }
 fn publish(c:&Connection,v:&Value)->Result<()> {
  let id=v["id"].as_str().unwrap();
- c.execute("UPDATE chat_messages SET suppressed=1 WHERE kind='workspace_artifact' AND body=?",[id])?;
+ // Keep the original creation card and publish subsequent edits as events.
+ c.execute("UPDATE chat_messages SET suppressed=0 WHERE seq=(SELECT MIN(seq) FROM chat_messages WHERE kind='workspace_artifact' AND body=?)",[id])?;
  c.execute("INSERT INTO chat_messages(chat_id,sender,body,kind,run_id,created) VALUES(?,?,?,'workspace_artifact','',?)",params![v["chat_id"].as_str(),v["bot_id"].as_str(),id,db::now()])?;Ok(())
 }
 impl Db {
@@ -138,7 +140,8 @@ pub async fn update(State(app):State<Shared>,Path(id):Path<String>,Json(patch):J
   assert!(db.workspace_artifact_update(id,&json!({"expected_revision":2,"source":"oops"})).is_err());
   let reopened=db.workspace_artifact_update(id,&json!({"expected_revision":2,"reopen":true})).unwrap();assert_eq!(reopened["archived"],false);assert_eq!(reopened["source"],a["source"]);
   assert!(Db::open(":memory:").unwrap().workspace_artifact_read(id).is_err());
-  assert_eq!(db.chat_messages(&run.chat_id).unwrap().iter().filter(|m|m["kind"]=="workspace_artifact").count(),1);
+  let messages=db.chat_messages(&run.chat_id).unwrap();let events:Vec<_>=messages.iter().filter(|m|m["kind"]=="workspace_artifact").collect();
+  assert_eq!(events.len(),3);assert_eq!(events[0]["artifact_action"],"created");assert!(events[1..].iter().all(|m|m["artifact_action"]=="updated"));
  }
  #[tokio::test]
  async fn folder_and_export_keep_latest_human_edits(){
@@ -211,7 +214,7 @@ pub async fn update(State(app):State<Shared>,Path(id):Path<String>,Json(patch):J
   }
   let latest=app.db.workspace_artifact_read(&id).unwrap();assert_eq!(latest["revision"],33);assert_eq!(latest["state"],initial["state"]);assert_eq!(latest["folder"],"Client Reports");assert_eq!(latest["path"],initial["path"]);
   let source=latest["source"].as_str().unwrap();assert!(source.starts_with("# Human approved introduction\n"));for round in 0..16{for label in ["author","reviewer"]{assert_eq!(source.matches(&format!("{label} contribution {round}\n")).count(),1);}}
-  assert_eq!(app.db.chat_messages(&author_run.chat_id).unwrap().iter().filter(|m|m["kind"]=="workspace_artifact").count(),1);
+  assert_eq!(app.db.chat_messages(&author_run.chat_id).unwrap().iter().filter(|m|m["kind"]=="workspace_artifact"&&m["artifact_action"]=="created").count(),1);
   assert_eq!(app.db.0.lock().unwrap().query_row("SELECT COUNT(*) FROM workspace_artifact_versions WHERE artifact_id=?",[&id],|r|r.get::<_,i64>(0)).unwrap(),33);
  }
 
@@ -246,7 +249,7 @@ pub async fn update(State(app):State<Shared>,Path(id):Path<String>,Json(patch):J
   assert_eq!(client.get(&url).bearer_auth("wrong-token").send().await.unwrap().status(),401);
   assert_eq!(app.db.workspace_artifact_read(&ids[0]).unwrap(),after);
   let tool_list=crate::runtime::call_tool(&app,&bot,&run,"artifact_list",json!({})).await.unwrap();let tool_list:Value=serde_json::from_str(tool_list["text"].as_str().unwrap()).unwrap();assert_eq!(tool_list.as_array().unwrap().len(),128);
-  assert_eq!(app.db.chat_messages(&run.chat_id).unwrap().iter().filter(|m|m["kind"]=="workspace_artifact"&&m["workspace_artifact"]["id"]==ids[0]).count(),1);
+  assert_eq!(app.db.chat_messages(&run.chat_id).unwrap().iter().filter(|m|m["kind"]=="workspace_artifact"&&m["workspace_artifact"]["id"]==ids[0]&&m["artifact_action"]=="created").count(),1);
   // A different bot can discover, review and edit the same workspace artifact.
   let reviewer=crate::tests::bot(&app.db,"claude-code");let review_id=app.db.queue(&reviewer.id,"review existing artifact",0).unwrap();let review_run=app.db.run(&review_id).unwrap();
   for provider in ["claude-code","codex","openrouter"] {let mut actor=reviewer.clone();actor.provider=provider.into();let specs=crate::runtime::tool_specs_for(&app,&actor);for name in ["artifact_list","artifact_read","artifact_create","artifact_update","artifact_export"]{assert!(specs.iter().any(|v|v["name"]==name));}}
@@ -256,7 +259,7 @@ pub async fn update(State(app):State<Shared>,Path(id):Path<String>,Json(patch):J
   let amended=crate::runtime::call_tool(&app,&reviewer,&review_run,"artifact_update",json!({"id":ids[0],"expected_revision":3,"source":"# Reviewed and corrected"})).await.unwrap();
   assert_ne!(amended["failed"],true);let amended:Value=serde_json::from_str(amended["text"].as_str().unwrap()).unwrap();assert_eq!(amended["state"],after["state"]);assert_eq!(amended["path"],after["path"]);
   let original_view=crate::runtime::call_tool(&app,&bot,&run,"artifact_read",json!({"id":ids[0]})).await.unwrap();assert_eq!(serde_json::from_str::<Value>(original_view["text"].as_str().unwrap()).unwrap(),amended);
-  assert_eq!(app.db.chat_messages(&run.chat_id).unwrap().iter().filter(|m|m["kind"]=="workspace_artifact"&&m["workspace_artifact"]["id"]==ids[0]).count(),1);
+  assert_eq!(app.db.chat_messages(&run.chat_id).unwrap().iter().filter(|m|m["kind"]=="workspace_artifact"&&m["workspace_artifact"]["id"]==ids[0]&&m["artifact_action"]=="created").count(),1);
   server.abort();
  }
 
