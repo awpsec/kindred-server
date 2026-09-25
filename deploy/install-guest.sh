@@ -6,7 +6,7 @@ set -eu
 [ -f ./kindred ] || { echo 'Put the compiled Linux kindred binary beside this script.' >&2; exit 1; }
 [ -f ./kindred-guest-desktop.service ] && [ -f ./start-desktop.sh ] || exit 1
 apt-get update
-DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends sudo openssh-server ca-certificates curl chromium openbox dbus-x11 xvfb x11-utils xdotool x11vnc imagemagick coreutils libpam-systemd tint2 feh xterm konsole fonts-dejavu-core pcmanfm librsvg2-bin util-linux python3-docx python3-venv python3-pip libreoffice-writer poppler-utils fonts-liberation
+DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends sudo openssh-server ca-certificates curl chromium openbox dbus-x11 xvfb x11-utils xdotool x11vnc imagemagick coreutils libpam-systemd tint2 rofi feh xterm konsole fonts-dejavu-core pcmanfm librsvg2-bin util-linux python3-docx python3-venv python3-pip libreoffice-writer poppler-utils fonts-liberation
 id bot >/dev/null 2>&1 || useradd --create-home --shell /bin/bash bot
 # The bot administers this dedicated VM. This grants no host privileges.
 install -d -m 0750 /etc/sudoers.d
@@ -28,7 +28,7 @@ install -d /usr/local/share/kindred/desktop
 install -m 644 ./desktop/* /usr/local/share/kindred/desktop/
 install -d /usr/local/share/konsole
 install -m 644 ./desktop/Kindred.colorscheme /usr/local/share/konsole/Kindred.colorscheme
-for asset in wallpaper browser files terminal; do
+for asset in wallpaper browser files terminal applications; do
     rsvg-convert "/usr/local/share/kindred/desktop/$asset.svg" -o "/usr/local/share/kindred/desktop/$asset.png"
 done
 install -d /etc/systemd/user

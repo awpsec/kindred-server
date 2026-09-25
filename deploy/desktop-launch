@@ -7,6 +7,7 @@ profile=/home/bot/.local/share/kindred/browser
 [ "$screen" -eq 1 ] || profile=$profile-$screen
 cd /workspace
 case "${1:-}" in
+  applications) exec rofi -show drun -show-icons -display-drun Applications -theme /usr/local/share/kindred/desktop/applications.rasi;;
   browser) exec chromium --user-data-dir="$profile" --no-first-run --window-size=1120,680 --restore-last-session;;
   files) exec pcmanfm --profile="kindred-$screen" --new-win /workspace;;
   terminal) exec konsole --separate --hide-menubar --hide-tabbar --profile /usr/local/share/kindred/desktop/Kindred.profile --workdir /workspace;;

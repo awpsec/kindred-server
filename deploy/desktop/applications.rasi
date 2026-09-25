@@ -1,0 +1,11 @@
+* { font: "DejaVu Sans 12"; background-color: #1b1e24; text-color: #edf0f5; }
+window { width: 580px; border: 1px; border-color: #454b56; border-radius: 18px; padding: 18px; }
+mainbox { spacing: 14px; }
+inputbar { spacing: 10px; padding: 12px; border-radius: 8px; background-color: #292e37; }
+entry { placeholder: "Search applications…"; background-color: inherit; }
+prompt { background-color: inherit; }
+listview { lines: 7; spacing: 4px; fixed-height: false; }
+element { padding: 10px; spacing: 12px; border-radius: 8px; }
+element selected { background-color: #3b4556; }
+element-icon { size: 28px; background-color: inherit; }
+element-text { vertical-align: 0.5; background-color: inherit; }

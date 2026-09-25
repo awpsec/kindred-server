@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Applications
+Comment=Search and open installed applications
+Exec=/usr/local/lib/kindred/desktop-launch applications
+Icon=/usr/local/share/kindred/desktop/applications.png
+Terminal=false
+StartupNotify=false

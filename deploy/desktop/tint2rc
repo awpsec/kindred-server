@@ -11,7 +11,7 @@ background_color = #2a2e33 96
 
 panel_items = L
 # Sit flush with the desktop edge, reserving only the dock's own height.
-panel_size = 204 56
+panel_size = 260 56
 panel_margin = 0 0
 panel_padding = 12 6 12
 panel_background_id = 1
@@ -35,6 +35,7 @@ launcher_icon_size = 40
 launcher_icon_asb = 100 0 0
 launcher_tooltip = 1
 startup_notifications = 0
+launcher_item_app = /usr/local/share/kindred/desktop/applications.desktop
 launcher_item_app = /usr/local/share/kindred/desktop/browser.desktop
 launcher_item_app = /usr/local/share/kindred/desktop/files.desktop
 launcher_item_app = /usr/local/share/kindred/desktop/terminal.desktop
