@@ -256,3 +256,12 @@ page/sheet navigation, close-during-load, web download bytes and native receipt
 reveal. Set `WEBKIT=1` for WebKit. `node test-native-document-previews.cjs` runs
 DOCX/XLSX/PDF smoke checks in an actual Linux desktop webview; set
 `KINDRED_NATIVE_EXE` and run under an isolated display (e.g. xvfb-run).
+
+`test-pane-resizing.cjs` covers pointer and keyboard resizing, avatar-rail fades,
+search expansion, saved widths, computer/frame pointer shielding, artifact-library
+resizing, macOS chrome and reduced motion. `test-pane-window-fit.cjs` checks both
+default and saved widths across laptop/tablet sizes: chat retains 420px, automatic
+fitting does not overwrite preferences, and very narrow windows use a temporary
+right-pane overlay. Run both in Chromium and with `WEBKIT=1`; these are fixture
+checks, not native macOS/Windows acceptance. Double-click a divider to reset it;
+arrow keys resize, Home/End select limits, and Escape cancels an active drag.
