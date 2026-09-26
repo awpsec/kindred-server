@@ -953,3 +953,21 @@ async fn server_update_requires_administrator_and_valid_release() {
         assert!(!status.is_success());
     }
 }
+
+#[tokio::test]
+async fn transfer_registration_retry_logs_into_the_same_empty_destination() {
+    let destination=Fixture::new(false);
+    let request=db::id();
+    let credentials=json!({"login":"moving","name":"Workspace","password":"fixture migration password","request_id":request});
+    let (status,first)=destination.request("POST","/identity/register","",credentials.clone()).await;
+    assert_eq!(status,200,"{first}");
+    // The desktop may have lost the successful registration response.
+    let (status,_)=destination.request("POST","/identity/register","",credentials.clone()).await;
+    assert_eq!(status,400);
+    let mut retry=credentials;retry["new_profile_name"]=json!("Workspace");
+    let (status,recovered)=destination.request("POST","/identity/login","",retry).await;
+    assert_eq!(status,200,"{recovered}");
+    assert_eq!(recovered["profile_id"],first["profile_id"]);
+    let (_,identity)=destination.request("GET","/identity/profiles",recovered["token"].as_str().unwrap(),Value::Null).await;
+    assert_eq!(identity["profiles"].as_array().unwrap().len(),1);
+}
