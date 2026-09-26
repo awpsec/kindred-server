@@ -261,7 +261,7 @@ impl Db {
     pub fn bot_chat_message(&self, bot: &str, id: &str, seq: i64, offset: usize) -> Result<Value> {
         owned(self, bot, id)?;
         let c = self.0.lock().unwrap();
-        let(sender,name,body):(String,String,String)=c.query_row("SELECT m.sender,COALESCE(b.name,m.sender),m.body FROM chat_messages m LEFT JOIN bots b ON b.id=m.sender WHERE m.seq=? AND m.chat_id=? AND m.suppressed=0",params![seq,id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
+        let(sender,name,body):(String,String,String)=c.query_row("SELECT m.sender,COALESCE(b.name,m.sender),m.body FROM chat_messages m LEFT JOIN bots b ON b.id=m.sender WHERE m.seq=? AND m.chat_id=? AND m.suppressed=0 AND (m.sender='user' OR m.sender LIKE 'human:%' OR EXISTS(SELECT 1 FROM continuity_current_messages live WHERE live.seq=m.seq))",params![seq,id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
         let source_state:Option<Value>=c.query_row("SELECT revision,status,successor FROM continuity_source_state WHERE message_seq=?",[seq],|r|Ok(json!({"revision":r.get::<_,i64>(0)?,"status":r.get::<_,String>(1)?,"successor":r.get::<_,Option<i64>>(2)?}))).optional()?;
         let chars = body.chars().count();
         ensure!(offset <= chars, "Message offset exceeds its length");

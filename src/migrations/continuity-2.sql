@@ -50,7 +50,10 @@ END;
 INSERT OR IGNORE INTO continuity_schema VALUES(2,unixepoch());
 
 -- Model-derived chat prose inherits the source epochs of its authoring run.
-CREATE VIEW IF NOT EXISTS continuity_current_messages AS
+DROP VIEW IF EXISTS continuity_current_messages;
+CREATE VIEW continuity_current_messages AS
 SELECT m.* FROM chat_messages m WHERE m.suppressed=0
 AND NOT EXISTS(SELECT 1 FROM continuity_source_state s WHERE s.message_seq=m.seq AND s.status<>'active')
-AND (m.sender='user' OR NOT EXISTS(SELECT 1 FROM continuity_dependencies d LEFT JOIN continuity_epochs e ON e.chat_id=d.source_chat_id WHERE d.run_id=m.run_id AND d.epoch<>COALESCE(e.epoch,0)));
+AND (m.sender='user' OR m.sender LIKE 'human:%' OR (
+  COALESCE((SELECT epoch FROM continuity_sessions WHERE run_id=m.run_id),0)=COALESCE((SELECT epoch FROM continuity_epochs WHERE chat_id=m.chat_id),0)
+  AND NOT EXISTS(SELECT 1 FROM continuity_dependencies d LEFT JOIN continuity_epochs e ON e.chat_id=d.source_chat_id WHERE d.run_id=m.run_id AND d.epoch<>COALESCE(e.epoch,0))));

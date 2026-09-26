@@ -649,3 +649,228 @@ async fn source_lifecycle_endpoint_requires_owner_auth_and_preserves_source_on_s
             .contains("Retained original")
     );
 }
+
+#[test]
+fn review_new_receipts_remain_readable_after_a_source_correction() {
+    let db = Db::open(":memory:").unwrap();
+    let (b, old) = setup(&db);
+    store::start_session(&db, &old, "pi", "model").unwrap();
+    let seq = message(&db, &old, "Old preference");
+    db.event(&old.id, "tool_result", json!({"text":"old-receipt"}))
+        .unwrap();
+    db.0.lock()
+        .unwrap()
+        .execute(
+            "UPDATE chat_messages SET body='Corrected preference' WHERE seq=?",
+            [seq],
+        )
+        .unwrap();
+    let fresh = db
+        .run(&db.queue(&b.id, "Perform the new task", 0).unwrap())
+        .unwrap();
+    store::start_session(&db, &fresh, "pi", "model").unwrap();
+    db.event(
+        &fresh.id,
+        "tool_result",
+        json!({"text":"fresh-confirmed-receipt"}),
+    )
+    .unwrap();
+    db.finish(&fresh.id, "completed", "fresh-confirmed-result", "")
+        .unwrap();
+    let observer = db
+        .run(&db.queue(&b.id, "Review recent progress", 0).unwrap())
+        .unwrap();
+    let context = continuity::context(&db, &observer).unwrap();
+    assert!(
+        context["recent_task_journal"]
+            .to_string()
+            .contains("fresh-confirmed-result")
+    );
+    assert!(
+        store::receipts(&db, &fresh, &fresh.id, i64::MAX)
+            .unwrap()
+            .to_string()
+            .contains("fresh-confirmed-receipt")
+    );
+    assert!(
+        !store::receipts(&db, &fresh, &old.id, i64::MAX)
+            .unwrap()
+            .to_string()
+            .contains("old-receipt")
+    );
+}
+
+#[test]
+fn review_exact_message_reads_cannot_resurrect_invalidated_derivations() {
+    let db = Db::open(":memory:").unwrap();
+    let (b, old) = setup(&db);
+    store::start_session(&db, &old, "pi", "model").unwrap();
+    let original = message(&db, &old, "Remove this private sentinel");
+    let derived = {
+        let c = db.0.lock().unwrap();
+        c.execute("INSERT INTO chat_messages(chat_id,sender,body,kind,run_id,created) VALUES(?,?,'Repeated private sentinel','assistant',?,?)", params![old.chat_id,b.id,old.id,db::now()]).unwrap();
+        c.last_insert_rowid()
+    };
+    store::revise_source(&db, original, &json!({"action":"forget","expected_text":"Remove this private sentinel","expected_revision":0})).unwrap();
+    assert!(
+        db.bot_chat_message(&b.id, &old.chat_id, derived, 0)
+            .is_err()
+    );
+    let fresh = db
+        .run(&db.queue(&b.id, "Use current evidence", 0).unwrap())
+        .unwrap();
+    store::start_session(&db, &fresh, "pi", "model").unwrap();
+    assert!(
+        store::source_refs(
+            &db.0.lock().unwrap(),
+            &fresh,
+            &json!({"sources":[{"message_seq":derived}]})
+        )
+        .is_err()
+    );
+}
+
+#[test]
+#[ignore = "requires a disposable database created by the published 0.83.0 binary"]
+fn published_database_upgrades_in_place_without_losing_continuity() {
+    let source = std::env::var("KINDRED_TEST_LEGACY_CONTINUITY_DB").unwrap();
+    let destination = std::env::temp_dir().join(format!("kindred-legacy-upgrade-{}.db", db::id()));
+    std::fs::copy(source, &destination).unwrap();
+    for _ in 0..2 {
+        let db = Db::open(destination.to_str().unwrap()).unwrap();
+        assert_eq!(
+            db.bot("legacy-bot").unwrap().memory,
+            "Keep this stable preference"
+        );
+        assert_eq!(
+            db.bot("legacy-bot").unwrap().instructions,
+            "Keep the same role"
+        );
+        let run = db.run("legacy-run").unwrap();
+        assert_eq!(run.output, "Verified result");
+        assert_eq!(db.routines().unwrap()[0].id, "legacy-routine");
+        assert_eq!(
+            continuity::notes(&db, &run, None, i64::MAX).unwrap()["items"][0]["summary"],
+            "Preserved checkpoint"
+        );
+        assert!(
+            continuity::search_for(&db, &run, None, "Legacy continuity evidence")
+                .unwrap()
+                .to_string()
+                .contains("Legacy continuity evidence")
+        );
+        while !store::backfill(&db, 1).unwrap() {}
+        assert_eq!(
+            db.0.lock()
+                .unwrap()
+                .query_row("PRAGMA integrity_check", [], |r| r.get::<_, String>(0))
+                .unwrap(),
+            "ok"
+        );
+    }
+    std::fs::remove_file(&destination).unwrap();
+    let _ = std::fs::remove_file(format!("{}.lock", destination.display()));
+}
+
+#[test]
+fn review_legacy_derived_messages_do_not_survive_source_forgetting() {
+    let db = Db::open(":memory:").unwrap();
+    let (b, old) = setup(&db);
+    // Legacy runs have no dependency/session records.
+    let original = message(&db, &old, "Legacy private sentinel");
+    let derived = {
+        let c = db.0.lock().unwrap();
+        c.execute("INSERT INTO chat_messages(chat_id,sender,body,kind,run_id,created) VALUES(?,?,'Legacy private sentinel repeated','assistant',?,?)", params![old.chat_id,b.id,old.id,db::now()]).unwrap();
+        c.last_insert_rowid()
+    };
+    store::revise_source(
+        &db,
+        original,
+        &json!({"action":"forget","expected_text":"Legacy private sentinel","expected_revision":0}),
+    )
+    .unwrap();
+    while !store::backfill(&db, 64).unwrap() {}
+    assert!(
+        db.bot_chat_message(&b.id, &old.chat_id, derived, 0)
+            .is_err()
+    );
+    assert!(
+        !continuity::search_for(&db, &old, None, "sentinel")
+            .unwrap()
+            .to_string()
+            .contains("Legacy private sentinel")
+    );
+    // Other people's original statements are evidence, not generated summaries.
+    let human = {
+        let c = db.0.lock().unwrap();
+        c.execute("INSERT INTO chat_messages(chat_id,sender,body,kind,run_id,created) VALUES(?,'human:fixture','Retained human correction','message',?,?)", params![old.chat_id,old.id,db::now()]).unwrap();
+        c.last_insert_rowid()
+    };
+    assert!(
+        db.bot_chat_read(&b.id, &old.chat_id, 0, 20)
+            .unwrap()
+            .to_string()
+            .contains("Retained human correction")
+    );
+    assert!(db.bot_chat_message(&b.id, &old.chat_id, human, 0).is_ok());
+}
+
+#[test]
+fn review_obligations_cannot_reintroduce_invalidated_derived_evidence() {
+    let db = Db::open(":memory:").unwrap();
+    let (b, old) = setup(&db);
+    store::start_session(&db, &old, "pi", "model").unwrap();
+    let original = message(&db, &old, "Forget private detail");
+    let derived = {
+        let c = db.0.lock().unwrap();
+        c.execute("INSERT INTO chat_messages(chat_id,sender,body,kind,run_id,created) VALUES(?,?,'derived-secret','assistant',?,?)", params![old.chat_id,b.id,old.id,db::now()]).unwrap();
+        c.last_insert_rowid()
+    };
+    db.event(&old.id, "tool_result", json!({"text":"derived-secret"}))
+        .unwrap();
+    let event: i64 =
+        db.0.lock()
+            .unwrap()
+            .query_row(
+                "SELECT max(seq) FROM events WHERE run_id=?",
+                [&old.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+    for (key, source) in [
+        ("message", json!({"message_seq":derived})),
+        ("event", json!({"event_seq":event})),
+    ] {
+        store::obligation_save(&db,&old,&json!({"key":key,"description":"Act on derived-secret","expected_revision":0,"sources":[source]})).unwrap();
+    }
+    // A correction also invalidates derivations, without the explicit forget path's redaction.
+    db.0.lock()
+        .unwrap()
+        .execute(
+            "UPDATE chat_messages SET body='Corrected input' WHERE seq=?",
+            [original],
+        )
+        .unwrap();
+    let fresh = db
+        .run(&db.queue(&b.id, "Review pending work", 0).unwrap())
+        .unwrap();
+    store::start_session(&db, &fresh, "pi", "model").unwrap();
+    let obligations = store::obligations(&db, &fresh, "", false).unwrap();
+    assert_eq!(obligations["total"], 2);
+    assert!(!obligations.to_string().contains("derived-secret"));
+    assert!(
+        obligations["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["requires_reconciliation"] == true)
+    );
+    assert!(
+        store::source_refs(
+            &db.0.lock().unwrap(),
+            &fresh,
+            &json!({"sources":[{"event_seq":event}]})
+        )
+        .is_err()
+    );
+}

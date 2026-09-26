@@ -120,13 +120,25 @@ pub async fn worker(app: crate::runtime::Shared) {
     }
 }
 
+fn source_run_valid(c: &Connection, source: &str, chat: &str) -> Result<bool> {
+    let source_epoch: i64 = c
+        .query_row(
+            "SELECT epoch FROM continuity_sessions WHERE run_id=?",
+            [source],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(0);
+    Ok(session_valid(c, source)? && source_epoch == epoch(c, chat)?)
+}
+
 pub fn source_refs(c: &Connection, run: &Run, args: &Value) -> Result<Value> {
     let refs = args["sources"].as_array().cloned().unwrap_or_default();
     ensure!(refs.len() <= 24, "Keep at most 24 exact source references");
     let mut checked = Vec::new();
     for source in refs {
         if let Some(seq) = source["message_seq"].as_i64() {
-            let valid: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM chat_messages m WHERE m.seq=? AND m.chat_id=? AND m.suppressed=0 AND NOT EXISTS(SELECT 1 FROM continuity_source_state s WHERE s.message_seq=m.seq AND s.status<>'active'))",params![seq,run.chat_id],|r|r.get(0))?;
+            let valid: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM continuity_current_messages m WHERE m.seq=? AND m.chat_id=? AND m.suppressed=0 AND NOT EXISTS(SELECT 1 FROM continuity_source_state s WHERE s.message_seq=m.seq AND s.status<>'active'))",params![seq,run.chat_id],|r|r.get(0))?;
             ensure!(
                 valid,
                 "Source must be a current retained message in this conversation"
@@ -141,6 +153,12 @@ pub fn source_refs(c: &Connection, run: &Run, args: &Value) -> Result<Value> {
             ensure!(
                 valid,
                 "Event source must belong to this bot and conversation"
+            );
+            let source_run: String =
+                c.query_row("SELECT run_id FROM events WHERE seq=?", [seq], |r| r.get(0))?;
+            ensure!(
+                source_run_valid(c, &source_run, &run.chat_id)?,
+                "Event source was invalidated; inspect current evidence"
             );
             let body: String =
                 c.query_row("SELECT body FROM events WHERE seq=?", [seq], |r| r.get(0))?;
@@ -317,7 +335,7 @@ pub fn obligations(db: &Db, run: &Run, after: &str, include_closed: bool) -> Res
         let mut invalid = false;
         for source in row["sources"].as_array().unwrap() {
             if let Some(seq) = source["message_seq"].as_i64() {
-                let valid:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM chat_messages m WHERE seq=? AND suppressed=0 AND NOT EXISTS(SELECT 1 FROM continuity_source_state s WHERE s.message_seq=m.seq AND s.status<>'active'))",[seq],|r|r.get(0))?;
+                let valid:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM continuity_current_messages m WHERE seq=? AND suppressed=0 AND NOT EXISTS(SELECT 1 FROM continuity_source_state s WHERE s.message_seq=m.seq AND s.status<>'active'))",[seq],|r|r.get(0))?;
                 invalid |= !valid;
                 if let Some(expected) = source["digest"].as_str() {
                     let body: Option<String> = c
@@ -329,14 +347,18 @@ pub fn obligations(db: &Db, run: &Run, after: &str, include_closed: bool) -> Res
                 }
             }
             if let Some(seq) = source["event_seq"].as_i64() {
-                let body: Option<String> = c
-                    .query_row("SELECT body FROM events WHERE seq=?", [seq], |r| r.get(0))
-                    .optional()?;
-                invalid |= body.is_none_or(|body| {
-                    source["digest"]
-                        .as_str()
-                        .is_some_and(|expected| digest(&body) != expected)
-                });
+                let record: Option<(String,String,String)> = c.query_row(
+                    "SELECT e.body,e.run_id,r.chat_id FROM events e JOIN runs r ON r.id=e.run_id WHERE e.seq=?", [seq], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))
+                ).optional()?;
+                invalid |= match record {
+                    None => true,
+                    Some((body, source_run, chat)) => {
+                        !source_run_valid(&c, &source_run, &chat)?
+                            || source["digest"]
+                                .as_str()
+                                .is_some_and(|expected| digest(&body) != expected)
+                    }
+                };
             }
         }
         row["requires_reconciliation"] = json!(invalid);
@@ -656,7 +678,7 @@ pub fn receipts(db: &Db, run: &Run, source: &str, before: i64) -> Result<Value> 
         "Run is outside this destination disclosure boundary"
     );
     let c = db.0.lock().unwrap();
-    let valid = session_valid(&c, source)? && epoch(&c, &owner.chat_id)? == 0;
+    let valid = source_run_valid(&c, source, &owner.chat_id)?;
     let mut rows=c.prepare("SELECT seq,kind,body,created FROM events WHERE run_id=? AND seq<? AND kind IN('tool_requested','tool_started','tool_result','approval','run_finished','process_wait','question_wait') ORDER BY seq DESC LIMIT 17")?.query_map(params![source,before],|r|{
         let mut body:Value=serde_json::from_str(&r.get::<_,String>(2)?).unwrap_or(json!({}));
         if !valid {let old=body;body=json!({"tool":old["tool"],"call_id":old["call_id"],"failed":old["failed"],"exit_code":old["exit_code"],"payload_withheld":true});}
