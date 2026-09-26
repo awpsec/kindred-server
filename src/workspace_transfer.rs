@@ -58,6 +58,16 @@ const TABLES: &[&str] = &[
     "workflow_responses",
     "continuity_notes",
     "continuity_revisions",
+    "continuity_epochs",
+    "continuity_note_meta",
+    "continuity_source_state",
+    "continuity_memory_guard",
+    "continuity_obligations",
+    "continuity_sessions",
+    "continuity_dependencies",
+    "command_jobs",
+    "command_waits",
+
 ];
 pub fn migrate(c: &Connection) -> Result<()> {
     c.execute_batch("CREATE TABLE IF NOT EXISTS workspace_transfers(id TEXT PRIMARY KEY,state TEXT NOT NULL,package TEXT NOT NULL,destination TEXT NOT NULL DEFAULT '');")?;
@@ -270,6 +280,16 @@ impl Db {
                     | "workflow_responses"
                     | "continuity_notes"
                         | "continuity_revisions"
+                    | "continuity_epochs"
+                    | "continuity_note_meta"
+                    | "continuity_source_state"
+                    | "continuity_memory_guard"
+                    | "continuity_obligations"
+                    | "continuity_sessions"
+                    | "continuity_dependencies"
+                    | "command_jobs"
+                    | "command_waits"
+
                         | "chat_completion_pending"
                         | "provider_inbox_routines"
                         | "provider_inbox_runs"
@@ -294,6 +314,16 @@ impl Db {
                     | "workflow_responses"
                     | "continuity_notes"
                     | "continuity_revisions"
+                    | "continuity_epochs"
+                    | "continuity_note_meta"
+                    | "continuity_source_state"
+                    | "continuity_memory_guard"
+                    | "continuity_obligations"
+                    | "continuity_sessions"
+                    | "continuity_dependencies"
+                    | "command_jobs"
+                    | "command_waits"
+
                     | "chat_completion_pending"
                     | "provider_inbox_routines"
                     | "provider_inbox_runs"

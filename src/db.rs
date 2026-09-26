@@ -193,6 +193,7 @@ impl Db {
             None
         };
         let c = Connection::open(path)?;
+        crate::continuity::store::check_version(&c)?;
         c.busy_timeout(std::time::Duration::from_secs(5))?;
         c.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;
         CREATE TABLE IF NOT EXISTS bots(id TEXT PRIMARY KEY,name TEXT NOT NULL,instructions TEXT NOT NULL,provider TEXT NOT NULL,model TEXT NOT NULL,memory TEXT NOT NULL,auto_approve INTEGER NOT NULL);

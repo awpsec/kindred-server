@@ -29,6 +29,8 @@ mod connector_edits;
 mod connector_policy;
 mod connector_records;
 mod continuity;
+#[cfg(test)]
+mod continuity_tests;
 mod visual_panels;
 mod workflow_panels;
 mod conversation_updates;

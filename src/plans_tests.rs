@@ -431,7 +431,7 @@ async fn runtime_contract_has_contextual_tools_and_live_user_revisions() {
     let b = app.db.bot(&r.bot_id).unwrap();
     let tools = runtime::tool_specs();
     let prompt = instructions::build(&app, &b, &r, &tools, Some(32000)).unwrap();
-    assert!(prompt.contains("Resolve client names"));
+    assert!(prompt.contains("Resolve names"));
     assert!(prompt.contains("reminder_set"));
     assert!(prompt.contains("checkbox"));
     let result = runtime::call_tool(&app, &b, &r, "checklist_create", list())

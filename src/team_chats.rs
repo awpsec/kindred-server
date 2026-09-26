@@ -262,12 +262,13 @@ impl Db {
         owned(self, bot, id)?;
         let c = self.0.lock().unwrap();
         let(sender,name,body):(String,String,String)=c.query_row("SELECT m.sender,COALESCE(b.name,m.sender),m.body FROM chat_messages m LEFT JOIN bots b ON b.id=m.sender WHERE m.seq=? AND m.chat_id=? AND m.suppressed=0",params![seq,id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
+        let source_state:Option<Value>=c.query_row("SELECT revision,status,successor FROM continuity_source_state WHERE message_seq=?",[seq],|r|Ok(json!({"revision":r.get::<_,i64>(0)?,"status":r.get::<_,String>(1)?,"successor":r.get::<_,Option<i64>>(2)?}))).optional()?;
         let chars = body.chars().count();
         ensure!(offset <= chars, "Message offset exceeds its length");
         let text: String = body.chars().skip(offset).take(4000).collect();
         let next = offset + text.chars().count();
         Ok(
-            json!({"chat_id":id,"message_seq":seq,"sender":sender,"sender_name":name,"text":text,"offset":offset,"next_offset":if next<chars{Some(next)}else{None},"total_characters":chars,"content_is_attributed_history":true}),
+            json!({"source_state":source_state,"chat_id":id,"message_seq":seq,"sender":sender,"sender_name":name,"text":text,"offset":offset,"next_offset":if next<chars{Some(next)}else{None},"total_characters":chars,"content_is_attributed_history":true}),
         )
     }
     pub fn bot_chats(&self, bot: &str, before: i64) -> Result<Value> {
@@ -295,7 +296,7 @@ impl Db {
         let participants = self.server_chat_participants(id)?;
         let limit = limit.clamp(1, 30);
         let c = self.0.lock().unwrap();
-        let mut rows:Vec<Value>=c.prepare("SELECT m.seq,m.sender,COALESCE(b.name,m.sender),m.kind,m.body,m.created,m.run_id FROM chat_messages m LEFT JOIN bots b ON b.id=m.sender WHERE m.chat_id=? AND m.seq<? AND m.suppressed=0 ORDER BY m.seq DESC LIMIT ?")?.query_map(params![id,if before>0{before}else{i64::MAX},limit+1],|r|{
+        let mut rows:Vec<Value>=c.prepare("SELECT m.seq,m.sender,COALESCE(b.name,m.sender),m.kind,m.body,m.created,m.run_id FROM continuity_current_messages m LEFT JOIN bots b ON b.id=m.sender WHERE m.chat_id=? AND m.seq<? AND m.suppressed=0 AND NOT EXISTS(SELECT 1 FROM continuity_source_state cs WHERE cs.message_seq=m.seq AND cs.status<>'active') ORDER BY m.seq DESC LIMIT ?")?.query_map(params![id,if before>0{before}else{i64::MAX},limit+1],|r|{
             let text:String=r.get(4)?;Ok(json!({"seq":r.get::<_,i64>(0)?,"sender":r.get::<_,String>(1)?,"sender_name":r.get::<_,String>(2)?,"kind":r.get::<_,String>(3)?,"text":crate::runtime::bounded(&text,4000),"text_shortened":text.len()>4000,"created":r.get::<_,i64>(5)?,"run_id":r.get::<_,String>(6)?}))
         })?.collect::<rusqlite::Result<_>>()?;
         let more = rows.len() > limit;
@@ -312,7 +313,7 @@ impl Db {
     }
     pub fn shared_chat_context(&self, bot: &str, current: &str) -> Result<Vec<Value>> {
         let c = self.0.lock().unwrap();
-        Ok(c.prepare("SELECT m.seq,c.id,c.name,m.sender,COALESCE(b.name,m.sender),m.body,m.created,m.kind FROM chat_messages m JOIN chats c ON c.id=m.chat_id LEFT JOIN bots b ON b.id=m.sender WHERE c.id<>?1 AND c.id NOT LIKE 'dm-%' AND m.suppressed=0 AND m.kind IN('message','assistant','result','handoff') AND EXISTS(SELECT 1 FROM json_each(c.members) WHERE value=?2) ORDER BY m.created DESC,m.seq DESC LIMIT 24")?.query_map(params![current,bot],|r|{let text:String=r.get(5)?;Ok(json!({"message_seq":r.get::<_,i64>(0)?,"chat_id":r.get::<_,String>(1)?,"chat_name":r.get::<_,String>(2)?,"sender":r.get::<_,String>(3)?,"sender_name":r.get::<_,String>(4)?,"text":crate::runtime::bounded(&text,1800),"text_shortened":text.len()>1800,"created":r.get::<_,i64>(6)?,"kind":r.get::<_,String>(7)?}))})?.collect::<rusqlite::Result<_>>()?)
+        Ok(c.prepare("SELECT m.seq,c.id,c.name,m.sender,COALESCE(b.name,m.sender),m.body,m.created,m.kind FROM continuity_current_messages m JOIN chats c ON c.id=m.chat_id LEFT JOIN bots b ON b.id=m.sender WHERE c.id<>?1 AND c.id NOT LIKE 'dm-%' AND m.suppressed=0 AND NOT EXISTS(SELECT 1 FROM continuity_source_state cs WHERE cs.message_seq=m.seq AND cs.status<>'active') AND m.kind IN('message','assistant','result','handoff') AND EXISTS(SELECT 1 FROM json_each(c.members) WHERE value=?2) ORDER BY m.created DESC,m.seq DESC LIMIT 24")?.query_map(params![current,bot],|r|{let text:String=r.get(5)?;Ok(json!({"message_seq":r.get::<_,i64>(0)?,"chat_id":r.get::<_,String>(1)?,"chat_name":r.get::<_,String>(2)?,"sender":r.get::<_,String>(3)?,"sender_name":r.get::<_,String>(4)?,"text":crate::runtime::bounded(&text,1800),"text_shortened":text.len()>1800,"created":r.get::<_,i64>(6)?,"kind":r.get::<_,String>(7)?}))})?.collect::<rusqlite::Result<_>>()?)
     }
     pub fn bot_chat_create(&self, bot: &Bot, run: &Run, args: &Value) -> Result<Value> {
         let key = crate::runtime::string(args, "key")?.trim();

@@ -45,6 +45,7 @@ macro_rules! require {
 pub fn router(app: Shared) -> Router {
     let api = Router::new()
         .route("/status", get(status))
+        .route("/continuity/sources/{seq}", axum::routing::patch(crate::continuity::store::source_update))
         .route("/workspace-artifact-folders", get(crate::workspace_artifacts::folder_list).post(crate::workspace_artifacts::folder_create).patch(crate::workspace_artifacts::folder_move))
         .route("/workspace-artifacts", get(crate::workspace_artifacts::list).post(crate::workspace_artifacts::create))
         .route("/workspace-artifacts/{id}/export", get(crate::workspace_artifacts::export))
