@@ -59,6 +59,19 @@ def refresh(source):
     print('Applications added; existing desktop sessions preserved. Backup: ' + str(backup))
 
 
+def merge_browser_new(script, source_script):
+    """The panel's New window uses browser-new; add only that action, keeping local launcher edits."""
+    if 'browser-new)' in script:
+        return script
+    action = next(line for line in source_script.splitlines() if line.startswith('  browser-new)'))
+    lines = script.splitlines(True)
+    index = next((i for i, line in enumerate(lines) if line.startswith('  browser)')), None)
+    if index is None or 'profile=' not in script:
+        raise SystemExit('Custom desktop launcher needs manual integration')
+    lines.insert(index + 1, action + '\n')
+    return ''.join(lines)
+
+
 def stage_panel(source):
     """Install the new managed panel for the next computer restart; preserve live apps."""
     if os.geteuid() != 0:
@@ -68,18 +81,25 @@ def stage_panel(source):
     current = shell.read_text()
     if 'tint2 -c /usr/local/share/kindred/desktop/tint2rc' not in current and '/usr/local/lib/kindred/kindred-dock' not in current:
         raise SystemExit('Custom desktop shell detected; manual integration needed')
-    for name in ['kindred-dock', 'start-desktop-shell']:
+    for name in ['kindred-dock', 'start-desktop-shell', 'desktop-launch']:
         if not (source / name).is_file():
             raise SystemExit('Missing panel source: ' + name)
+    launcher = target / 'desktop-launch'
+    script = merge_browser_new(launcher.read_text(), (source / 'desktop-launch').read_text())
     env = {**os.environ, 'DEBIAN_FRONTEND': 'noninteractive'}
     subprocess.run(['apt-get', 'update', '-qq'], env=env, check=True)
     subprocess.run(['apt-get', 'install', '-y', '--no-install-recommends',
                     'python3-gi', 'gir1.2-gtk-3.0', 'gir1.2-wnck-3.0', 'x11-utils'], env=env, check=True)
     backup = Path('/var/backups/kindred-desktop') / datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')
     backup.mkdir(parents=True, mode=0o700)
-    for name in ['start-desktop-shell', 'kindred-dock']:
+    for name in ['start-desktop-shell', 'kindred-dock', 'desktop-launch']:
         if (target / name).exists():
             shutil.copy2(target / name, backup / name)
+    if script != launcher.read_text():
+        temporary = target / 'desktop-launch.new'
+        temporary.write_text(script)
+        temporary.chmod(0o755)
+        temporary.replace(launcher)
     # Activate the supervisor last. The running supervisor and all apps stay untouched.
     for name in ['kindred-dock', 'start-desktop-shell']:
         temporary = target / (name + '.new')
