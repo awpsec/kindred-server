@@ -1,6 +1,6 @@
 [package]
 name = "kindred"
-version = "0.82.0"
+version = "0.83.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Self-hosted AI teammates with a shared libvirt computer"
