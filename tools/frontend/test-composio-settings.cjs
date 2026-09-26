@@ -18,6 +18,8 @@ const fs=require('node:fs'),path=require('node:path'),assert=require('node:asser
  await summary.click();await row.getByText('(household@example.test)',{exact:true}).waitFor();
  await summary.click();assert.equal(await row.getByText('Household',{exact:true}).isVisible(),false);
  await summary.click();assert.equal(probes,1);
+ assert.equal(await page.locator('.composio-key-editor').evaluate(n=>n.open),false);
+ await page.locator('.composio-key-editor summary').click();
  assert.equal(await page.getByRole('link',{name:'Open Composio dashboard'}).locator('svg').count(),1);
  assert.equal(await page.getByRole('link',{name:'Open Composio dashboard'}).innerText(),'');
  const remove=page.getByRole('button',{name:'Remove Composio key'}),save=page.getByRole('button',{name:'Save project key'});
