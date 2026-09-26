@@ -10,7 +10,7 @@ exec 9>"$state/desktop-shell-$screen.lock"
 flock -n 9 || exit 0
 feh --no-fehbg --bg-fill /usr/local/share/kindred/desktop/wallpaper.png
 # Keep the lock in this supervisor; launched apps must not inherit it.
-tint2 -c /usr/local/share/kindred/desktop/tint2rc 9>&- &
+/usr/local/lib/kindred/kindred-dock 9>&- &
 dock=$!
 trap 'kill "$dock" 2>/dev/null || true' EXIT INT TERM
 wait "$dock"

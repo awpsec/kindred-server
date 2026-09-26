@@ -1,0 +1,213 @@
+#!/usr/bin/python3
+"""Kindred's X11 panel. Window state comes from the WM, including minimized windows."""
+import datetime
+import os
+from pathlib import Path
+import subprocess
+
+import gi
+gi.require_version('Gtk', '3.0')
+gi.require_version('Gdk', '3.0')
+gi.require_version('GdkX11', '3.0')
+gi.require_version('Wnck', '3.0')
+from gi.repository import Gdk, GdkX11, GLib, Gtk, Wnck
+
+ASSETS = Path(os.environ.get('KINDRED_DOCK_ASSETS', '/usr/local/share/kindred/desktop'))
+LAUNCHER = os.environ.get('KINDRED_DOCK_LAUNCHER', '/usr/local/lib/kindred/desktop-launch')
+PINNED = [('browser', 'Browser'), ('files', 'Files'), ('terminal', 'Terminal')]
+
+
+def app_key(window):
+    name = (window.get_class_group_name() or window.get_class_instance_name() or '').lower()
+    for key, aliases in [('browser', ('chromium',)), ('files', ('pcmanfm',)),
+                         ('terminal', ('konsole', 'xterm'))]:
+        if any(alias in name for alias in aliases):
+            return key
+    return name or str(window.get_xid())
+
+
+class Dock(Gtk.Window):
+    def __init__(self):
+        super().__init__(title='Kindred Dock')
+        self.set_wmclass('kindred-dock', 'Kindred Dock')
+        self.set_decorated(False)
+        self.set_resizable(False)
+        self.set_type_hint(Gdk.WindowTypeHint.DOCK)
+        self.set_skip_taskbar_hint(True)
+        self.set_skip_pager_hint(True)
+        self.stick()
+        self.set_keep_above(True)
+        css = Gtk.CssProvider()
+        css.load_from_data(b'''
+        window { background: #181c23; color: #eef1f6; }
+        button { background: transparent; border: none; box-shadow: none;
+                 border-radius: 9px; padding: 3px 9px; color: #eef1f6; }
+        button:hover { background: #303845; }
+        button.active { background: #354459; }
+        .dot { color: #b6cfee; font-size: 10px; min-height: 10px; }
+        .clock { font-size: 15px; font-weight: 600; }
+        .date { font-size: 11px; color: #bdc6d4; }
+        menu { background: #242b35; color: #eef1f6; padding: 6px; }
+        menuitem { padding: 8px 12px; }
+        menuitem:hover { background: #354459; }
+        ''')
+        Gtk.StyleContext.add_provider_for_screen(self.get_screen(), css, 600)
+        row = Gtk.Box(spacing=10)
+        row.set_border_width(6)
+        self.add(row)
+        applications = self.icon_button('applications', 'Applications')
+        applications.connect('clicked', lambda _: self.launch('applications'))
+        row.pack_start(applications, False, False, 0)
+        row.pack_start(Gtk.Separator(), False, False, 0)
+        self.tasks = Gtk.Box(spacing=4)
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.NEVER)
+        scroll.add(self.tasks)
+        row.pack_start(scroll, True, True, 0)
+        row.pack_start(Gtk.Separator(), False, False, 0)
+        clock = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        clock.set_margin_start(8)
+        clock.set_margin_end(10)
+        self.time = Gtk.Label()
+        self.time.get_style_context().add_class('clock')
+        self.date = Gtk.Label()
+        self.date.get_style_context().add_class('date')
+        clock.pack_start(self.time, True, False, 0)
+        clock.pack_start(self.date, True, False, 0)
+        row.pack_end(clock, False, False, 0)
+        self.clock = clock
+        self.screen = Wnck.Screen.get_default()
+        self.screen.force_update()
+        self.signature = None
+        self.groups = {}
+        self.menu = None
+        self.connect('realize', lambda _: self.geometry())
+        self.get_screen().connect('size-changed', lambda _: self.geometry())
+        self.connect('destroy', lambda _: Gtk.main_quit() if Gtk.main_level() else None)
+        self.update()
+        GLib.timeout_add(500, self.update)
+        self.show_all()
+
+    def geometry(self):
+        screen = self.get_screen()
+        width, height = screen.get_width(), screen.get_height()
+        self.set_size_request(width, 64)
+        self.resize(width, 64)
+        self.move(0, height - 64)
+        xid = str(self.get_window().get_xid())
+        # Reserve exactly this panel's height so maximized apps never cover it.
+        for prop, values in [('_NET_WM_STRUT', [0, 0, 0, 64]),
+                             ('_NET_WM_STRUT_PARTIAL', [0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 0, width - 1])]:
+            subprocess.run(['xprop', '-id', xid, '-f', prop, '32c', '-set', prop,
+                            ', '.join(map(str, values))], check=True, capture_output=True)
+
+    def launch(self, key):
+        subprocess.Popen([LAUNCHER, key], close_fds=True)
+
+    def icon_button(self, key, title, window=None):
+        button = Gtk.Button()
+        button.set_tooltip_text(title)
+        button.get_accessible().set_name(title)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        asset = ASSETS / (key + '.svg')
+        if asset.is_file():
+            from gi.repository import GdkPixbuf
+            image = Gtk.Image.new_from_pixbuf(GdkPixbuf.Pixbuf.new_from_file_at_scale(str(asset), 32, 32, True))
+        elif window and window.get_icon():
+            image = Gtk.Image.new_from_pixbuf(window.get_icon().scale_simple(32, 32, 2))
+        else:
+            image = Gtk.Image.new_from_icon_name('application-x-executable', Gtk.IconSize.LARGE_TOOLBAR)
+        box.pack_start(image, True, True, 0)
+        dot = Gtk.Label(label='●' if window else ' ')
+        dot.get_style_context().add_class('dot')
+        box.pack_end(dot, False, False, 0)
+        button.add(box)
+        return button
+
+    def timestamp(self):
+        return Gtk.get_current_event_time() or GdkX11.x11_get_server_time(self.get_window())
+
+    def activate(self, window, timestamp):
+        workspace = window.get_workspace()
+        if workspace:
+            workspace.activate(timestamp)
+        window.unminimize(timestamp)
+        window.activate(timestamp)
+
+    def clicked(self, key):
+        windows = self.groups.get(key, [])
+        if not windows:
+            self.launch(key)
+        elif len(windows) == 1:
+            self.activate(windows[0], self.timestamp())
+        else:
+            self.window_menu(key)
+
+    def pressed(self, button, event, key):
+        if event.button == 3:
+            self.window_menu(key, event)
+            return True
+        return False
+
+    def window_menu(self, key, event=None):
+        menu = Gtk.Menu()
+        for window in self.groups.get(key, []):
+            title = window.get_name() or 'Untitled window'
+            item = Gtk.MenuItem(label=('Minimized · ' if window.is_minimized() else '') + title)
+            submenu = Gtk.Menu()
+            for label, action in [('Show window', self.activate),
+                                  ('Close window', lambda w, t: w.close(t))]:
+                entry = Gtk.MenuItem(label=label)
+                entry.connect('activate', lambda _, w=window, fn=action: fn(w, self.timestamp()))
+                submenu.append(entry)
+            item.set_submenu(submenu)
+            menu.append(item)
+        if not self.groups.get(key):
+            item = Gtk.MenuItem(label='No open windows')
+            item.set_sensitive(False)
+            menu.append(item)
+        self.menu = menu
+        menu.connect('deactivate', lambda _: setattr(self, 'menu', None))
+        menu.show_all()
+        if event:
+            menu.popup_at_pointer(event)
+        else:
+            menu.popup_at_widget(self.tasks, Gdk.Gravity.NORTH_WEST, Gdk.Gravity.SOUTH_WEST, None)
+
+    def update(self):
+        now = datetime.datetime.now().astimezone()
+        self.time.set_text(now.strftime('%H:%M %Z'))
+        self.date.set_text(now.strftime('%a, %d %b %Y'))
+        self.clock.set_tooltip_text(now.strftime('%A, %d %B %Y · %Z (UTC%z)'))
+        groups = {}
+        for window in self.screen.get_windows():
+            if window.is_skip_tasklist():
+                continue
+            groups.setdefault(app_key(window), []).append(window)
+        self.groups = groups
+        active = self.screen.get_active_window()
+        signature = (tuple((key, tuple((w.get_xid(), w.get_name(), w.is_minimized()) for w in wins))
+                           for key, wins in groups.items()), active.get_xid() if active else None)
+        if signature != self.signature and self.menu is None:
+            self.signature = signature
+            for child in self.tasks.get_children():
+                child.destroy()
+            entries = PINNED + [(key, windows[0].get_class_group_name() or 'Application')
+                                for key, windows in groups.items() if key not in dict(PINNED)]
+            for key, title in entries:
+                windows = groups.get(key, [])
+                button = self.icon_button(key, title + (f' · {len(windows)} open' if windows else ''),
+                                          windows[0] if windows else None)
+                if active in windows:
+                    button.get_style_context().add_class('active')
+                button.connect('clicked', lambda _, k=key: self.clicked(k))
+                button.connect('button-press-event', self.pressed, key)
+                self.tasks.pack_start(button, False, False, 0)
+            self.tasks.show_all()
+        return True
+
+
+if __name__ == '__main__':
+    Wnck.set_client_type(Wnck.ClientType.PAGER)
+    Dock()
+    Gtk.main()

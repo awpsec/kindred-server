@@ -59,7 +59,39 @@ def refresh(source):
     print('Applications added; existing desktop sessions preserved. Backup: ' + str(backup))
 
 
+def stage_panel(source):
+    """Install the new managed panel for the next computer restart; preserve live apps."""
+    if os.geteuid() != 0:
+        raise SystemExit('Run as root inside the bot computer')
+    target = Path('/usr/local/lib/kindred')
+    shell = target / 'start-desktop-shell'
+    current = shell.read_text()
+    if 'tint2 -c /usr/local/share/kindred/desktop/tint2rc' not in current and '/usr/local/lib/kindred/kindred-dock' not in current:
+        raise SystemExit('Custom desktop shell detected; manual integration needed')
+    for name in ['kindred-dock', 'start-desktop-shell']:
+        if not (source / name).is_file():
+            raise SystemExit('Missing panel source: ' + name)
+    env = {**os.environ, 'DEBIAN_FRONTEND': 'noninteractive'}
+    subprocess.run(['apt-get', 'update', '-qq'], env=env, check=True)
+    subprocess.run(['apt-get', 'install', '-y', '--no-install-recommends',
+                    'python3-gi', 'gir1.2-gtk-3.0', 'gir1.2-wnck-3.0', 'x11-utils'], env=env, check=True)
+    backup = Path('/var/backups/kindred-desktop') / datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')
+    backup.mkdir(parents=True, mode=0o700)
+    for name in ['start-desktop-shell', 'kindred-dock']:
+        if (target / name).exists():
+            shutil.copy2(target / name, backup / name)
+    # Activate the supervisor last. The running supervisor and all apps stay untouched.
+    for name in ['kindred-dock', 'start-desktop-shell']:
+        temporary = target / (name + '.new')
+        shutil.copy2(source / name, temporary)
+        temporary.chmod(0o755)
+        temporary.replace(target / name)
+    print('Panel staged for the next computer restart. Live sessions unchanged. Backup: ' + str(backup))
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--source', type=Path, default=Path(__file__).resolve().parent)
-    refresh(parser.parse_args().source)
+    parser.add_argument('--panel', action='store_true', help='Stage the full-width panel for the next computer restart')
+    args = parser.parse_args()
+    (stage_panel if args.panel else refresh)(args.source)
