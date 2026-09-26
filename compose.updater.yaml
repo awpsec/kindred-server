@@ -1,0 +1,8 @@
+# Optional host supervisor bridge. The Docker socket is never mounted in Kindred.
+# Use with: docker compose -f compose.yaml -f compose.updater.yaml up -d
+services:
+  server:
+    volumes:
+      - /run/kindred-updater:/run/kindred-updater:ro
+    group_add:
+      - "${KINDRED_UPDATER_GID:?Set the host kindred group ID}"

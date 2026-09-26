@@ -936,3 +936,20 @@ async fn computer_resource_controls_require_admin_and_use_current_profile() {
         assert_eq!(value["profile"], profile);
     }
 }
+
+#[tokio::test]
+async fn server_update_requires_administrator_and_valid_release() {
+    let f=Fixture::new(false);
+    let owner=f.register("update-owner").await;
+    let member=f.register("update-member").await;
+    for method in ["GET", "POST"] {
+        for token in ["", member["token"].as_str().unwrap()] {
+            let (status, _)=f.request(method,"/identity/server-update",token,json!({"version":"0.83.0"})).await;
+            assert!(!status.is_success());
+        }
+    }
+    for version in ["", "../latest", "1.2", "1.2.3;reboot", "https://example.com"] {
+        let (status, _)=f.request("POST","/identity/server-update",owner["token"].as_str().unwrap(),json!({"version":version})).await;
+        assert!(!status.is_success());
+    }
+}

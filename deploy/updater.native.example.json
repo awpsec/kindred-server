@@ -1,0 +1,9 @@
+{
+  "mode": "native",
+  "binary": "/usr/local/bin/kindred",
+  "service": "kindred.service",
+  "data_directory": "/var/lib/kindred",
+  "backup_directory": "/var/backups/kindred-updater",
+  "health_url": "http://127.0.0.1:9444/health",
+  "group": "kindred"
+}

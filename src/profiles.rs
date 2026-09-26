@@ -367,6 +367,7 @@ pub fn router(portal: Portal) -> Router {
         .route("/identity/directory", post(directory))
         .route("/identity/password", post(change_password))
         .route("/identity/admin", get(admin).post(admin_update))
+        .route("/identity/server-update", get(server_update_status).post(server_update_start))
         .route("/identity/computer-settings", get(computer_settings).post(save_computer_settings))
         .route("/device/claim", post(claim_device))
         .route("/api/devices/link", post(link_device))
@@ -886,6 +887,19 @@ async fn save_computer_settings(
         );
     }
     Ok(Json(crate::vm::resize_resources(&app.config.vm, v).await?))
+}
+
+async fn server_update_status(State(p): State<Portal>, headers: HeaderMap) -> ApiResult {
+    p.origin(&headers)?;
+    ensure!(p.identity(bearer(&headers))?.admin, "Administrator access required");
+    Ok(Json(crate::server_update::request("status", None).await?))
+}
+async fn server_update_start(State(p): State<Portal>, headers: HeaderMap, Json(body): Json<Value>) -> ApiResult {
+    p.origin(&headers)?;
+    ensure!(p.identity(bearer(&headers))?.admin, "Administrator access required");
+    let version=body["version"].as_str().unwrap_or("");
+    ensure!(!version.is_empty() && version.len()<32 && version.split('.').count()==3 && version.split('.').all(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())), "Invalid release version");
+    Ok(Json(crate::server_update::request("start", Some(version)).await?))
 }
 
 async fn admin(State(p): State<Portal>, headers: HeaderMap) -> ApiResult {

@@ -1,0 +1,6 @@
+{
+  "mode": "compose",
+  "compose_directory": "/opt/kindred-server",
+  "health_url": "http://127.0.0.1:9444/health",
+  "group": "kindred"
+}

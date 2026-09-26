@@ -102,6 +102,7 @@ mod vm_maintenance;
 mod vnc;
 mod web;
 mod release_github;
+mod server_update;
 #[cfg(test)]
 mod workflow_recovery_tests;
 mod workspace_import;

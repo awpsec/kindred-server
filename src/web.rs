@@ -1713,12 +1713,13 @@ fn static_assets<S: Clone + Send + Sync + 'static>() -> Router<S> {
             "/",
             get(|| async { Html(include_str!("../ui/index.html")) }),
         )
+        .route("/server-update.js", get(|| async { ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8")], include_str!("../ui/server-update.js")) }))
         .route(
             "/app.js",
             get(|| async {
                 (
                     [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
-                    include_str!("../ui/app.js"),
+                    include_str!("../ui/app.js").replace("const UI_VERSION = \"0.63.0\";", &format!("const UI_VERSION = {:?};", env!("CARGO_PKG_VERSION"))),
                 )
             }),
         )
