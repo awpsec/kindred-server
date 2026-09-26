@@ -12,11 +12,19 @@ class Updates(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory);old=root/'releases/old';old.mkdir(parents=True)
             (old/'worker.mjs').write_text('original');(old/'session.mjs').write_text("export const SDK_VERSION = '0.85.1';");current=root/'current';current.symlink_to(old)
+            npm=old/'node/lib/node_modules/npm/bin/npm-cli.js'
+            npm.parent.mkdir(parents=True);npm.write_text('bundled npm')
+            (old/'node/bin').mkdir();(old/'node/bin/npm').symlink_to('../lib/node_modules/npm/bin/npm-cli.js')
+            (old/'node_modules').mkdir();(old/'node_modules/stale').write_text('old SDK')
             calls=[]
             def run(args,**kwargs):
                 self.assertEqual(current.resolve(),old)
                 calls.append([str(a) for a in args])
                 if 'install' in args:
+                    stage=kwargs['cwd']
+                    self.assertTrue((stage/'node/bin/npm').is_symlink())
+                    self.assertEqual((stage/'node/bin/npm').read_text(),'bundled npm')
+                    self.assertFalse((stage/'node_modules').exists())
                     package=kwargs['cwd']/'node_modules/@earendil-works/pi-coding-agent/package.json';package.parent.mkdir(parents=True);package.write_text('{"version":"0.99.0"}')
             with patch.object(m,'run',side_effect=run):m.pi(current)
             self.assertEqual(len(calls),2)

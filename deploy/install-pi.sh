@@ -32,4 +32,9 @@ if [ "$mode" = activate ]; then
     ln -s "releases/$version" "$prefix/current.new"
     mv -Tf -- "$prefix/current.new" "$prefix/current"
 fi
+# The server stages verified updates and atomically switches current as its own user.
+# Released bundles remain readable; only the containing directories need ownership.
+if [ "$(id -u)" -eq 0 ] && id kindred >/dev/null 2>&1; then
+    chown kindred:kindred "$prefix" "$prefix/releases"
+fi
 printf 'Installed Kindred Pi harness %s with Pi SDK 0.85.1 and Node %s\n' "$version" "$node_version"
