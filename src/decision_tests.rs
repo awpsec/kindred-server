@@ -100,7 +100,6 @@ fn weekly_schedule_rejects_invalid_or_ambiguous_configuration() {
         json!({"days":[0]}),
         json!({"every_minutes":0}),
         json!({"start":"8:33"}),
-        json!({"start":"23:00","end":"01:00"}),
     ] {
         let mut s = serde_json::to_value(schedule()).unwrap();
         for (k, v) in value.as_object().unwrap() {

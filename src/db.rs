@@ -382,10 +382,14 @@ impl Db {
         Ok(text.and_then(|v| serde_json::from_str(&v).ok()))
     }
     pub fn save_setting(&self, key: &str, value: &Value) -> Result<()> {
-        self.0.lock().unwrap().execute(
+        let mut c = self.0.lock().unwrap();
+        let tx = c.transaction()?;
+        if key == "general" { crate::timezone::convert_routines(&tx, value)?; }
+        tx.execute(
             "INSERT INTO settings VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             params![key, value.to_string()],
         )?;
+        tx.commit()?;
         Ok(())
     }
     pub fn delete_skill(&self, name: &str) -> Result<()> {

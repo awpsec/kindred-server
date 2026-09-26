@@ -1,6 +1,6 @@
 //! Wall-clock schedules retain their local time across daylight-saving changes.
 use anyhow::{Context, Result, ensure};
-use chrono::{DateTime, Datelike, Days, NaiveTime, TimeZone, Timelike, Utc};
+use chrono::{DateTime, Datelike, Duration, NaiveTime, Offset, TimeZone, Timelike, Utc};
 use chrono_tz::Tz;
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
@@ -41,14 +41,46 @@ impl WeeklySchedule {
         };
         let (start, end) = (minutes(&self.start)?, minutes(&self.end)?);
         ensure!(
-            end >= start,
-            "The last run must be at or after the first run on the same day"
-        );
-        ensure!(
             (1..=1440).contains(&self.every_minutes),
             "Repeat must be between 1 and 1440 minutes"
         );
-        Ok((zone, start, end))
+        Ok((zone, start, if end < start { end + 1440 } else { end }))
+    }
+    /// Convert the wall-clock rule at its next occurrence, retaining cadence and
+    /// weekday rollover. Future runs use the destination zone's DST rules.
+    pub(crate) fn in_timezone(&self, destination: Tz, at: i64) -> Result<Self> {
+        let (source, start, end) = self.parsed()?;
+        let instant =
+            DateTime::<Utc>::from_timestamp(at, 0).context("Invalid schedule timestamp")?;
+        let delta = (instant
+            .with_timezone(&destination)
+            .offset()
+            .fix()
+            .local_minus_utc()
+            - instant
+                .with_timezone(&source)
+                .offset()
+                .fix()
+                .local_minus_utc())
+            / 60;
+        let shifted = start as i32 + delta;
+        let day_shift = shifted.div_euclid(1440);
+        let clock = |minute: i32| {
+            let m = minute.rem_euclid(1440);
+            format!("{:02}:{:02}", m / 60, m % 60)
+        };
+        let mut converted = self.clone();
+        converted.timezone = destination.name().to_owned();
+        converted.days = self
+            .days
+            .iter()
+            .map(|d| (*d as i32 - 1 + day_shift).rem_euclid(7) as u32 + 1)
+            .collect();
+        converted.days.sort_unstable();
+        converted.start = clock(shifted);
+        converted.end = clock(end as i32 + delta);
+        converted.validate()?;
+        Ok(converted)
     }
     pub fn validate(&self) -> Result<()> {
         self.parsed().map(|_| ())
@@ -59,15 +91,15 @@ impl WeeklySchedule {
             .context("Invalid schedule timestamp")?
             .with_timezone(&zone)
             .date_naive();
-        for offset in 0..=8 {
+        for offset in -1..=8 {
             let day = date
-                .checked_add_days(Days::new(offset))
+                .checked_add_signed(Duration::days(offset))
                 .context("Schedule date is out of range")?;
             if !self.days.contains(&day.weekday().number_from_monday()) {
                 continue;
             }
             for minute in (start..=end).step_by(self.every_minutes as usize) {
-                let local = day.and_hms_opt(minute / 60, minute % 60, 0).unwrap();
+                let local = day.and_hms_opt(0, 0, 0).unwrap() + Duration::minutes(minute as i64);
                 // Skip nonexistent spring times; execute a repeated fall time only once.
                 if let Some(time) = zone.from_local_datetime(&local).earliest() {
                     if time.timestamp() > timestamp {
@@ -84,9 +116,12 @@ impl WeeklySchedule {
             .context("Invalid schedule timestamp")?
             .with_timezone(&zone);
         let minute = time.hour() * 60 + time.minute();
-        Ok(self.days.contains(&time.weekday().number_from_monday())
-            && minute >= start
-            && minute <= end)
+        let today = time.weekday().number_from_monday();
+        let yesterday = (today + 5) % 7 + 1;
+        Ok(
+            (self.days.contains(&today) && minute >= start && minute <= end)
+                || (end >= 1440 && self.days.contains(&yesterday) && minute + 1440 <= end),
+        )
     }
 }
 
