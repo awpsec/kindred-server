@@ -205,9 +205,11 @@ fn views(db: &Db) -> Result<Vec<Value>> {
 }
 /// A single user-facing catalogue; activity entries are not scheduled a second time.
 pub fn routines(db: &Db) -> Result<Vec<Value>> {
+    let hidden = crate::routine_controls::expired_once_ids(db, db::now())?;
     let mut items = db
         .routines()?
         .into_iter()
+        .filter(|r| !hidden.contains(&r.id))
         .map(|r| {
             let id=r.id.clone();
             let mut v = serde_json::to_value(r)?;

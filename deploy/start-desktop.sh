@@ -9,7 +9,7 @@ browser=/home/bot/.local/share/kindred/browser
 [ "$screen" -eq 1 ] || browser=$browser-$screen
 mkdir -p "$XDG_RUNTIME_DIR" "$browser"
 chmod 700 "$XDG_RUNTIME_DIR" "$browser"
-Xvfb "$DISPLAY" -screen 0 1280x800x24 -nolisten tcp &
+Xvfb "$DISPLAY" -screen 0 1440x900x24 -nolisten tcp &
 xpid=$!
 trap 'kill "$xpid" 2>/dev/null || true' EXIT INT TERM
 i=0

@@ -4,6 +4,21 @@ use anyhow::{Context, Result, ensure};
 use rusqlite::{OptionalExtension, params};
 use serde_json::{Value, json};
 
+// Presentation only: keep the definition and execution history available to bots.
+// A consumed schedule is not complete while a command continuation is pending.
+pub fn expired_once_ids(db: &db::Db, now: i64) -> Result<std::collections::HashSet<String>> {
+    let c = db.0.lock().unwrap();
+    Ok(c.prepare("SELECT q.id FROM routines q
+        JOIN runs last ON last.id=(SELECT r.id FROM runs r JOIN routine_runs rr ON rr.run_id=r.id WHERE rr.routine_id=q.id ORDER BY r.created DESC,r.rowid DESC LIMIT 1)
+        WHERE q.run_at IS NOT NULL AND q.enabled=0 AND last.status='completed'
+        AND (SELECT max(created) FROM events WHERE run_id=last.id AND kind='run_finished')<=?1
+        AND NOT EXISTS(SELECT 1 FROM routine_runs rr JOIN runs r ON r.id=rr.run_id WHERE rr.routine_id=q.id AND r.status IN ('queued','running','awaiting_user','awaiting_approval','cancelling'))
+        AND NOT EXISTS(SELECT 1 FROM routine_runs rr JOIN command_waits w ON w.run_id=rr.run_id WHERE rr.routine_id=q.id AND w.continuation='')
+        AND NOT EXISTS(SELECT 1 FROM routine_runs rr JOIN command_jobs j ON j.run_id=rr.run_id WHERE rr.routine_id=q.id AND j.status IN ('starting','running'))")?
+        .query_map([now.saturating_sub(6 * 60 * 60)], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?)
+}
+
 pub fn cancel_queued(c: &rusqlite::Connection, id: &str, reason: &str) -> Result<usize> {
     Ok(c.execute("UPDATE runs SET status='cancelled',error=? WHERE status='queued' AND id IN (SELECT run_id FROM routine_runs WHERE routine_id=?)", params![reason,id])?)
 }
@@ -132,6 +147,87 @@ mod tests {
     fn text(v: Value) -> Value {
         assert_ne!(v["failed"], true, "{v}");
         serde_json::from_str(v["text"].as_str().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn completed_once_disappears_after_six_hours_without_losing_history() {
+        let app = app();
+        let b = bot(&app.db, "codex");
+        let now = db::now();
+        let once = routine(&app, &b.id, Some(now - 3600));
+        let run = app.db.run_routine_now(&once.id).unwrap();
+        assert!(
+            !expired_once_ids(&app.db, now + 86400)
+                .unwrap()
+                .contains(&once.id)
+        );
+        app.db.finish(&run, "completed", "Done", "").unwrap();
+        app.db.event(&run, "run_finished", json!({})).unwrap();
+        app.db
+            .0
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE events SET created=? WHERE run_id=? AND kind='run_finished'",
+                params![now, run],
+            )
+            .unwrap();
+        assert!(
+            !expired_once_ids(&app.db, now + 21599)
+                .unwrap()
+                .contains(&once.id)
+        );
+        assert!(
+            expired_once_ids(&app.db, now + 21600)
+                .unwrap()
+                .contains(&once.id)
+        );
+        assert!(app.db.routines().unwrap().iter().any(|r| r.id == once.id));
+        assert_eq!(app.db.run(&run).unwrap().output, "Done");
+        // A pending command continuation is unfinished work, even if its turn ended.
+        app.db
+            .0
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO command_waits(run_id,ids,context) VALUES(?,'[]','Continue')",
+                [&run],
+            )
+            .unwrap();
+        assert!(
+            !expired_once_ids(&app.db, now + 86400)
+                .unwrap()
+                .contains(&once.id)
+        );
+        app.db
+            .0
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM command_waits WHERE run_id=?", [&run])
+            .unwrap();
+        // A manual retry must reappear immediately, including failures.
+        let retry = app.db.run_routine_now(&once.id).unwrap();
+        assert!(
+            !expired_once_ids(&app.db, now + 86400)
+                .unwrap()
+                .contains(&once.id)
+        );
+        app.db.finish(&retry, "failed", "", "Try again").unwrap();
+        app.db.event(&retry, "run_finished", json!({})).unwrap();
+        assert!(
+            !expired_once_ids(&app.db, now + 86400)
+                .unwrap()
+                .contains(&once.id)
+        );
+        let repeating = routine(&app, &b.id, None);
+        let run = app.db.run_routine_now(&repeating.id).unwrap();
+        app.db.finish(&run, "completed", "Done", "").unwrap();
+        app.db.event(&run, "run_finished", json!({})).unwrap();
+        assert!(
+            !expired_once_ids(&app.db, now + 86400)
+                .unwrap()
+                .contains(&repeating.id)
+        );
     }
 
     #[test]
