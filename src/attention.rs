@@ -51,7 +51,9 @@ impl Db {
         label: &str,
         description: &str,
         notifications: bool,
+        progress_updates: Option<&str>,
     ) -> Result<()> {
+        ensure!(progress_updates.is_none_or(|v|v=="inherit"||crate::progress_updates::valid(v)), "Invalid progress updates setting");
         ensure!(
             !name.trim().is_empty() && name.len() <= 80,
             "Name must be 1..80 bytes"
@@ -64,6 +66,7 @@ impl Db {
         let tx = c.transaction()?;
         let changed = tx.execute("UPDATE bots SET name=?1,profile=json_set(profile,'$.label',?2,'$.description',?3,'$.notifications',json(?4)) WHERE id=?5", params![name.trim(),label,description,if notifications {"true"} else {"false"},id])?;
         ensure!(changed == 1, "Bot not found");
+        if let Some(mode)=progress_updates { tx.execute("UPDATE bots SET profile=json_set(profile,'$.progress_updates',?) WHERE id=?",params![mode,id])?; }
         tx.execute(
             "UPDATE chats SET name=? WHERE id=?",
             params![name.trim(), format!("dm-{id}")],
@@ -203,7 +206,7 @@ mod tests {
             200
         );
         app.db
-            .save_bot_identity(&b.id, "  New name  ", "Inbox", "Description", false)
+            .save_bot_identity(&b.id, "  New name  ", "Inbox", "Description", false, None)
             .unwrap();
         let saved = app.db.bot(&b.id).unwrap();
         assert_eq!(saved.name, "New name");
@@ -219,7 +222,7 @@ mod tests {
         }
         assert_eq!(saved.profile.notifications, false);
         assert_eq!(saved.profile.label, "Inbox");
-        assert!(app.db.save_bot_identity(&b.id, " ", "", "", true).is_err());
+        assert!(app.db.save_bot_identity(&b.id, " ", "", "", true, None).is_err());
         assert_eq!(app.db.bot(&b.id).unwrap().name, "New name");
     }
 

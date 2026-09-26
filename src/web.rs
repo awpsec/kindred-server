@@ -732,6 +732,9 @@ async fn save_settings(State(app): State<Shared>, Json(v): Json<Value>) -> Resul
         matches!(timezone_mode, "auto" | "fixed"),
         "Invalid time zone mode"
     );
+    require!(v.get("progress_updates").is_none_or(Value::is_string), "Invalid progress updates setting");
+    let progress_updates = v["progress_updates"].as_str().or_else(||prior["progress_updates"].as_str()).unwrap_or("balanced");
+    require!(crate::progress_updates::valid(progress_updates), "Invalid progress updates setting");
     let default_provider = v.get("default_provider").unwrap_or(&prior["default_provider"]);
     require!(default_provider.as_str().is_some_and(crate::provider_accounts::valid_id), "Invalid default provider");
     let model_defaults = v.get("model_defaults").unwrap_or(&prior["model_defaults"]);
@@ -743,7 +746,7 @@ async fn save_settings(State(app): State<Shared>, Json(v): Json<Value>) -> Resul
         let effort = selection["reasoning_effort"].as_str().unwrap_or("");
         require!(model.len() <= 200 && !model.chars().any(char::is_control) && effort.len() <= 40 && effort.bytes().all(|b| b.is_ascii_lowercase() || b == b'_'), "Invalid default model selection");
     }
-    let settings = json!({"default_provider":default_provider,"model_defaults":model_defaults,"local_access":local_access,"approval_mode":approval,"name":name,"identity":identity,"theme":theme,"reduced_motion":v["reduced_motion"]==true,"notifications":notifications,"show_activity":show_activity,"separate_bot_chats":separate_bot_chats,"timezone":timezone,"timezone_mode":timezone_mode});
+    let settings = json!({"progress_updates":progress_updates,"default_provider":default_provider,"model_defaults":model_defaults,"local_access":local_access,"approval_mode":approval,"name":name,"identity":identity,"theme":theme,"reduced_motion":v["reduced_motion"]==true,"notifications":notifications,"show_activity":show_activity,"separate_bot_chats":separate_bot_chats,"timezone":timezone,"timezone_mode":timezone_mode});
     app.db.save_setting("general", &settings)?;
     Ok(Json(settings))
 }
@@ -1111,6 +1114,8 @@ async fn mark_chat_read(
 }
 #[derive(Deserialize)]
 struct BotIdentity {
+    #[serde(default)]
+    progress_updates: Option<String>,
     name: String,
     label: String,
     description: String,
@@ -1127,6 +1132,7 @@ async fn update_bot_identity(
         &value.label,
         &value.description,
         value.notifications,
+        value.progress_updates.as_deref(),
     )?;
     Ok(Json(app.db.bot(&id)?))
 }

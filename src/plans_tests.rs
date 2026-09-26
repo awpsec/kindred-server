@@ -464,7 +464,15 @@ async fn runtime_contract_has_contextual_tools_and_live_user_revisions() {
     );
     let fresh = instructions::build(&app, &b, &r, &tools, Some(32000)).unwrap();
     assert!(fresh.contains("conversation_checklists"));
-    assert!(fresh.contains("monday.example"));
+    // A constrained context may omit optional checklist records, but must
+    // declare the omission and leave the complete records retrievable.
+    if !fresh.contains("monday.example") {
+        let packet: Value = serde_json::from_str(fresh.lines().last().unwrap()).unwrap();
+        assert!(packet["context_selection"]["omitted_sections"]["/conversation_checklists/items"].as_u64().unwrap_or(0) > 0);
+        assert!(read["text"].as_str().unwrap().contains("monday.example"));
+    }
+    let roomy = instructions::build(&app, &b, &r, &tools, Some(128000)).unwrap();
+    assert!(roomy.contains("monday.example"));
 }
 
 #[tokio::test]

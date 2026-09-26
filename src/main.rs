@@ -1,3 +1,4 @@
+mod progress_updates;
 mod artifact_export;
 mod chat_edit;
 mod artifact_library;

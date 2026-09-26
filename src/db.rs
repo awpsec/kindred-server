@@ -32,7 +32,7 @@ pub fn valid_approval(mode: &str) -> bool {
 pub fn general_settings(saved: Option<Value>) -> Value {
     let mut settings = json!({"name":"You","identity":"","theme":"dark",
         "reduced_motion":false,"approval_mode":"ask","show_activity":false,"separate_bot_chats":true,
-        "default_provider":"codex","model_defaults":{},"local_access":false,"notifications":"all","timezone":"","timezone_mode":"auto"});
+        "default_provider":"codex","model_defaults":{},"local_access":false,"notifications":"all","timezone":"","timezone_mode":"auto","progress_updates":"balanced"});
     if let Some(Value::Object(saved)) = saved {
         settings.as_object_mut().unwrap().extend(saved);
     }
@@ -80,6 +80,7 @@ pub struct BotProfile {
     pub notifications: bool,
     pub local_access: bool,
     pub local_device_id: String,
+    pub progress_updates: String,
 }
 impl Default for BotProfile {
     fn default() -> Self {
@@ -95,6 +96,7 @@ impl Default for BotProfile {
             notifications: true,
             local_access: false,
             local_device_id: String::new(),
+            progress_updates: "inherit".into(),
         }
     }
 }
@@ -952,6 +954,7 @@ pub(crate) fn validate_bot(b: &Bot) -> Result<()> {
                 .all(|v| v.is_ascii_lowercase() || v == b'_'),
         "invalid thinking level"
     );
+    ensure!(b.profile.progress_updates == "inherit" || crate::progress_updates::valid(&b.profile.progress_updates), "Invalid progress updates setting");
     ensure!(
         b.profile.label.len() <= 80
             && b.profile.description.len() <= 2000
