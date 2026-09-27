@@ -301,6 +301,7 @@ mod tests {
     #[test]
     fn classifier_excludes_configuration_and_budget_failures() {
         for message in [
+            crate::cli_providers::CLAUDE_SESSION_EXPIRED,
             "Tool-step budget exhausted",
             "Choose the provider default thinking level",
             "OpenRouter returned HTTP 401. Check credentials",

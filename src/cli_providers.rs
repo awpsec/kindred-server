@@ -17,6 +17,15 @@ use std::{
 use tokio::io::BufReader;
 
 const HELPER: &str = "/usr/local/lib/kindred/provider-cli.py";
+pub(crate) const CLAUDE_SESSION_EXPIRED: &str = "Claude could not refresh its sign-in session. Reconnect Claude in Settings → Connections, then continue this task.";
+
+fn expired_claude_session(provider: &str, frame: &Value) -> bool {
+    provider == "claude-code"
+        && frame["is_error"] == true
+        && frame["text"].as_str().is_some_and(|text| {
+            text.trim().starts_with("Failed to authenticate: OAuth session expired and could not be refreshed")
+        })
+}
 pub async fn action(
     State(app): State<Shared>,
     Path((provider, action)): Path<(String, String)>,
@@ -204,6 +213,11 @@ pub async fn run(app: &App, bot: &Bot, run: &Run) -> Result<String> {
                         "provider_diagnostic",
                         json!({"text":part,"status_notice":"provider_error"}),
                     )?;
+                    // This is an explicit terminal authentication failure, not
+                    // silence to wait four minutes for and retry five times.
+                    if expired_claude_session(&bot.provider, &frame) {
+                        bail!(CLAUDE_SESSION_EXPIRED);
+                    }
                     continue;
                 }
                 ensure!(
@@ -378,4 +392,17 @@ pub async fn run(app: &App, bot: &Bot, run: &Run) -> Result<String> {
         }
     }
     bail!("Provider event limit reached")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn claude_session_expiry_requires_provider_error_provenance() {
+        let text = "Failed to authenticate: OAuth session expired and could not be refreshed";
+        assert!(expired_claude_session("claude-code", &json!({"is_error":true,"text":text})));
+        assert!(!expired_claude_session("claude-code", &json!({"text":text})));
+        assert!(!expired_claude_session("kimi-code", &json!({"is_error":true,"text":text})));
+        assert!(!expired_claude_session("claude-code", &json!({"is_error":true,"text":"Connection timed out"})));
+    }
 }
