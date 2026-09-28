@@ -125,6 +125,23 @@ pub fn leases(app: &App) -> Result<Leases> {
         _integrations: integrations,
     })
 }
+async fn update_guest_runtime(app: &App) -> Result<()> {
+    ensure!(app.config.vm.guest_binary == "/usr/local/bin/kindred", "Custom guest executable must be updated by its administrator");
+    let source=std::env::current_exe()?;
+    let size=tokio::fs::metadata(&source).await?.len();
+    ensure!(size>0 && size<=256*1024*1024,"Guest runtime size is outside the transfer limit");
+    let bytes=tokio::fs::read(source).await?;
+    let digest=ring::digest::digest(&ring::digest::SHA256,&bytes);
+    let hash=digest.as_ref().iter().map(|b|format!("{b:02x}")).collect::<String>();
+    let helper=include_str!("../deploy/update-guest-runtime.py").replace('\'', "'\"'\"'");
+    let mut command=vm::ssh(&app.config.vm);
+    command.arg(format!("sudo -n python3 -c '{helper}' {hash} {}",env!("CARGO_PKG_VERSION")));
+    let output=vm::capture(command,Some(bytes),90,4096).await?;
+    let receipt:Value=serde_json::from_slice(&output)?;
+    ensure!(receipt["version"]==env!("CARGO_PKG_VERSION") && receipt["updated"].is_boolean(),"Guest runtime receipt did not verify");
+    Ok(())
+}
+
 async fn guest(app: &App, operation: &str, job: Option<&str>) -> Result<Value> {
     let mut cmd = vm::ssh(&app.config.vm);
     let action = if let Some(id) = job {
@@ -291,6 +308,14 @@ pub async fn worker(app: Shared) {
                 if let Err(error)=vm::capture(command,Some(include_bytes!("../deploy/update-harnesses.py").to_vec()),1200,16384).await {
                     eprintln!("Pi harness update: {error}");
                     reconcile(&app.db,&serde_json::json!({"phase":"failed","job_id":id,"error":"The server's Pi harness could not be updated. Previous runtime retained; check server logs."}),db::now())?;
+                    held=None;
+                    return Ok(());
+                }
+                // Only after idle reservation and screen leases: never replace a
+                // guest executable underneath an active managed command.
+                if let Err(error)=update_guest_runtime(&app).await {
+                    eprintln!("Guest runtime update: {error}");
+                    reconcile(&app.db,&serde_json::json!({"phase":"failed","job_id":id,"error":"The Kindred guest runtime could not be updated. The previous runtime is retained; check server logs."}),db::now())?;
                     held=None;
                     return Ok(());
                 }
