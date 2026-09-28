@@ -82,6 +82,9 @@ impl Db {
         )?;
         ensure!(!archived, "This chat is archived");
         chat.members = serde_json::from_str(&members)?;
+        ensure!(chat.members.iter().any(|id| id == &run.bot_id), "Teammate is not in this active chat");
+        let profile: String=tx.query_row("SELECT profile FROM bots WHERE id=?",[&run.bot_id],|r|r.get(0))?;
+        ensure!(serde_json::from_str::<Value>(&profile)?["archived"] != true, "This bot is archived");
         let previous = metadata(&tx, source, "task_recovery")?;
         let root = previous
             .as_ref()
@@ -94,21 +97,33 @@ impl Db {
         )?;
         // Keep even a maximum-length original request intact. Recovery rules and
         // source activity are supplied separately in the shared instruction packet.
-        let next = crate::chats::insert_run(&tx, &chat, &run.bot_id, &original, &db::id(), "", 0)?;
+        // A fresh user follow-up after Stop may already be handling the handoff.
+        // Reuse only the immediate next turn for this bot, in the same chat;
+        // never absorb a routine, command, teammate message or completed work.
+        let followup: Option<String> = if status == "cancelled" {
+            tx.query_row("SELECT r.id FROM runs r JOIN run_message_sources s ON s.run_id=r.id JOIN chat_messages m ON m.seq=s.message_seq WHERE r.bot_id=?1 AND r.chat_id=?2 AND r.status IN ('queued','running','awaiting_user','awaiting_approval') AND r.created>=?3 AND EXISTS(SELECT 1 FROM events WHERE run_id=?4 AND kind='run_stop_requested' AND created>=?5) AND r.rowid=(SELECT MIN(rowid) FROM runs WHERE bot_id=?1 AND rowid>(SELECT rowid FROM runs WHERE id=?4)) AND r.depth=0 AND r.reply_to='' AND m.sender='user' AND m.kind='message' AND m.suppressed=0 AND NOT EXISTS(SELECT 1 FROM run_commands WHERE run_id=r.id) AND NOT EXISTS(SELECT 1 FROM routine_runs WHERE run_id=r.id) AND NOT EXISTS(SELECT 1 FROM events WHERE run_id=r.id AND kind='task_recovery')",params![run.bot_id,run.chat_id,db::now()-120,source,db::now()-900],|r|r.get(0)).optional()?
+        } else { None };
+        let merged = followup.is_some();
+        let next = match followup {
+            Some(id) => id,
+            None => crate::chats::insert_run(&tx, &chat, &run.bot_id, &original, &db::id(), "", 0)?,
+        };
         tx.execute("INSERT INTO run_commands(run_id,receipt) SELECT ?,receipt FROM run_commands WHERE run_id=?", params![next,root])?;
-        tx.execute("INSERT INTO chat_messages(chat_id,sender,body,kind,run_id,created) VALUES(?,'user','Continuing task','continuation',?,?)", params![chat.id,next,db::now()])?;
-        let seq = tx.last_insert_rowid();
-        tx.execute(
-            "INSERT INTO run_message_sources VALUES(?,?)",
-            params![next, seq],
-        )?;
-        tx.execute("INSERT INTO message_replies(message_seq,reply_to_seq) SELECT ?,p.reply_to_seq FROM message_replies p JOIN run_message_sources s ON s.message_seq=p.message_seq WHERE s.run_id=?", params![seq,root])?;
+        if !merged {
+            tx.execute("INSERT INTO chat_messages(chat_id,sender,body,kind,run_id,created) VALUES(?,'user','Continuing task','continuation',?,?)", params![chat.id,next,db::now()])?;
+            let seq = tx.last_insert_rowid();
+            tx.execute(
+                "INSERT INTO run_message_sources VALUES(?,?)",
+                params![next, seq],
+            )?;
+            tx.execute("INSERT INTO message_replies(message_seq,reply_to_seq) SELECT ?,p.reply_to_seq FROM message_replies p JOIN run_message_sources s ON s.message_seq=p.message_seq WHERE s.run_id=?", params![seq,root])?;
+        }
         for (owner, kind, body) in [
             (source, "task_continued", json!({"run_id":next})),
             (
                 next.as_str(),
                 "task_recovery",
-                json!({"source_run_id":source,"root_run_id":root}),
+                json!({"source_run_id":source,"root_run_id":root,"merged_followup":merged}),
             ),
         ] {
             tx.execute(
@@ -130,6 +145,46 @@ mod tests {
     use super::*;
     use crate::tests;
     use std::future::IntoFuture;
+
+    #[test]
+    fn continue_reuses_followup_without_requeueing_or_rewriting_user_note() {
+        for running in [false,true] {
+            let app=tests::app();let bot=tests::bot(&app.db,"codex");
+            let source=app.db.queue(&bot.id,"Finish the original task",0).unwrap();
+            app.db.cancel(&source).unwrap();
+            app.db.finish(&source,"cancelled","","Stopped").unwrap();
+            let followup=app.db.queue(&bot.id,"I signed in for you; carry on",0).unwrap();
+            if running {assert_eq!(app.db.claim_bot(&bot.id).unwrap().unwrap().id,followup);}
+            let before=app.db.run(&followup).unwrap();
+            assert_eq!(app.db.continue_task(&source).unwrap(),followup);
+            assert_eq!(app.db.continue_task(&source).unwrap(),followup);
+            let after=app.db.run(&followup).unwrap();
+            assert_eq!(before.prompt,after.prompt);assert_eq!(before.status,after.status);
+            assert_eq!(app.db.runs(None).unwrap().len(),2);
+            assert_eq!(app.db.task_recovery(&after).unwrap().unwrap()["root_run_id"],source);
+            assert!(!app.db.chat_messages(&after.chat_id).unwrap().iter().any(|m|m["kind"]=="continuation"));
+            if running {
+                let value=crate::conversation_updates::with_live_context(&app.db,&after,json!({"text":"Screen inspected"})).unwrap();
+                let context:Value=serde_json::from_str(value["text"].as_str().unwrap()).unwrap();
+                assert_eq!(context["kindred_live_context"]["task_recovery"]["original_request"],"Finish the original task");
+                let second=crate::conversation_updates::with_live_context(&app.db,&after,json!({"text":"Next result"})).unwrap();
+                assert!(!second.to_string().contains("merged_followup"));
+            }
+        }
+    }
+    #[test]
+    fn continue_does_not_absorb_completed_or_stale_followups() {
+        for stale in [false,true] {
+            let app=tests::app();let bot=tests::bot(&app.db,"codex");
+            let source=app.db.queue(&bot.id,"Original",0).unwrap();
+            app.db.cancel(&source).unwrap();
+            app.db.finish(&source,"cancelled","","Stopped").unwrap();
+            let note=app.db.queue(&bot.id,"A separate message",0).unwrap();
+            if stale {app.db.0.lock().unwrap().execute("UPDATE runs SET created=created-300 WHERE id=?",[&note]).unwrap();}
+            else {app.db.finish(&note,"completed","Done","").unwrap();}
+            assert_ne!(app.db.continue_task(&source).unwrap(),note);
+        }
+    }
 
     #[tokio::test]
     async fn continuation_http_is_authenticated_atomic_and_idempotent() {

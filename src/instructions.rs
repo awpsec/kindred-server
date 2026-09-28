@@ -134,12 +134,16 @@ pub fn build(
             .run(recovery["source_run_id"].as_str().unwrap_or(""))?;
         let root = recovery["root_run_id"].as_str().unwrap_or("").to_owned();
         recovery["instructions"] = json!(
-            "The user requested continuation of this stopped task. The current user input is the original request, NOT authorization to repeat completed work. Review source activity and the conversation before the next action. Continue only unfinished work in the original scope. Do not repeat an external write with an uncertain outcome, override a declined action, or recreate existing routines. Check current state first; ask if an outcome cannot be verified. Missing or truncated history is not evidence an action did not happen."
+            "The user requested continuation of this stopped task. The current user input may be a follow-up note combined with Continue task. Preserve that note alongside original_request; neither authorizes repeating completed work. Review source activity and the conversation before the next action. Continue only unfinished work in the original scope. Do not repeat an external write with an uncertain outcome, override a declined action, or recreate existing routines. Check current state first; ask if an outcome cannot be verified. Missing or truncated history is not evidence an action did not happen."
         );
         recovery["source_status"] = json!(source.status);
         let sources_valid=crate::continuity::store::session_valid(&app.db.0.lock().unwrap(),&source.id)?;
         recovery["source_error"] = if sources_valid {json!(source.error)}else{Value::Null};
         recovery["source_context_invalidated"]=json!(!sources_valid);
+        if recovery["merged_followup"] == true {
+            let root_valid=crate::continuity::store::session_valid(&app.db.0.lock().unwrap(), &root)?;
+            recovery["original_request"] = if root_valid { json!(app.db.run(&root)?.prompt) } else { Value::Null };
+        }
         let mut attempts = Vec::new();
         let mut owner = source.id.clone();
         let mut seen = std::collections::HashSet::new();
