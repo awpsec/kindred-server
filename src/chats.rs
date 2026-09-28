@@ -181,12 +181,15 @@ impl Db {
         Ok(())
     }
     pub fn chats(&self) -> Result<Vec<Chat>> {
+        self.chats_matching(None)
+    }
+    fn chats_matching(&self, id: Option<&str>) -> Result<Vec<Chat>> {
         Ok(self
             .0
             .lock()
             .unwrap()
-            .prepare("SELECT c.id,c.name,c.members,c.archived,c.pinned,(SELECT json_object('sender',m.sender,'text',CASE WHEN m.kind='connection_card' THEN 'Connect account' WHEN m.kind='workspace_artifact' THEN COALESCE((SELECT json_extract(body,'$.title') FROM workspace_artifacts WHERE id=m.body),'Shared document') WHEN m.kind='checklist' THEN COALESCE((SELECT json_extract(body,'$.title') FROM checklists WHERE id=m.body),m.body) WHEN m.kind IN ('reminder_card','reminder') THEN COALESCE((SELECT json_extract(body,'$.message') FROM reminders WHERE id=m.body),m.body) WHEN m.kind='question' THEN COALESCE((SELECT CASE WHEN q.status='answered' THEN q.question||' '||q.answer ELSE q.question END FROM questions q WHERE q.id=m.body),m.body) ELSE m.body END,'created',m.created,'kind',m.kind) FROM chat_messages m WHERE m.chat_id=c.id AND m.suppressed=0 AND trim(m.body)!='' AND m.kind NOT IN ('notice','collaboration','connector_artifact') ORDER BY m.created DESC,COALESCE(m.history_order,printf('%020d:%020d',m.seq,0)) DESC LIMIT 1),c.description,c.bot_only FROM chats c ORDER BY c.rowid DESC")?
-            .query_map([], |r| {
+            .prepare(&format!("SELECT c.id,c.name,c.members,c.archived,c.pinned,(SELECT json_object('sender',m.sender,'text',CASE WHEN m.kind='connection_card' THEN 'Connect account' WHEN m.kind='workspace_artifact' THEN COALESCE((SELECT json_extract(body,'$.title') FROM workspace_artifacts WHERE id=m.body),'Shared document') WHEN m.kind='checklist' THEN COALESCE((SELECT json_extract(body,'$.title') FROM checklists WHERE id=m.body),m.body) WHEN m.kind IN ('reminder_card','reminder') THEN COALESCE((SELECT json_extract(body,'$.message') FROM reminders WHERE id=m.body),m.body) WHEN m.kind='question' THEN COALESCE((SELECT CASE WHEN q.status='answered' THEN q.question||' '||q.answer ELSE q.question END FROM questions q WHERE q.id=m.body),m.body) ELSE m.body END,'created',m.created,'kind',m.kind) FROM chat_messages m WHERE m.chat_id=c.id AND m.suppressed=0 AND trim(m.body)!='' AND m.kind NOT IN ('notice','collaboration','connector_artifact') ORDER BY m.created DESC,COALESCE(m.history_order,printf('%020d:%020d',m.seq,0)) DESC LIMIT 1),c.description,c.bot_only FROM chats c WHERE {} ORDER BY c.rowid DESC", if id.is_some() { "c.id=?1" } else { "?1 IS NULL" }))?
+            .query_map([id], |r| {
                 Ok(Chat {
                     bot_only: r.get(7)?,
                     description: r.get(6)?,
@@ -201,7 +204,7 @@ impl Db {
             .collect::<rusqlite::Result<_>>()?)
     }
     pub fn chat(&self, id: &str) -> Result<Chat> {
-        self.chats()?
+        self.chats_matching(Some(id))?
             .into_iter()
             .find(|c| c.id == id)
             .ok_or_else(|| anyhow::anyhow!("Chat not found"))

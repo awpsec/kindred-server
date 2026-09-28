@@ -966,3 +966,36 @@ fn pi_progress_reaches_activity_without_overriding_human_waits() {
     let events = app.db.activity_events(&id).unwrap();
     assert_eq!(crate::runtime::activity("running", events.last()).1, "Looking at the screen");
 }
+
+#[test]
+fn event_polling_indexes_preserve_history_and_activity() {
+    let db = Db::open(":memory:").unwrap();
+    let b = bot(&db, "codex");
+    let first = db.queue(&b.id, "First", 0).unwrap();
+    let second = db.queue(&b.id, "Second", 0).unwrap();
+    for i in 0..12 {
+        db.event(if i % 2 == 0 { &first } else { &second }, "tool_result", json!({"tool":"test","args":{"command":i.to_string()}})).unwrap();
+    }
+    let history = db.events(&first).unwrap();
+    let activity = db.activity_events(&first).unwrap();
+    let c = db.0.lock().unwrap();
+    let plan:String = c.query_row("EXPLAIN QUERY PLAN SELECT * FROM events WHERE run_id=? ORDER BY seq", [&first], |r|r.get(3)).unwrap();
+    assert!(plan.contains("event_run_sequence"), "{plan}");
+    c.execute_batch("DROP INDEX event_run_sequence; DROP INDEX event_run_created; DROP INDEX run_bot_created;").unwrap();
+    drop(c);
+    assert_eq!(history, db.events(&first).unwrap());
+    assert_eq!(activity, db.activity_events(&first).unwrap());
+}
+
+#[test]
+fn single_chat_lookup_matches_sidebar_projection() {
+    let db = Db::open(":memory:").unwrap();
+    for _ in 0..8 {
+        let b = bot(&db, "codex");
+        db.queue(&b.id, "A message", 0).unwrap();
+    }
+    for chat in db.chats().unwrap() {
+        assert_eq!(serde_json::to_value(db.chat(&chat.id).unwrap()).unwrap(), serde_json::to_value(chat).unwrap());
+    }
+    assert!(db.chat("missing").is_err());
+}

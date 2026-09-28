@@ -202,6 +202,10 @@ impl Db {
         CREATE TABLE IF NOT EXISTS runs(id TEXT PRIMARY KEY,bot_id TEXT NOT NULL REFERENCES bots(id),prompt TEXT NOT NULL,status TEXT NOT NULL,output TEXT NOT NULL DEFAULT '',error TEXT NOT NULL DEFAULT '',created INTEGER NOT NULL,depth INTEGER NOT NULL DEFAULT 0);
         CREATE INDEX IF NOT EXISTS runs_status ON runs(status,created);
         CREATE TABLE IF NOT EXISTS events(seq INTEGER PRIMARY KEY AUTOINCREMENT,run_id TEXT NOT NULL REFERENCES runs(id),kind TEXT NOT NULL,body TEXT NOT NULL,created INTEGER NOT NULL);
+        CREATE INDEX IF NOT EXISTS event_run_sequence ON events(run_id,seq);
+        CREATE INDEX IF NOT EXISTS event_run_created ON events(run_id,created);
+        CREATE INDEX IF NOT EXISTS run_created ON runs(created);
+        CREATE INDEX IF NOT EXISTS run_bot_created ON runs(bot_id,created);
         CREATE TABLE IF NOT EXISTS approvals(id TEXT PRIMARY KEY,run_id TEXT NOT NULL REFERENCES runs(id),tool TEXT NOT NULL,args TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'pending');
         CREATE TABLE IF NOT EXISTS skills(name TEXT PRIMARY KEY,body TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS screens(bot_id TEXT PRIMARY KEY REFERENCES bots(id),slot INTEGER UNIQUE NOT NULL,takeover INTEGER NOT NULL DEFAULT 0,quiet_until INTEGER NOT NULL DEFAULT 0);
