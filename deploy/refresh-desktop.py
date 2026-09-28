@@ -89,7 +89,7 @@ def stage_panel(source):
     env = {**os.environ, 'DEBIAN_FRONTEND': 'noninteractive'}
     subprocess.run(['apt-get', 'update', '-qq'], env=env, check=True)
     subprocess.run(['apt-get', 'install', '-y', '--no-install-recommends',
-                    'python3-gi', 'gir1.2-gtk-3.0', 'gir1.2-wnck-3.0', 'x11-utils'], env=env, check=True)
+                    'python3-gi', 'gir1.2-gtk-3.0', 'gir1.2-wnck-3.0', 'librsvg2-common', 'x11-utils'], env=env, check=True)
     backup = Path('/var/backups/kindred-desktop') / datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')
     backup.mkdir(parents=True, mode=0o700)
     for name in ['start-desktop-shell', 'kindred-dock', 'desktop-launch']:
