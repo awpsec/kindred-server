@@ -123,8 +123,10 @@ def pi(current):
                         ignore=lambda directory, names: ['node_modules']
                         if Path(directory) == source_root and 'node_modules' in names else [])
         environment = dict(os.environ, PATH=str(stage / 'node/bin') + ':' + os.environ.get('PATH', ''))
-        run([stage / 'node/bin/npm', 'install', '--omit=dev', '--ignore-scripts', '--no-audit', '--no-fund',
+        run([stage / 'node/bin/npm', 'install', '--cache', stage / '.npm-cache', '--omit=dev', '--ignore-scripts', '--no-audit', '--no-fund',
              '--registry=https://registry.npmjs.org', '@earendil-works/pi-coding-agent@latest', '@earendil-works/pi-ai@latest'], cwd=stage, env=environment)
+        # Do not retain download caches in immutable runtime releases.
+        shutil.rmtree(stage / '.npm-cache', ignore_errors=True)
         sdk = json.loads((stage / 'node_modules/@earendil-works/pi-coding-agent/package.json').read_text())['version']
         if not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', sdk):
             raise ValueError('Expected a stable Pi SDK')

@@ -22,6 +22,8 @@ class Updates(unittest.TestCase):
                 calls.append([str(a) for a in args])
                 if 'install' in args:
                     stage=kwargs['cwd']
+                    self.assertEqual(args[args.index('--cache')+1],stage/'.npm-cache')
+                    (stage/'.npm-cache').mkdir()
                     self.assertTrue((stage/'node/bin/npm').is_symlink())
                     self.assertEqual((stage/'node/bin/npm').read_text(),'bundled npm')
                     self.assertFalse((stage/'node_modules').exists())
@@ -32,6 +34,7 @@ class Updates(unittest.TestCase):
             self.assertNotEqual(current.resolve(),old)
             self.assertEqual((current/'worker.mjs').read_text(),'original')
             self.assertTrue(old.exists())
+            self.assertFalse((current/'.npm-cache').exists())
             self.assertIn('0.99.0',(current/'session.mjs').read_text())
     def test_failed_pi_check_keeps_current_and_removes_stage(self):
         with tempfile.TemporaryDirectory() as directory:
