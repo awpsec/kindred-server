@@ -19,16 +19,20 @@ pub struct Sessions(Mutex<HashMap<String, Entry>>);
 struct Entry {
     state: Arc<AsyncMutex<Session>>,
     engaged: Arc<AtomicBool>,
+    pending_rpc: Arc<AtomicBool>,
 }
 impl Default for Entry {
     fn default() -> Self {
         let engaged = Arc::new(AtomicBool::new(false));
+        let pending_rpc = Arc::new(AtomicBool::new(false));
         Self {
             state: Arc::new(AsyncMutex::new(Session {
                 engaged: engaged.clone(),
+                pending_rpc: pending_rpc.clone(),
                 ..Default::default()
             })),
             engaged,
+            pending_rpc,
         }
     }
 }
@@ -37,6 +41,7 @@ pub struct Session {
     lease: Option<OwnedMutexGuard<()>>,
     observed: bool,
     engaged: Arc<AtomicBool>,
+    pending_rpc: Arc<AtomicBool>,
 }
 impl Sessions {
     fn session(&self, run: &str) -> Arc<AsyncMutex<Session>> {
@@ -54,6 +59,9 @@ impl Sessions {
             .unwrap()
             .get(run)
             .is_some_and(|s| s.engaged.load(Ordering::SeqCst))
+    }
+    pub fn pending_rpc(&self, run: &str) -> bool {
+        self.0.lock().unwrap().get(run).is_some_and(|s| s.pending_rpc.load(Ordering::SeqCst))
     }
     pub fn release(&self, run: &str) {
         if let Some(s) = self.0.lock().unwrap().get(run) {
@@ -76,7 +84,7 @@ pub struct Cleanup<'a> {
 }
 impl Drop for Cleanup<'_> {
     fn drop(&mut self) {
-        if !self.clean && self.app.desktop_sessions.engaged(self.run) {
+        if !self.clean && self.app.desktop_sessions.pending_rpc(self.run) {
             // An interrupted guest RPC may outlive its SSH connection. Mark the
             // display unavailable before dropping ownership, including task abort.
             let _ = self.app.db.screen_set_quiet(self.slot, db::now() + 65);
@@ -144,6 +152,17 @@ pub async fn enter(app: &App, run: &Run, tool: &str) -> Result<OwnedMutexGuard<S
     Ok(session)
 }
 impl Session {
+    pub async fn rpc<F: std::future::Future<Output = Result<serde_json::Value>>>(&mut self, work: F) -> Result<serde_json::Value> {
+        self.pending_rpc.store(true, Ordering::SeqCst);
+        let result = work.await;
+        // A completed RPC is safe to hand over. A dropped/failed transport can
+        // leave its remote command running, so retain the recovery safeguard.
+        if result.as_ref().is_ok_and(|v| v["timed_out"] != true) {
+            self.pending_rpc.store(false, Ordering::SeqCst);
+        }
+        result
+    }
+
     pub fn observed(&mut self, result: &serde_json::Value) {
         self.observed =
             result["failed"] != true && result["image"].as_str().is_some_and(|s| !s.is_empty());
@@ -263,7 +282,7 @@ mod interruption_tests {
     use super::*;
     #[tokio::test]
     async fn cancelling_desktop_work_recovers_the_screen_but_chat_cancellation_does_not_pause_it() {
-        for desktop in [false, true] {
+        for (desktop, pending) in [(false, false), (true, false), (true, true)] {
             let app = crate::tests::app();
             let bot = crate::tests::bot(&app.db, "codex");
             app.db.queue(&bot.id, "Work", 0).unwrap();
@@ -272,7 +291,12 @@ mod interruption_tests {
             let mut lease = None;
             let (result, abrupt) = crate::runtime::drive_run(&app, &run, slot, &mut lease, async {
                 if desktop {
-                    drop(enter(&app, &run, "computer_screenshot").await?);
+                    let mut session=enter(&app, &run, "computer_screenshot").await?;
+                    session.rpc(async { Ok(serde_json::json!({"image":"fixture"})) }).await?;
+                    if pending {
+                        app.db.cancel(&run.id)?;
+                        session.rpc(std::future::pending()).await?;
+                    }
                 }
                 app.db.cancel(&run.id)?;
                 std::future::pending::<()>().await;
@@ -281,10 +305,31 @@ mod interruption_tests {
             .await
             .unwrap();
             assert!(result.is_err());
-            assert_eq!(abrupt, desktop);
-            assert_eq!(app.db.screen_quiet(slot).unwrap() > db::now(), desktop);
+            assert_eq!(abrupt, pending);
+            assert_eq!(app.db.screen_quiet(slot).unwrap() > db::now(), pending);
             assert!(app.screen_lock(slot).try_lock_owned().is_ok());
         }
+    }
+    #[tokio::test]
+    async fn stopping_short_rpc_waits_for_acknowledgement_without_recovery_delay() {
+        let app=crate::tests::app();
+        let bot=crate::tests::bot(&app.db,"codex");
+        app.db.queue(&bot.id,"Work",0).unwrap();
+        let run=app.db.claim_bot(&bot.id).unwrap().unwrap();
+        let slot=app.db.screen(&bot.id).unwrap();
+        let (result,abrupt)=crate::runtime::drive_run(&app,&run,slot,&mut None,async {
+            let mut session=enter(&app,&run,"computer_screenshot").await?;
+            session.rpc(async {
+                app.db.cancel(&run.id)?;
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                Ok(serde_json::json!({"image":"fixture"}))
+            }).await?;
+            std::future::pending::<()>().await;
+            Ok(String::new())
+        }).await.unwrap();
+        assert!(result.is_err());assert!(!abrupt);
+        assert_eq!(app.db.screen_quiet(slot).unwrap(),0);
+        assert!(app.screen_lock(slot).try_lock_owned().is_ok());
     }
     #[tokio::test]
     async fn waiting_for_desktop_control_can_be_cancelled_without_acquiring_it() {

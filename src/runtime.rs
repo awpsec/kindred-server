@@ -841,8 +841,8 @@ async fn call_tool_inner(
         }
         "computer_release" => json!({"text":"Desktop released. Continue other work; take a fresh screenshot before further desktop actions."}),
         "computer_screenshot" => {
-            let mut result =
-                vm::guest_screen(&app.config.vm, app.db.screen(&bot.id)?, name, json!({})).await?;
+            let work = vm::guest_screen(&app.config.vm, app.db.screen(&bot.id)?, name, json!({}));
+            let mut result = desktop.as_mut().expect("desktop session").rpc(work).await?;
             if let Some(session) = &mut desktop { session.observed(&result); }
             if args["share_in_chat"] == true {
                 let id = app.db.attach_screenshot(
@@ -1151,7 +1151,8 @@ async fn call_tool_inner(
                     args["timezone"] = json!(zone.name());
                 }
             }
-            vm::guest_screen(&app.config.vm, app.db.screen(&bot.id)?, name, args).await?
+            let work = vm::guest_screen(&app.config.vm, app.db.screen(&bot.id)?, name, args);
+            if let Some(session) = &mut desktop { session.rpc(work).await? } else { work.await? }
         }
     };
     Ok(result)
@@ -1388,7 +1389,7 @@ pub async fn scheduler(app: Shared) {
                     };
                     let (result, abrupt) = drive_run(&app, &run, slot, &mut lease, work)
                         .await
-                        .unwrap_or_else(|e| (Err(e), lease.is_some() || app.desktop_sessions.engaged(&run.id)));
+                        .unwrap_or_else(|e| (Err(e), lease.is_some() || app.desktop_sessions.pending_rpc(&run.id)));
                     let finish = || -> Result<()> {
                         if let Err(e) = crate::command_jobs::auto_wait(&app.db, &run) {
                             eprintln!("Could not save command wait: {e}");
@@ -1453,12 +1454,19 @@ pub(crate) async fn drive_run<F: std::future::Future<Output = Result<String>>>(
     };
     loop {
         if let Some(reason) = stop_reason() {
-            return Ok((Err(anyhow::anyhow!(reason)), lease.is_some() || app.desktop_sessions.engaged(&run.id)));
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            while app.desktop_sessions.pending_rpc(&run.id) && tokio::time::Instant::now() < deadline {
+                tokio::select! {
+                    _ = &mut work => break,
+                    _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+                }
+            }
+            return Ok((Err(anyhow::anyhow!(reason)), lease.is_some() || app.desktop_sessions.pending_rpc(&run.id)));
         }
         tokio::select! {
             result = &mut work => {
                 if let Some(reason) = stop_reason() {
-                    return Ok((Err(anyhow::anyhow!(reason)), lease.is_some() || app.desktop_sessions.engaged(&run.id)));
+                    return Ok((Err(anyhow::anyhow!(reason)), lease.is_some() || app.desktop_sessions.pending_rpc(&run.id)));
                 }
                 desktop_cleanup.clean = true;
                 return Ok((result, false));
@@ -1481,7 +1489,7 @@ pub(crate) async fn drive_run<F: std::future::Future<Output = Result<String>>>(
                         }
                     }
                 } else if active >= Duration::from_secs(app.config.run_timeout_seconds) {
-                    return Ok((Err(anyhow::anyhow!("Run time limit reached. Review completed actions before retrying.")), lease.is_some() || app.desktop_sessions.engaged(&run.id)));
+                    return Ok((Err(anyhow::anyhow!("Run time limit reached. Review completed actions before retrying.")), lease.is_some() || app.desktop_sessions.pending_rpc(&run.id)));
                 }
             }
         }
