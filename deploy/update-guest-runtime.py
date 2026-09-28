@@ -36,7 +36,7 @@ def install(stream, target, expected_hash, version):
         result = subprocess.run([str(temporary), '--version'], capture_output=True, text=True, timeout=15, check=True)
         if result.stdout.strip() != 'kindred ' + version:
             raise RuntimeError('Guest executable version did not match the server.')
-        result = subprocess.run([str(temporary), 'guest-rpc'], input=json.dumps({'tool':'command_poll','args':{'commands':[]},'screen':1}), capture_output=True, text=True, timeout=15, check=True)
+        result = subprocess.run([str(temporary), 'guest-rpc'], env={**os.environ, 'KINDRED_GUEST': '1'}, input=json.dumps({'tool':'command_poll','args':{'commands':[]},'screen':1}), capture_output=True, text=True, timeout=15, check=True)
         if json.loads(result.stdout) != {'commands': []}:
             raise RuntimeError('Guest executable does not support managed commands.')
         if hashlib.sha256(target.read_bytes()).hexdigest() == expected_hash:

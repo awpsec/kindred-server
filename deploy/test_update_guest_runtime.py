@@ -10,9 +10,9 @@ update=importlib.util.module_from_spec(spec);spec.loader.exec_module(update)
 
 
 def binary(version='test', supported=True):
-    return ('#!/usr/bin/python3\nimport sys,json\n'
+    return ('#!/usr/bin/python3\nimport sys,json,os\n'
             'if sys.argv[1]=="--version": print("kindred '+version+'")\n'
-            'else:\n packet=json.load(sys.stdin)\n assert packet=={"tool":"command_poll","args":{"commands":[]},"screen":1}\n print('+repr('{"commands":[]}' if supported else '{"error":"unknown guest tool"}')+')\n').encode()
+            'else:\n assert os.environ.get("KINDRED_GUEST")=="1"\n packet=json.load(sys.stdin)\n assert packet=={"tool":"command_poll","args":{"commands":[]},"screen":1}\n print('+repr('{"commands":[]}' if supported else '{"error":"unknown guest tool"}')+')\n').encode()
 
 
 class RuntimeUpdate(unittest.TestCase):
