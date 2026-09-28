@@ -225,19 +225,21 @@ def apt(arguments, log):
         return process.wait()
 
 
-def update_harnesses(log):
+def update_harnesses(log, report=lambda detail: None):
     # Use the complete verified runtime installer, preserving account/profile data.
     with tempfile.TemporaryDirectory(prefix='kindred-codex-') as directory:
         root = Path(directory)
         (root / 'download-codex.py').write_text(CODEX_DOWNLOADER)
         (root / 'check-codex.py').write_text(CODEX_CHECKER)
         (root / 'update-harnesses.py').write_text(HARNESS_UPDATER)
+        report('Updating Codex…')
         result = subprocess.run(['/usr/bin/python3', str(root / 'download-codex.py'),
                                  '--update', '/usr/local/bin/codex'],
                                 stdin=subprocess.DEVNULL, stdout=log, stderr=log, timeout=600)
         if result.returncode:
             raise RuntimeError('Codex update failed. The previous verified runtime is retained; inspect the computer update log.')
 
+        report('Updating Claude and Kimi…')
         result = subprocess.run(['/usr/bin/python3', str(root / 'update-harnesses.py'), 'guest'],
                                 stdin=subprocess.DEVNULL, stdout=log, stderr=log, timeout=1200)
         if result.returncode:
@@ -265,10 +267,15 @@ def worker(job_id):
         try:
             before = package_digest()
             with (ROOT / 'packages.log').open('wb') as log:
-                update_harnesses(log)
+                def report(detail):
+                    value['detail'] = detail
+                    atomic(ROOT / 'state.json', value)
+                update_harnesses(log, report)
+                report('Checking Linux package updates…')
                 code = apt(['-o', 'APT::Update::Error-Mode=any', 'update'], log)
                 if code:
                     raise RuntimeError(f'Package index update failed (exit {code}).')
+                report('Installing Linux package updates…')
                 code = apt(['--yes', '--with-new-pkgs', 'upgrade'], log)
                 if code:
                     raise RuntimeError(f'Package installation failed (exit {code}).')

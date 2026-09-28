@@ -26,6 +26,8 @@ pub struct State {
     pub next_check: i64,
     pub reboot_recommended: bool,
     pub error: String,
+    #[serde(default)]
+    pub detail: String,
 }
 pub fn migrate(c: &Connection) -> Result<()> {
     c.execute_batch("CREATE TABLE IF NOT EXISTS vm_maintenance(id INTEGER PRIMARY KEY CHECK(id=1),enabled INTEGER NOT NULL DEFAULT 1,phase TEXT NOT NULL DEFAULT 'idle',job_id TEXT NOT NULL DEFAULT '',attempted INTEGER NOT NULL DEFAULT 0,finished INTEGER NOT NULL DEFAULT 0,last_success INTEGER NOT NULL DEFAULT 0,next_check INTEGER NOT NULL DEFAULT 0,reboot_recommended INTEGER NOT NULL DEFAULT 0,error TEXT NOT NULL DEFAULT '',idle_since INTEGER NOT NULL DEFAULT 0); INSERT OR IGNORE INTO vm_maintenance(id) VALUES(1);")?;
@@ -46,6 +48,9 @@ pub fn migrate(c: &Connection) -> Result<()> {
             [],
         )?;
     }
+    if !c.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('vm_maintenance') WHERE name='detail')", [], |r| r.get::<_, bool>(0))? {
+        c.execute("ALTER TABLE vm_maintenance ADD COLUMN detail TEXT NOT NULL DEFAULT ''", [])?;
+    }
     Ok(())
 }
 pub fn busy(c: &Connection) -> Result<bool> {
@@ -56,7 +61,7 @@ pub fn busy(c: &Connection) -> Result<bool> {
     )?)
 }
 pub fn state(db: &Db) -> Result<State> {
-    Ok(db.0.lock().unwrap().query_row("SELECT enabled,phase,job_id,attempted,finished,last_success,next_check,reboot_recommended,error,requested FROM vm_maintenance WHERE id=1",[],|r|Ok(State {requested:r.get(9)?,enabled:r.get(0)?,phase:r.get(1)?,job_id:r.get(2)?,attempted:r.get(3)?,finished:r.get(4)?,last_success:r.get(5)?,next_check:r.get(6)?,reboot_recommended:r.get(7)?,error:r.get(8)?}))?)
+    Ok(db.0.lock().unwrap().query_row("SELECT enabled,phase,job_id,attempted,finished,last_success,next_check,reboot_recommended,error,requested,detail FROM vm_maintenance WHERE id=1",[],|r|Ok(State {detail:r.get(10)?,requested:r.get(9)?,enabled:r.get(0)?,phase:r.get(1)?,job_id:r.get(2)?,attempted:r.get(3)?,finished:r.get(4)?,last_success:r.get(5)?,next_check:r.get(6)?,reboot_recommended:r.get(7)?,error:r.get(8)?}))?)
 }
 pub fn available(db: &Db) -> Result<()> {
     ensure!(
@@ -101,7 +106,7 @@ fn due(db: &Db, now: i64, reserve: bool) -> Result<bool> {
     let ready = manual
         || (now - since >= IDLE && (attempted == 0 || now - attempted >= INTERVAL) && now >= next);
     if ready && reserve {
-        tx.execute("UPDATE vm_maintenance SET phase='starting',job_id=?,previous_attempt=attempted,attempted=?,next_check=?,error='',idle_since=0 WHERE id=1",params![db::id(),now,now+INTERVAL])?;
+        tx.execute("UPDATE vm_maintenance SET phase='starting',job_id=?,previous_attempt=attempted,attempted=?,next_check=?,error='',detail='Updating server providers…',idle_since=0 WHERE id=1",params![db::id(),now,now+INTERVAL])?;
     }
     tx.commit()?;
     Ok(ready)
@@ -239,6 +244,7 @@ fn reconcile(db: &Db, value: &Value, now: i64) -> Result<bool> {
             "The update result belongs to another attempt"
         );
     }
+    tx.execute("UPDATE vm_maintenance SET detail=? WHERE id=1", [value["detail"].as_str().unwrap_or("")])?;
     // Preserve the server attempt clock, including uncertain dispatches and guest deferrals.
     let attempted: i64 =
         tx.query_row("SELECT attempted FROM vm_maintenance WHERE id=1", [], |r| {
