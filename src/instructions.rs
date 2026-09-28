@@ -7,7 +7,7 @@ use anyhow::{Result, bail};
 use rusqlite::OptionalExtension;
 use serde_json::{Value, json};
 
-pub const VERSION: &str = "34";
+pub const VERSION: &str = "35";
 pub const CORE: &str = include_str!("prompts/00-core.md");
 pub const BOUNDED_CORE: &str = include_str!("prompts/00-bounded-core.md");
 pub const CHAPTERS: &[(&str, &str)] = &[
@@ -108,6 +108,7 @@ pub fn build(
     let bot = &current_bot;
     crate::continuity::store::start_session(&app.db,run,&bot.provider,&bot.model)?;
     let private_destination=run.chat_id==format!("dm-{}",bot.id);
+    crate::current_tasks::snapshot(&app.db.0.lock().unwrap(), &run.id)?;
     crate::conversation_updates::record_runtime_context(&app.db, run)?;
     // API models retrieve reference chapters through kindred_guide. A larger
     // context window should not force the entire manual into every request.
@@ -303,7 +304,7 @@ pub fn build(
         "progress_updates":crate::progress_updates::context(&app.db,bot)?,
         "schema_version":1,"guide_version":VERSION,"guide_tier":if full_guide{"full"}else{"core_with_reference_tool"},
         "generated_at_unix_utc":db::now(),"timezone":crate::timezone::context(&app.db, db::now())?,
-        "bot":{"id":bot.id,"name":bot.name,"role_label":bot.profile.label,"role_description":bot.profile.description,
+        "bot":{"id":bot.id,"name":bot.name,"current_task":bot.profile.current_task,"role_label":bot.profile.label,"role_description":bot.profile.description,
             "role_instructions":bot.instructions,"durable_memory":crate::continuity::store::memory(&app.db,run,&bot.memory)?,
             "configured_provider":bot.provider,"configured_model_selector":bot.model,"configured_reasoning_effort":bot.reasoning_effort},
         "user_identity_preferences":if private_destination {general["identity"].as_str().unwrap_or("")}else{""},

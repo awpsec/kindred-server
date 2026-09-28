@@ -4,7 +4,7 @@ use crate::{
     rpc::Rpc,
     vm,
 };
-use anyhow::{Result, bail, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::{sync::Arc, time::Duration};
 use tokio::sync::Mutex;
@@ -301,8 +301,14 @@ pub fn tool_specs() -> Vec<Value> {
             vec!["name"],
         ),
         (
+            "bot_task_update",
+            "Set or clear a persistent, workspace-visible current task label for yourself or a teammate. Read bots_list first and pass its expected_revision and exact expected_label; stale writes fail. A label changed by someone else after your turn began cannot be overwritten by this turn. Use a short non-sensitive title for authorized work. An empty label clears it. This does not execute, delegate, schedule, resume or stop work: set the label BEFORE send_to_bot for delegation, so the recipient starts with this assignment. Keep the label through waiting, follow-ups and individual turn completion. Clear only when the whole assignment is complete, abandoned or explicitly removed; never erase a newer assignment or recreate a user-cleared label just from old history.",
+            json!({"bot_id":{"type":"string"},"label":{"type":"string","maxLength":100},"expected_revision":{"type":"integer","minimum":0},"expected_label":{"type":"string"}}),
+            vec!["bot_id","label","expected_revision","expected_label"],
+        ),
+        (
             "bots_list",
-            "List available teammates and their provider. They share this VM and its credentials.",
+            "List available teammates, their providers, and current task labels with revisions. They share this VM and its credentials.",
             json!({}),
             vec![],
         ),
@@ -458,7 +464,7 @@ pub fn tool_specs() -> Vec<Value> {
         ),
         (
             "send_to_bot",
-            "Actually deliver a message to a named teammate using their ID from the teammate directory or bots_list. Required when the user asks you to tell, inform, notify, ask or request work from another bot: replying to the user alone does not reach that bot. In a DM, this opens or reuses the pair's separate collaboration chat and leaves the DM intact. In a shared chat, they join if needed (up to six members). State the requester and subject by name. Role questions concern assigned responsibilities. Their final result wakes you automatically; end this turn after delegating, never poll. Maximum 3 requests per turn, 24 turns per user message.",
+            "Set the teammate’s task label with bot_task_update before this handoff when an assignment label is appropriate. Actually deliver a message to a named teammate using their ID from the teammate directory or bots_list. Required when the user asks you to tell, inform, notify, ask or request work from another bot: replying to the user alone does not reach that bot. In a DM, this opens or reuses the pair's separate collaboration chat and leaves the DM intact. In a shared chat, they join if needed (up to six members). State the requester and subject by name. Role questions concern assigned responsibilities. Their final result wakes you automatically; end this turn after delegating, never poll. Maximum 3 requests per turn, 24 turns per user message.",
             json!({"bot_id":{"type":"string"},"message":{"type":"string"}}),
             vec!["bot_id", "message"],
         ),
@@ -944,8 +950,15 @@ async fn call_tool_inner(
             let skill = app.db.save_skill(&args)?;
             json!({"text":format!("Skill saved: {}",serde_json::to_string(&skill)?),"skill":skill})
         }
+        "bot_task_update" => {
+            let revision = args["expected_revision"].as_u64().context("expected_revision is required")?;
+            let mut c=app.db.0.lock().unwrap();let tx=c.transaction()?;
+            let task=crate::current_tasks::update_by_bot(&tx,&run.id,string(&args,"bot_id")?,string(&args,"label")?,revision,string(&args,"expected_label")?)?;
+            tx.commit()?;
+            json!({"text":serde_json::to_string(&task)?,"current_task":task})
+        }
         "bots_list" => {
-            json!({"text":serde_json::to_string(&app.db.bots()?.iter().filter(|b|!b.profile.archived).map(|b|json!({"id":b.id,"name":b.name,"provider":b.provider})).collect::<Vec<_>>())?})
+            json!({"text":serde_json::to_string(&app.db.bots()?.iter().filter(|b|!b.profile.archived).map(|b|json!({"id":b.id,"name":b.name,"provider":b.provider,"current_task":b.profile.current_task})).collect::<Vec<_>>())?})
         }
         "send_to_bot" => {
             let target = string(&args, "bot_id")?;

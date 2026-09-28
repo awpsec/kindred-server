@@ -551,7 +551,7 @@ mod tests {
 pub fn record_runtime_context(db: &Db, run: &Run) -> Result<Option<Value>> {
     let bot = db.bot(&run.bot_id)?;
     let chat = db.chat(&run.chat_id)?;
-    let current = json!({"bot_id":bot.id,"name":bot.name,"role_label":bot.profile.label,
+    let current = json!({"bot_id":bot.id,"name":bot.name,"current_task":bot.profile.current_task,"role_label":bot.profile.label,
         "role_description":bot.profile.description,"progress_updates":crate::progress_updates::context(db,&bot)?,"chat_id":chat.id,"chat_description":chat.description});
     let previous: Option<String> = db.0.lock().unwrap().query_row(
         "SELECT body FROM events WHERE run_id=? AND kind='runtime_context' ORDER BY seq DESC LIMIT 1",
