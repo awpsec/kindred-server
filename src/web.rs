@@ -53,7 +53,6 @@ pub fn router(app: Shared) -> Router {
         .route("/attention", get(attention))
         .route("/chats/{id}/read", put(mark_chat_read))
         .route("/bots/{id}/identity", put(update_bot_identity))
-        .route("/bots/{id}/task", put(update_bot_task))
         .route("/chats", get(chats).post(create_chat))
         .route("/chats/{id}", get(chat).put(update_chat))
         .route("/chats/{id}/messages", post(chat_send))
@@ -368,12 +367,6 @@ async fn create_drafted_bot(
         .map(|b| serde_json::from_value(b.clone()))
         .transpose()?;
     Ok(Json(app.db.create_drafted_bot(&id, edited)?))
-}
-async fn update_bot_task(State(app): State<Shared>, Path(id): Path<String>, Json(v): Json<Value>) -> Result<Json<Value>> {
-    let label=v["label"].as_str().ok_or_else(||anyhow::anyhow!("label is required"))?;
-    let revision=v["expected_revision"].as_u64().ok_or_else(||anyhow::anyhow!("expected_revision is required"))?;
-    let task=crate::current_tasks::update(&app.db.0.lock().unwrap(),&id,label,Some(revision))?;
-    Ok(Json(serde_json::to_value(task)?))
 }
 async fn update_bot(
     State(app): State<Shared>,

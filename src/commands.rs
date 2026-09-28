@@ -52,7 +52,7 @@ pub(crate) fn slug(value: &str) -> bool {
 pub(crate) fn reserved(name: &str) -> bool {
     matches!(
         name,
-        "task" | "task-remove" | "commands"
+        "commands"
             | "skills"
             | "new-skill"
             | "summarize"
@@ -155,18 +155,6 @@ pub fn migrate(c: &Connection) -> Result<()> {
                 "UPDATE skills SET command=? WHERE name=?",
                 params![default_name(c, &name)?, name],
             )?;
-        }
-    }
-    // Preserve existing workflows when introducing these built-in names.
-    let conflicts:Vec<(String,String)>=c.prepare("SELECT name,command FROM skills WHERE command IN ('task','task-remove')")?.query_map([],|r|Ok((r.get(0)?,r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
-    for (name,old) in conflicts {
-        let mut suffix=0;
-        loop {
-            let candidate=if suffix==0 {format!("skill-{old}")} else {format!("skill-{old}-{suffix}")};
-            if !c.query_row("SELECT EXISTS(SELECT 1 FROM skills WHERE command=?)",[&candidate],|r|r.get::<_,bool>(0))? {
-                c.execute("UPDATE skills SET command=? WHERE name=?",params![candidate,name])?;break;
-            }
-            suffix+=1;
         }
     }
     c.execute_batch("CREATE UNIQUE INDEX IF NOT EXISTS skill_command_name ON skills(command) WHERE command!='';
@@ -418,8 +406,6 @@ fn entry(
 }
 fn catalog(c: &Connection) -> Result<Vec<Command>> {
     let mut commands = vec![
-        entry("task", "Set a bot’s current task label", vec![param("label", true, true)], "built-in", "task", ""),
-        entry("task-remove", "Clear a bot’s current task label", vec![param("bot", false, true)], "built-in", "task", ""),
         entry(
             "commands",
             "Browse commands and reusable skills",

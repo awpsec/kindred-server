@@ -1,4 +1,3 @@
-mod current_tasks;
 mod progress_updates;
 mod artifact_export;
 mod chat_edit;

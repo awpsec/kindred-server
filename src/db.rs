@@ -69,7 +69,6 @@ pub struct Bot {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct BotProfile {
-    pub current_task: crate::current_tasks::CurrentTask,
     pub label: String,
     pub description: String,
     pub shape: String,
@@ -86,7 +85,6 @@ pub struct BotProfile {
 impl Default for BotProfile {
     fn default() -> Self {
         Self {
-            current_task: Default::default(),
             label: String::new(),
             description: String::new(),
             shape: "round".into(),
@@ -309,7 +307,6 @@ impl Db {
         self.save_bot_preferences(b, false)
     }
     pub fn create_bot(&self, b: &Bot) -> Result<()> {
-        let mut fresh=b.clone();fresh.profile.current_task=Default::default();let b=&fresh;
         validate_bot(b)?;
         let mut c = self.0.lock().unwrap();
         let tx = c.transaction()?;
@@ -346,7 +343,6 @@ impl Db {
         }
         write_bot(&tx, b, preserve_text)?;
         if b.profile.archived {
-            tx.execute("UPDATE bots SET profile=json_set(profile,'$.current_task',json_object('label','','revision',COALESCE(json_extract(profile,'$.current_task.revision'),0)+1,'writer_run','')) WHERE id=? AND COALESCE(json_extract(profile,'$.current_task.label'),'')!=''",[&b.id])?;
             crate::routine_controls::remove_archived_bot_schedules(&tx)?;
             crate::chats::archive_inactive_bot_chats(&tx)?;
         }
@@ -407,7 +403,6 @@ impl Db {
     }
     pub fn queue(&self, bot_id: &str, prompt: &str, depth: i64) -> Result<String> {
         ensure!(depth == 0, "Use a shared chat for teammate requests");
-        ensure!(!crate::current_tasks::is_slash(prompt), "Set task labels from the bot’s chat, not the run endpoint");
         let chat_id = format!("dm-{bot_id}");
         if self.chat(&chat_id).is_err() {
             let b = self.bot(bot_id)?;
@@ -713,7 +708,7 @@ impl Db {
     /// Unassigned context reads stay quiet; assigned human work is already participation.
     pub fn group_activity_started(&self, run: &str) -> Result<bool> {
         Ok(self.0.lock().unwrap().query_row(
-            "SELECT EXISTS(SELECT 1 FROM events WHERE run_id=? AND (kind='recipient_selected' OR (kind='assistant' AND length(trim(COALESCE(json_extract(body,'$.text'),'')))>0) OR (kind='tool_started' AND COALESCE(json_extract(body,'$.tool'),'') NOT IN ('','finish_quietly','chat_read','chats_list','bots_list','bot_task_update','bot_instructions_get','memory_search','memory_read','recall','remember','instructions_read','kindred_guide','skills_list'))))",
+            "SELECT EXISTS(SELECT 1 FROM events WHERE run_id=? AND (kind='recipient_selected' OR (kind='assistant' AND length(trim(COALESCE(json_extract(body,'$.text'),'')))>0) OR (kind='tool_started' AND COALESCE(json_extract(body,'$.tool'),'') NOT IN ('','finish_quietly','chat_read','chats_list','bots_list','bot_instructions_get','memory_search','memory_read','recall','remember','instructions_read','kindred_guide','skills_list'))))",
             [run], |r| r.get(0))?)
     }
 
@@ -1020,7 +1015,7 @@ pub(crate) fn write_bot(c: &Connection, b: &Bot, preserve_text: bool) -> Result<
             c.execute("UPDATE chats SET name=? WHERE id=?", params![new.join(", "),id])?;
         }
     }
-    c.execute("INSERT INTO bots(id,name,instructions,provider,model,memory,auto_approve,profile,reasoning_effort,approval_mode) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,instructions=CASE WHEN ?11 THEN bots.instructions ELSE excluded.instructions END,provider=excluded.provider,model=excluded.model,memory=CASE WHEN ?11 THEN bots.memory ELSE excluded.memory END,auto_approve=excluded.auto_approve,profile=json_set(excluded.profile,'$.current_task',json(COALESCE(json_extract(bots.profile,'$.current_task'),'{\"label\":\"\",\"revision\":0}'))),reasoning_effort=excluded.reasoning_effort,approval_mode=excluded.approval_mode", params![b.id,b.name,b.instructions,b.provider,b.model,b.memory,b.auto_approve,serde_json::to_string(&b.profile)?,b.reasoning_effort,b.approval_mode,preserve_text])?;
+    c.execute("INSERT INTO bots(id,name,instructions,provider,model,memory,auto_approve,profile,reasoning_effort,approval_mode) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,instructions=CASE WHEN ?11 THEN bots.instructions ELSE excluded.instructions END,provider=excluded.provider,model=excluded.model,memory=CASE WHEN ?11 THEN bots.memory ELSE excluded.memory END,auto_approve=excluded.auto_approve,profile=excluded.profile,reasoning_effort=excluded.reasoning_effort,approval_mode=excluded.approval_mode", params![b.id,b.name,b.instructions,b.provider,b.model,b.memory,b.auto_approve,serde_json::to_string(&b.profile)?,b.reasoning_effort,b.approval_mode,preserve_text])?;
     Ok(())
 }
 

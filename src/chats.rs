@@ -547,14 +547,6 @@ impl Db {
             !crate::workspace_transfer::frozen(&tx)?,
             "This workspace is being moved. Resume or cancel its transfer in Profile settings"
         );
-        if crate::current_tasks::slash(&tx, &chat, prompt, mentions)? {
-            ensure!(files.is_empty() && reply_to.is_none(), "Task labels cannot include attachments or a quoted reply");
-            if let Some(key) = request_id {
-                tx.execute("INSERT INTO chat_send_receipts VALUES(?,?,?,?)", params![key,id,digest.as_ref(),"[]"])?;
-            }
-            tx.commit()?;
-            return Ok(vec![]);
-        }
         let command = crate::commands::resolve(&tx, prompt)?;
         let literal = crate::commands::literal(prompt);
         let effective_prompt = command
