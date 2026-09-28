@@ -150,6 +150,12 @@ fn addressed_mode(
                 for (_, other) in ordered {
                     prefix = prefix.replace(other, "");
                 }
+                // Conversational fillers count as a greeting only with a
+                // vocative separator or a direct request, not "so Piper finished".
+                let suffix = line[at + name.len()..].trim_start();
+                let conversational_address = !from_bot && (suffix.is_empty()
+                    || suffix.starts_with([',', ':', '—', '–'])
+                    || ["and ", "please ", "can you ", "could you ", "would you "].iter().any(|p| suffix.starts_with(p)));
                 if (!from_bot && human_vocative(&line[..at], &line[at+name.len()..])) || prefix
                     .split(|c: char| !word(c))
                     .filter(|s| !s.is_empty())
@@ -170,7 +176,7 @@ fn addressed_mode(
                                 | "then"
                                 | "over"
                                 | "to"
-                        )
+                        ) || (conversational_address && matches!(s, "ah" | "oh" | "so" | "well" | "alright" | "right"))
                     })
                 {
                     selected.push((*id).clone());
@@ -593,6 +599,44 @@ mod tests {
         let other = db.chat_send(&chat.id, "Sam, take a look", &[]).unwrap()[0].clone();
         db.event(&other,"assistant",json!({"text":"I’ll check the report."})).unwrap();
         assert!(db.group_activity_started(&other).unwrap());
+    }
+
+    #[test]
+    fn conversational_openings_route_to_the_named_bot() {
+        let members=vec![("a".into(),"Atlas".into()),("p".into(),"Piper".into())];
+        for text in [
+            "Ah ok so Piper, it might be worth drafting a follow up.",
+            "Oh, okay, so **Piper**, could you handle that?",
+            "Well alright Piper, let's draft the reply.",
+            "Ah ok so Atlas and Piper, review this together.",
+        ] {
+            let expected=if text.contains("Atlas and") {vec!["a","p"]} else {vec!["p"]};
+            assert_eq!(addressed(text,&members,false),expected,"{text}");
+            assert_eq!(addressed_direct(text,&members,false),expected,"{text}");
+        }
+        for text in [
+            "Ah ok so ask Piper, they know.",
+            "So Piper finished the report.",
+            "Oh Piper is already working on it.",
+            "Ah ok so I read Piper's report.",
+            "Oh, tell Piper to check it.",
+            "> Ah ok so Piper, draft a reply.",
+            "`Ah ok so Piper, draft a reply.`",
+            "Ah ok so Piperson, draft a reply.",
+        ] {assert!(addressed(text,&members,false).is_empty(),"{text}");}
+        assert_eq!(addressed("Ah ok so Piper, help @Atlas",&members,false),vec!["a"]);
+        assert!(addressed("Ah ok so Piper, please review this",&members,true).is_empty());
+
+        let db=crate::db::Db::open(":memory:").unwrap();
+        let mut a=crate::tests::bot(&db,"codex");a.name="Atlas".into();db.save_bot(&a).unwrap();
+        let mut p=crate::tests::bot(&db,"codex");p.name="Piper".into();db.save_bot(&p).unwrap();
+        let chat=Chat{id:db::id(),name:"Team".into(),description:"Atlas coordinates".into(),members:vec![a.id.clone(),p.id.clone()],bot_only:false,archived:false,pinned:false,last_message:None};
+        db.save_chat(&chat).unwrap();
+        let runs=db.chat_send(&chat.id,"Ah ok so Piper, it might be worth drafting a follow up.",&[]).unwrap();
+        assert_eq!(runs.len(),1);
+        assert_eq!(db.run(&runs[0]).unwrap().bot_id,p.id);
+        assert!(db.runs(Some(&a.id)).unwrap().is_empty());
+        assert!(db.recipient_selected(&runs[0]).unwrap());
     }
 
     #[test]
