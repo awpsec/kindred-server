@@ -15,6 +15,7 @@ import signal
 import sys
 import tempfile
 import zipfile
+from xml.parsers import expat
 
 MAX_INPUT = 8 * 1024 * 1024
 MAX_OUTPUT = 32 * 1024 * 1024
@@ -27,10 +28,46 @@ def validate(data):
         entries = archive.infolist()
         if len(entries) > 4096 or sum(x.file_size for x in entries) > 64 * 1024 * 1024:
             raise ValueError('Document is too complex to preview')
-        if 'word/document.xml' not in archive.namelist():
+        if not {'word/document.xml', '[Content_Types].xml', '_rels/.rels'}.issubset(archive.namelist()):
             raise ValueError('Not a DOCX document')
         if any(x.flag_bits & 1 for x in entries):
             raise ValueError('Encrypted documents cannot be previewed')
+
+        # Reject broken/hostile XML before OfficeKit can show an import dialog.
+        # SAX validation avoids building a second large document tree.
+        elements = 0
+        for entry in entries:
+            if not entry.filename.lower().endswith(('.xml', '.rels')):
+                continue
+            if entry.file_size > 12 * 1024 * 1024:
+                raise ValueError('Document XML is too large')
+            parser = expat.ParserCreate(namespace_separator="}")
+            depth = 0
+            first = True
+            def start(name, attrs):
+                nonlocal elements, depth, first
+                if first and entry.filename == 'word/document.xml' and name not in (
+                    'http://schemas.openxmlformats.org/wordprocessingml/2006/main}document',
+                    'http://purl.oclc.org/ooxml/wordprocessingml/main}document',
+                ):
+                    raise ValueError('Invalid Word document root')
+                first = False
+                elements += 1
+                depth += 1
+                if elements > 500000 or depth > 256:
+                    raise ValueError('Document XML is too complex')
+            def end(name):
+                nonlocal depth
+                depth -= 1
+            def doctype(*args):
+                raise ValueError('Document XML cannot contain a DTD')
+            parser.StartElementHandler = start
+            parser.EndElementHandler = end
+            parser.StartDoctypeDeclHandler = doctype
+            with archive.open(entry) as part:
+                while chunk := part.read(65536):
+                    parser.Parse(chunk, False)
+                parser.Parse(b'', True)
 
 
 def restrict(directory):
@@ -151,7 +188,7 @@ def render_kit(root):
     api.destroy(office)
 
 
-def convert(data):
+def convert(data, timeout=75):
     validate(data)
     with tempfile.TemporaryDirectory(prefix='kindred-document-') as temp:
         root = Path(temp)
@@ -185,7 +222,7 @@ def convert(data):
             except BaseException:
                 os._exit(1)
         import time
-        deadline = time.monotonic() + 75
+        deadline = time.monotonic() + timeout
         try:
             while True:
                 done, code = os.waitpid(pid, os.WNOHANG)

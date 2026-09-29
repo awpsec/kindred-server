@@ -8,6 +8,8 @@ from pathlib import Path
 import socket
 import tempfile
 import unittest
+import time
+from unittest.mock import patch
 import zipfile
 
 spec = importlib.util.spec_from_file_location('renderer', Path(__file__).with_name('render-document.py'))
@@ -34,6 +36,28 @@ class RendererTests(unittest.TestCase):
             z.writestr('word/document.xml', b' ' * (65 * 1024 * 1024))
         with self.assertRaises(ValueError):
             r.validate(data.getvalue())
+
+    def test_rejects_malformed_dtd_and_deep_xml_before_office(self):
+        with zipfile.ZipFile(io.BytesIO(document())) as source:
+            files = {name: source.read(name) for name in source.namelist()}
+        cases = [b'<broken>', b'<!DOCTYPE x [<!ENTITY a "test">]><x>&a;</x>',
+                 ('<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">' + '<x>' * 257 + '</x>' * 257 + '</w:document>').encode(),
+                 b'<not-a-word-document/>',
+                 '<!DOCTYPE x><x/>'.encode('utf-16')]
+        for xml in cases:
+            output = io.BytesIO()
+            with zipfile.ZipFile(output, 'w', zipfile.ZIP_DEFLATED) as archive:
+                for name, data in files.items():
+                    archive.writestr(name, xml if name == 'word/document.xml' else data)
+            with self.assertRaises((ValueError, r.expat.ExpatError)):
+                r.validate(output.getvalue())
+
+    def test_timeout_reaps_worker_and_removes_scratch_directory(self):
+        before = set(Path(tempfile.gettempdir()).glob('kindred-document-*'))
+        with patch.object(r, 'render_kit', lambda root: time.sleep(5)):
+            with self.assertRaises(TimeoutError):
+                r.convert(document(), timeout=0.15)
+        self.assertEqual(set(Path(tempfile.gettempdir()).glob('kindred-document-*')), before)
 
     def test_actual_layout(self):
         pdf = r.convert(document())

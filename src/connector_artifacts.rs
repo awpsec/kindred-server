@@ -752,6 +752,25 @@ mod tests {
         );
     }
     #[test]
+    fn large_page_update_preserves_full_connector_input() {
+        let (app, _, run, _, _) = fixture();
+        let mut body = "<p data-kind=\"digest\">A retained log entry.</p>\n".repeat(1800);
+        body.truncate(81_000);
+        assert_eq!(body.len(), 81_000);
+        let args = json!({"origin":"claude-account","connection":"Atlassian",
+            "tool_name":"update_page","input":{"page_id":"fixture-page",
+            "body":{"storage":{"value":body,"representation":"storage"}},"version":{"number":2}}});
+        let id = create(&app.db, &run, &args).unwrap();
+        let saved = record(&app.db.0.lock().unwrap(), &id).unwrap();
+        assert_eq!(saved["input"], args["input"]);
+        assert_eq!(saved["original_input"], args["input"]);
+        // The bound is encoded bytes, not a character count.
+        let mut oversized = args;
+        oversized["input"]["body"]["storage"]["value"] = json!("界".repeat(81_000));
+        assert!(create(&app.db, &run, &oversized).unwrap_err().to_string().contains("too large"));
+    }
+
+    #[test]
     fn catalogue_records_survive_completion_and_history() {
         let cases: Vec<Value> = serde_json::from_str(include_str!(
             "../tools/frontend/fixtures/connector-records.json"

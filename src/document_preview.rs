@@ -64,3 +64,45 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod stress_tests {
+    // Explicitly opt in locally; normal CI does not start an office engine.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "needs LibreOffice and KINDRED_DOCX_STRESS_FIXTURE"]
+    async fn concurrent_conversions_are_bounded_and_recover() {
+        let data = std::fs::read(std::env::var("KINDRED_DOCX_STRESS_FIXTURE").unwrap()).unwrap();
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(12));
+        let mut tasks = Vec::new();
+        for _ in 0..12 {
+            let barrier = barrier.clone();
+            let data = data.clone();
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                super::render("report.docx".into(), data).await
+            }));
+        }
+        let mut successes = 0;
+        let mut busy = 0;
+        for task in tasks {
+            match task.await.unwrap() {
+                Ok(pdf) => {
+                    assert!(pdf.starts_with(b"%PDF-"));
+                    successes += 1;
+                }
+                Err(error) => {
+                    assert!(error.to_string().contains("Another document"), "{error}");
+                    busy += 1;
+                }
+            }
+        }
+        assert_eq!((successes, busy), (1, 11));
+        assert!(super::render("report.docx".into(), data).await.is_ok());
+        // Failed input also releases the slot immediately.
+        assert!(
+            super::render("report.docx".into(), b"bad zip".to_vec())
+                .await
+                .is_err()
+        );
+    }
+}
