@@ -1,3 +1,4 @@
+mod document_preview;
 mod progress_updates;
 mod artifact_export;
 mod chat_edit;

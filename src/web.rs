@@ -121,6 +121,7 @@ pub fn router(app: Shared) -> Router {
         .route("/runs/{id}", get(run))
         .route("/attachments/{id}", get(attachment))
         .route("/deliverables/{id}", get(download_deliverable))
+        .route("/deliverables/{id}/preview", get(preview_deliverable))
         .route(
             "/uploads",
             post(upload_file).layer(DefaultBodyLimit::max(12 * 1024 * 1024)),
@@ -1226,6 +1227,12 @@ async fn remove_upload(State(app): State<Shared>, Path(id): Path<String>) -> Res
     app.db.remove_upload(&id)?;
     Ok(Json(json!({"ok":true})))
 }
+async fn preview_deliverable(State(app): State<Shared>, Path(id): Path<String>) -> Result<Response> {
+    let (name, bytes) = app.db.file_download(&id)?;
+    let pdf = crate::document_preview::render(name, bytes).await?;
+    Ok(([(header::CONTENT_TYPE, "application/pdf"), (header::CACHE_CONTROL, "no-store")], pdf).into_response())
+}
+
 async fn download_deliverable(
     State(app): State<Shared>,
     Path(id): Path<String>,

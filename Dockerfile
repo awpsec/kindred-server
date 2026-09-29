@@ -8,7 +8,7 @@ COPY ui ./ui
 RUN cargo build --locked --release --jobs 2
 
 FROM debian:trixie-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl python3 openssh-client qemu-system-x86 qemu-utils genisoimage xz-utils util-linux && rm -rf /var/lib/apt/lists/* && useradd --uid 1000 --create-home kindred
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl python3 openssh-client qemu-system-x86 qemu-utils genisoimage xz-utils util-linux libreoffice-writer libseccomp2 fonts-liberation fonts-crosextra-carlito fonts-crosextra-caladea fonts-dejavu-core && rm -rf /var/lib/apt/lists/* && useradd --uid 1000 --create-home kindred
 COPY --from=builder /build/target/release/kindred /usr/local/bin/kindred
 COPY harness /opt/kindred/source/harness
 COPY deploy /opt/kindred/source/deploy
