@@ -158,3 +158,23 @@ References checked for this release:
 
 The automated release tests use local provider fixtures and do not validate a
 real Claude account's subscription entitlement or spend company-plan quota.
+
+## Forgotten passwords
+
+Choose **Forgot password?** on the sign-in screen. Server administration has a
+**Password resets** page with the username, request time, connection IP, and a
+request reference the user can match. An administrator can approve or deny it.
+The requesting browser updates automatically; approval opens New password and
+Confirm password fields. Saving revokes existing sessions and device links.
+
+Pending requests expire after 24 hours; approval allows 15 minutes to set the
+password. The request secret stays in that browser tab’s session storage and is
+stored only as a digest on the server. Administrators never receive it. Requests
+are rate-limited, disabled accounts cannot reset, and an administrator cannot
+approve their own request. A sole administrator therefore needs host-assisted
+recovery if they lose their password. Unknown usernames receive the same pending
+response without appearing in the administrator’s list.
+
+The connection IP is the actual TCP peer. Forwarded headers are not trusted; behind
+a reverse proxy this may identify the proxy, not the user’s device. Match the
+request reference with the user before approving; an IP is not identity proof.

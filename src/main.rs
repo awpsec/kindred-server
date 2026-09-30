@@ -199,7 +199,7 @@ async fn main() -> Result<()> {
                 env!("CARGO_PKG_VERSION"),
                 config.public_url
             );
-            axum::serve(listener, router)
+            axum::serve(listener, router.into_make_service_with_connect_info::<std::net::SocketAddr>())
                 .with_graceful_shutdown(async {
                     let _ = tokio::signal::ctrl_c().await;
                 })

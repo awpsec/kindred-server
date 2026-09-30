@@ -1115,3 +1115,36 @@ async fn invited_users_have_independent_profiles_and_removal_cleans_all_private_
         .await;
     assert_eq!(users["users"].as_array().unwrap().len(), 2);
 }
+
+#[tokio::test]
+async fn password_reset_requires_admin_approval_and_requesting_browser_proof() {
+    let f=Fixture::new(false);let owner=f.register("admin").await;let member=f.register("member").await;
+    let admin=owner["token"].as_str().unwrap();let user=member["token"].as_str().unwrap();
+    let req=Request::builder().method("POST").uri("/identity/password-reset/request").header("content-type","application/json").header("x-forwarded-for","203.0.113.99").extension(axum::extract::ConnectInfo("192.0.2.10:4567".parse::<std::net::SocketAddr>().unwrap())).body(Body::from(r#"{"login":"member"}"#)).unwrap();
+    let response=router(f.p.clone()).oneshot(req).await.unwrap();assert_eq!(response.status(),200);
+    let request:Value=serde_json::from_slice(&to_bytes(response.into_body(),16384).await.unwrap()).unwrap();
+    let (_,list)=f.request("GET","/identity/admin/password-resets",admin,Value::Null).await;
+    assert_eq!(list["requests"][0]["ip"],"192.0.2.10");assert!(list["requests"][0]["created"].as_i64().unwrap()>0);
+    assert!(!list.to_string().contains(request["token"].as_str().unwrap()));
+    let save=json!({"token":request["token"],"password":"new test password","confirm_password":"new test password"});
+    assert_ne!(f.request("POST","/identity/password-reset/finish","",save.clone()).await.0,200);
+    let approval=json!({"id":request["id"],"action":"approve"});
+    assert_ne!(f.request("POST","/identity/admin/password-resets",user,approval.clone()).await.0,200);
+    assert_eq!(f.request("POST","/identity/admin/password-resets",admin,approval.clone()).await.0,200);
+    assert_ne!(f.request("POST","/identity/admin/password-resets",admin,approval).await.0,200);
+    let (_,state)=f.request("POST","/identity/password-reset/status","",json!({"token":request["token"]})).await;assert_eq!(state["state"],"approved");
+    let mut wrong=save.clone();wrong["token"]=json!("wrong browser proof");assert_ne!(f.request("POST","/identity/password-reset/finish","",wrong).await.0,200);
+    let mut wrong=save.clone();wrong["confirm_password"]=json!("mismatch");assert_ne!(f.request("POST","/identity/password-reset/finish","",wrong).await.0,200);
+    assert_eq!(f.request("POST","/identity/password-reset/finish","",save.clone()).await.0,200);
+    assert!(f.p.identity(user).is_err());assert!(f.p.identity(admin).is_ok());
+    assert_ne!(f.request("POST","/identity/password-reset/finish","",save).await.0,200);
+    assert_ne!(f.request("POST","/identity/login","",json!({"login":"member","password":"test password for profiles"})).await.0,200);
+    assert_eq!(f.request("POST","/identity/login","",json!({"login":"member","password":"new test password"})).await.0,200);
+    let (_,denied)=f.request("POST","/identity/password-reset/request","",json!({"login":"member"})).await;
+    assert_eq!(f.request("POST","/identity/admin/password-resets",admin,json!({"id":denied["id"],"action":"deny"})).await.0,200);
+    let (_,state)=f.request("POST","/identity/password-reset/status","",json!({"token":denied["token"]})).await;assert_eq!(state["state"],"denied");
+    f.p.registry.lock().unwrap().execute("UPDATE password_resets SET expires=0",[]).unwrap();
+    let (_,state)=f.request("POST","/identity/password-reset/status","",json!({"token":denied["token"]})).await;assert_eq!(state["state"],"expired");
+    let (_,unknown)=f.request("POST","/identity/password-reset/request","",json!({"login":"unknown"})).await;assert_eq!(unknown["state"],"pending");
+    let (_,list)=f.request("GET","/identity/admin/password-resets",admin,Value::Null).await;assert!(list["requests"].as_array().unwrap().is_empty());
+}

@@ -3,10 +3,11 @@
 import importlib.util,json,os,signal,subprocess,sys,time
 from pathlib import Path
 root=Path('/data');root.mkdir(exist_ok=True)
-profiles=root/'profiles';profiles.mkdir(exist_ok=True,mode=0o700)
+profiles=root/'profiles'
 if os.getuid()==0:
-    os.chown(root,1000,1000);os.chown(profiles,1000,1000)
+    os.chown(root,1000,1000)
     os.setgroups(os.getgroups());os.setgid(1000);os.setuid(1000)
+profiles.mkdir(exist_ok=True,mode=0o700)
 os.umask(0o077)
 url=os.environ.get('KINDRED_PUBLIC_URL','http://127.0.0.1:9444').rstrip('/')
 config=f'''listen = "0.0.0.0:9444"

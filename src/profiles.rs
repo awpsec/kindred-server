@@ -29,6 +29,8 @@ use tower::ServiceExt;
 
 #[path = "server_chats.rs"]
 mod server_chats;
+#[path = "password_reset.rs"]
+mod password_reset;
 
 type Portal = Arc<Profiles>;
 type ApiResult = std::result::Result<Json<Value>, web::Error>;
@@ -129,6 +131,7 @@ impl Profiles {
             CREATE TABLE IF NOT EXISTS controls(key TEXT PRIMARY KEY,value TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS sessions_expiry ON sessions(expires);")?;
         server_chats::migrate(&registry)?;
+        password_reset::migrate(&registry)?;
         let portal = Arc::new(Self {
             self_ref: Default::default(),
             config,
@@ -386,6 +389,10 @@ pub fn router(portal: Portal) -> Router {
         )
         .route("/identity/directory", post(directory))
         .route("/identity/password", post(change_password))
+        .route("/identity/password-reset/request", post(password_reset::request))
+        .route("/identity/password-reset/status", post(password_reset::status))
+        .route("/identity/password-reset/finish", post(password_reset::finish))
+        .route("/identity/admin/password-resets", get(password_reset::list).post(password_reset::decide))
         .route("/identity/admin", get(admin).post(admin_update))
         .route("/identity/admin/remove", post(remove_account))
         .route(
@@ -829,6 +836,7 @@ async fn change_password(
     tx.execute("DELETE FROM sessions WHERE account_id=?", [&id.account])?;
     tx.execute("DELETE FROM device_links WHERE account_id=?", [&id.account])?;
     let token = Profiles::session(&tx, &id.account, &id.profile)?;
+    tx.execute("DELETE FROM password_resets WHERE account=?", [&id.account])?;
     tx.commit()?;
     Ok(Json(json!({"token":token,"profile_id":id.profile})))
 }
@@ -1152,6 +1160,7 @@ async fn remove_account(
         tx.execute(&format!("DELETE FROM {table} WHERE account=?"), [&user])?;
     }
     tx.execute("DELETE FROM profiles WHERE account_id=?", [&user])?;
+    tx.execute("DELETE FROM password_resets WHERE account=?", [&user])?;
     tx.execute("DELETE FROM accounts WHERE id=?", [&user])?;
     tx.execute(
         "DELETE FROM controls WHERE key=?",
