@@ -93,7 +93,7 @@ def timezone_name():
         return target.split('zoneinfo/', 1)[1] if 'zoneinfo/' in target else ''
 
 
-def letter_tile(title):
+def letter_tile(title, size=ICON):
     """Kindred-style tile for applications that publish no icon of their own."""
     letter = html.escape((title.strip()[:1] or '?').upper())
     tint = TILES[sum(map(ord, title)) % len(TILES)]
@@ -102,22 +102,31 @@ def letter_tile(title):
            '<rect x="2.5" y="2.5" width="59" height="59" rx="14.5" fill="none" stroke="#fff" stroke-opacity=".1"/>'
            f'<text x="32" y="42" font-family="DejaVu Sans" font-size="27" font-weight="bold" '
            f'fill="#e5e9ef" text-anchor="middle">{letter}</text></svg>')
-    loader = GdkPixbuf.PixbufLoader.new_with_type('svg')
-    loader.set_size(ICON, ICON)
-    loader.write(svg.encode())
-    loader.close()
-    return loader.get_pixbuf()
+    try:
+        loader = GdkPixbuf.PixbufLoader.new_with_type('svg')
+        loader.set_size(size, size)
+        loader.write(svg.encode())
+        loader.close()
+        return loader.get_pixbuf()
+    except GLib.Error:
+        # Old guests may not have the SVG loader yet. Keep the desktop usable.
+        tile = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB, True, 8, size, size)
+        tile.fill(int(tint.lstrip('#') + 'ff', 16))
+        return tile
 
 
 def icon_for(key, title, window=None, size=ICON, generic=None):
     asset = ASSETS / (key + '.svg')
     if asset.is_file():
-        return GdkPixbuf.Pixbuf.new_from_file_at_scale(str(asset), size, size, True)
+        try:
+            return GdkPixbuf.Pixbuf.new_from_file_at_scale(str(asset), size, size, True)
+        except GLib.Error:
+            pass
     icon = window.get_icon() if window else None
     # Openbox gives icon-less clients its stock icon, which libwnck does not flag as fallback.
     if icon and not window.get_icon_is_fallback() and icon.get_pixels() != generic:
         return icon.scale_simple(size, size, GdkPixbuf.InterpType.HYPER)
-    return letter_tile(title)
+    return letter_tile(title, size)
 
 
 def describe(title, windows):
