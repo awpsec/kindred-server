@@ -17,6 +17,7 @@ const fs=require('node:fs');
    if(path.endsWith('/profiles'))return route.fulfill({json:{active:'personal',account_id:'owner',username:'Admin',admin:true,profiles:[{id:'personal',name:'Personal',active:true},{id:'work',name:'Work',active:false}]}});
    if(path.endsWith('/computer-settings'))return route.fulfill({json:{supported:true,provisioned:true,state:'shut off',resources:{cpus:4,memory_mb:8192,disk_gb:75}}});
    if(path.endsWith('/admin/remove')){users=users.filter(u=>u.id!==body.user_id);return route.fulfill({json:{removed:true}});}
+   if(path.endsWith('/admin')&&body?.action==='disable')users.find(u=>u.id===body.user_id).disabled=body.disabled;
    if(path.endsWith('/admin'))return route.fulfill({json:body?.action==='invite'?{invite:'fixture-one-use-token'}:{users,max_users:128,registration:false}});
    return route.fulfill({json:{}});
   });
@@ -27,18 +28,21 @@ const fs=require('node:fs');
   await page.getByRole('menuitem',{name:'Switch to Work',exact:true}).waitFor();
   await page.getByRole('menuitem',{name:'Server administration',exact:true}).click();
   await page.getByRole('table',{name:'Server users'}).waitFor();
-  assert.equal(await page.locator('.server-user-row').count(),20);
+  assert.equal(await page.locator('.server-user-row').count(),19);
   const size=await page.locator('.server-admin-dialog').boundingBox();assert(size.width>=850&&size.height>=600);
   assert(await page.locator('.server-user-table').evaluate(e=>e.scrollHeight>e.clientHeight));
   await page.getByRole('button',{name:'Create invitation link'}).click();await page.waitForFunction(()=>document.querySelector('.profile-invite')?.value);assert.equal(await page.getByLabel('One-use invitation link').inputValue(),origin+'/#invite=fixture-one-use-token');
   await page.getByRole('button',{name:'Computers',exact:true}).click();await page.getByText('Bot computer resources',{exact:true}).waitFor();
   await page.getByRole('button',{name:'Users',exact:true}).click();
-  await page.getByRole('button',{name:'Remove Member 1',exact:true}).click();
-  if(process.env.PREVIEW_DIR)await page.locator('dialog').last().screenshot({path:process.env.PREVIEW_DIR+'/remove-user-confirmation.png'});
-  await page.getByRole('button',{name:'Cancel',exact:true}).click();assert(!calls.some(c=>c.path.endsWith('/admin/remove')));
-  await page.getByRole('button',{name:'Remove Member 1',exact:true}).click();await page.getByRole('button',{name:'Remove user',exact:true}).click();
-  await page.waitForFunction(()=>document.querySelectorAll('.server-user-row').length===19);assert.deepEqual(calls.find(c=>c.path.endsWith('/admin/remove')).body,{user_id:'member-0',confirm:'Member 1'});
-  if(process.env.PREVIEW_DIR){fs.mkdirSync(process.env.PREVIEW_DIR,{recursive:true});for(const theme of ['dark','light']){await page.evaluate(t=>document.documentElement.dataset.theme=t,theme);for(const tab of ['Users','Password resets','Computers','Updates']){await page.locator('.settings-nav').getByRole('button',{name:tab,exact:true}).click();await page.locator('.server-admin-dialog').screenshot({path:process.env.PREVIEW_DIR+'/server-admin-'+tab.toLowerCase().replaceAll(' ','-')+'-'+theme+'.png'});}}}
+  await page.locator('.server-user-row').filter({hasText:'Member 1'}).first().hover();
+  await page.getByRole('button',{name:'Disable Member 1',exact:true}).click();
+  if(process.env.PREVIEW_DIR)await page.locator('dialog').last().screenshot({path:process.env.PREVIEW_DIR+'/disable-user-confirmation.png'});
+  await page.getByRole('button',{name:'Cancel',exact:true}).click();assert(!calls.some(c=>c.body?.action==='disable'));
+  await page.locator('.server-user-row').filter({hasText:'Member 1'}).first().hover();
+  await page.getByRole('button',{name:'Disable Member 1',exact:true}).click();await page.getByRole('button',{name:'Confirm',exact:true}).click();
+  await page.getByRole('button',{name:'Enable Member 1',exact:true}).waitFor();assert.deepEqual(calls.find(c=>c.body?.action==='disable').body,{action:'disable',user_id:'member-0',disabled:true});
+  assert.equal(await page.getByRole('columnheader').count(),0);assert(await page.locator('.server-user-row').evaluateAll(rows=>rows.every(r=>r.getBoundingClientRect().height<=42)));
+  if(process.env.PREVIEW_DIR){fs.mkdirSync(process.env.PREVIEW_DIR,{recursive:true});for(const theme of ['dark','light']){await page.evaluate(t=>document.documentElement.dataset.theme=t,theme);for(const tab of ['Users','Password resets','Computers','Updates']){await page.locator('.settings-nav').getByRole('button',{name:tab,exact:true}).click();if(tab==='Users')await page.locator('.server-user-row').filter({hasText:'Member 2'}).hover();await page.locator('.server-admin-dialog').screenshot({path:process.env.PREVIEW_DIR+'/server-admin-'+tab.toLowerCase().replaceAll(' ','-')+'-'+theme+'.png'});}}}
   await page.locator('.settings-nav').getByRole('button',{name:'Password resets',exact:true}).click();await page.getByRole('button',{name:'Approve',exact:true}).click();await page.getByText('Approved · awaiting new password').waitFor();assert.equal(resetState,'approved');
   await page.setViewportSize({width:390,height:844});assert(await page.locator('.server-admin-dialog').evaluate(e=>e.scrollWidth<=e.clientWidth+1));
   await page.goto(origin+'/admin-fixture#invite=fixture-one-use-token');
@@ -53,6 +57,6 @@ const fs=require('node:fs');
   if(process.env.PREVIEW_DIR)await page.locator('dialog').screenshot({path:process.env.PREVIEW_DIR+'/password-reset-approved.png'});
   await page.getByLabel('New password',{exact:true}).fill('new test password');await page.getByLabel('Confirm password',{exact:true}).fill('wrong password');await page.getByRole('button',{name:'Save password',exact:true}).click();await page.getByText('Passwords do not match.',{exact:true}).waitFor();assert(!calls.some(c=>c.path.endsWith('/password-reset/finish')));
   await page.getByLabel('Confirm password',{exact:true}).fill('new test password');await page.getByRole('button',{name:'Save password',exact:true}).click();await page.getByText('Password saved. Sign in with your new password.').waitFor();assert.equal(await page.evaluate(()=>sessionStorage.getItem('kindred-password-reset')),null);
-  console.log('PASS administration layout, scrollable users, profile switch entry, invitation link, confirmation and removal');
+  console.log('PASS administration layout, scrollable users, profile switch entry, invitation link, confirmation and disabling');
  }finally{await browser.close();server.close();}
 })().catch(e=>{console.error(e);server.close();process.exitCode=1;});

@@ -16,8 +16,11 @@ and Personal, without creating another login. Invitation links open account crea
 each new person needs their own link. Links carry the invitation in the URL fragment,
 which is cleared after opening the form.
 
-**Server administration → Users** lists accounts and profile counts. Removing a user
-requires confirmation, revokes access, cancels tasks, stops each managed computer,
+**Server administration → Users** lists compact account names and profile counts.
+Hover or keyboard-focus a row to disable it with confirmation; touch devices keep
+the control visible. Disabled accounts can be enabled again. Disabling preserves
+profiles and files. The administrator removal API separately supports permanent
+deletion: it requires confirmation, revokes access, cancels tasks, stops each managed computer,
 and deletes all of that account's profile directories, including VM disks and
 credentials. Removal cannot target your own account. If stopping a VM fails, the
 account remains disabled and removal can be retried. Shared conversation history
