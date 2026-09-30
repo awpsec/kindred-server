@@ -55,6 +55,80 @@ class SoftwareCache(unittest.TestCase):
                 with patch.object(manager,'run',image),self.assertRaisesRegex(ValueError,'changed during'):manager.software_image()
                 self.assertFalse(any(p for p in cache.glob('software-*.iso') if not p.name.endswith('.creating.iso')))
 
+class StartupRecovery(unittest.TestCase):
+    def test_existing_disk_never_downloads_replacement_backing_image(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder);(root/'disk.qcow2').write_bytes(b'existing overlay');(root/'seed.iso').write_bytes(b'existing seed');(root/'ssh_host_ed25519_key.pub').write_text('ssh-ed25519 fixture')
+            with patch.object(manager,'base_image') as base,patch.object(manager,'software_image',return_value='software.iso'):
+                self.assertEqual(manager.seed(root,'fixture',{'port':22000}),'software.iso')
+                base.assert_not_called()
+                self.assertEqual((root/'disk.qcow2').read_bytes(),b'existing overlay')
+                self.assertEqual((root/'seed.iso').read_bytes(),b'existing seed')
+
+    def test_running_vm_needs_no_install_media_after_update(self):
+        root=Path('/fixture')
+        settings={'id':'fixture','memory_mb':6144}
+        with patch.object(manager,'prepare',return_value=settings),patch.object(manager,'qmp',return_value={'status':'running'}),patch.object(manager,'seed') as seed,patch.object(manager,'run') as run:
+            self.assertEqual(manager.start(root,'fixture'),settings)
+            seed.assert_not_called();run.assert_not_called()
+
+    def test_faulted_qemu_still_owns_disk_and_cannot_be_started_twice(self):
+        root=Path('/fixture')
+        for state in ('io-error','paused','shutdown','guest-panicked','prelaunch'):
+            with self.subTest(state=state),patch.object(manager,'qmp',return_value={'status':state}),patch.object(manager,'prepare',return_value={}),patch.object(manager,'seed') as seed,patch.object(manager,'run') as run:
+                self.assertTrue(manager.running(root))
+                with self.assertRaises(ValueError):manager.start(root,'fixture')
+                with self.assertRaisesRegex(ValueError,'Shut down'):
+                    manager.resize_resources(root,'fixture',{'cpus':2,'memory_mb':2048,'disk_gb':30})
+                seed.assert_not_called();run.assert_not_called()
+
+    def test_launch_errors_are_actionable_and_diagnostics_are_retained(self):
+        errors=[(b'cannot allocate memory','memory'),(b'No space left on device','disk is full'),(b'Could not set up host forwarding rule','port is already in use'),(b'Failed to get write lock','disk is still in use'),(b'failed to initialize kvm','virtualization'),(b'unexpected fixture error /private/path','startup-error.log')]
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder)
+            for detail,message in errors:
+                with self.subTest(detail=detail),patch.object(manager,'run',side_effect=subprocess.CalledProcessError(1,['qemu'],stderr=detail)):
+                    with self.assertRaisesRegex(ValueError,message) as error:manager.launch(root,['qemu'])
+                    self.assertEqual((root/'startup-error.log').read_text(),detail.decode())
+                    self.assertNotIn('/private/path',str(error.exception))
+
+    def test_exit_after_daemonize_is_not_a_success(self):
+        with tempfile.TemporaryDirectory() as folder,patch.object(manager,'run'),patch.object(manager,'running',return_value=False):
+            with self.assertRaisesRegex(ValueError,'exited during startup'):manager.launch(Path(folder),['qemu'])
+
+    def test_success_clears_old_failure(self):
+        with tempfile.TemporaryDirectory() as folder,patch.object(manager,'run'),patch.object(manager,'qmp',return_value={'status':'running'}):
+            root=Path(folder);(root/'startup-error.log').write_text('old failure')
+            manager.launch(root,['qemu']);self.assertFalse((root/'startup-error.log').exists())
+
+@unittest.skipUnless(shutil.which('qemu-system-x86_64'), 'QEMU required')
+class RealQemuStartup(unittest.TestCase):
+    def test_launch_pause_and_shutdown_keep_process_ownership(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder)
+            args=['qemu-system-x86_64','-machine','q35,accel=tcg','-m','64','-display','none','-nodefaults','-qmp',f'unix:{root}/monitor.sock,server=on,wait=off','-daemonize']
+            try:
+                manager.launch(root,args)
+                self.assertTrue(manager.running(root))
+                manager.qmp(root,'stop')
+                self.assertTrue(manager.running(root))
+                with self.assertRaisesRegex(ValueError,'paused'):manager.require_running(root)
+                manager.qmp(root,'cont');manager.require_running(root)
+            finally:
+                if manager.running(root):manager.qmp(root,'quit')
+
+    def test_occupied_forward_port_reports_actionable_failure(self):
+        import socket
+        with tempfile.TemporaryDirectory() as folder,socket.socket() as blocker:
+            root=Path(folder);blocker.bind(('127.0.0.1',0));blocker.listen()
+            port=blocker.getsockname()[1]
+            args=['qemu-system-x86_64','-machine','q35,accel=tcg','-m','64','-display','none','-nodefaults','-netdev',f'user,id=network,hostfwd=tcp:127.0.0.1:{port}-:22','-qmp',f'unix:{root}/monitor.sock,server=on,wait=off','-daemonize']
+            try:
+                with self.assertRaisesRegex(ValueError,'port is already in use'):manager.launch(root,args)
+                self.assertIn('forward', (root/'startup-error.log').read_text().lower())
+            finally:
+                if manager.running(root):manager.qmp(root,'quit')
+
 class ResourcePersistence(unittest.TestCase):
     def test_existing_computer_keeps_allocation_when_service_defaults_change(self):
         with tempfile.TemporaryDirectory() as temporary:

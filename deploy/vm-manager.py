@@ -101,7 +101,9 @@ def qmp(root, command):
         return response['return']
 
 def running(root):
-    try: return qmp(root,'query-status').get('status') in ('running','paused','prelaunch')
+    # A paused, faulted or shutting-down QEMU still owns its disk and port.
+    # Never treat it as absent and start a second process or resize its disk.
+    try: return bool(qmp(root,'query-status').get('status'))
     except PermissionError as error:
         raise ValueError('Kindred cannot access the bot computer control socket. Restore its ownership and permissions for the Kindred service account.') from error
     except (OSError,ValueError): return False
@@ -124,8 +126,10 @@ def prepare(root, profile):
     return settings
 
 def seed(root, profile, settings):
-    base=base_image()
     if not (root/'disk.qcow2').exists():
+        # An existing overlay must keep its original backing image. Downloading
+        # today's Debian image cannot repair a missing old backing image.
+        base=base_image()
         temporary=root/'disk.creating.qcow2'
         if temporary.exists(): temporary.unlink()
         run(['qemu-img','create','-f','qcow2','-F','qcow2','-b',base,temporary,str(settings['disk_gb'])+'G'])
@@ -234,11 +238,52 @@ def memory_available(meminfo=Path('/proc/meminfo'), cgroup_root=Path('/sys/fs/cg
             available=min(available,int(limit.read_text())-int(used.read_text()))
     return max(0,available)
 
+def require_running(root):
+    status=qmp(root,'query-status').get('status','unknown')
+    if status=='running': return
+    if status=='io-error':
+        raise ValueError('The bot computer paused because of a disk I/O error. Check free space on the server or Docker Desktop disk before restarting it.')
+    raise ValueError('The bot computer is '+status+'. Shut it down before starting it again; its existing disk will be reused.')
+
+def launch(root, args):
+    try:
+        run(args)
+    except subprocess.CalledProcessError as error:
+        detail=(error.stderr or b'').decode('utf-8',errors='replace')[-8192:]
+        atomic(root/'startup-error.log',detail)
+        lower=detail.lower()
+        if 'cannot allocate memory' in lower or 'could not allocate' in lower:
+            reason='Not enough memory to launch the bot computer. Reduce its memory allocation or increase memory available to Docker Desktop or the server.'
+        elif 'no space left on device' in lower:
+            reason='The server or Docker Desktop disk is full. Free disk space before starting the bot computer.'
+        elif 'host forwarding rule' in lower or 'address already in use' in lower:
+            reason='The bot computer connection port is already in use. Restart the local server before trying again.'
+        elif 'failed to get' in lower and 'lock' in lower:
+            reason='The bot computer disk is still in use. Wait for shutdown to finish before starting it again.'
+        elif 'backing file' in lower and ('no such file' in lower or 'could not open' in lower):
+            reason='The bot computer backing image is missing or unreadable. Restore the original image from backup; downloading a replacement can damage the existing disk.'
+        elif 'kvm' in lower:
+            reason='Hardware virtualization is unavailable. Check the server virtualization settings and KVM access.'
+        else:
+            reason='The bot computer could not launch. Details were saved in its startup-error.log on the server.'
+        raise ValueError(reason) from error
+    if not running(root):
+        raise ValueError('The bot computer exited during startup. Check server memory and the computer console log before retrying.')
+    require_running(root)
+    (root/'startup-error.log').unlink(missing_ok=True)
+
 def start(root, profile):
     settings=prepare(root,profile)
+    # Existing running computers must not depend on downloading or repackaging
+    # installation media after a server update.
+    if running(root):
+        require_running(root)
+        return settings
     software=seed(root,profile,settings)
     with locked(ROOT/'capacity.lock'):
-        if running(root): return settings
+        if running(root):
+            require_running(root)
+            return settings
         active=sum(running(p.parent) for p in ROOT.glob('*/computer/computer.json'))
         if active>=number('KINDRED_VM_MAX_RUNNING',4,1,128): raise ValueError('All computer slots are in use. Stop an idle profile computer or ask the administrator to raise the limit.')
         if memory_available()<(settings['memory_mb']+512)*1024*1024: raise ValueError('Not enough memory to start this computer. Stop an idle computer or increase the Kindred service/container memory limit to cover the VM and server together.')
@@ -252,7 +297,7 @@ def start(root, profile):
               '-drive',f'file={software},media=cdrom,readonly=on,index=1',
               '-netdev',f"user,id=network,ipv6=off,hostfwd=tcp:127.0.0.1:{settings['port']}-:22",'-device','virtio-net-pci,netdev=network',
               '-qmp',f'unix:{root}/monitor.sock,server=on,wait=off','-serial',f'file:{root}/console.log','-pidfile',root/'qemu.pid','-daemonize']
-        run(args)
+        launch(root,args)
     return settings
 
 # Update only Kindred's bridge, not provider packages, credentials or VM data.
