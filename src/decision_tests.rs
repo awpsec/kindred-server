@@ -560,6 +560,7 @@ fn group_questions_keep_topic_scope_but_arrive_and_resume_in_private() {
         let result=app.db.ask_question(&run,question()).unwrap();let result:serde_json::Value=serde_json::from_str(result["text"].as_str().unwrap()).unwrap();
         let id=result["question"]["id"].as_str().unwrap().to_string();
         assert_eq!(app.db.question(&id).unwrap().delivery_chat_id,format!("dm-{}",b.id));
+        assert_eq!(app.db.question(&id).unwrap().context,question().context);
         assert!(app.db.chat_messages(&chat.id).unwrap().is_empty());
         let duplicate=app.db.ask_question(&run,question()).unwrap();assert!(duplicate["text"].as_str().unwrap().contains(&id));
         assert_eq!(app.db.decision_context(&b.id,&chat.id,None).unwrap().len(),1);
@@ -567,5 +568,8 @@ fn group_questions_keep_topic_scope_but_arrive_and_resume_in_private() {
     }
     assert_ne!(ids[0],ids[1]);
     assert_eq!(app.db.chat_messages(&format!("dm-{}",b.id)).unwrap().iter().filter(|m|m["kind"]=="question").count(),2);
-    for id in ids {let q=app.db.answer_question(&id,Answer{selected:Some(0),custom:None}).unwrap();assert_eq!(app.db.run(&q.continuation_run_id).unwrap().chat_id,q.delivery_chat_id);}
+    for id in ids {let q=app.db.answer_question(&id,Answer{selected:Some(0),custom:None}).unwrap();assert_eq!(app.db.run(&q.continuation_run_id).unwrap().chat_id,q.delivery_chat_id);
+        let prompt=app.db.run(&q.continuation_run_id).unwrap().prompt;
+        assert!(prompt.contains(&format!("originating group ({})",q.chat_id)));
+        assert!(prompt.contains("Keep these routing instructions out of visible replies."));}
 }
