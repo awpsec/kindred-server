@@ -4,12 +4,12 @@ const assert=require('node:assert/strict');
 const fs=require('node:fs');
 (async()=>{
  await new Promise(r=>server.listen(0,'127.0.0.1',r));const origin='http://127.0.0.1:'+server.address().port;
- const browser=await(process.env.WEBKIT?webkit:chromium).launch();
+ const browser=await(process.env.WEBKIT?webkit:chromium).launch();if(process.env.PREVIEW_DIR)fs.mkdirSync(process.env.PREVIEW_DIR,{recursive:true});
  try{
   const page=await browser.newPage({viewport:{width:1200,height:850}});const calls=[];let resetState='pending';
   let users=[{id:'owner',username:'Admin',admin:true,profile_count:2},...Array.from({length:18},(_,i)=>({id:'member-'+i,username:'Member '+(i+1),admin:false,profile_count:2}))];
   await page.route('**/identity/**',async route=>{const path=new URL(route.request().url()).pathname,body=route.request().method()==='POST'?route.request().postDataJSON():null;calls.push({path,body});
-   if(path.endsWith('/admin/password-resets')){if(body)resetState=body.action==='approve'?'approved':'denied';return route.fulfill({json:{requests:[{id:'a1b2c3d4-fixture',username:'Member 2',created:1790798400,ip:'192.0.2.10',state:resetState}]}});}
+   if(path.endsWith('/admin/password-resets')){if(body)resetState=body.action==='approve'?'approved':'denied';return route.fulfill({json:{requests:[{id:'a1b2c3d4-fixture',username:'Member 2',created:1790798400,ip:'192.0.2.10',location:'Boston, Massachusetts, United States',state:resetState}]}});}
    if(path.endsWith('/password-reset/request'))return route.fulfill({json:{token:'private-browser-proof',id:'a1b2c3d4-fixture',state:'pending'}});
    if(path.endsWith('/password-reset/status'))return route.fulfill({json:{state:resetState}});
    if(path.endsWith('/password-reset/finish'))return route.fulfill({json:{saved:true}});
@@ -34,6 +34,7 @@ const fs=require('node:fs');
   await page.getByRole('button',{name:'Computers',exact:true}).click();await page.getByText('Bot computer resources',{exact:true}).waitFor();
   await page.getByRole('button',{name:'Users',exact:true}).click();
   await page.getByRole('button',{name:'Remove Member 1',exact:true}).click();
+  if(process.env.PREVIEW_DIR)await page.locator('dialog').last().screenshot({path:process.env.PREVIEW_DIR+'/remove-user-confirmation.png'});
   await page.getByRole('button',{name:'Cancel',exact:true}).click();assert(!calls.some(c=>c.path.endsWith('/admin/remove')));
   await page.getByRole('button',{name:'Remove Member 1',exact:true}).click();await page.getByRole('button',{name:'Remove user',exact:true}).click();
   await page.waitForFunction(()=>document.querySelectorAll('.server-user-row').length===19);assert.deepEqual(calls.find(c=>c.path.endsWith('/admin/remove')).body,{user_id:'member-0',confirm:'Member 1'});

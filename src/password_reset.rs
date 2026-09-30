@@ -1,10 +1,13 @@
 //! Admin-approved resets are bound to a secret held by the requesting browser.
 use super::*;
+#[path = "password_reset_location.rs"]
+mod location;
 macro_rules! ensure { ($condition:expr, $($message:tt)*) => { if !$condition { return Err(anyhow::anyhow!($($message)*).into()); } }; }
 
 pub(super) fn migrate(c: &Connection) -> Result<()> {
     c.execute_batch("CREATE TABLE IF NOT EXISTS password_resets(id TEXT PRIMARY KEY,digest BLOB NOT NULL UNIQUE,account TEXT REFERENCES accounts(id),created INTEGER NOT NULL,expires INTEGER NOT NULL,ip TEXT NOT NULL,state TEXT NOT NULL,decided INTEGER,decided_by TEXT);
       CREATE INDEX IF NOT EXISTS password_resets_expiry ON password_resets(expires);")?;
+    if !c.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('password_resets') WHERE name='location')",[],|r|r.get::<_,bool>(0))?{c.execute("ALTER TABLE password_resets ADD COLUMN location TEXT",[])?;}
     Ok(())
 }
 pub(super) async fn request(
@@ -43,6 +46,13 @@ pub(super) async fn request(
         .optional()?;
     tx.execute("INSERT INTO password_resets(id,digest,account,created,expires,ip,state) VALUES(?,?,?,?,?,?,'pending')",params![id,hash(&code),account,now,now+86400,ip])?;
     tx.commit()?;
+    drop(c);
+    if std::env::var("KINDRED_RESET_LOCATION_LOOKUPS").as_deref()!=Ok("false") && !headers.contains_key("forwarded") && !headers.contains_key("x-forwarded-for") && !headers.contains_key("x-real-ip") {
+        if let Ok(address)=ip.parse::<std::net::IpAddr>() {if location::public_ip(address){
+            let portal=Arc::downgrade(&p);let request=id.clone();
+            tokio::spawn(async move{if let Some(value)=location::lookup(address).await{if let Some(p)=portal.upgrade(){let _=p.registry.lock().unwrap().execute("UPDATE password_resets SET location=? WHERE id=?",params![value,request]);}}});
+        }}
+    }
     Ok(Json(
         json!({"token":code,"id":id,"state":"pending","expires_at":now+86400}),
     ))
@@ -67,7 +77,7 @@ pub(super) async fn list(State(p): State<Portal>, headers: HeaderMap) -> ApiResu
         "Administrator access required"
     );
     let c = p.registry.lock().unwrap();
-    let rows=c.prepare("SELECT r.id,a.login,r.created,r.ip,r.state,r.decided FROM password_resets r JOIN accounts a ON a.id=r.account WHERE r.expires>? AND a.disabled=0 ORDER BY r.created DESC,r.rowid DESC")?.query_map([db::now()],|r|Ok(json!({"id":r.get::<_,String>(0)?,"username":r.get::<_,String>(1)?,"created":r.get::<_,i64>(2)?,"ip":r.get::<_,String>(3)?,"state":r.get::<_,String>(4)?,"decided":r.get::<_,Option<i64>>(5)?})))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let rows=c.prepare("SELECT r.id,a.login,r.created,r.ip,r.state,r.decided,r.location FROM password_resets r JOIN accounts a ON a.id=r.account WHERE r.expires>? AND a.disabled=0 ORDER BY r.created DESC,r.rowid DESC")?.query_map([db::now()],|r|Ok(json!({"id":r.get::<_,String>(0)?,"username":r.get::<_,String>(1)?,"created":r.get::<_,i64>(2)?,"ip":r.get::<_,String>(3)?,"state":r.get::<_,String>(4)?,"decided":r.get::<_,Option<i64>>(5)?,"location":r.get::<_,Option<String>>(6)?})))?.collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(Json(json!({"requests":rows})))
 }
 pub(super) async fn decide(

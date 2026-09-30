@@ -178,3 +178,12 @@ response without appearing in the administrator’s list.
 The connection IP is the actual TCP peer. Forwarded headers are not trusted; behind
 a reverse proxy this may identify the proxy, not the user’s device. Match the
 request reference with the user before approving; an IP is not identity proof.
+
+Approximate city/region/country is looked up asynchronously through
+[IPWhois](https://ipwhois.io/documentation) over HTTPS for direct public connection
+addresses. Only the IP is sent, never the username or reset secret. Private,
+tailnet, reserved and identifiable proxy connections are not queried. Lookups have
+a three-second timeout and four-request concurrency limit; failure or unavailable
+location never blocks recovery. Set `KINDRED_RESET_LOCATION_LOOKUPS=false` on the
+server to disable external lookups. The estimate may reflect a VPN exit or ISP,
+not the person's physical location. It is not proof of identity.
