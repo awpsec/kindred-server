@@ -175,6 +175,12 @@ pub async fn execute_screen(tool: &str, args: &Value, screen: i64) -> Result<Val
                 "Expected HTTPS URL without embedded credentials"
             );
             let mut cmd = Command::new("chromium");
+            if args["_decisions_observation"] == true {
+                // Only the server's verified Codex route sets this flag. A new
+                // browser exposes CDP on guest loopback; an existing Chromium
+                // process keeps its launch settings and falls back if needed.
+                cmd.args(["--remote-debugging-address=127.0.0.1", "--remote-debugging-port=0"]);
+            }
             cmd.env("DISPLAY", display).args([
                 "--no-first-run",
                 &format!("--user-data-dir={browser}"),

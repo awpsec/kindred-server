@@ -97,6 +97,7 @@ pub fn uses_desktop(tool: &str, args: &serde_json::Value) -> bool {
     matches!(
         tool,
         "computer_screenshot"
+            | "computer_browser_task"
             | "computer_open_url"
             | "computer_click"
             | "computer_type"

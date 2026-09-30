@@ -11,6 +11,7 @@ mod bot_archive_tests;
 mod bot_drafts;
 mod bot_archive;
 mod bot_instructions;
+mod browser_use;
 #[cfg(test)]
 mod chat_history_tests;
 #[cfg(test)]

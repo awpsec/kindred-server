@@ -51,7 +51,7 @@ impl Db {
     // observation after this run's latest computer action before a handoff.
     pub fn require_observed_handoff(&self, run: &str) -> Result<()> {
         let (action,observed):(Option<i64>,Option<i64>)=self.0.lock().unwrap().query_row(
-            "SELECT MAX(CASE WHEN json_extract(body,'$.tool') IN ('computer_open_url','computer_click','computer_type','computer_key','computer_scroll') AND COALESCE(json_extract(body,'$.failed'),0)=0 THEN seq END),MAX(CASE WHEN json_extract(body,'$.tool')='computer_screenshot' AND json_extract(body,'$.has_image')=1 AND COALESCE(json_extract(body,'$.failed'),0)=0 THEN seq END) FROM events WHERE run_id=? AND kind='tool_result'",[run],|r|Ok((r.get(0)?,r.get(1)?)))?;
+            "SELECT MAX(CASE WHEN json_extract(body,'$.tool') IN ('computer_open_url','computer_click','computer_type','computer_key','computer_scroll','computer_browser_task') AND COALESCE(json_extract(body,'$.failed'),0)=0 THEN seq END),MAX(CASE WHEN json_extract(body,'$.tool')='computer_screenshot' AND json_extract(body,'$.has_image')=1 AND COALESCE(json_extract(body,'$.failed'),0)=0 THEN seq END) FROM events WHERE run_id=? AND kind='tool_result'",[run],|r|Ok((r.get(0)?,r.get(1)?)))?;
         ensure!(
             action.is_none_or(|action| observed.is_some_and(|seen| seen > action)),
             "Inspect a fresh computer_screenshot after your last computer action before requesting user help. Describe the actual visible page; a successful click does not prove the expected form or verification step appeared."

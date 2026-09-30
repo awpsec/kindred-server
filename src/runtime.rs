@@ -10,6 +10,8 @@ use std::{sync::Arc, time::Duration};
 use tokio::sync::Mutex;
 
 pub struct App {
+    // None until a supported official Decisions transport/auth adapter exists.
+    pub decisions: Option<Arc<dyn crate::browser_use::Decisions>>,
     pub desktop_sessions: crate::desktop_sessions::Sessions,
     pub profile_portal: std::sync::OnceLock<(std::sync::Weak<crate::profiles::Profiles>, String)>,
     pub mail_lock: Mutex<()>,
@@ -40,6 +42,7 @@ impl App {
         // Downtime while the server was offline is not observed idle time.
         crate::vm_maintenance::touch(&db.0.lock().unwrap())?;
         let app = Arc::new(Self {
+            decisions: None,
             desktop_sessions: Default::default(),
             profile_portal: Default::default(),
             mail_lock: Mutex::new(()),
@@ -75,6 +78,9 @@ impl App {
 
 pub fn tool_specs_for(app: &App, bot: &Bot) -> Vec<Value> {
     let mut specs = tool_specs();
+    if crate::browser_use::preferred(app, bot) {
+        specs.push(crate::browser_use::spec());
+    }
     if bot.provider != "codex" {
         specs.retain(|s| s["name"] != "codex_connector");
     }
@@ -582,6 +588,7 @@ pub fn needs_approval(app: &App, bot: &Bot, tool: &str, args: &Value) -> Result<
                         | "computer_type"
                         | "computer_key"
                         | "computer_scroll"
+                        | "computer_browser_task"
                 ) && args["action_scope"] == "routine_vm")
         }
         _ => true,
@@ -662,7 +669,7 @@ async fn call_tool_inner(
 ) -> Result<Value> {
     crate::provider_inbox::guard_tool(&app.db, run, name, &args)?;
     ensure!(
-        tool_specs()
+        name == "computer_browser_task" || tool_specs()
             .into_iter()
             .chain(crate::local_access::specs())
             .any(|t| t["name"] == name),
@@ -672,6 +679,9 @@ async fn call_tool_inner(
         !app.db.turn_deferred(&run.id)?,
         "This turn is waiting for a saved choice or background command. No further tools may run; end the turn."
     );
+    if name == "computer_browser_task" {
+        return crate::browser_use::call(app, bot, run, args).await;
+    }
     if matches!(
         name,
         "guest_exec"
@@ -1148,6 +1158,9 @@ async fn call_tool_inner(
         }
         _ => {
             let mut args = args;
+            if name == "computer_open_url" {
+                crate::browser_use::prepare_open(app, bot, &mut args);
+            }
             if name == "guest_exec" {
                 if let Some(zone) = crate::timezone::current(&app.db)? {
                     args["timezone"] = json!(zone.name());
@@ -1302,6 +1315,7 @@ fn tool_activity(b: &Value) -> (&'static str, &'static str) {
         "computer_click" | "computer_key" | "computer_scroll" => {
             ("wrench", "Working at the computer")
         }
+        "computer_browser_task" => ("wrench", "Working in the browser"),
         _ => ("think", "Working on it"),
     }
 }
