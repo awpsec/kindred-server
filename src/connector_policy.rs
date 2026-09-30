@@ -132,18 +132,27 @@ pub(crate) fn approval_override_locked(
     if args["forced"] == true || args["origin"] == "codex-account" {
         return Ok(Some(false));
     }
+    let sending = crate::connector_artifacts::email_send(args);
+    if sending {
+        // Recheck the saved run at dispatch as well as the initial review. A
+        // standing grant must not bypass a draft request or a denied review.
+        let prompt: Option<String> = c.query_row(
+            "SELECT r.prompt FROM connector_artifacts a JOIN runs r ON r.id=a.run_id WHERE a.id=? AND a.bot_id=?",
+            params![args["artifact_id"].as_str().unwrap_or(""), bot], |r| r.get(0)).optional()?;
+        if prompt.as_deref().is_some_and(crate::connector_artifacts::email_review_requested) {
+            return Ok(Some(false));
+        }
+    }
     let (Some(origin), Some(account), Some(connector)) = (
         args["origin"].as_str(),
         args["account_key"].as_str(),
         args["connector_key"].as_str(),
     ) else {
-        return Ok(None);
+        return Ok(if sending { Some(false) } else { None });
     };
-    if crate::connector_artifacts::email_send(args) {
+    if sending {
         let scoped: Option<String> = c.query_row("SELECT permission FROM connector_action_grants WHERE bot_id=? AND origin=? AND account_key=? AND connector_key=? AND action='email_send'",params![bot,origin,account,connector],|r|r.get(0)).optional()?;
-        if let Some(value) = scoped {
-            return Ok(Some(value == "allow"));
-        }
+        return Ok(Some(scoped.as_deref() == Some("allow")));
     }
     // A visible off switch means ask, including before any preference was saved.
     // Do not let the general Full access policy turn an absent connector grant on.
@@ -1069,7 +1078,7 @@ mod tests {
         save_settings(&app,&bot.id,&json!({"request":"email_sending_reset","origin":"claude-account","account_key":"a".repeat(64),"connector_key":"gmail-1"})).unwrap();
         assert_eq!(
             approval_override(&app.db, &bot.id, &send).unwrap(),
-            Some(true)
+            Some(false)
         );
         assert_eq!(app.db.run_approvals(&run.id).unwrap().len(), 1);
     }

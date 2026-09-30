@@ -599,6 +599,8 @@ pub async fn approve_required(
     args: &Value,
     force: bool,
 ) -> Result<bool> {
+    let force = force || (crate::connector_artifacts::email_send(args)
+        && crate::connector_artifacts::email_review_requested(&run.prompt));
     // Resolve on every action so live preference changes also affect an existing run.
     let connector_override = if matches!(
         tool,

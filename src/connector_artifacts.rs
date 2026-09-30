@@ -55,7 +55,9 @@ pub fn email_send(args: &Value) -> bool {
         "gmail" | "outlook" | "microsoftoutlook"
     ) && matches!(
         tool.as_str(),
-        "sendemail"
+        "send" | "reply" | "replyall" | "forward" | "forwardemail" | "forwardmessage"
+            | "gmailreply" | "gmailforward" | "outlookreply" | "outlookforward"
+            | "sendemail"
             | "sendmessage"
             | "senddraft"
             | "replytoemail"
@@ -72,6 +74,15 @@ pub fn email_send(args: &Value) -> bool {
             | "outlooksendmail"
             | "microsoftoutlooksendmail"
     )
+}
+/// Conservative review guard: drafting language must not inherit a standing send
+/// grant. False positives ask for review; never infer permission from prose.
+pub fn email_review_requested(prompt: &str) -> bool {
+    prompt.split(|c: char| !c.is_alphabetic()).any(|word| {
+        matches!(word.to_ascii_lowercase().as_str(),
+            "draft" | "drafts" | "drafted" | "drafting" | "review" | "approve" |
+            "approval" | "compose" | "prepare" | "write" | "propose" | "preview")
+    })
 }
 pub fn read_only_hint(args: &Value) -> bool {
     let tool = tool_name(args)
@@ -191,6 +202,9 @@ pub fn record(c: &Connection, id: &str) -> Result<Value> {
     ] {
         value[k] = v;
     }
+    // Correct historical receipts made before reply/forward were recognized as
+    // sends, without executing or changing the recorded action.
+    value["email_send"] = json!(email_send(&json!({"toolkit":value["connector"],"tool_name":value["tool"]})));
     value["email"] = email_fields(&value["input"]);
     if crate::connector_edits::read_only(&value) {
         if let Some(fields) = value["email"].as_object_mut() {
@@ -568,7 +582,7 @@ pub fn update(app: &App, id: &str, v: &Value) -> Result<Value> {
         .as_i64()
         .context("Review the current card before changing it")?;
     let action = v["action"].as_str().unwrap_or("");
-    if action == "edit" {
+    if matches!(action, "edit" | "remove_attachments") {
         let mut c = app.db.0.lock().unwrap();
         let tx = c.transaction()?;
         let mut card = record(&tx, &id)?;
@@ -576,7 +590,20 @@ pub fn update(app: &App, id: &str, v: &Value) -> Result<Value> {
             card["revision"] == revision && card["status"] == "pending",
             "This draft changed or is no longer waiting. Reload the current version."
         );
-        let next = crate::connector_edits::apply(&card, &v["fields"])?;
+        let next = if action == "remove_attachments" {
+            ensure!(card["kind"] == "email" && !crate::connector_edits::read_only(&card), "This is not an editable email");
+            let mut next = card["input"].clone();
+            let mut removed = false;
+            for path in ["/attachments", "/attachment_ids", "/message/attachments"] {
+                if let Some(value) = next.pointer_mut(path) {
+                    ensure!(value.is_array(), "This attachment format needs to be changed by the bot");
+                    removed |= !value.as_array().unwrap().is_empty();
+                    *value = json!([]);
+                }
+            }
+            ensure!(removed, "No removable attachments on this draft");
+            next
+        } else { crate::connector_edits::apply(&card, &v["fields"])? };
         let approval = card["approval_id"].as_str().unwrap_or("").to_owned();
         let raw:String=tx.query_row("SELECT args FROM approvals WHERE id=? AND status='pending' AND run_id IN(SELECT id FROM runs WHERE status='awaiting_approval')",[&approval],|r|r.get(0)).context("This approval has ended")?;
         let mut args: Value = serde_json::from_str(&raw)?;
@@ -947,6 +974,62 @@ mod tests {
         );
         assert!(dispatch(&app.db, &run, &args).is_err());
     }
+    #[test]
+    fn old_reply_receipt_is_identified_as_sent_without_execution() {
+        let (app,_,_,_,id)=fixture();
+        let c=app.db.0.lock().unwrap();
+        let mut card=record(&c,&id).unwrap();card["tool"]=json!("mcp__claude_ai_Gmail__reply");card["email_send"]=json!(false);
+        c.execute("UPDATE connector_artifacts SET body=?,status='completed' WHERE id=?",params![card.to_string(),id]).unwrap();
+        let restored=record(&c,&id).unwrap();
+        assert_eq!(restored["email_send"],true);assert_eq!(restored["status"],"completed");
+    }
+
+    #[test]
+    fn draft_request_overrides_explicit_send_grant_at_dispatch() {
+        let (app, bot, run, args, id) = fixture();
+        let rev = pending(&app, &run, &args);
+        update(&app, &id, &json!({"action":"approve","revision":rev,"choice":"always_allow_email"})).unwrap();
+        app.db.0.lock().unwrap().execute("UPDATE runs SET prompt='Please draft an email for me' WHERE id=?",[&run.id]).unwrap();
+        let mut fresh = args.clone();
+        let next = create(&app.db, &run, &fresh).unwrap();fresh["artifact_id"] = json!(next);
+        assert_eq!(crate::connector_policy::approval_override(&app.db,&bot.id,&fresh).unwrap(),Some(false));
+        set_status(&app.db,&next,"ready").unwrap();
+        assert!(dispatch(&app.db,&run,&fresh).is_err());
+    }
+
+    #[tokio::test]
+    async fn native_gmail_reply_requires_review_despite_general_connection_grant() {
+        let (app, bot, run, mut args, _) = fixture();
+        app.db.0.lock().unwrap().execute("INSERT INTO connector_grants(bot_id,origin,account_key,connector_key,permission) VALUES(?,'claude-account',?,'gmail-1','allow')",params![bot.id,"a".repeat(64)]).unwrap();
+        args["tool_name"] = json!("mcp__claude_ai_Gmail__reply");
+        args["input"] = json!({"body":"Review this first","messageId":"fixture-message","replyAll":true});
+        let id = create(&app.db,&run,&args).unwrap();args["artifact_id"] = json!(id);
+        assert_eq!(record(&app.db.0.lock().unwrap(),&id).unwrap()["email_send"],true);
+        let (a,b,r)=(app.clone(),bot.clone(),run.clone());
+        let task=tokio::spawn(async move {review(&a,&b,&r,"claude_connector",&mut args,false).await});
+        let card=tokio::time::timeout(std::time::Duration::from_secs(5),async {
+            loop {
+                let card=record(&app.db.0.lock().unwrap(),&id).unwrap();
+                if card["status"]=="pending" {break card;}
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }).await.unwrap();
+        assert!(!task.is_finished());
+        update(&app,&id,&json!({"action":"deny","revision":card["revision"]})).unwrap();
+        assert!(!task.await.unwrap().unwrap());
+    }
+
+    #[test]
+    fn attachment_removal_changes_only_pending_review_and_keeps_thread() {
+        let (app, _, run, args, id)=fixture();let rev=pending(&app,&run,&args);
+        let card=update(&app,&id,&json!({"action":"remove_attachments","revision":rev})).unwrap();
+        assert_eq!(card["input"]["attachments"],json!([]));
+        assert_eq!(card["input"]["thread_id"],"preserve-thread");
+        assert_eq!(card["input"]["body"],"Original body");
+        assert_eq!(card["status"],"pending");
+        assert!(update(&app,&id,&json!({"action":"approve","revision":rev})).is_err());
+    }
+
     #[test]
     fn email_permission_is_send_only_and_scoped_and_revocation_wins() {
         let (app, bot, run, args, id) = fixture();
