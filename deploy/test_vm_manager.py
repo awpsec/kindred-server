@@ -23,6 +23,17 @@ def software_fixture(root):
     return software
 
 class SoftwareCache(unittest.TestCase):
+    def test_retirement_stops_computer_and_prevents_restart(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary);profile='01234567-89ab-4cde-8fab-0123456789ab'
+            with patch.object(manager,'ROOT',root),patch.object(manager.sys,'argv',['manager','retire',profile]),patch.object(manager,'running',side_effect=[True,False,False,False,False]),patch.object(manager,'qmp') as qmp:
+                manager.main()
+                qmp.assert_called_once_with(root/profile/'computer','system_powerdown')
+                self.assertTrue((root/'_retired'/profile).exists())
+                with self.assertRaisesRegex(ValueError,'removed account'):manager.directory(profile)
+            with patch.object(manager,'ROOT',root),patch.object(manager.sys,'argv',['manager','retire',profile]),patch.object(manager,'running',return_value=False):
+                manager.main() # Retrying deletion is safe.
+
     def test_inaccessible_control_socket_is_not_reported_as_stopped(self):
         with patch.object(manager,'qmp',side_effect=PermissionError('denied')):
             with self.assertRaisesRegex(ValueError,'service account'):
@@ -103,6 +114,24 @@ class StartupRecovery(unittest.TestCase):
 
 @unittest.skipUnless(shutil.which('qemu-system-x86_64'), 'QEMU required')
 class RealQemuStartup(unittest.TestCase):
+    def test_retire_stops_real_qemu_and_rejects_new_starts(self):
+        with tempfile.TemporaryDirectory() as folder:
+            base=Path(folder);profile='01234567-89ab-4cde-8fab-0123456789ab'
+            with patch.object(manager,'ROOT',base):
+                root=manager.directory(profile)
+                args=['qemu-system-x86_64','-machine','q35,accel=tcg','-m','64','-display','none','-nodefaults','-qmp',f'unix:{root}/monitor.sock,server=on,wait=off','-pidfile',str(root/'qemu.pid'),'-daemonize']
+                clock=manager.time.monotonic;calls=[0]
+                def fast_deadline():
+                    calls[0]+=1
+                    return clock()+(61 if calls[0]>1 else 0)
+                try:
+                    manager.launch(root,args)
+                    with patch.object(manager.sys,'argv',['manager','retire',profile]),patch.object(manager.time,'monotonic',fast_deadline):manager.main()
+                    self.assertFalse(manager.running(root))
+                    with self.assertRaisesRegex(ValueError,'removed account'):manager.directory(profile)
+                finally:
+                    if manager.running(root):manager.qmp(root,'quit')
+
     def test_launch_pause_and_shutdown_keep_process_ownership(self):
         with tempfile.TemporaryDirectory() as folder:
             root=Path(folder)

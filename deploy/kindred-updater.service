@@ -9,6 +9,7 @@ ExecStart=/usr/bin/python3 /usr/local/lib/kindred/server-updater.py
 Restart=on-failure
 RuntimeDirectory=kindred-updater
 RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
 UMask=0077
 
 [Install]

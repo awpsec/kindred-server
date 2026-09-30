@@ -51,6 +51,9 @@ pub struct Profiles {
     password_slots: Arc<tokio::sync::Semaphore>,
     attempts: Mutex<HashMap<String, (i64, usize)>>,
     schedulers: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    profile_schedulers: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
+    profile_catalogues: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
+    removals: tokio::sync::Mutex<()>,
     run_schedulers: bool,
     shared_lock: Mutex<()>,
 }
@@ -135,6 +138,9 @@ impl Profiles {
             password_slots: Arc::new(tokio::sync::Semaphore::new(4)),
             attempts: Default::default(),
             schedulers: Default::default(),
+            profile_schedulers: Default::default(),
+            profile_catalogues: Default::default(),
+            removals: Default::default(),
             run_schedulers,
             shared_lock: Mutex::new(()),
         });
@@ -183,18 +189,20 @@ impl Profiles {
             .into_owned();
         config.vm.control_helper.clear();
         let app = App::open(config, secret())?;
-        let _ = app.profile_portal.set((self.self_ref.get().cloned().unwrap_or_default(),id.into()));
+        let _ = app
+            .profile_portal
+            .set((self.self_ref.get().cloned().unwrap_or_default(), id.into()));
         app.db.save_setting("_account_disabled", &json!(disabled))?;
         if app.db.setting("general")?.is_none() {
             app.db
                 .save_setting("general", &db::general_settings(Some(json!({"name":name}))))?;
         }
         if self.run_schedulers {
-            self.schedulers
-                .lock()
-                .unwrap()
-                .push(tokio::spawn(crate::runtime::scheduler(app.clone())));
-            tokio::spawn(crate::provider_catalog::startup(app.clone()));
+            self.profile_schedulers.lock().unwrap().insert(
+                id.into(),
+                tokio::spawn(crate::runtime::scheduler(app.clone())),
+            );
+            self.profile_catalogues.lock().unwrap().insert(id.into(),tokio::spawn(crate::provider_catalog::startup(app.clone())));
         }
         apps.insert(id.into(), app.clone());
         Ok(app)
@@ -222,6 +230,14 @@ impl Profiles {
         row.ok_or_else(|| anyhow::anyhow!("Your session expired. Sign in again."))
     }
     fn session(c: &Connection, account: &str, profile: &str) -> Result<String> {
+        ensure!(
+            c.query_row(
+                "SELECT EXISTS(SELECT 1 FROM accounts WHERE id=? AND disabled=0)",
+                [account],
+                |r| r.get::<_, bool>(0)
+            )?,
+            "Account unavailable"
+        );
         c.execute("DELETE FROM sessions WHERE expires<=?", [db::now()])?;
         let count: i64 = c.query_row(
             "SELECT COUNT(*) FROM sessions WHERE account_id=?",
@@ -338,6 +354,10 @@ impl Profiles {
 }
 impl Drop for Profiles {
     fn drop(&mut self) {
+        for (_,handle) in self.profile_catalogues.lock().unwrap().drain() {handle.abort();}
+        for (_, handle) in self.profile_schedulers.lock().unwrap().drain() {
+            handle.abort();
+        }
         for handle in self.schedulers.lock().unwrap().drain(..) {
             handle.abort();
         }
@@ -367,8 +387,15 @@ pub fn router(portal: Portal) -> Router {
         .route("/identity/directory", post(directory))
         .route("/identity/password", post(change_password))
         .route("/identity/admin", get(admin).post(admin_update))
-        .route("/identity/server-update", get(server_update_status).post(server_update_start))
-        .route("/identity/computer-settings", get(computer_settings).post(save_computer_settings))
+        .route("/identity/admin/remove", post(remove_account))
+        .route(
+            "/identity/server-update",
+            get(server_update_status).post(server_update_start),
+        )
+        .route(
+            "/identity/computer-settings",
+            get(computer_settings).post(save_computer_settings),
+        )
         .route("/device/claim", post(claim_device))
         .route("/api/devices/link", post(link_device))
         .route(
@@ -451,7 +478,7 @@ async fn register(State(p): State<Portal>, headers: HeaderMap, Json(v): Json<Val
         );
         let first = count == 0;
         let invite = v["invite"].as_str().unwrap_or("");
-        if !first && !p.registration_open(&tx)? {
+        if !first && (!invite.is_empty() || !p.registration_open(&tx)?) {
             ensure!(
                 tx.execute(
                     "DELETE FROM invites WHERE digest=? AND expires>?",
@@ -590,6 +617,14 @@ fn insert_profile(
     name: &str,
     request: Option<&str>,
 ) -> Result<String> {
+    ensure!(
+        c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM accounts WHERE id=? AND disabled=0)",
+            [account],
+            |r| r.get::<_, bool>(0)
+        )?,
+        "Account unavailable"
+    );
     if let Some(request) = request {
         ensure!(
             uuid::Uuid::parse_str(request).is_ok(),
@@ -891,15 +926,35 @@ async fn save_computer_settings(
 
 async fn server_update_status(State(p): State<Portal>, headers: HeaderMap) -> ApiResult {
     p.origin(&headers)?;
-    ensure!(p.identity(bearer(&headers))?.admin, "Administrator access required");
+    ensure!(
+        p.identity(bearer(&headers))?.admin,
+        "Administrator access required"
+    );
     Ok(Json(crate::server_update::request("status", None).await?))
 }
-async fn server_update_start(State(p): State<Portal>, headers: HeaderMap, Json(body): Json<Value>) -> ApiResult {
+async fn server_update_start(
+    State(p): State<Portal>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> ApiResult {
     p.origin(&headers)?;
-    ensure!(p.identity(bearer(&headers))?.admin, "Administrator access required");
-    let version=body["version"].as_str().unwrap_or("");
-    ensure!(!version.is_empty() && version.len()<32 && version.split('.').count()==3 && version.split('.').all(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())), "Invalid release version");
-    Ok(Json(crate::server_update::request("start", Some(version)).await?))
+    ensure!(
+        p.identity(bearer(&headers))?.admin,
+        "Administrator access required"
+    );
+    let version = body["version"].as_str().unwrap_or("");
+    ensure!(
+        !version.is_empty()
+            && version.len() < 32
+            && version.split('.').count() == 3
+            && version
+                .split('.')
+                .all(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())),
+        "Invalid release version"
+    );
+    Ok(Json(
+        crate::server_update::request("start", Some(version)).await?,
+    ))
 }
 
 async fn admin(State(p): State<Portal>, headers: HeaderMap) -> ApiResult {
@@ -944,6 +999,14 @@ async fn admin_update(
             let user = field(&v, "user_id", 64)?;
             ensure!(user != id.account, "You cannot disable your own account");
             ensure!(
+                !tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM controls WHERE key=?)",
+                    [format!("removing:{user}")],
+                    |r| r.get::<_, bool>(0)
+                )?,
+                "Account removal is in progress. Retry removal to finish."
+            );
+            ensure!(
                 tx.execute(
                     "UPDATE accounts SET disabled=? WHERE id=?",
                     params![v["disabled"] == true, user]
@@ -982,6 +1045,122 @@ async fn admin_update(
         }
     }
     Ok(Json(json!({"saved":true})))
+}
+
+// Deletion is retryable: revoke access first, stop each VM before deleting any
+// disk, and retain the registry entry until all private data has been removed.
+async fn remove_account(
+    State(p): State<Portal>,
+    headers: HeaderMap,
+    Json(v): Json<Value>,
+) -> ApiResult {
+    p.origin(&headers)?;
+    let actor = p.identity(bearer(&headers))?;
+    ensure!(actor.admin, "Administrator access required");
+    let user = field(&v, "user_id", 64)?.to_owned();
+    ensure!(user != actor.account, "You cannot remove your own account");
+    let _removal = p.removals.lock().await;
+    ensure!(p.identity(bearer(&headers))?.admin,"Administrator access required");
+    let profiles: Vec<String> = {
+        let mut c = p.registry.lock().unwrap();
+        let tx = c.transaction()?;
+        let name: String = tx.query_row("SELECT login FROM accounts WHERE id=?", [&user], |r| {
+            r.get(0)
+        })?;
+        ensure!(
+            v["confirm"].as_str() == Some(name.as_str()),
+            "Confirm the username before removing this account"
+        );
+        let profiles = tx
+            .prepare("SELECT id FROM profiles WHERE account_id=?")?
+            .query_map([&user], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        ensure!(
+            profiles.iter().all(|id| uuid::Uuid::parse_str(id).is_ok()),
+            "This account owns a legacy host computer. Migrate its workspace before removing the account."
+        );
+        tx.execute("UPDATE accounts SET disabled=1 WHERE id=?", [&user])?;
+        tx.execute(
+            "INSERT OR REPLACE INTO controls VALUES(?, 'true')",
+            [format!("removing:{user}")],
+        )?;
+        tx.execute("DELETE FROM sessions WHERE account_id=?", [&user])?;
+        tx.execute("DELETE FROM device_links WHERE account_id=?", [&user])?;
+        tx.commit()?;
+        profiles
+    };
+    for profile in &profiles {
+        let app = p.app(profile)?;
+        app.db.save_setting("_account_disabled", &json!(true))?;
+        app.vnc.close_all();
+        let runs:Vec<String>=app.db.0.lock().unwrap().prepare("SELECT id FROM runs WHERE status IN ('queued','running','awaiting_user','awaiting_approval')")?.query_map([],|r|r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        for run in runs {
+            app.db.cancel(&run)?;
+        }
+        let handle = p.profile_schedulers.lock().unwrap().remove(profile);
+        if let Some(handle) = handle {
+            handle.abort();
+            let _ = handle.await;
+        }
+        let catalogue=p.profile_catalogues.lock().unwrap().remove(profile);
+        if let Some(handle)=catalogue {handle.abort();let _=handle.await;}
+        let mut leases = Vec::new();
+        for slot in 1..=32 {
+            leases.push(
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(15),
+                    app.screen_lock(slot).lock_owned(),
+                )
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "Tasks are still stopping. The account is disabled; retry removal shortly."
+                    )
+                })?,
+            );
+        }
+        let root = Path::new(&p.config.profiles.directory).join(profile);
+        // Retire even an unprovisioned profile so in-flight VM requests cannot
+        // create its first disk after account removal.
+        crate::vm::managed(&app.config.vm, "retire", 90).await?;
+        // Hold screen leases through removal; the manager's tombstone prevents
+        // an already-started request from recreating this computer afterward.
+        if root.exists() {
+            tokio::fs::remove_dir_all(&root).await?;
+        }
+    }
+    let mut c = p.registry.lock().unwrap();
+    let tx = c.transaction()?;
+    server_chats::remove_account(&tx, &user, &actor.account)?;
+    for table in ["profile_requests", "directory"] {
+        tx.execute(&format!("DELETE FROM {table} WHERE account_id=?"), [&user])?;
+    }
+    for profile in &profiles {
+        for table in ["server_feed", "server_feed_positions", "server_questions"] {
+            tx.execute(
+                &format!("DELETE FROM {table} WHERE profile_id=?"),
+                [profile],
+            )?;
+        }
+    }
+    for table in [
+        "server_uploads",
+        "server_sends",
+        "server_reactions",
+        "server_question_answers",
+    ] {
+        tx.execute(&format!("DELETE FROM {table} WHERE account=?"), [&user])?;
+    }
+    tx.execute("DELETE FROM profiles WHERE account_id=?", [&user])?;
+    tx.execute("DELETE FROM accounts WHERE id=?", [&user])?;
+    tx.execute(
+        "DELETE FROM controls WHERE key=?",
+        [format!("removing:{user}")],
+    )?;
+    tx.commit()?;
+    drop(c);
+    for profile in profiles {p.apps.lock().unwrap().remove(&profile);}
+    Ok(Json(json!({"removed":true})))
 }
 
 async fn transfer_status(State(p): State<Portal>, headers: HeaderMap) -> ApiResult {
@@ -1155,7 +1334,15 @@ async fn dispatch(State(p): State<Portal>, mut request: Request<Body>) -> Respon
 }
 
 impl Profiles {
-    pub(crate) fn bot_chat_edit(&self, profile: &str, app: &App, actor: &db::Bot, run: Option<&db::Run>, args: &Value, approved: Option<&Value>) -> Result<Value> {
-        server_chats::bot_edit(self,profile,app,actor,run,args,approved)
+    pub(crate) fn bot_chat_edit(
+        &self,
+        profile: &str,
+        app: &App,
+        actor: &db::Bot,
+        run: Option<&db::Run>,
+        args: &Value,
+        approved: Option<&Value>,
+    ) -> Result<Value> {
+        server_chats::bot_edit(self, profile, app, actor, run, args, approved)
     }
 }

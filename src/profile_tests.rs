@@ -971,3 +971,147 @@ async fn transfer_registration_retry_logs_into_the_same_empty_destination() {
     let (_,identity)=destination.request("GET","/identity/profiles",recovered["token"].as_str().unwrap(),Value::Null).await;
     assert_eq!(identity["profiles"].as_array().unwrap().len(),1);
 }
+
+#[tokio::test]
+async fn invited_users_have_independent_profiles_and_removal_cleans_all_private_data() {
+    let f = Fixture::new(false);
+    let admin = f.register("administrator").await;
+    let token = admin["token"].as_str().unwrap();
+    f.request(
+        "POST",
+        "/identity/admin",
+        token,
+        json!({"action":"registration","open":false}),
+    )
+    .await;
+    let mut users = Vec::new();
+    for login in ["member-one", "member-two"] {
+        let (_, invite) = f
+            .request("POST", "/identity/admin", token, json!({"action":"invite"}))
+            .await;
+        let body = json!({"login":login,"name":"Personal","password":"test password for profiles","invite":invite["invite"]});
+        let (status, user) = f
+            .request("POST", "/identity/register", "", body.clone())
+            .await;
+        assert_eq!(status, 200);
+        let mut replay = body;
+        replay["login"] = json!(format!("{login}-replay"));
+        assert_ne!(
+            f.request("POST", "/identity/register", "", replay).await.0,
+            200
+        );
+        let t = user["token"].as_str().unwrap();
+        let (status, work) = f
+            .request("POST", "/identity/profiles", t, json!({"name":"Work"}))
+            .await;
+        assert_eq!(status, 200);
+        let (_, projection) = f.request("GET", "/identity/profiles", t, Value::Null).await;
+        assert_eq!(projection["profiles"].as_array().unwrap().len(), 2);
+        users.push((user, work));
+    }
+    let first = users[0].0["token"].as_str().unwrap();
+    let second = users[1].0["token"].as_str().unwrap();
+    assert_ne!(
+        f.request(
+            "POST",
+            "/identity/switch",
+            second,
+            json!({"profile_id":users[0].1["id"]})
+        )
+        .await
+        .0,
+        200
+    );
+    let identity = f.p.identity(first).unwrap();
+    let other_account=f.p.identity(second).unwrap().account;
+    let room=json!({"id":"shared-room","name":"Team","owner":identity.account,"participants":[{"id":format!("person:{}",identity.account),"kind":"person","name":"Member one","account":identity.account},{"id":format!("person:{other_account}"),"kind":"person","name":"Member two","account":other_account}]});
+    f.p.registry.lock().unwrap().execute("INSERT INTO server_rooms(id,body,created) VALUES(?,?,?)",params!["shared-room",room.to_string(),db::now()]).unwrap();
+    let body = json!({"user_id":identity.account,"confirm":"member-one"});
+    assert_ne!(
+        f.request("POST", "/identity/admin/remove", second, body.clone())
+            .await
+            .0,
+        200
+    );
+    assert_ne!(
+        f.request(
+            "POST",
+            "/identity/admin/remove",
+            token,
+            json!({"user_id":f.p.identity(token).unwrap().account,"confirm":"administrator"})
+        )
+        .await
+        .0,
+        200
+    );
+    assert_ne!(
+        f.request(
+            "POST",
+            "/identity/admin/remove",
+            token,
+            json!({"user_id":identity.account,"confirm":"wrong"})
+        )
+        .await
+        .0,
+        200
+    );
+    let ids = [
+        identity.profile.clone(),
+        users[0].1["id"].as_str().unwrap().into(),
+    ];
+    for id in &ids {
+        let root = f.root.join(id).join("computer");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("disk.qcow2"), b"private disk").unwrap();
+    }
+    // Failed VM shutdown must retain the account and disks, but revoke access.
+    std::fs::write(
+        f.root.join("fixture-manager.py"),
+        "raise SystemExit('VM still busy')",
+    )
+    .unwrap();
+    assert_ne!(
+        f.request("POST", "/identity/admin/remove", token, body.clone())
+            .await
+            .0,
+        200
+    );
+    assert!(f.p.identity(first).is_err());
+    assert!(f.root.join(&ids[0]).exists());
+    assert_ne!(
+        f.request(
+            "POST",
+            "/identity/admin",
+            token,
+            json!({"action":"disable","user_id":identity.account,"disabled":false})
+        )
+        .await
+        .0,
+        200
+    );
+    std::fs::write(
+        f.root.join("fixture-manager.py"),
+        "import sys,json\nassert sys.argv[1]=='retire'\nprint(json.dumps({'state':'retired'}))\n",
+    )
+    .unwrap();
+    let (status, result) = f
+        .request("POST", "/identity/admin/remove", token, body)
+        .await;
+    assert_eq!(status, 200, "{result}");
+    for id in ids {
+        assert!(!f.root.join(&id).exists());
+        assert!(!f.p.apps.lock().unwrap().contains_key(&id));
+    }
+    let room:String=f.p.registry.lock().unwrap().query_row("SELECT body FROM server_rooms WHERE id='shared-room'",[],|r|r.get(0)).unwrap();
+    let room:Value=serde_json::from_str(&room).unwrap();assert_eq!(room["participants"].as_array().unwrap().len(),1);assert_eq!(room["owner"],other_account);
+    assert!(f.p.identity(second).is_ok());
+    assert!(
+        f.root
+            .join(users[1].0["profile_id"].as_str().unwrap())
+            .exists()
+    );
+    let (_, users) = f
+        .request("GET", "/identity/admin", token, Value::Null)
+        .await;
+    assert_eq!(users["users"].as_array().unwrap().len(), 2);
+}

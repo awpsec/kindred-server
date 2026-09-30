@@ -6,10 +6,23 @@ selects the profile from an authenticated session; client-supplied database path
 VM paths or another account's profile IDs cannot select a different tenant.
 
 The first signup becomes administrator in a transaction. Administrators can close
-registration, create one-use 24-hour invitations and disable other accounts. Disabling
+registration, create one-use 24-hour invitation links and disable other accounts. Disabling
 revokes account sessions and device links, cancels outstanding runs, pauses schedules,
 closes viewers and requests managed-guest shutdown. It preserves data for re-enabling.
 The administrator cannot disable their own account through this control.
+
+The account menu offers **Add profile** and switches between profiles, such as Work
+and Personal, without creating another login. Invitation links open account creation;
+each new person needs their own link. Links carry the invitation in the URL fragment,
+which is cleared after opening the form.
+
+**Server administration → Users** lists accounts and profile counts. Removing a user
+requires confirmation, revokes access, cancels tasks, stops each managed computer,
+and deletes all of that account's profile directories, including VM disks and
+credentials. Removal cannot target your own account. If stopping a VM fails, the
+account remains disabled and removal can be retried. Shared conversation history
+stays available to its other members; the removed user's membership is removed.
+Legacy accounts with externally managed computers must be migrated before deletion.
 
 Creating an account or changing its password requires at least four characters.
 There are no uppercase, number or symbol requirements; simple passwords such as

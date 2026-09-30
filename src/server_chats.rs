@@ -53,6 +53,41 @@ impl Room {
             .any(|m| m.kind == "person" && m.account == account)
     }
 }
+pub(super) fn remove_account(c: &Connection, account: &str, administrator: &str) -> Result<()> {
+    let rooms: Vec<(String, String)> = c
+        .prepare("SELECT id,body FROM server_rooms")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (id, body) in rooms {
+        let mut room: Room = serde_json::from_str(&body)?;
+        let removed: Vec<String> = room
+            .participants
+            .iter()
+            .filter(|p| p.account == account)
+            .map(|p| p.id.clone())
+            .collect();
+        room.participants.retain(|p| p.account != account);
+        room.delegates
+            .retain(|key, value| !removed.contains(key) && !removed.contains(value));
+        if room.owner == account {
+            room.owner = room
+                .participants
+                .iter()
+                .find(|p| p.kind == "person")
+                .map(|p| p.account.clone())
+                .unwrap_or_else(|| administrator.into());
+        }
+        for participant in removed {
+            c.execute("DELETE FROM server_jobs WHERE participant=?", [participant])?;
+        }
+        c.execute(
+            "UPDATE server_rooms SET body=? WHERE id=?",
+            params![serde_json::to_string(&room)?, id],
+        )?;
+    }
+    Ok(())
+}
+
 pub(super) fn migrate(c: &Connection) -> Result<()> {
     c.execute_batch("CREATE TABLE IF NOT EXISTS server_rooms(id TEXT PRIMARY KEY,body TEXT NOT NULL,created INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS server_bot_shares(profile_id TEXT NOT NULL,bot_id TEXT NOT NULL,PRIMARY KEY(profile_id,bot_id));

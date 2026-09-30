@@ -106,7 +106,7 @@ remain restricted to the original profile. New installations should use Compose.
 
 ## Change computer resources
 
-In **Server administration → Bot computer resources**, administrators can change
+In **Server administration → Computers**, administrators can change
 CPU count, RAM and disk capacity for their current workspace. Shut down the
 computer there, save the resources, then start it again. Stop active bot work and
 return any controlled screens first. Existing disks and sign-ins are retained;
@@ -119,7 +119,10 @@ variables `KINDRED_VM_CPUS`, `KINDRED_VM_MEMORY_MB` and `KINDRED_VM_DISK_GB` are
 defaults for **new** computers, not resize commands for existing ones. After
 editing Compose or its `.env`, run `docker compose up -d` to apply the new
 configuration; `docker compose restart` alone does not apply it. Docker Desktop
-and the host must also have enough available RAM and disk space. Externally
+and the host must also have enough available RAM and disk space. Set the container
+memory limit above the total RAM of all concurrently running computers, with
+headroom for the server and QEMU. `KINDRED_VM_MAX_RUNNING` limits concurrent
+computers; it does not allocate additional container memory. Externally
 managed VMs remain configurable through their host VM manager.
 
 ## Bot computers on a tailnet

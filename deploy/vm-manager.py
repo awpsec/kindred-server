@@ -52,7 +52,9 @@ def directory(value):
     value = identifier(value)
     root = (ROOT / value / 'computer').resolve()
     if root.parent.parent != ROOT: raise ValueError('Invalid computer directory')
-    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with locked(ROOT/'_lifecycle'/value):
+        if (ROOT/'_retired'/value).exists(): raise ValueError('This computer belongs to a removed account')
+        root.mkdir(parents=True, exist_ok=True, mode=0o700)
     return root
 
 def download(url, path, limit):
@@ -399,13 +401,38 @@ def resize_resources(root, profile, values):
 def main():
     os.umask(0o077)
     if len(sys.argv)!=3: raise ValueError('Expected action and profile ID')
-    action,profile=sys.argv[1:];root=directory(profile)
-    if action not in ('ensure','start','domstate','connection-status','shutdown','reboot','resource-settings','resize-resources'): raise ValueError('Unknown computer action')
+    action,profile=sys.argv[1:]
+    if action=='retire': identifier(profile)
+    if action=='retire' and (ROOT/'_retired'/profile).exists():
+        root=ROOT/profile/'computer'
+    else: root=directory(profile)
+    if action not in ('ensure','start','domstate','connection-status','shutdown','reboot','resource-settings','resize-resources','retire'): raise ValueError('Unknown computer action')
     if action=='connection-status':
         print(json.dumps({'setup':connection_status(root)}));return
     if action=='domstate':
         print(json.dumps({'state':'running' if running(root) else 'shut off','provisioned':(root/'computer.json').exists()}));return
-    with locked(root/'operation.lock'):
+    with locked(ROOT/'_operations'/profile):
+        if action=='retire':
+            with locked(ROOT/'_lifecycle'/profile):
+                (ROOT/'_retired').mkdir(exist_ok=True,mode=0o700)
+                atomic(ROOT/'_retired'/profile,{'retired':True})
+            if running(root):
+                qmp(root,'system_powerdown')
+                deadline=time.monotonic()+60
+                while running(root) and time.monotonic()<deadline: time.sleep(.5)
+                if running(root): qmp(root,'quit')
+                deadline=time.monotonic()+5
+                while running(root) and time.monotonic()<deadline: time.sleep(.1)
+                if running(root): raise ValueError('Computer has not stopped; retry account removal')
+            # A lost QMP socket must not allow deletion of a live VM's disk.
+            pidfile=root/'qemu.pid'
+            if pidfile.exists():
+                pid=int(pidfile.read_text().strip())
+                try: command=Path(f'/proc/{pid}/cmdline').read_bytes()
+                except FileNotFoundError: command=b''
+                if str(root).encode() in command: raise ValueError('Computer process is still exiting; retry account removal')
+            print(json.dumps({'state':'retired'}));return
+        if (ROOT/'_retired'/profile).exists(): raise ValueError('This computer belongs to a removed account')
         if action == 'resource-settings':
             print(json.dumps(resource_settings(root, profile)));return
         if action == 'resize-resources':
