@@ -194,7 +194,7 @@ not the person's physical location. It is not proof of identity.
 ### Standalone access from another device
 
 On the desktop hosting Standalone, open Server admin → Network. Choose
-**LAN and tailnet**, enter the complete connection addresses (one per line),
+**All interfaces**, enter the complete connection addresses (one per line),
 and Save. For example, use `http://100.64.1.2:9444` for the computer's Tailscale
 IPv4 address. Restart now applies the saved settings without pulling an update.
 Restarting interrupts running tasks and bot computers; their disks and accounts

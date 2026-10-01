@@ -1148,3 +1148,19 @@ async fn password_reset_requires_admin_approval_and_requesting_browser_proof() {
     let (_,unknown)=f.request("POST","/identity/password-reset/request","",json!({"login":"unknown"})).await;assert_eq!(unknown["state"],"pending");
     let (_,list)=f.request("GET","/identity/admin/password-resets",admin,Value::Null).await;assert!(list["requests"].as_array().unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn switching_accounts_does_not_extend_sign_in_lifetime() {
+    let f=Fixture::new(false);
+    let (status,user)=f.request("POST","/identity/register","",json!({"login":"owner","name":"Owner","password":"test-password"})).await;
+    assert_eq!(status,200,"{user}");
+    let token=user["token"].as_str().unwrap();
+    let expiry=db::now()+3600;
+    f.p.registry.lock().unwrap().execute("UPDATE sessions SET expires=? WHERE digest=?",params![expiry,hash(token)]).unwrap();
+    let (status,switched)=f.request("POST","/identity/switch",token,json!({"profile_id":user["profile_id"]})).await;
+    assert_eq!(status,200,"{switched}");
+    let rotated=switched["token"].as_str().unwrap();
+    let actual:i64=f.p.registry.lock().unwrap().query_row("SELECT expires FROM sessions WHERE digest=?",[hash(rotated)],|r|r.get(0)).unwrap();
+    assert_eq!(actual,expiry);
+    assert!(f.p.identity(token).is_err());
+}

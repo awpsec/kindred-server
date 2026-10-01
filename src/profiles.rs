@@ -444,7 +444,7 @@ async fn meta(State(p): State<Portal>) -> ApiResult {
         r.get(0)
     })?;
     Ok(Json(
-        json!({"profiles":true,"server_chats":true,"first_user":first,"legacy_claim":first&&p.legacy.is_some(),"registration":p.registration_open(&c)?,"version":env!("CARGO_PKG_VERSION")}),
+        json!({"profiles":true,"server_chats":true,"deployment":if std::env::var("KINDRED_DEPLOYMENT").as_deref()==Ok("standalone"){"standalone"}else{"hosted"},"first_user":first,"legacy_claim":first&&p.legacy.is_some(),"registration":p.registration_open(&c)?,"version":env!("CARGO_PKG_VERSION")}),
     ))
 }
 async fn register(State(p): State<Portal>, headers: HeaderMap, Json(v): Json<Value>) -> ApiResult {
@@ -727,8 +727,10 @@ async fn switch(State(p): State<Portal>, headers: HeaderMap, Json(v): Json<Value
         )?,
         "Profile unavailable"
     );
-    // Switching rotates the device's session instead of accumulating tokens.
+    // Rotation preserves the original sign-in deadline; switching is not login.
+    let expires:i64=c.query_row("SELECT expires FROM sessions WHERE digest=?",[hash(bearer(&headers))],|r|r.get(0))?;
     let token = Profiles::session(&c, &id.account, profile)?;
+    c.execute("UPDATE sessions SET expires=? WHERE digest=?",params![expires,hash(&token)])?;
     c.execute(
         "DELETE FROM sessions WHERE digest=?",
         [hash(bearer(&headers))],
