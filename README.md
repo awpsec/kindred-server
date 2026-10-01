@@ -55,6 +55,7 @@ See [hosting and backups](docs/HOSTING.md) before exposing a server to others.
 | Provider authentication and requirements | [Provider integrations](docs/PROVIDER_INTEGRATIONS.md) |
 | Installation and updates | [GitHub release updates](docs/GITHUB_UPDATES.md) |
 | Accounts and isolation | [Profiles](docs/PROFILES.md) |
+| Phone notifications | [Native mobile push](docs/MOBILE_PUSH.md) |
 | Development | [Contributing](CONTRIBUTING.md) |
 | Security issues | [Security policy](SECURITY.md) |
 

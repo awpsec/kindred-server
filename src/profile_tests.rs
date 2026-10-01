@@ -1164,3 +1164,150 @@ async fn switching_accounts_does_not_extend_sign_in_lifetime() {
     assert_eq!(actual,expiry);
     assert!(f.p.identity(token).is_err());
 }
+
+struct RecordingPush(Mutex<Vec<crate::mobile_push::Push>>);
+impl crate::mobile_push::Transport for RecordingPush {
+    fn platforms(&self) -> crate::mobile_push::Platforms {
+        crate::mobile_push::Platforms { ios: true, android: true }
+    }
+    fn send<'a>(&'a self, push: &'a crate::mobile_push::Push) -> crate::mobile_push::SendFuture<'a> {
+        self.0.lock().unwrap().push(push.clone());
+        Box::pin(async { crate::mobile_push::Outcome::Delivered })
+    }
+}
+
+fn finished_run(app: &Shared, bot: &str) -> i64 {
+    let run = app.db.queue(bot, "Private prompt", 0).unwrap();
+    app.db.finish(&run, "completed", "Private answer", "").unwrap();
+    app.db.event(&run, "run_finished", json!({})).unwrap();
+    app.db.0.lock().unwrap().query_row("SELECT MAX(seq) FROM events", [], |r| r.get(0)).unwrap()
+}
+
+#[tokio::test]
+async fn mobile_devices_cover_every_owned_profile_and_follow_the_session() {
+    let f = Fixture::new(false);
+    let user = f.register("phone-owner").await;
+    let token = user["token"].as_str().unwrap().to_owned();
+    let first = user["profile_id"].as_str().unwrap().to_owned();
+    let (_, me) = f.request("GET", "/identity/profiles", &token, Value::Null).await;
+    let account = me["account_id"].as_str().unwrap().to_owned();
+    // A second owned profile exists before the phone registers.
+    let (_, created) = f.request("POST", "/identity/profiles", &token, json!({"name":"Second"})).await;
+    let second = created["id"].as_str().unwrap().to_owned();
+    let installation = db::id();
+    let path = format!("/api/mobile/devices/{installation}");
+    let body = json!({"platform":"android","token":"fcm-registration-token-1","environment":"production","account_id":account});
+    assert_eq!(f.request("PUT", &path, "", body.clone()).await.0, 401);
+    assert_eq!(f.request("PUT", &path, "x".repeat(64).as_str(), body.clone()).await.0, 401);
+    let mut other = body.clone();
+    other["account_id"] = json!(db::id());
+    assert_eq!(f.request("PUT", &path, &token, other).await.0, 400);
+    assert_eq!(f.request("PUT", "/api/mobile/devices/not-a-uuid", &token, body.clone()).await.0, 400);
+    let (status, saved) = f.request("PUT", &path, &token, body.clone()).await;
+    assert_eq!(status, 200, "{saved}");
+    assert_eq!((saved["delivery_enabled"].clone(), saved["profiles"].clone()), (json!(false), json!(2)));
+    assert!(!saved.to_string().contains("fcm-registration-token-1"));
+    let (status, push) = f.request("GET", &format!("/api/mobile/push-status?installation_uuid={installation}"), &token, Value::Null).await;
+    assert_eq!(status, 200);
+    assert_eq!(push, json!({"enabled":false,"platforms":{"ios":false,"android":false},"registered":true,"profiles":2,"registered_profiles":2}));
+    assert_eq!(f.request("GET", "/api/mobile/push-status", "", Value::Null).await.0, 401);
+
+    // Bots in both owned profiles alert while the session sits on the first.
+    let (one, two) = (f.p.app(&first).unwrap(), f.p.app(&second).unwrap());
+    let transport = Arc::new(RecordingPush(Default::default()));
+    f.p.mobile_push_tick(transport.clone()).await;
+    let (bot_one, bot_two) = (crate::tests::bot(&one.db, "codex"), crate::tests::bot(&two.db, "codex"));
+    let event_one = finished_run(&one, &bot_one.id);
+    let event_two = finished_run(&two, &bot_two.id);
+    f.p.mobile_push_tick(transport.clone()).await;
+    {
+        let mut sent: Vec<_> = transport.0.lock().unwrap().iter().map(|p| (p.profile_id.clone(), p.chat_id.clone(), p.event_id, p.account_id.clone(), p.installation.clone())).collect();
+        sent.sort();
+        let mut expected = vec![(first.clone(), format!("dm-{}", bot_one.id), event_one, account.clone(), installation.clone()), (second.clone(), format!("dm-{}", bot_two.id), event_two, account.clone(), installation.clone())];
+        expected.sort();
+        assert_eq!(sent, expected);
+    }
+    transport.0.lock().unwrap().clear();
+
+    // Switching profiles rotates the session; registrations in every owned profile follow it.
+    let (status, switched) = f.request("POST", "/identity/switch", &token, json!({"profile_id":second})).await;
+    assert_eq!(status, 200, "{switched}");
+    let token = switched["token"].as_str().unwrap().to_owned();
+    f.p.mobile_push_tick(transport.clone()).await;
+    assert_eq!((one.db.mobile_devices().unwrap().len(), two.db.mobile_devices().unwrap().len()), (1, 1));
+    finished_run(&one, &bot_one.id);
+    f.p.mobile_push_tick(transport.clone()).await;
+    assert_eq!(transport.0.lock().unwrap().iter().map(|p| p.profile_id.clone()).collect::<Vec<_>>(), vec![first.clone()]);
+
+    // A profile created later inherits the phone, starting at its own present.
+    let (_, third) = f.request("POST", "/identity/profiles", &token, json!({"name":"Third"})).await;
+    let three = f.p.app(third["id"].as_str().unwrap()).unwrap();
+    assert_eq!(three.db.mobile_devices().unwrap().len(), 1);
+    assert_eq!(three.db.mobile_devices().unwrap()[0].installation, installation);
+
+    // Another account's profiles never receive this account's registration or events.
+    let other_user = f.register("other-phone-owner").await;
+    let other_token = other_user["token"].as_str().unwrap();
+    let other_app = f.p.app(other_user["profile_id"].as_str().unwrap()).unwrap();
+    assert!(other_app.db.mobile_devices().unwrap().is_empty());
+    let other_bot = crate::tests::bot(&other_app.db, "codex");
+    transport.0.lock().unwrap().clear();
+    finished_run(&other_app, &other_bot.id);
+    f.p.mobile_push_tick(transport.clone()).await;
+    assert!(transport.0.lock().unwrap().is_empty());
+    // The other account cannot remove or probe this account's installation.
+    assert_eq!(f.request("DELETE", &path, other_token, Value::Null).await.1["removed"], false);
+    assert_eq!(one.db.mobile_devices().unwrap().len(), 1);
+    // A device moved into a profile the account no longer owns is not live there.
+    other_app.db.register_mobile_device(&crate::mobile_push::Registration::parse(&installation, &body, &account).unwrap(), &hash(&token), "forged").unwrap();
+    f.p.mobile_push_tick(transport.clone()).await;
+    assert!(other_app.db.mobile_devices().unwrap().is_empty());
+
+    // Password rotation keeps registrations in every owned profile.
+    let (status, changed) = f.request("POST", "/identity/password", &token, json!({"current_password":"test password for profiles","password":"a new password"})).await;
+    assert_eq!(status, 200, "{changed}");
+    let token = changed["token"].as_str().unwrap().to_owned();
+    f.p.mobile_push_tick(transport.clone()).await;
+    for app in [&one, &two, &three] {
+        assert_eq!(app.db.mobile_devices().unwrap().len(), 1);
+    }
+
+    // Session expiry removes them everywhere on the next pass.
+    f.p.registry.lock().unwrap().execute("UPDATE sessions SET expires=0 WHERE digest=?", [hash(&token)]).unwrap();
+    f.p.mobile_push_tick(transport.clone()).await;
+    for app in [&one, &two, &three] {
+        assert!(app.db.mobile_devices().unwrap().is_empty());
+    }
+
+    // Signing out removes them immediately from every owned profile.
+    let login = json!({"login":"phone-owner","password":"a new password"});
+    let token = f.request("POST", "/identity/login", "", login.clone()).await.1["token"].as_str().unwrap().to_owned();
+    assert_eq!(f.request("PUT", &path, &token, body.clone()).await.0, 200);
+    assert_eq!(f.request("POST", "/identity/logout", &token, json!({})).await.0, 200);
+    for app in [&one, &two, &three] {
+        assert!(app.db.mobile_devices().unwrap().is_empty());
+    }
+
+    // Delete covers every owned profile and is idempotent; sign out everywhere clears all.
+    let token = f.request("POST", "/identity/login", "", login.clone()).await.1["token"].as_str().unwrap().to_owned();
+    assert_eq!(f.request("PUT", &path, &token, body.clone()).await.0, 200);
+    let (status, removed) = f.request("DELETE", &path, &token, Value::Null).await;
+    assert_eq!((status, removed["removed"].clone()), (StatusCode::OK, json!(true)));
+    for app in [&one, &two, &three] {
+        assert!(app.db.mobile_devices().unwrap().is_empty());
+    }
+    assert_eq!(f.request("DELETE", &path, &token, Value::Null).await.1["removed"], false);
+    assert_eq!(f.request("PUT", &path, &token, body.clone()).await.0, 200);
+    assert_eq!(f.request("POST", "/identity/logout", &token, json!({"all_devices":true})).await.0, 200);
+    for app in [&one, &two, &three] {
+        assert!(app.db.mobile_devices().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn legacy_device_tokens_cannot_register_mobile_push() {
+    let f = Fixture::new(true);
+    let path = format!("/api/mobile/devices/{}", db::id());
+    let body = json!({"platform":"ios","token":"ab".repeat(32),"environment":"production","account_id":db::id()});
+    assert_eq!(f.request("PUT", &path, "legacy-owner-token-12345678901234567890", body).await.0, 401);
+}

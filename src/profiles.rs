@@ -31,6 +31,8 @@ use tower::ServiceExt;
 mod server_chats;
 #[path = "password_reset.rs"]
 mod password_reset;
+#[path = "mobile_push_routes.rs"]
+mod mobile_push_routes;
 
 type Portal = Arc<Profiles>;
 type ApiResult = std::result::Result<Json<Value>, web::Error>;
@@ -58,6 +60,7 @@ pub struct Profiles {
     removals: tokio::sync::Mutex<()>,
     run_schedulers: bool,
     shared_lock: Mutex<()>,
+    push_platforms: crate::mobile_push::Platforms,
 }
 
 #[derive(Clone)]
@@ -132,6 +135,8 @@ impl Profiles {
             CREATE INDEX IF NOT EXISTS sessions_expiry ON sessions(expires);")?;
         server_chats::migrate(&registry)?;
         password_reset::migrate(&registry)?;
+        let push = crate::mobile_push::Settings::from_env();
+        let push_platforms = push.platforms();
         let portal = Arc::new(Self {
             self_ref: Default::default(),
             config,
@@ -146,6 +151,7 @@ impl Profiles {
             removals: Default::default(),
             run_schedulers,
             shared_lock: Mutex::new(()),
+            push_platforms,
         });
         let _ = portal.self_ref.set(Arc::downgrade(&portal));
         if let Some(app) = legacy {
@@ -167,6 +173,13 @@ impl Profiles {
                 .lock()
                 .unwrap()
                 .push(tokio::spawn(server_chats::worker(Arc::downgrade(&portal))));
+            if push_platforms.any() {
+                let transport: Arc<dyn crate::mobile_push::Transport> =
+                    Arc::new(crate::mobile_push::Providers::new(push)?);
+                portal.schedulers.lock().unwrap().push(tokio::spawn(
+                    mobile_push_routes::worker(Arc::downgrade(&portal), transport),
+                ));
+            }
         }
         Ok(portal)
     }
@@ -370,6 +383,7 @@ impl Drop for Profiles {
 pub fn router(portal: Portal) -> Router {
     Router::new()
         .merge(server_chats::routes())
+        .merge(mobile_push_routes::routes())
         .route("/identity/meta", get(meta))
         .route("/identity/register", post(register))
         .route("/identity/login", post(login))
@@ -610,6 +624,11 @@ async fn login(State(p): State<Portal>, headers: HeaderMap, Json(v): Json<Value>
         (token, profile)
     };
     p.app(&profile)?;
+    if v["new_profile_name"].is_string() {
+        if let Err(error) = p.inherit_mobile_devices(&account, &profile) {
+            eprintln!("New profile did not inherit mobile push registrations: {error:#}");
+        }
+    }
     Ok(Json(json!({"token":token,"profile_id":profile})))
 }
 async fn list(State(p): State<Portal>, headers: HeaderMap) -> ApiResult {
@@ -683,6 +702,9 @@ async fn create(State(p): State<Portal>, headers: HeaderMap, Json(v): Json<Value
         profile
     };
     p.app(&profile)?;
+    if let Err(error) = p.inherit_mobile_devices(&id.account, &profile) {
+        eprintln!("New profile did not inherit mobile push registrations: {error:#}");
+    }
     Ok(Json(json!({"id":profile,"name":name})))
 }
 async fn rename(State(p): State<Portal>, headers: HeaderMap, Json(v): Json<Value>) -> ApiResult {
@@ -718,6 +740,7 @@ async fn switch(State(p): State<Portal>, headers: HeaderMap, Json(v): Json<Value
     let id = p.identity(bearer(&headers))?;
     ensure!(!id.legacy, "Sign in to switch profiles");
     let profile = field(&v, "profile_id", 64)?;
+    let apps = p.owned_apps(&id.account)?;
     let c = p.registry.lock().unwrap();
     ensure!(
         c.query_row(
@@ -731,6 +754,8 @@ async fn switch(State(p): State<Portal>, headers: HeaderMap, Json(v): Json<Value
     let expires:i64=c.query_row("SELECT expires FROM sessions WHERE digest=?",[hash(bearer(&headers))],|r|r.get(0))?;
     let token = Profiles::session(&c, &id.account, profile)?;
     c.execute("UPDATE sessions SET expires=? WHERE digest=?",params![expires,hash(&token)])?;
+    // Phone registrations in every owned profile follow the rotated session.
+    Profiles::rebind_mobile(&apps, &hash(bearer(&headers)), &hash(&token))?;
     c.execute(
         "DELETE FROM sessions WHERE digest=?",
         [hash(bearer(&headers))],
@@ -745,13 +770,34 @@ async fn logout(State(p): State<Portal>, headers: HeaderMap, Json(v): Json<Value
         "Legacy access tokens are managed by the server owner"
     );
     let c = p.registry.lock().unwrap();
-    if v["all_devices"] == true {
+    let profiles: Vec<String> = if v["all_devices"] == true {
         c.execute("DELETE FROM sessions WHERE account_id=?", [&id.account])?;
+        c.prepare("SELECT id FROM profiles WHERE account_id=?")?
+            .query_map([&id.account], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?
     } else {
         c.execute(
             "DELETE FROM sessions WHERE digest=?",
             [hash(bearer(&headers))],
         )?;
+        Vec::new()
+    };
+    drop(c);
+    // Signed-out sessions stop mobile pushes immediately in every owned profile;
+    // the delivery worker also drops registrations whose session later ends.
+    // Sign-out has already succeeded; cleanup failures are retried by the worker.
+    if profiles.is_empty() {
+        let removed = p.owned_apps(&id.account).and_then(|apps| {
+            apps.iter().try_for_each(|(_, app)| app.db.remove_mobile_sessions(&[hash(bearer(&headers))]).map(drop))
+        });
+        if let Err(error) = removed {
+            eprintln!("Mobile push registrations will be removed by the worker: {error:#}");
+        }
+    }
+    for profile in profiles {
+        if let Err(error) = p.app(&profile).and_then(|app| app.db.remove_mobile_account(&id.account)) {
+            eprintln!("Mobile push registrations will be removed by the worker: {error:#}");
+        }
     }
     Ok(Json(json!({"signed_out":true})))
 }
@@ -826,6 +872,7 @@ async fn change_password(
         Ok(password_hash(&new, &copy))
     })
     .await??;
+    let apps = p.owned_apps(&id.account)?;
     let mut c = p.registry.lock().unwrap();
     let tx = c.transaction()?;
     ensure!(
@@ -839,6 +886,9 @@ async fn change_password(
     tx.execute("DELETE FROM device_links WHERE account_id=?", [&id.account])?;
     let token = Profiles::session(&tx, &id.account, &id.profile)?;
     tx.execute("DELETE FROM password_resets WHERE account=?", [&id.account])?;
+    // This device's own session was rotated, so its registrations in every owned
+    // profile follow. Holding the registry lock keeps the worker from seeing the gap.
+    Profiles::rebind_mobile(&apps, &hash(bearer(&headers)), &hash(&token))?;
     tx.commit()?;
     Ok(Json(json!({"token":token,"profile_id":id.profile})))
 }

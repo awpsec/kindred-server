@@ -263,6 +263,7 @@ impl Db {
         crate::visual_panels::migrate(&c)?;
         crate::workspace_artifacts::migrate(&c)?;
         crate::command_jobs::migrate(&c)?;
+        crate::mobile_push::migrate(&c)?;
         crate::command_jobs::recover_waits(&c)?;
         // A saved wait ended its provider turn; it is safe to recover the wait,
         // not to replay the preceding command or provider session.
