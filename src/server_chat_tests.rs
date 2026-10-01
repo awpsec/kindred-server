@@ -484,14 +484,16 @@ async fn shared_questions_continue_once_and_notifications_do_not_cross_membershi
     let question=private.iter().find(|m|m["kind"]=="question").unwrap()["question"].clone();
     assert_eq!(question["delivery_chat_id"],dm);
     assert_eq!(question["chat_id"],key);
-    assert!(question["context"].as_str().unwrap().contains(key));
+    assert_eq!(question["context"], "Please pick the current blocker.");
     let qid=question["id"].as_str().unwrap();
     let own=aa.db.notifications(Some(0)).unwrap();
     assert!(own["items"].as_array().unwrap().iter().any(|n|n["chat_id"]==dm));
     let answered=aa.db.answer_question(qid,crate::questions::Answer{selected:Some(0),custom:None}).unwrap();
     let repeated=aa.db.answer_question(qid,crate::questions::Answer{selected:Some(0),custom:None}).unwrap();
     assert_eq!(answered.continuation_run_id,repeated.continuation_run_id);
-    assert_eq!(aa.db.run(&answered.continuation_run_id).unwrap().chat_id,dm);
+    let continuation = aa.db.run(&answered.continuation_run_id).unwrap();
+    assert_eq!(continuation.chat_id, dm);
+    assert!(continuation.prompt.contains(key));
     assert_eq!(aa.db.runs(None).unwrap().len(),2);
     assert!(aa.db.answer_question(qid,crate::questions::Answer{selected:Some(1),custom:None}).is_err());
     let notes=f.ok("GET",&format!("/api/notifications?after={cursor}"),&b,Value::Null).await;
