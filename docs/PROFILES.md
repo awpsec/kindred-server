@@ -190,3 +190,26 @@ a three-second timeout and four-request concurrency limit; failure or unavailabl
 location never blocks recovery. Set `KINDRED_RESET_LOCATION_LOOKUPS=false` on the
 server to disable external lookups. The estimate may reflect a VPN exit or ISP,
 not the person's physical location. It is not proof of identity.
+
+### Standalone access from another device
+
+On the desktop hosting Standalone, open Server admin → Network. Choose
+**LAN and tailnet**, enter the complete connection addresses (one per line),
+and Save. For example, use `http://100.64.1.2:9444` for the computer's Tailscale
+IPv4 address. Restart now applies the saved settings without pulling an update.
+Restarting interrupts running tasks and bot computers; their disks and accounts
+are preserved. The desktop continues using localhost.
+
+The setting defaults to localhost, persists outside versioned bundles, and is
+applied by later managed standalone starts and upgrades. Both desktop and server
+must be updated for this feature. Only the hosting desktop can change it.
+The phone must have a network route to the computer, and host firewall rules
+must permit port 9444. The computer must remain awake. This setting does not
+configure port forwarding, Tailscale ACLs, TLS, or mobile push delivery.
+
+Connection origins are explicitly allowlisted. HTTP origins are accepted only
+for private/loopback/link-local addresses, Tailscale's 100.64.0.0/10 range,
+`.ts.net`, and `.local`; other origins require HTTPS. HTTP over a normal LAN
+does not encrypt credentials; use a tailnet or an HTTPS proxy for private access.
+Public URL validation otherwise remains unchanged. Native mobile background
+alerts require a separate push integration; browser polling is not a substitute.

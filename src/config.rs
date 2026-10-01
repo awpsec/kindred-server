@@ -142,6 +142,14 @@ fn safe_executable(value: &str) -> bool {
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"/._-".contains(&b))
 }
+fn private_network_host(host: &str) -> bool {
+    let host=host.trim_matches(['[',']']);
+    match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(ip)) => ip.is_private() || ip.is_loopback() || ip.is_link_local() || (ip.octets()[0]==100 && (64..=127).contains(&ip.octets()[1])),
+        Ok(std::net::IpAddr::V6(ip)) => ip.is_loopback() || (ip.segments()[0]&0xfe00)==0xfc00 || (ip.segments()[0]&0xffc0)==0xfe80,
+        Err(_) => host=="localhost" || host.ends_with(".ts.net") || host.ends_with(".local"),
+    }
+}
 impl Config {
     pub fn allows_origin(&self, origin: &str) -> bool {
         origin == self.public_url.trim_end_matches('/')
@@ -221,7 +229,13 @@ impl Config {
         for origin in &self.allowed_origins {
             let mut single = self.clone();
             single.allowed_origins.clear();
-            single.public_url = origin.clone();
+            let mut address=reqwest::Url::parse(origin)?;
+            // Explicitly listed private-network origins may use HTTP. Public
+            // origins still require HTTPS, and the runtime allowlist stays exact.
+            if address.scheme()=="http" && private_network_host(address.host_str().unwrap_or("")) {
+                address.set_scheme("https").map_err(|_|anyhow::anyhow!("Invalid origin scheme"))?;
+            }
+            single.public_url = address.to_string();
             single.validate()?;
         }
         let url = reqwest::Url::parse(&self.public_url)?;
@@ -248,6 +262,16 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn explicit_private_origins_allow_phone_access_without_public_http() {
+        for origin in ["http://100.64.1.2:9444", "http://192.168.1.5:9444", "http://laptop.example.ts.net:9444"] {
+            let mut c=Config::default();c.allowed_origins=vec![origin.into()];c.validate().unwrap();
+            assert!(c.allows_origin(origin));assert!(!c.allows_origin("http://attacker.example"));
+        }
+        for origin in ["http://example.com:9444","http://8.8.8.8:9444","http://user:pass@100.64.1.2:9444","http://100.64.1.2:9444/path"] {
+            let mut c=Config::default();c.allowed_origins=vec![origin.into()];assert!(c.validate().is_err());
+        }
+    }
     #[test]
     fn rejects_command_and_option_injection() {
         for bad in [

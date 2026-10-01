@@ -18,7 +18,7 @@ class PrivateDirectoryRestart(unittest.TestCase):
             root=Path(folder);data=root/'data';profiles=data/'profiles';profiles.mkdir(parents=True)
             for path in [data,profiles]:os.chown(path,1000,1000);path.chmod(0o700)
             try:
-                docker('run','--pull=never','-d','--name',name,'--network','none','--security-opt','no-new-privileges:true','--cap-drop','ALL','--cap-add','CHOWN','--cap-add','SETUID','--cap-add','SETGID','-v',f'{data}:/data','-v',f'{Path(__file__).with_name("container-entry.py").resolve()}:/opt/kindred/source/deploy/container-entry.py:ro',image)
+                docker('run','--pull=never','-d','--name',name,'--network','none','--security-opt','no-new-privileges:true','--cap-drop','ALL','--cap-add','CHOWN','--cap-add','SETUID','--cap-add','SETGID','-e','KINDRED_ALLOWED_ORIGINS=["https://laptop.example.ts.net"]','-v',f'{data}:/data','-v',f'{Path(__file__).with_name("container-entry.py").resolve()}:/opt/kindred/source/deploy/container-entry.py:ro',image)
                 for attempt in range(2):
                     for _ in range(30):
                         try:
@@ -26,6 +26,7 @@ class PrivateDirectoryRestart(unittest.TestCase):
                             break
                         except subprocess.CalledProcessError:time.sleep(.2)
                     else:self.fail('Server did not become healthy with private profile directories')
+                    docker('exec','-u','kindred',name,'python3','-c',"""import tomllib; c=tomllib.load(open('/data/server.toml','rb')); assert c['allowed_origins']==['https://laptop.example.ts.net']; assert c['public_url']=='http://127.0.0.1:9444'""")
                     if attempt==0:docker('restart','-t','5',name)
             finally:
                 subprocess.run(['docker','rm','-f',name],capture_output=True,timeout=30)

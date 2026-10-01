@@ -12,6 +12,7 @@ os.umask(0o077)
 url=os.environ.get('KINDRED_PUBLIC_URL','http://127.0.0.1:9444').rstrip('/')
 config=f'''listen = "0.0.0.0:9444"
 public_url = {json.dumps(url)}
+allowed_origins = {json.dumps(json.loads(os.environ.get("KINDRED_ALLOWED_ORIGINS","[]")))}
 database = "/data/kindred.db"
 max_parallel_runs = {int(os.environ.get('KINDRED_MAX_PARALLEL_RUNS','4'))}
 [profiles]
