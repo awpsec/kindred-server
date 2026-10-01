@@ -18,7 +18,7 @@ const {server}=require('./fixtures/desktop.cjs');const assert=require('node:asse
  assert.equal(await p.locator('#address').inputValue(),'https://home.example');assert(await p.locator('#address').isHidden());
  await p.locator('#server-form button[type=submit]').click();
  assert(await p.evaluate(()=>calls.some(c=>c.name==='connect_profile_server'&&c.args.address==='https://home.example')));
- await p.locator('#known-server').selectOption('new');assert(await p.locator('#address').isVisible());assert.equal(await p.locator('#address').inputValue(),'');
+ await p.locator('#known-server').click();await p.getByRole('listbox',{name:'Server'}).getByRole('option',{name:'Add a new server…',exact:true}).click();assert(await p.locator('#address').isVisible());assert.equal(await p.locator('#address').inputValue(),'');
  await p.locator('.select[data-key=b]').click();assert(await p.evaluate(()=>calls.some(c=>c.name==='switch_native_profile'&&c.args.key==='b')));
  }finally{await browser.close()}
 }console.log('PASS server grouping, backend selection, new address, saved account selection in Chromium and WebKit');
