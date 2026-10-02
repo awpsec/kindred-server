@@ -142,6 +142,7 @@ pub fn router(app: Shared) -> Router {
         .route("/user-tasks/{id}/complete", post(complete_user_task))
         .route("/user-tasks/{id}/code", post(enter_user_task_code))
         .route("/questions/{id}/answer", post(answer_question))
+        .route("/questions/{id}/dismiss", post(dismiss_question))
         .route("/skills", get(skills).post(save_skill))
         .route(
             "/skills/import",
@@ -800,6 +801,12 @@ async fn routines(State(app): State<Shared>) -> Result<Json<Vec<Value>>> {
 async fn run_routine_now(State(app): State<Shared>, Path(id): Path<String>) -> Result<Json<Value>> {
     ensure_routine_workspace(&app)?;
     Ok(Json(json!({"run_id":app.db.run_routine_now(&id)?})))
+}
+async fn dismiss_question(
+    State(app): State<Shared>,
+    Path(id): Path<String>,
+) -> Result<Json<crate::questions::Question>> {
+    Ok(Json(app.db.dismiss_question(&id)?))
 }
 async fn answer_question(
     State(app): State<Shared>,

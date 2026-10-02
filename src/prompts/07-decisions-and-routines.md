@@ -16,6 +16,8 @@ The saved decision includes ownership information. If `is_current_continuation` 
 
 If the decision belongs to another continuation, do not repeat its action from a later routine check. Inspect its state or result when needed. If it is still active, respect that ownership. If its result is uncertain or failed, report the actual condition and resolve the next step without duplicating an external effect.
 
+A dismissed question was skipped without an answer. It selects no option, grants no permission, and creates no continuation. Leave its dependent action unresolved; do not re-ask the unchanged question or send an acknowledgement. Only revisit it when the user requests it or materially new facts require a new decision.
+
 A pending question deliberately ends its turn. Kindred records the card and releases the execution while waiting for the user. Do not keep working on a dependent action, assume the default option or append a final narrative as though the decision were already resolved. The answer starts a new assigned continuation in the appropriate conversation.
 
 For a user choice such as "I'll handle it," provide the relevant verified link or short steps when that is the selected path, then leave the action to the user. For "do nothing," respect inaction unless materially new information changes the decision. Do not re-ask the unchanged question on every check.

@@ -1366,25 +1366,17 @@ async fn answer(
     };
     let app = p.app(&profile)?;
     ensure!(!app.account_disabled(), "This bot's owner is unavailable");
-    let value: crate::questions::Answer = serde_json::from_value(v.clone())?;
+    let dismiss = v == json!({"dismiss":true});
+    let value: Option<crate::questions::Answer> = if dismiss { None } else { Some(serde_json::from_value(v.clone())?) };
     let current = app.db.question(&question)?;
-    ensure!(
-        value.selected.is_some() ^ value.custom.is_some(),
-        "Choose an option or write a response"
-    );
-    let text = if let Some(i) = value.selected {
-        current
-            .options
-            .get(i)
-            .ok_or_else(|| anyhow::anyhow!("Invalid choice"))?
-            .clone()
-    } else {
-        value.custom.as_deref().unwrap_or("").trim().to_owned()
-    };
-    ensure!(
-        !text.is_empty() && text.len() <= 4000,
-        "Use a response of 1 to 4000 bytes"
-    );
+    let text = if let Some(value) = &value {
+        ensure!(value.selected.is_some() ^ value.custom.is_some(), "Choose an option or write a response");
+        let text = if let Some(i) = value.selected {
+            current.options.get(i).ok_or_else(|| anyhow::anyhow!("Invalid choice"))?.clone()
+        } else { value.custom.as_deref().unwrap_or("").trim().to_owned() };
+        ensure!(!text.is_empty() && text.len() <= 4000, "Use a response of 1 to 4000 bytes");
+        text
+    } else { String::new() };
     {
         let c = p.registry.lock().unwrap();
         if let Some((account, body)) = c
@@ -1406,7 +1398,8 @@ async fn answer(
             )?;
         }
     }
-    let answered = match app.db.answer_question(&question, value) {
+    let resolved = match value { Some(value) => app.db.answer_question(&question, value), None => app.db.dismiss_question(&question) };
+    let answered = match resolved {
         Ok(q) => q,
         Err(e) => {
             p.registry.lock().unwrap().execute(
@@ -1424,7 +1417,9 @@ async fn answer(
             "UPDATE server_questions SET body=? WHERE seq=?",
             params![body.to_string(), seq],
         )?;
+        if !dismiss {
         tx.execute("INSERT OR IGNORE INTO server_messages(room_id,sender,body,created,round_id,source_profile,source_seq,reply_to) VALUES(?,?,?,?,?,?,?,?)",params![key,format!("person:{}",id.account),text,db::now(),db::id(),format!("answer:{profile}"),seq,seq])?;
+        }
         tx.commit()?;
     }
     sync(&p)?;

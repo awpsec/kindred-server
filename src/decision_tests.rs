@@ -573,3 +573,45 @@ fn group_questions_keep_topic_scope_but_arrive_and_resume_in_private() {
         assert!(prompt.contains(&format!("originating group ({})",q.chat_id)));
         assert!(prompt.contains("Keep these routing instructions out of visible replies."));}
 }
+
+#[tokio::test]
+async fn dismiss_question_is_authenticated_durable_and_never_answers_or_resumes() {
+    let app = app();
+    let b = bot(&app.db, "codex");
+    app.db.queue(&b.id, "Review an old decision", 0).unwrap();
+    let run = app.db.claim().unwrap().unwrap();
+    app.db.ask_question(&run, question()).unwrap();
+    let id = app.db.chat_messages(&run.chat_id).unwrap().pop().unwrap()["question"]["id"].as_str().unwrap().to_owned();
+    app.db.finish(&run.id, "completed", "", "").unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/api/questions/{id}/dismiss", listener.local_addr().unwrap());
+    let server = tokio::spawn(axum::serve(listener, web::router(app.clone())).into_future());
+    let client = reqwest::Client::new();
+    assert_eq!(client.post(&url).send().await.unwrap().status(), 401);
+    for _ in 0..2 {
+        let response = client.post(&url).bearer_auth(&app.token).send().await.unwrap();
+        assert!(response.status().is_success());
+        let q: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(q["status"], "dismissed");
+        assert_eq!(q["answer"], "");
+        assert!(q["selected"].is_null());
+        assert_eq!(q["continuation_run_id"], "");
+    }
+    assert!(app.db.claim().unwrap().is_none());
+    assert!(app.db.answer_question(&id, option(0)).is_err());
+    assert_eq!(app.db.events(&run.id).unwrap().iter().filter(|e| e["kind"] == "question_dismissed").count(), 1);
+    assert_eq!(app.db.decision_context(&b.id, &run.chat_id, None).unwrap()[0]["status"], "dismissed");
+    app.db.queue(&b.id, "A later check", 0).unwrap();
+    let later = app.db.claim().unwrap().unwrap();
+    let existing = app.db.ask_question(&later, question()).unwrap();
+    assert_eq!(existing["deferred_question"], false);
+    assert!(existing["text"].as_str().unwrap().contains("No option was selected"));
+    assert_eq!(app.db.chat_messages(&run.chat_id).unwrap().iter().filter(|m|m["kind"]=="question").count(), 1);
+    let mut changed = question(); changed.topic_key = "different-decision".into();
+    app.db.ask_question(&later, changed).unwrap();
+    let answered_id = app.db.chat_messages(&later.chat_id).unwrap().into_iter().find(|m|m["kind"]=="question" && m["question"]["id"]!=id).unwrap()["question"]["id"].as_str().unwrap().to_owned();
+    app.db.answer_question(&answered_id, option(1)).unwrap();
+    assert!(app.db.dismiss_question(&answered_id).is_err());
+    assert_eq!(app.db.question(&answered_id).unwrap().status, "answered");
+    server.abort();
+}

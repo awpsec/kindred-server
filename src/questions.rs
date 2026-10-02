@@ -210,8 +210,23 @@ impl Db {
         }
         tx.commit()?;
         Ok(
-            json!({"deferred_question":deferred,"text":serde_json::to_string(&json!({"question":q,"is_current_continuation":q.continuation_run_id==run.id,"instruction":if deferred {"The choice card is in your private conversation with the owner. This turn ends now and releases the computer. The user's answer will start a continuation in that private chat. Do not assume a selection or perform a dependent action."} else if q.continuation_run_id==run.id {"YOU are the assigned continuation for this answer. Answered means the user chose, not that the action was completed. Continue from the saved choice; inspect current state and carry out the requested work under the existing approval policy."} else {"This topic already has a saved decision. Do not ask again or repeat the action. Only the recorded continuation should execute that decision; check its result before reporting success."}}))?}),
+            json!({"deferred_question":deferred,"text":serde_json::to_string(&json!({"question":q,"is_current_continuation":q.continuation_run_id==run.id,"instruction":if deferred {"The choice card is in your private conversation with the owner. This turn ends now and releases the computer. The user's answer will start a continuation in that private chat. Do not assume a selection or perform a dependent action."} else if q.status=="dismissed" {"The user dismissed this question without answering. No option was selected and no dependent action is authorized. Do not reopen this unchanged topic or send a follow-up just to acknowledge dismissal."} else if q.continuation_run_id==run.id {"YOU are the assigned continuation for this answer. Answered means the user chose, not that the action was completed. Continue from the saved choice; inspect current state and carry out the requested work under the existing approval policy."} else {"This topic already has a saved decision. Do not ask again or repeat the action. Only the recorded continuation should execute that decision; check its result before reporting success."}}))?}),
         )
+    }
+    /// Dismissing records no answer and starts no continuation. Repeated requests
+    /// are harmless; a concurrent answer wins or loses atomically under the DB lock.
+    pub fn dismiss_question(&self, id: &str) -> Result<Question> {
+        let mut c = self.0.lock().unwrap();
+        let tx = c.transaction()?;
+        let q = tx.query_row("SELECT * FROM questions WHERE id=?", [id], row)?;
+        if q.status == "dismissed" { return Ok(q); }
+        ensure!(q.status == "pending", "This question is no longer waiting for an answer");
+        tx.execute("UPDATE questions SET status='dismissed' WHERE id=? AND status='pending'", [id])?;
+        tx.execute("INSERT INTO events(run_id,kind,body,created) VALUES(?,'question_dismissed',?,?)",
+            params![q.run_id, json!({"id":id,"instruction":"Dismissed without an answer. No option was selected and no dependent action is authorized."}).to_string(), db::now()])?;
+        let result = tx.query_row("SELECT * FROM questions WHERE id=?", [id], row)?;
+        tx.commit()?;
+        Ok(result)
     }
     pub fn answer_question(&self, id: &str, answer: Answer) -> Result<Question> {
         ensure!(
