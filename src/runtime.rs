@@ -1417,11 +1417,7 @@ pub async fn scheduler(app: Shared) {
                             Ok(output) => app.db.finish(&run.id, "completed", &output, "")?,
                             Err(error) => app.db.finish(
                                 &run.id,
-                                if app.db.cancelled(&run.id) {
-                                    "cancelled"
-                                } else {
-                                    "failed"
-                                },
+                                failure_status(&app, &run, &error),
                                 "",
                                 &error.to_string(),
                             )?,
@@ -1445,6 +1441,17 @@ pub async fn scheduler(app: Shared) {
     }
 }
 
+pub(crate) fn failure_status(app: &App, run: &Run, error: &anyhow::Error) -> &'static str {
+    if app.db.cancelled(&run.id) {
+        "cancelled"
+    } else if crate::run_limits::is_limit(error) {
+        // A limit stop is resumed with Continue; nothing is queued or replayed here.
+        "interrupted"
+    } else {
+        "failed"
+    }
+}
+
 // Keep the provider future alive while a human works; no new run or replay is queued.
 pub(crate) async fn drive_run<F: std::future::Future<Output = Result<String>>>(
     app: &App,
@@ -1457,8 +1464,12 @@ pub(crate) async fn drive_run<F: std::future::Future<Output = Result<String>>>(
     let legacy_lease = lease.is_some();
     tokio::pin!(work);
     let mut tick = tokio::time::interval(Duration::from_millis(100));
-    let mut last = tokio::time::Instant::now();
-    let mut active = Duration::ZERO;
+    // Stop and human handoff stay on the 100ms tick; limit activity is read at most once per POLL.
+    let mut watch = crate::run_limits::Watch::new(
+        crate::run_limits::Limits::from_config(&app.config),
+        tokio::time::Instant::now(),
+        crate::run_limits::snapshot(&app.db, &run.id)?,
+    );
     let stop_reason = || {
         if app.account_disabled() {
             Some("This account was disabled by the server administrator.")
@@ -1490,8 +1501,6 @@ pub(crate) async fn drive_run<F: std::future::Future<Output = Result<String>>>(
             _ = tick.tick() => {
                 let waiting = app.db.pending_user_task(&run.id)?;
                 let now = tokio::time::Instant::now();
-                if waiting.is_none() { active += now - last; }
-                last = now;
                 if let Some(task) = waiting {
                     // The provider is blocked inside request_user_action. No guest tool is running.
                     lease.take();
@@ -1504,8 +1513,14 @@ pub(crate) async fn drive_run<F: std::future::Future<Output = Result<String>>>(
                             }
                         }
                     }
-                } else if active >= Duration::from_secs(app.config.run_timeout_seconds) {
-                    return Ok((Err(anyhow::anyhow!("Run time limit reached. Review completed actions before retrying.")), lease.is_some() || app.desktop_sessions.pending_rpc(&run.id)));
+                }
+                // Waiting is observed too, so a person's time never counts toward either limit.
+                if watch.due(now) {
+                    if let Some(stop) = watch.observe(now, watch.read(&app.db, &run.id)?) {
+                        // Durable receipt before the provider future is dropped.
+                        app.db.event(&run.id, "run_limit", stop.event(watch.limits()))?;
+                        return Ok((Err(anyhow::Error::new(stop)), lease.is_some() || app.desktop_sessions.pending_rpc(&run.id)));
+                    }
                 }
             }
         }

@@ -81,6 +81,7 @@ mod routine_controls;
 mod routine_duplicate_tests;
 mod routine_updates;
 mod rpc;
+mod run_limits;
 mod runtime;
 mod schedules;
 mod screen_control;

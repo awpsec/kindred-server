@@ -394,7 +394,8 @@ mod tests {
     #[tokio::test]
     async fn human_takeover_pauses_deadline_and_resumes_the_same_call_once() {
         let mut app = app();
-        Arc::get_mut(&mut app).unwrap().config.run_timeout_seconds = 1;
+        let config = &mut Arc::get_mut(&mut app).unwrap().config;
+        (config.idle_timeout_seconds, config.task_timeout_seconds) = (1, Some(1));
         let bot = bot(&app.db, "openrouter");
         let id = app
             .db

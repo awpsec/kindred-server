@@ -247,6 +247,7 @@ async fn codex_rpc(app: &App, bot: &Bot, run: &Run, rpc: &mut Rpc) -> Result<Str
             let mut end_turn = false;
             let response = match method {
                 "item/tool/call" => {
+                    crate::provider_retry::check_tool_budget(app, run)?;
                     steps += 1;
                     let result = if app.config.max_steps > 0 && steps > app.config.max_steps {
                         json!({"text":"Tool budget exhausted; return your partial result.","failed":true})

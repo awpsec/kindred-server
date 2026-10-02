@@ -147,7 +147,7 @@ async fn run_worker(
         "type":"start", "protocol":1, "provider":bot.provider, "model":bot.model,
         "session_id":format!("{}:{}",bot.id,run.chat_id),
         "model_info":model_info, "api_key":key, "endpoint":endpoint, "fixture":fixture,
-        "request_timeout_ms":app.config.run_timeout_seconds * 1000,
+        "request_timeout_ms":app.config.request_timeout_seconds * 1000,
         "instructions":runtime::instructions_for(app, bot, run, &tools, model_info["context_window"].as_u64())?, "prompt":run.prompt, "tools":tools,
         "reasoning_effort":bot.reasoning_effort, "require_zdr":app.config.openrouter.require_zdr,
         "max_steps":app.config.max_steps
@@ -229,6 +229,7 @@ async fn run_worker(
                     allowed.contains(name),
                     "Pi requested a tool outside Kindred's tool set"
                 );
+                crate::provider_retry::check_tool_budget(app, run)?;
                 let tool_result = runtime::call_tool(app, bot, run, name, frame["args"].clone())
                     .await
                     .unwrap_or_else(|e| json!({"text":e.to_string(),"failed":true}));
@@ -326,6 +327,30 @@ pub fn sse_response(value: Value) -> axum::response::Response {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn model_request_timeout_is_independent_of_task_cap() {
+        let mut app = crate::tests::app();
+        let config = &mut std::sync::Arc::get_mut(&mut app).unwrap().config;
+        config.task_timeout_seconds = Some(3600);
+        config.run_timeout_seconds = 1800;
+        config.request_timeout_seconds = 90;
+        let bot = crate::tests::bot(&app.db, "openrouter");
+        app.db.queue(&bot.id, "Check request limits", 0).unwrap();
+        let run = app.db.claim_bot(&bot.id).unwrap().unwrap();
+        let script = std::env::temp_dir().join(format!("kindred-timeout-{}.py", crate::db::id()));
+        std::fs::write(&script, r#"import sys,json
+v=json.loads(sys.stdin.readline())
+assert v['request_timeout_ms']==90000
+print(json.dumps({'type':'ready','protocol':1,'sdk_version':'0.85.1','provider':v['provider'],'model':v['model']}),flush=True)
+print(json.dumps({'type':'assistant','text':'Checked.'}),flush=True)
+print(json.dumps({'type':'complete','output':'Checked.'}),flush=True)
+"#).unwrap();
+        let worker = crate::config::Pi { node_binary:"/usr/bin/python3".into(), worker_script:script.to_string_lossy().into_owned() };
+        let result = super::run_worker(&app, &bot, &run, "fixture-key", serde_json::json!({"context_window":128000}), "https://example.invalid", true, &worker).await;
+        let _ = std::fs::remove_file(script);
+        assert_eq!(result.unwrap(), "Checked.");
+    }
+
     use super::*;
     use std::sync::{
         Arc,

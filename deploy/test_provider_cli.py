@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 HELPER = Path(__file__).with_name('provider-cli.py').resolve()
 spec=importlib.util.spec_from_file_location('bridge', HELPER)
@@ -157,6 +158,13 @@ class Bridge(unittest.TestCase):
         for marker in [{'error':'authentication_failed'},{'is_error':True}]:
             with self.subTest(marker=marker):
                 self.exercise('claude-code',error_packet={'type':'assistant',**marker,'message':{'content':[{'type':'text','text':'Diagnostic only'}]}})
+
+    def test_long_stream_is_not_limited_by_packet_count(self):
+        final = "    emit({'type':'result','subtype':'success','is_error':False})"
+        self.assertIn(final, FAKE)
+        fixture = FAKE.replace(final, "    for _ in range(10050): emit({'type':'system','subtype':'status'})\n" + final)
+        with patch(__name__ + '.FAKE', fixture):
+            self.exercise('claude-code')
 
     def test_catalogue_uses_control_request_without_user_turn(self):
         with tempfile.TemporaryDirectory() as d:

@@ -16,7 +16,13 @@ pub struct Config {
     pub pi: Pi,
     pub max_steps: usize,
     pub max_parallel_runs: usize,
+    /// Legacy blanket run timer. Only a customized value still caps tasks;
+    /// see `task_timeout_seconds()`.
     pub run_timeout_seconds: u64,
+    pub request_timeout_seconds: u64,
+    pub idle_timeout_seconds: u64,
+    pub task_timeout_seconds: Option<u64>,
+    pub task_action_limit: usize,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -122,7 +128,11 @@ impl Default for Config {
             pi: Pi::default(),
             max_steps: 0,
             max_parallel_runs: 4,
-            run_timeout_seconds: 1800,
+            run_timeout_seconds: 0,
+            request_timeout_seconds: 600,
+            idle_timeout_seconds: 1800,
+            task_timeout_seconds: None,
+            task_action_limit: 10_000,
         }
     }
 }
@@ -157,6 +167,25 @@ impl Config {
                 .allowed_origins
                 .iter()
                 .any(|v| origin == v.trim_end_matches('/'))
+    }
+    /// Active-time cap for one task in seconds; 0 means no total cap.
+    /// An explicit `task_timeout_seconds` wins. The old shipped default
+    /// `run_timeout_seconds = 1800` no longer cuts off productive work, but a
+    /// customized legacy value is still honored.
+    pub fn task_timeout_seconds(&self) -> u64 {
+        match self.task_timeout_seconds {
+            Some(seconds) => seconds,
+            None if matches!(self.run_timeout_seconds, 0 | 1800) => 0,
+            None => self.run_timeout_seconds,
+        }
+    }
+    /// Tool actions allowed per task. A nonzero legacy `max_steps` is a lower
+    /// ceiling and keeps its meaning.
+    pub fn task_action_limit(&self) -> usize {
+        match self.max_steps {
+            0 => self.task_action_limit,
+            steps => steps.min(self.task_action_limit),
+        }
     }
     pub fn load(path: &Path) -> Result<Self> {
         let config: Self = toml::from_str(
@@ -210,11 +239,27 @@ impl Config {
         );
         ensure!(
             self.max_steps <= 100,
-            "max_steps must be 0 (unlimited) or between 1 and 100"
+            "max_steps must be 0 (use task_action_limit) or between 1 and 100"
         );
         ensure!(
-            (30..=7200).contains(&self.run_timeout_seconds),
-            "run timeout must be 30..7200 seconds"
+            self.run_timeout_seconds == 0 || (30..=7200).contains(&self.run_timeout_seconds),
+            "run_timeout_seconds must be 0 (unset) or 30..7200 seconds"
+        );
+        ensure!(
+            (30..=7200).contains(&self.request_timeout_seconds),
+            "request_timeout_seconds must be 30..7200 seconds"
+        );
+        ensure!(
+            (30..=86400).contains(&self.idle_timeout_seconds),
+            "idle_timeout_seconds must be 30..86400 seconds"
+        );
+        ensure!(
+            matches!(self.task_timeout_seconds, None | Some(0) | Some(30..=604800)),
+            "task_timeout_seconds must be 0 (unlimited) or 30..604800 seconds"
+        );
+        ensure!(
+            (1..=1_000_000).contains(&self.task_action_limit),
+            "task_action_limit must be 1..1000000"
         );
         ensure!(
             self.vm.vnc_port > 0
@@ -286,6 +331,45 @@ mod tests {
         let mut c = Config::default();
         c.vm.codex_binary = "/bin/codex; id".into();
         assert!(c.validate().is_err());
+    }
+    #[test]
+    fn task_limits_roundtrip_and_validate() {
+        let mut c = Config::default();
+        c.validate().unwrap();
+        assert_eq!((c.request_timeout_seconds, c.idle_timeout_seconds), (600, 1800));
+        assert_eq!((c.task_timeout_seconds(), c.task_action_limit()), (0, 10_000));
+        c.task_timeout_seconds = Some(86_400);
+        c.idle_timeout_seconds = 3600;
+        c.task_action_limit = 500;
+        let back: Config = toml::from_str(&toml::to_string(&c).unwrap()).unwrap();
+        back.validate().unwrap();
+        assert_eq!(back.task_timeout_seconds, Some(86_400));
+        assert_eq!((back.idle_timeout_seconds, back.task_action_limit), (3600, 500));
+        let check = |edit: &dyn Fn(&mut Config)| { let mut c = Config::default(); edit(&mut c); c.validate().is_ok() };
+        assert!(check(&|c| c.task_timeout_seconds = Some(0)));
+        assert!(check(&|c| c.task_timeout_seconds = Some(604_800)));
+        for bad in [1, 29, 604_801] { assert!(!check(&|c| c.task_timeout_seconds = Some(bad))); }
+        for bad in [0, 29, 7201] { assert!(!check(&|c| c.request_timeout_seconds = bad)); }
+        for bad in [0, 29, 86_401] { assert!(!check(&|c| c.idle_timeout_seconds = bad)); }
+        for bad in [0, 1_000_001] { assert!(!check(&|c| c.task_action_limit = bad)); }
+        for bad in [1, 29, 7201] { assert!(!check(&|c| c.run_timeout_seconds = bad)); }
+        assert!(!check(&|c| c.max_steps = 101));
+    }
+    #[test]
+    fn legacy_limits_migrate_without_reviving_the_old_cutoff() {
+        let parse = |text: &str| { let c: Config = toml::from_str(text).unwrap(); c.validate().unwrap(); c };
+        // Existing installs wrote the old default explicitly.
+        let old = parse("max_steps = 0\nrun_timeout_seconds = 1800\n");
+        assert_eq!((old.task_timeout_seconds(), old.task_action_limit()), (0, 10_000));
+        assert_eq!(old.idle_timeout_seconds, 1800);
+        let custom = parse("max_steps = 40\nrun_timeout_seconds = 3600\n");
+        assert_eq!((custom.task_timeout_seconds(), custom.task_action_limit()), (3600, 40));
+        let explicit = parse("run_timeout_seconds = 3600\ntask_timeout_seconds = 0\n");
+        assert_eq!(explicit.task_timeout_seconds(), 0);
+        let explicit = parse("run_timeout_seconds = 3600\ntask_timeout_seconds = 7200\n");
+        assert_eq!(explicit.task_timeout_seconds(), 7200);
+        assert_eq!(parse("max_steps = 100\ntask_action_limit = 20\n").task_action_limit(), 20);
+        assert_eq!(parse("").task_timeout_seconds(), 0);
     }
     #[test]
     fn remote_requires_tls() {

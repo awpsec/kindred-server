@@ -39,17 +39,26 @@ fn can_resume(app: &App, run: &Run) -> Result<bool> {
     Ok(!c.query_row("SELECT EXISTS(SELECT 1 FROM events requested WHERE requested.run_id=? AND requested.kind='tool_requested' AND NOT EXISTS(SELECT 1 FROM events result WHERE result.run_id=requested.run_id AND result.kind='tool_result' AND result.seq>requested.seq AND json_extract(result.body,'$.call_id')=json_extract(requested.body,'$.call_id'))) OR EXISTS(SELECT 1 FROM connector_artifacts WHERE run_id=? AND status IN ('preparing','pending','approved','ready','executing','interrupted','failed'))",[&run.id,&run.id],|r|r.get::<_,bool>(0))?)
 }
 
+#[derive(Debug)]
+pub struct ActionLimit(pub usize);
+impl std::fmt::Display for ActionLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "This task reached its action limit ({}). Progress is saved. Review Activity before continuing; do not repeat completed actions.", self.0)
+    }
+}
+impl std::error::Error for ActionLimit {}
+
 pub fn check_tool_budget(app: &App, run: &Run) -> Result<()> {
-    if app.config.max_steps == 0 { return Ok(()); }
+    let limit = app.config.task_action_limit();
     let count: usize = app.db.0.lock().unwrap().query_row(
         "SELECT count(*) FROM events WHERE run_id=? AND kind='tool_requested'",
         [&run.id],
         |r| r.get(0),
     )?;
-    ensure!(
-        count < app.config.max_steps,
-        "This task reached its action limit. Completed actions are preserved in Activity."
-    );
+    if count >= limit {
+        app.db.event(&run.id, "run_limit", json!({"reason":"actions","limit":limit,"actions":count}))?;
+        return Err(ActionLimit(limit).into());
+    }
     Ok(())
 }
 
@@ -298,6 +307,29 @@ mod tests {
         assert!(check_tool_budget(&app, &run).is_err());
     }
 
+    #[test]
+    fn task_action_ceiling_applies_without_the_old_small_step_budget() {
+        let mut app = tests::app();
+        std::sync::Arc::get_mut(&mut app).unwrap().config.task_action_limit = 2;
+        assert_eq!(app.config.max_steps, 0);
+        let bot = tests::bot(&app.db, "claude-code");
+        let id = app.db.queue(&bot.id, "Long task", 0).unwrap();
+        let run = app.db.claim_bot(&bot.id).unwrap().unwrap();
+        for call in 0..2 {
+            check_tool_budget(&app, &run).unwrap();
+            app.db.event(&id, "tool_requested", json!({"call_id":call})).unwrap();
+            app.db.event(&id, "tool_result", json!({"call_id":call,"text":"Saved"})).unwrap();
+        }
+        let error = check_tool_budget(&app, &run).unwrap_err();
+        assert!(error.is::<ActionLimit>());
+        assert_eq!(crate::runtime::failure_status(&app, &run, &error), "interrupted");
+        assert!(!transient(&error));
+        assert!(app.db.events(&id).unwrap().iter().any(|e| e["kind"]=="run_limit" && e["body"]["reason"]=="actions"));
+        app.db.finish(&id, "interrupted", "", &error.to_string()).unwrap();
+        let next = app.db.continue_task(&id).unwrap();
+        assert_eq!(app.db.continue_task(&id).unwrap(), next);
+        assert_eq!(app.db.events(&id).unwrap().iter().filter(|e|e["kind"]=="tool_requested").count(),2);
+    }
     #[test]
     fn classifier_excludes_configuration_and_budget_failures() {
         for message in [

@@ -84,6 +84,13 @@ async fn account(app: &Shared, provider: &str, action: &str, v: &mut Value) -> R
     }
     Ok(result)
 }
+// Model silence and native connector execution are different phases. A native
+// call gets a fixed one-hour deadline; intervening frames cannot renew it.
+fn frame_timeout(ready: bool, request_seconds: u64, oldest_native: Option<Duration>) -> Duration {
+    oldest_native.map(|elapsed| Duration::from_secs(3600).saturating_sub(elapsed))
+        .unwrap_or_else(|| Duration::from_secs(if ready { request_seconds } else { 60 }))
+}
+
 pub async fn run(app: &App, bot: &Bot, run: &Run) -> Result<String> {
     ensure!(
         matches!(bot.provider.as_str(), "claude-code" | "kimi-code"),
@@ -122,13 +129,21 @@ pub async fn run(app: &App, bot: &Bot, run: &Run) -> Result<String> {
     let mut connector_rows: Vec<Value> = Vec::new();
     let mut connector_account = String::new();
     let mut connector_calls: HashMap<String, Value> = HashMap::new();
-    for _ in 0..10000 {
+    let mut connector_started: HashMap<String, tokio::time::Instant> = HashMap::new();
+    loop {
+        let native_elapsed = connector_started.values().map(|at| at.elapsed()).max();
+        // timeout(0, ready_future) can still return a ready frame. Check the
+        // deadline explicitly so a busy stream cannot keep an overdue call alive.
+        ensure!(native_elapsed.is_none_or(|elapsed| elapsed < Duration::from_secs(3600)),
+            "A native connector call exceeded its execution limit. Its external outcome is unknown; check it before continuing.");
         let frame = tokio::time::timeout(
-            Duration::from_secs(if ready { 240 } else { 60 }),
+            frame_timeout(ready, app.config.request_timeout_seconds, native_elapsed),
             crate::pi::read(&mut output),
         )
         .await
-        .context("Subscription provider timed out")??;
+        .context(if native_elapsed.is_some() {
+            "A native connector call exceeded its execution limit. Its external outcome is unknown; check it before continuing."
+        } else { "Subscription provider timed out" })??;
         match frame["type"].as_str().unwrap_or("") {
             "connector_catalogue"
                 if !ready && bot.provider == "claude-code" && connector_account.is_empty() =>
@@ -271,6 +286,8 @@ pub async fn run(app: &App, bot: &Bot, run: &Run) -> Result<String> {
                             && previous["forced"] != true,
                         "Changed connector permission request"
                     );
+                    // Permission review is a human wait, not connector execution.
+                    connector_started.remove(id);
                     args["artifact_id"] = previous["artifact_id"].clone();
                     connector_calls.get_mut(id).unwrap()["forced"] = json!(true);
                 } else {
@@ -305,6 +322,7 @@ pub async fn run(app: &App, bot: &Bot, run: &Run) -> Result<String> {
                 connector_calls.insert(id.into(), args.clone());
                 ensure!(!app.db.cancelled(&run.id), "Run cancelled");
                 if approved {
+                    connector_started.insert(id.into(), tokio::time::Instant::now());
                     crate::connector_artifacts::dispatch(&app.db, run, &args)?;
                     app.db.event(
                         &run.id,
@@ -320,6 +338,7 @@ pub async fn run(app: &App, bot: &Bot, run: &Run) -> Result<String> {
             }
             "connector_result" if ready && bot.provider == "claude-code" => {
                 let id = runtime::string(&frame, "id")?;
+                connector_started.remove(id);
                 let args = connector_calls
                     .remove(id)
                     .context("Unexpected connector execution receipt")?;
@@ -348,6 +367,7 @@ pub async fn run(app: &App, bot: &Bot, run: &Run) -> Result<String> {
                         && allowed.contains(name),
                     "Invalid provider tool request"
                 );
+                crate::provider_retry::check_tool_budget(app, run)?;
                 let result = runtime::call_tool(app, bot, run, name, frame["args"].clone())
                     .await
                     .unwrap_or_else(|e| json!({"text":e.to_string(),"failed":true}));
@@ -391,12 +411,19 @@ pub async fn run(app: &App, bot: &Bot, run: &Run) -> Result<String> {
             _ => bail!("Unexpected subscription provider frame"),
         }
     }
-    bail!("Provider event limit reached")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn long_native_calls_have_a_separate_nonrenewing_deadline() {
+        assert_eq!(frame_timeout(false, 600, None), Duration::from_secs(60));
+        assert_eq!(frame_timeout(true, 600, None), Duration::from_secs(600));
+        assert_eq!(frame_timeout(true, 600, Some(Duration::from_secs(300))), Duration::from_secs(3300));
+        assert_eq!(frame_timeout(true, 600, Some(Duration::from_secs(3590))), Duration::from_secs(10));
+        assert_eq!(frame_timeout(true, 600, Some(Duration::from_secs(3601))), Duration::ZERO);
+    }
     #[test]
     fn claude_session_expiry_requires_provider_error_provenance() {
         let text = "Failed to authenticate: OAuth session expired and could not be refreshed";

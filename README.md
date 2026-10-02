@@ -66,3 +66,5 @@ source on `main` may contain changes that have not shipped yet.
 
 [MIT](LICENSE). Third-party components retain their own [licenses](THIRD_PARTY_NOTICES.md).
 Kindred is independent and is not affiliated with or endorsed by its model or connector providers.
+
+[Long-running tasks and runtime limits](docs/LONG_RUNNING_TASKS.md)

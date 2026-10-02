@@ -4,9 +4,14 @@ public_url = "http://127.0.0.1:7340"
 allowed_origins = []
 database = "/var/lib/kindred/kindred.db"
 token_env = "KINDRED_TOKEN"
-max_steps = 0 # Unlimited tool calls; set 1..100 for an explicit limit.
+max_steps = 0 # Use task_action_limit; set 1..100 for a lower per-task limit.
 max_parallel_runs = 4
-run_timeout_seconds = 1800
+# Healthy tasks have no total time cutoff. Request/tool failures remain bounded.
+request_timeout_seconds = 600
+idle_timeout_seconds = 1800
+task_timeout_seconds = 0
+# A task-wide ceiling, including safe provider retries. Lower max_steps still wins.
+task_action_limit = 10000
 
 [vm]
 control_helper = "/usr/local/libexec/kindred-virsh"
