@@ -27,7 +27,11 @@ fn validate(v:&Value)->Result<()> {
  ensure!(v["source"].as_str().is_some_and(|s|s.len()<=64000),"Source must be text up to 64 KB");
  ensure!(v.get("kind").is_none()||matches!(v["kind"].as_str(),Some("document"|"slides"|"sheet"|"app")),"Use document, slides, sheet or app");
  ensure!(v.get("folder").is_none()||v["folder"].as_str().is_some_and(|s|s.len()<=120&&!s.chars().any(char::is_control)),"Folder must be text up to 120 bytes");
- ensure!(v["state"].to_string().len()<=32000,"Shared state exceeds 32 KB");Ok(())
+ // Rich document state includes the structured editing model as well as its
+ // rendered HTML. Keep ordinary shared state bounded independently.
+ let rich=v["kind"]=="document" && v["language"]=="html" && v["source"].as_str().is_some_and(|s|s.starts_with("<!--kindred-document-v1-->"));
+ if rich {let mut shared=v["state"].clone();if let Some(object)=shared.as_object_mut(){object.remove("kindredDocument");}ensure!(shared.to_string().len()<=32000,"Shared state exceeds 32 KB");ensure!(v["state"].to_string().len()<=256000,"Formatted document exceeds 256 KB");}
+ else {ensure!(v["state"].to_string().len()<=32000,"Shared state exceeds 32 KB");}Ok(())
 }
 fn record(c:&Connection,id:&str)->Result<Value> {
  let (body,chat,bot,revision,updated,archived):(String,String,String,i64,i64,bool)=c.query_row("SELECT body,chat_id,bot_id,revision,updated,archived FROM workspace_artifacts WHERE id=?",[id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).context("Artifact not found in this workspace")?;
@@ -112,6 +116,14 @@ pub async fn create(State(app):State<Shared>,Json(args):Json<Value>)->Result<Jso
 pub async fn get(State(app):State<Shared>,Path(id):Path<String>)->Result<Json<Value>,crate::web::Error>{Ok(Json(app.db.workspace_artifact_read(&id)?))}
 pub async fn update(State(app):State<Shared>,Path(id):Path<String>,Json(patch):Json<Value>)->Result<Json<Value>,crate::web::Error>{Ok(Json(app.db.workspace_artifact_update(&id,&patch)?))}
 #[cfg(test)] mod tests {
+ #[test] fn native_document_state_has_a_separate_bounded_budget(){
+  let mut v=serde_json::json!({"title":"Doc","kind":"document","language":"html","source":"<!--kindred-document-v1--><main></main>","state":{"kindredDocument":{"version":1,"html":"a".repeat(40000)}}});
+  assert!(super::validate(&v).is_ok());
+  v["state"]["ordinary"]=serde_json::json!("a".repeat(33000));assert!(super::validate(&v).is_err());
+  v["state"].as_object_mut().unwrap().remove("ordinary");v["source"]=serde_json::json!("<main></main>");assert!(super::validate(&v).is_err());
+  v["source"]=serde_json::json!("<!--kindred-document-v1--><main></main>");v["state"]["kindredDocument"]["html"]=serde_json::json!("a".repeat(256001));assert!(super::validate(&v).is_err());
+ }
+
  use super::*;
  #[test]fn folders_survive_reopen_migrate_and_reorder_without_losing_new_folders(){
   let dir=std::env::temp_dir().join(format!("kindred-folder-test-{}",db::id()));std::fs::create_dir_all(&dir).unwrap();let path=dir.join("workspace.db");let db=Db::open(path.to_str().unwrap()).unwrap();

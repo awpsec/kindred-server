@@ -144,6 +144,9 @@ fn docx(source: &str) -> Result<Vec<u8>> {
     }
     close(&mut body, &mut paragraph);
     ensure!(!cell, "Invalid document table");
+    word_package(&body)
+}
+fn word_package(body: &str) -> Result<Vec<u8>> {
     let document = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?><w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:body>{body}<w:sectPr><w:pgSz w:w=\"12240\" w:h=\"15840\"/><w:pgMar w:top=\"720\" w:right=\"720\" w:bottom=\"720\" w:left=\"720\"/></w:sectPr></w:body></w:document>"
     );
@@ -166,6 +169,48 @@ fn docx(source: &str) -> Result<Vec<u8>> {
     }
     Ok(zip.finish()?.into_inner())
 }
+
+fn rich_runs(v: &Value) -> String {
+    if v["type"]=="hardBreak" {return "<w:r><w:br/></w:r>".into();}
+    if v["type"]=="text" {
+        let mut props=String::new();
+        for mark in v["marks"].as_array().into_iter().flatten() {
+            match mark["type"].as_str().unwrap_or("") {
+                "bold"=>props.push_str("<w:b/>"), "italic"=>props.push_str("<w:i/>"),
+                "underline"=>props.push_str("<w:u w:val=\"single\"/>"), "strike"=>props.push_str("<w:strike/>"),
+                "textStyle"=>{
+                    let a=&mark["attrs"];
+                    if let Some(font)=a["fontFamily"].as_str(){props.push_str(&format!("<w:rFonts w:ascii=\"{}\" w:hAnsi=\"{}\"/>",xml(font),xml(font)));}
+                    if let Some(size)=a["fontSize"].as_str().and_then(|s|s.trim_end_matches("px").parse::<f64>().ok()).filter(|n|n.is_finite()) {props.push_str(&format!("<w:sz w:val=\"{}\"/>",(size.clamp(6.,200.)*1.5).round() as u32));}
+                    if let Some(c)=a["color"].as_str().and_then(|c|c.strip_prefix('#')).filter(|c|c.len()==6&&c.bytes().all(|b|b.is_ascii_hexdigit())){props.push_str(&format!("<w:color w:val=\"{c}\"/>"));}
+                },_=>{}
+            }
+        }
+        return format!("<w:r><w:rPr>{props}</w:rPr><w:t xml:space=\"preserve\">{}</w:t></w:r>",xml(v["text"].as_str().unwrap_or("")));
+    }
+    v["content"].as_array().into_iter().flatten().map(rich_runs).collect()
+}
+fn rich_blocks(v: &Value, depth: usize) -> Result<String> {
+    ensure!(depth<64,"Document nesting is too deep");
+    let children=v["content"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+    let mut body=String::new();
+    match v["type"].as_str().unwrap_or("") {
+        "paragraph"|"heading"|"codeBlock"=>{
+            let mut props=String::new();
+            if v["type"]=="heading" {let level=v["attrs"]["level"].as_u64().unwrap_or(1).clamp(1,6);props.push_str(&format!("<w:pStyle w:val=\"Heading{level}\"/>"));}
+            if let Some(align)=v["attrs"]["textAlign"].as_str().filter(|s|["left","center","right","justify"].contains(s)){props.push_str(&format!("<w:jc w:val=\"{}\"/>",if align=="justify"{"both"}else{align}));}
+            body=format!("<w:p><w:pPr>{props}</w:pPr>{}</w:p>",rich_runs(v));
+        },
+        "table"=>{body.push_str("<w:tbl><w:tblPr><w:tblBorders><w:top w:val=\"single\" w:sz=\"4\"/><w:left w:val=\"single\" w:sz=\"4\"/><w:bottom w:val=\"single\" w:sz=\"4\"/><w:right w:val=\"single\" w:sz=\"4\"/><w:insideH w:val=\"single\" w:sz=\"4\"/><w:insideV w:val=\"single\" w:sz=\"4\"/></w:tblBorders></w:tblPr>");for c in children{body.push_str(&rich_blocks(c,depth+1)?);}body.push_str("</w:tbl>");},
+        "tableRow"=>{body.push_str("<w:tr>");for c in children{body.push_str(&rich_blocks(c,depth+1)?);}body.push_str("</w:tr>");},
+        "tableCell"|"tableHeader"=>{body.push_str("<w:tc>");for c in children{body.push_str(&rich_blocks(c,depth+1)?);}if children.is_empty()||children.last().is_some_and(|c|c["type"]=="table"){body.push_str("<w:p/>");}body.push_str("</w:tc>");},
+        "bulletList"|"orderedList"=>{let start=v["attrs"]["start"].as_u64().unwrap_or(1);for (i,c) in children.iter().enumerate(){let mut item=rich_blocks(c,depth+1)?;let prefix=if v["type"]=="orderedList"{format!("{}. ",start+i as u64)}else{"• ".into()};let run=format!("<w:r><w:t xml:space=\"preserve\">{prefix}</w:t></w:r>");if let Some(at)=item.find("</w:pPr>"){item.insert_str(at+"</w:pPr>".len(),&run);}body.push_str(&item);}},
+        "image"=>{body=format!("<w:p><w:r><w:t>{}</w:t></w:r></w:p>",xml(v["attrs"]["alt"].as_str().unwrap_or("[Image]")));},
+        "horizontalRule"=>body="<w:p><w:pPr><w:pBdr><w:bottom w:val=\"single\" w:sz=\"4\"/></w:pBdr></w:pPr></w:p>".into(),
+        _=>for c in children{body.push_str(&rich_blocks(c,depth+1)?);}
+    }
+    Ok(body)
+}
 pub fn export(v: &Value) -> Result<Value> {
     let source = v["source"].as_str().unwrap_or("");
     let (extension, mime, bytes) = match v["language"].as_str() {
@@ -173,6 +218,10 @@ pub fn export(v: &Value) -> Result<Value> {
             "docx",
             "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             docx(source)?,
+        ),
+        Some("html") if source.starts_with("<!--kindred-document-v1-->") && v["state"]["kindredDocument"]["html"].as_str().is_some_and(|html|source.ends_with(&format!("<main>{html}</main>"))) => (
+            "docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            word_package(&rich_blocks(&v["state"]["kindredDocument"]["document"], 0)?)?,
         ),
         Some("html") => {
             let state = serde_json::to_string(&v["state"])?.replace('<', "\\u003c");
@@ -220,6 +269,20 @@ pub fn export(v: &Value) -> Result<Value> {
 mod tests {
     use super::*;
     use std::io::Read;
+
+    #[test]
+    fn rich_document_keeps_formatting_and_revision_in_docx() {
+        use std::io::Read;
+        let html="<p>Saved & edited</p>";
+        let document=json!({"type":"doc","content":[{"type":"paragraph","attrs":{"textAlign":"center"},"content":[{"type":"text","text":"Saved & edited","marks":[{"type":"bold"},{"type":"underline"},{"type":"textStyle","attrs":{"fontFamily":"Georgia","fontSize":"20px","color":"#123456"}}]}]},{"type":"orderedList","content":[{"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"One"}]}]}]}]});
+        let mut v=json!({"kind":"document","title":"Report","language":"html","revision":9,"source":format!("<!--kindred-document-v1--><style></style><main>{html}</main>"),"state":{"kindredDocument":{"version":1,"html":html,"document":document}}});
+        let result=export(&v).unwrap();assert_eq!(result["filename"],"Report.docx");assert_eq!(result["revision"],9);
+        let bytes=STANDARD.decode(result["data_base64"].as_str().unwrap()).unwrap();
+        let mut zip=zip::ZipArchive::new(Cursor::new(bytes)).unwrap();let mut body=String::new();zip.by_name("word/document.xml").unwrap().read_to_string(&mut body).unwrap();
+        for part in ["Saved &amp; edited","w:ascii=\"Georgia\"","w:sz w:val=\"30\"","w:color w:val=\"123456\"","w:jc w:val=\"center\"","<w:b/>","<w:u w:val=\"single\"/>","</w:pPr><w:r><w:t xml:space=\"preserve\">1. </w:t>"] {assert!(body.contains(part),"Missing {part}: {body}");}
+        // A bot/source update must never download stale rich-editor state.
+        v["source"]=json!("<!--kindred-document-v1--><main>New source</main>");assert_eq!(export(&v).unwrap()["filename"],"Report.html");
+    }
     #[test]
     fn snapshots_keep_saved_state_and_document_mode() {
         let v = json!({"title":"A/report","language":"html","revision":7,"source":"<!doctype html><html><head></head><body>Page</body></html>","state":{"text":"</script><script>bad()</script>"}});
