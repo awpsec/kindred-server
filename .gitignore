@@ -5,6 +5,8 @@ kindred.toml
 *.env
 *.db*
 *.pem
+# Public, test-only RSA key used by mobile push signature tests. Never use for real credentials.
+!/src/test-fixtures/mobile-push-test-rsa.pem
 /dist/
 /desktop/gen/
 node_modules/
