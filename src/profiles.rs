@@ -33,6 +33,8 @@ mod server_chats;
 mod password_reset;
 #[path = "mobile_push_routes.rs"]
 mod mobile_push_routes;
+#[path = "mobile_pairing.rs"]
+mod mobile_pairing;
 
 type Portal = Arc<Profiles>;
 type ApiResult = std::result::Result<Json<Value>, web::Error>;
@@ -135,6 +137,7 @@ impl Profiles {
             CREATE INDEX IF NOT EXISTS sessions_expiry ON sessions(expires);")?;
         server_chats::migrate(&registry)?;
         password_reset::migrate(&registry)?;
+        mobile_pairing::migrate(&registry)?;
         let push = crate::mobile_push::Settings::from_env();
         let push_platforms = push.platforms();
         let portal = Arc::new(Self {
@@ -384,6 +387,7 @@ pub fn router(portal: Portal) -> Router {
     Router::new()
         .merge(server_chats::routes())
         .merge(mobile_push_routes::routes())
+        .merge(mobile_pairing::routes())
         .route("/identity/meta", get(meta))
         .route("/identity/register", post(register))
         .route("/identity/login", post(login))
@@ -458,7 +462,7 @@ async fn meta(State(p): State<Portal>) -> ApiResult {
         r.get(0)
     })?;
     Ok(Json(
-        json!({"profiles":true,"server_chats":true,"deployment":if std::env::var("KINDRED_DEPLOYMENT").as_deref()==Ok("standalone"){"standalone"}else{"hosted"},"first_user":first,"legacy_claim":first&&p.legacy.is_some(),"registration":p.registration_open(&c)?,"version":env!("CARGO_PKG_VERSION")}),
+        json!({"profiles":true,"server_chats":true,"mobile_pairing":true,"deployment":if std::env::var("KINDRED_DEPLOYMENT").as_deref()==Ok("standalone"){"standalone"}else{"hosted"},"first_user":first,"legacy_claim":first&&p.legacy.is_some(),"registration":p.registration_open(&c)?,"version":env!("CARGO_PKG_VERSION")}),
     ))
 }
 async fn register(State(p): State<Portal>, headers: HeaderMap, Json(v): Json<Value>) -> ApiResult {

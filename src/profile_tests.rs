@@ -1311,3 +1311,76 @@ async fn legacy_device_tokens_cannot_register_mobile_push() {
     let body = json!({"platform":"ios","token":"ab".repeat(32),"environment":"production","account_id":db::id()});
     assert_eq!(f.request("PUT", &path, "legacy-owner-token-12345678901234567890", body).await.0, 401);
 }
+
+fn mobile_pairing_fixture() -> Fixture {
+    let mut f=Fixture::new(false);
+    let mut config=f.p.config.clone();
+    config.allowed_origins=vec!["https://kindred.example".into(),"https://server.example".into()];
+    f.p=Profiles::open(config,None,false).unwrap();
+    f
+}
+fn mobile_pairing_code(value: &Value) -> String {
+    let url=reqwest::Url::parse(value["url"].as_str().unwrap()).unwrap();
+    assert_eq!(url.scheme(),"kindred"); assert_eq!(url.host_str(),Some("pair"));
+    let code=url.fragment().unwrap().strip_prefix("code=").unwrap().to_owned();
+    assert_eq!(code.len(),64);code
+}
+#[tokio::test]
+async fn mobile_pairing_preserves_account_profile_and_consumes_once() {
+    let f=mobile_pairing_fixture();let account=f.register("phone-owner").await;
+    let token=account["token"].as_str().unwrap();let identity=f.p.identity(token).unwrap();
+    let (unauth,_)=f.request("POST","/identity/mobile-pairing","",json!({"server":"https://kindred.example"})).await;
+    assert_ne!(unauth,200);
+    let (_,profile)=f.request("POST","/identity/profiles",token,json!({"name":"Work"})).await;
+    let (_,switched)=f.request("POST","/identity/switch",token,json!({"profile_id":profile["id"]})).await;
+    let token=switched["token"].as_str().unwrap();
+    let (status,issued)=f.request("POST","/identity/mobile-pairing",token,json!({"server":"https://kindred.example"})).await;
+    assert_eq!(status,200,"{issued}");let code=mobile_pairing_code(&issued);
+    let width=issued["qr"]["width"].as_u64().unwrap() as usize;
+    assert_eq!(issued["qr"]["modules"].as_array().unwrap().len(),width*width);
+    let stored:Vec<u8>=f.p.registry.lock().unwrap().query_row("SELECT digest FROM mobile_pairings WHERE id=?",[issued["id"].as_str().unwrap()],|r|r.get(0)).unwrap();
+    assert_eq!(stored,hash(&code));assert_ne!(stored,code.as_bytes());
+    let claim=f.request("POST","/identity/mobile-pairing/claim","",json!({"code":code}));
+    let duplicate=f.request("POST","/identity/mobile-pairing/claim","",json!({"code":code}));
+    let (a,b)=tokio::join!(claim,duplicate);assert_ne!(a.0,b.0);
+    let phone=if a.0==200 {a.1}else{assert_eq!(b.0,200);b.1};
+    let mobile_token=phone["token"].as_str().unwrap();assert_ne!(mobile_token,token);
+    let mobile=f.p.identity(mobile_token).unwrap();assert_eq!(mobile.account,identity.account);assert_eq!(mobile.profile,profile["id"].as_str().unwrap());
+    assert_eq!(phone["login"],"phone-owner");assert_eq!(phone["account_id"],identity.account);
+    let path=format!("/identity/mobile-pairing/{}",issued["id"].as_str().unwrap());
+    assert_eq!(f.request("GET",&path,token,Value::Null).await.1["status"],"claimed");
+    f.request("POST","/identity/logout",token,json!({})).await;
+    assert!(f.p.identity(mobile_token).is_ok(),"Phone has its own session");
+}
+#[tokio::test]
+async fn mobile_pairing_expires_cancels_and_tracks_issuer_revocation() {
+    let f=mobile_pairing_fixture();let one=f.register("pair-one").await;let two=f.register("pair-two").await;
+    let token=one["token"].as_str().unwrap();let other=two["token"].as_str().unwrap();
+    for mode in ["cancel","replace","expire","revoke"] {
+        let (_,issued)=f.request("POST","/identity/mobile-pairing",token,json!({"server":"https://server.example"})).await;
+        let path=format!("/identity/mobile-pairing/{}",issued["id"].as_str().unwrap());
+        f.request("DELETE",&path,other,Value::Null).await;
+        assert_eq!(f.request("GET",&path,token,Value::Null).await.1["status"],"pending");
+        assert_eq!(f.request("GET",&path,other,Value::Null).await.1["status"],"expired");
+        match mode {
+            "cancel"=>{f.request("DELETE",&path,token,Value::Null).await;},
+            "replace"=>{f.request("POST","/identity/mobile-pairing",token,json!({"server":"https://server.example"})).await;},
+            "expire"=>{f.p.registry.lock().unwrap().execute("UPDATE mobile_pairings SET expires=0",[]).unwrap();},
+            _=>{f.request("POST","/identity/logout",token,json!({})).await;},
+        }
+        let (status,_)=f.request("POST","/identity/mobile-pairing/claim","",json!({"code":mobile_pairing_code(&issued)})).await;
+        assert_ne!(status,200,"{mode}");
+    }
+}
+#[tokio::test]
+async fn mobile_pairing_rejects_local_addresses_and_untrusted_browser_claims() {
+    let f=mobile_pairing_fixture();let one=f.register("pair-origin").await;let token=one["token"].as_str().unwrap();
+    for address in ["http://server.example","https://localhost","https://127.0.0.1","https://[::1]","https://[::ffff:127.0.0.1]","https://0.0.0.0","https://user@server.example","https://server.example/path","https://server.example?query=yes","https://unconfigured.example","https://server.example."] {
+        assert_ne!(f.request("POST","/identity/mobile-pairing",token,json!({"server":address})).await.0,200,"{address}");
+    }
+    let (_,issued)=f.request("POST","/identity/mobile-pairing",token,json!({"server":"https://server.example"})).await;
+    let body=json!({"code":mobile_pairing_code(&issued)});
+    let request=Request::builder().method("POST").uri("/identity/mobile-pairing/claim").header("content-type","application/json").header("origin","https://evil.example").body(Body::from(body.to_string())).unwrap();
+    assert_ne!(router(f.p.clone()).oneshot(request).await.unwrap().status(),200);
+    assert_eq!(f.request("POST","/identity/mobile-pairing/claim","",body).await.0,200);
+}

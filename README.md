@@ -68,3 +68,5 @@ source on `main` may contain changes that have not shipped yet.
 Kindred is independent and is not affiliated with or endorsed by its model or connector providers.
 
 [Long-running tasks and runtime limits](docs/LONG_RUNNING_TASKS.md)
+
+[Connect the mobile app](docs/MOBILE_PAIRING.md) covers QR account pairing, reachable server addresses, and code expiry.
