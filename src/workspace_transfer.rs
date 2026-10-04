@@ -197,7 +197,8 @@ impl Db {
         for provider in &custom {
             crate::provider_accounts::validate(provider)?;
         }
-        let settings = json!({"general":general.map(|s|serde_json::from_str::<Value>(&s)).transpose()?.unwrap_or(json!({})),"custom_providers":custom});
+        let primary=crate::primary_bot::selected(&tx)?;
+        let settings = json!({"primary_bot":primary,"general":general.map(|s|serde_json::from_str::<Value>(&s)).transpose()?.unwrap_or(json!({})),"custom_providers":custom});
         let package = json!({"format":"kindred-workspace","format_version":1,"id":id,"name":name,"created":db::now(),"tables":tables,"settings":settings});
         let serialized = serde_json::to_string(&package)?;
         ensure!(
@@ -371,6 +372,12 @@ impl Db {
             "UPDATE reminders SET status='paused',revision=revision+1 WHERE status='pending'",
             [],
         )?;
+        let primary=&package["settings"]["primary_bot"];
+        ensure!(primary.is_null()||primary.is_string(),"Invalid primary bot preference");
+        if let Some(id)=primary.as_str(){
+            ensure!(tx.query_row("SELECT EXISTS(SELECT 1 FROM bots WHERE id=? AND COALESCE(json_extract(profile,'$.archived'),0)=0)",[id],|r|r.get::<_,bool>(0))?,"Primary bot is not active in this workspace");
+        }
+        tx.execute("INSERT INTO settings(key,value) VALUES('primary_bot',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[primary.to_string()])?;
         let mut general = package["settings"]["general"].clone();
         ensure!(general.is_object(), "Invalid workspace preferences");
         general["local_access"] = json!(false);

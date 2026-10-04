@@ -348,6 +348,7 @@ impl Db {
         }
         write_bot(&tx, b, preserve_text)?;
         if b.profile.archived {
+            tx.execute("DELETE FROM settings WHERE key='primary_bot' AND json_extract(value,'$')=?",[&b.id])?;
             crate::routine_controls::remove_archived_bot_schedules(&tx)?;
             crate::chats::archive_inactive_bot_chats(&tx)?;
         }

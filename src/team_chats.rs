@@ -190,6 +190,9 @@ fn addressed_mode(
 /// Choose one default recipient without an inference call. Explicit addresses and
 /// broadcasts are handled by the caller; every member can still read the history.
 pub fn default_recipient(body: &str, description: &str, members: &[(String, String)], recent: &[String]) -> Vec<String> {
+    default_recipient_with_primary(body,description,members,recent,None)
+}
+pub fn default_recipient_with_primary(body: &str, description: &str, members: &[(String,String)], recent: &[String], primary: Option<&str>) -> Vec<String> {
     if members.is_empty() { return vec![]; }
     let text = visible_text(body).to_lowercase();
     let owners: Vec<_> = members.iter().filter(|(_, name)| {
@@ -207,6 +210,7 @@ pub fn default_recipient(body: &str, description: &str, members: &[(String, Stri
     if let Some(id) = recent.iter().find(|id| members.iter().any(|(member, _)| member == *id)) {
         return vec![id.clone()];
     }
+    if let Some(id)=primary.filter(|id|members.iter().any(|(member,_)|member==id)){return vec![id.to_owned()];}
     vec![members.iter().min_by_key(|(id,_)| id).unwrap().0.clone()]
 }
 
@@ -1010,6 +1014,15 @@ mod group_creation_tests {
 #[cfg(test)]
 mod lightweight_routing_tests {
     use super::*;
+    #[test]
+    fn primary_bot_only_fills_unassigned_member_routing() {
+        let members=vec![("a".into(),"Atlas".into()),("b".into(),"Piper".into())];
+        assert_eq!(default_recipient_with_primary("Hello","",&members,&[],Some("b")),vec!["b"]);
+        assert_eq!(default_recipient_with_primary("Hello","",&members,&[],Some("foreign")),vec!["a"]);
+        assert_eq!(default_recipient_with_primary("Continue","",&members,&["a".into()],Some("b")),vec!["a"]);
+        assert_eq!(default_recipient_with_primary("Hello","Atlas coordinates",&members,&[],Some("b")),vec!["a"]);
+        assert_eq!(default_recipient_with_primary("Summarize Atlas's work","",&members,&[],Some("b")),vec!["a"]);
+    }
     #[test]
     fn bounded_routing_uses_owner_coordinator_recent_speaker_then_stable_fallback() {
         let members=vec![("a".into(),"Atlas".into()),("b".into(),"Piper".into()),("c".into(),"Scratch".into())];

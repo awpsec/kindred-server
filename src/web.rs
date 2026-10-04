@@ -168,6 +168,7 @@ pub fn router(app: Shared) -> Router {
         )
         .route("/routines/{id}/run", post(run_routine_now))
         .route("/settings", get(settings).put(save_settings))
+        .route("/primary-bot", put(save_primary_bot))
         .route(
             "/settings/timezone/initialize",
             post(crate::timezone::initialize_route),
@@ -307,7 +308,7 @@ async fn status(
     Query(screen): Query<ScreenQuery>,
 ) -> Result<Json<Value>> {
     Ok(Json(
-        json!({"version":env!("CARGO_PKG_VERSION"),"vm":app.config.vm.domain,"maintenance":crate::vm_maintenance::state(&app.db)?,"control_pauses":crate::screen_control::paused(&app.db)?,"public_url":app.config.public_url,"takeover":app.db.screen_takeover(screen_slot(&app,&screen.bot_id)?)?,"openrouter_configured":crate::connections::openrouter_key(&app).is_some(),"openrouter_zdr":app.config.openrouter.require_zdr,"max_steps":app.config.task_action_limit(),"screen_bot_id":screen.bot_id,"computer_pointer":app.db.setting(&format!("computer-pointer:{}",screen.bot_id))?,"computer_busy":app.screen_lock(screen_slot(&app,&screen.bot_id)?).try_lock().is_err() || app.db.screen_quiet(screen_slot(&app,&screen.bot_id)?)?>db::now(),"computer_recovering_seconds":(app.db.screen_quiet(screen_slot(&app,&screen.bot_id)?)?-db::now()).max(0)}),
+        json!({"primary_bot_id":crate::primary_bot::get(&app.db)?,"version":env!("CARGO_PKG_VERSION"),"vm":app.config.vm.domain,"maintenance":crate::vm_maintenance::state(&app.db)?,"control_pauses":crate::screen_control::paused(&app.db)?,"public_url":app.config.public_url,"takeover":app.db.screen_takeover(screen_slot(&app,&screen.bot_id)?)?,"openrouter_configured":crate::connections::openrouter_key(&app).is_some(),"openrouter_zdr":app.config.openrouter.require_zdr,"max_steps":app.config.task_action_limit(),"screen_bot_id":screen.bot_id,"computer_pointer":app.db.setting(&format!("computer-pointer:{}",screen.bot_id))?,"computer_busy":app.screen_lock(screen_slot(&app,&screen.bot_id)?).try_lock().is_err() || app.db.screen_quiet(screen_slot(&app,&screen.bot_id)?)?>db::now(),"computer_recovering_seconds":(app.db.screen_quiet(screen_slot(&app,&screen.bot_id)?)?-db::now()).max(0)}),
     ))
 }
 async fn bots(State(app): State<Shared>) -> Result<Json<Vec<Bot>>> {
@@ -665,7 +666,16 @@ async fn delete_routine(State(app): State<Shared>, Path(id): Path<String>) -> Re
     )?))
 }
 async fn settings(State(app): State<Shared>) -> Result<Json<Value>> {
-    Ok(Json(db::general_settings(app.db.setting("general")?)))
+    let mut value=db::general_settings(app.db.setting("general")?);
+    value["primary_bot_id"]=json!(crate::primary_bot::get(&app.db)?);
+    Ok(Json(value))
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PrimaryBotSelection { bot_id: Option<String> }
+async fn save_primary_bot(State(app): State<Shared>, Json(value): Json<PrimaryBotSelection>) -> Result<Json<Value>> {
+    crate::primary_bot::set(&app.db, value.bot_id.as_deref())?;
+    Ok(Json(json!({"bot_id":crate::primary_bot::get(&app.db)?})))
 }
 async fn save_settings(State(app): State<Shared>, Json(v): Json<Value>) -> Result<Json<Value>> {
     let prior = db::general_settings(app.db.setting("general")?);
@@ -750,6 +760,8 @@ async fn save_settings(State(app): State<Shared>, Json(v): Json<Value>) -> Resul
     }
     let settings = json!({"progress_updates":progress_updates,"default_provider":default_provider,"model_defaults":model_defaults,"local_access":local_access,"approval_mode":approval,"name":name,"identity":identity,"theme":theme,"reduced_motion":v["reduced_motion"]==true,"notifications":notifications,"show_activity":show_activity,"separate_bot_chats":separate_bot_chats,"timezone":timezone,"timezone_mode":timezone_mode});
     app.db.save_setting("general", &settings)?;
+    let mut settings=settings;
+    settings["primary_bot_id"]=json!(crate::primary_bot::get(&app.db)?);
     Ok(Json(settings))
 }
 async fn connections(State(app): State<Shared>) -> Result<Json<Value>> {

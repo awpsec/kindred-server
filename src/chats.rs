@@ -581,7 +581,7 @@ impl Db {
         } else {
             let recent = tx.prepare("SELECT sender FROM chat_messages WHERE chat_id=? AND kind IN ('message','assistant','result') AND sender!='user' AND suppressed=0 ORDER BY seq DESC LIMIT 12")?
                 .query_map([id], |r| r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
-            crate::team_chats::default_recipient(prompt, &chat.description, &crate::team_chats::members(&tx, &chat)?, &recent)
+            crate::team_chats::default_recipient_with_primary(prompt, &chat.description, &crate::team_chats::members(&tx, &chat)?, &recent, crate::primary_bot::selected(&tx)?.as_deref())
         };
         ensure!(targets.len() <= 6, "Too many mentions");
         let round = db::id();

@@ -7,7 +7,7 @@ use anyhow::{Result, bail};
 use rusqlite::OptionalExtension;
 use serde_json::{Value, json};
 
-pub const VERSION: &str = "34";
+pub const VERSION: &str = "35";
 pub const CORE: &str = include_str!("prompts/00-core.md");
 pub const BOUNDED_CORE: &str = include_str!("prompts/00-bounded-core.md");
 pub const CHAPTERS: &[(&str, &str)] = &[
@@ -274,7 +274,11 @@ pub fn build(
         );
         history["order"] = json!("newest_first");
         history["database_window_limit"] = json!(300);
-        let fallback_responder = if chat.id.starts_with("dm-") { Value::Null } else { group_reply_nominee(&members) };
+        let preferred=crate::primary_bot::get(&app.db)?;
+        let fallback_responder = if chat.id.starts_with("dm-") { Value::Null } else {
+            members.iter().find(|m| m["kind"]=="bot" && m["archived"]!=true && preferred.as_deref().is_some_and(|id|m["id"]==id))
+                .map(|m|json!({"id":m["id"],"name":m["name"]})).unwrap_or_else(||group_reply_nominee(&members))
+        };
         json!({"fallback_responder":fallback_responder,"reply_coordination":"Kindred routes general human messages to one recipient without polling every bot. If this run is a human message routed to you, answer it naturally or delegate to the right teammate; do not defer solely because fallback_responder names another bot. Explicit addresses, quoted replies and requests for everyone retain their chosen recipients. For bot-to-bot messages, defer to the addressed bot or task owner. If none is clear, fallback_responder supplies the common nominee; only that bot gives the main answer. Other bots finish quietly unless adding a missing firsthand fact or correction. Explicit requests for each bot's update, separate assignments, and questions directed to you override this fallback. Do not announce this selection process.","id":chat.id,"name":chat.name,"description":chat.description,"bot_only":chat.bot_only,"human_participation":if chat.id.starts_with("dm-") {"Private chat with the owner. Speak naturally to them."} else if chat.bot_only {"Observer, not a participant. Coordinate with named bots. Ask the owner privately via ask_question."} else {"Address the intended human or bot by name. Ask owner questions privately via ask_question."},"members":members,"recent_messages":history})
     };
     let general = app.db.setting("general")?.unwrap_or(json!({}));
@@ -301,6 +305,7 @@ pub fn build(
         "continuity":crate::continuity::bounded_context(&app.db,run,if full {16000}else{4000})?,
         "provider_retry":retry_context,
         "progress_updates":crate::progress_updates::context(&app.db,bot)?,
+        "primary_bot":crate::primary_bot::context(&app.db,&bot.id,private_destination)?,
         "schema_version":1,"guide_version":VERSION,"guide_tier":if full_guide{"full"}else{"core_with_reference_tool"},
         "generated_at_unix_utc":db::now(),"timezone":crate::timezone::context(&app.db, db::now())?,
         "bot":{"id":bot.id,"name":bot.name,"role_label":bot.profile.label,"role_description":bot.profile.description,

@@ -957,7 +957,8 @@ async fn call_tool_inner(
             json!({"text":format!("Skill saved: {}",serde_json::to_string(&skill)?),"skill":skill})
         }
         "bots_list" => {
-            json!({"text":serde_json::to_string(&app.db.bots()?.iter().filter(|b|!b.profile.archived).map(|b|json!({"id":b.id,"name":b.name,"provider":b.provider})).collect::<Vec<_>>())?})
+            let primary=crate::primary_bot::get(&app.db)?;
+            json!({"text":serde_json::to_string(&app.db.bots()?.iter().filter(|b|!b.profile.archived).map(|b|json!({"id":b.id,"name":b.name,"provider":b.provider,"is_primary":primary.as_deref()==Some(b.id.as_str())})).collect::<Vec<_>>())?})
         }
         "send_to_bot" => {
             let target = string(&args, "bot_id")?;
