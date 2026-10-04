@@ -94,7 +94,11 @@ async fn fresh_and_sparse_profiles_can_save_local_access_without_losing_identity
     let (status, saved) = f.request("PUT", "/api/settings", token, settings).await;
     assert_eq!(status, 200, "{saved}");
     assert_eq!(saved["local_access"], true);
-    assert_eq!(app.db.setting("general").unwrap().unwrap(), saved);
+    // The API includes the separately stored primary-bot selection. It is
+    // intentionally not persisted as part of general settings.
+    let mut persisted = saved.clone();
+    assert_eq!(persisted.as_object_mut().unwrap().remove("primary_bot_id"), Some(Value::Null));
+    assert_eq!(app.db.setting("general").unwrap().unwrap(), persisted);
 
     // This is the sparse row created by servers before the fix, including a
     // client that has already loaded it before upgrading the server.
@@ -116,7 +120,9 @@ async fn fresh_and_sparse_profiles_can_save_local_access_without_losing_identity
     assert_eq!(preserved["identity"], "Keep my preferences");
     old["identity"] = json!(42);
     assert_eq!(f.request("PUT", "/api/settings", token, old).await.0, 400);
-    assert_eq!(app.db.setting("general").unwrap().unwrap(), preserved);
+    let mut persisted = preserved.clone();
+    assert_eq!(persisted.as_object_mut().unwrap().remove("primary_bot_id"), Some(Value::Null));
+    assert_eq!(app.db.setting("general").unwrap().unwrap(), persisted);
 }
 
 #[tokio::test]
