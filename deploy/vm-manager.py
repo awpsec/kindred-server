@@ -398,8 +398,31 @@ def resize_resources(root, profile, values):
     atomic(root/'computer.json', settings)
     return resource_settings(root, profile)
 
+def restore_computers():
+    """Restore provisioned computers without blocking HTTP startup or creating new disks."""
+    for config in sorted(ROOT.glob('*/computer/computer.json')):
+        profile=config.parent.parent.name
+        try:
+            identifier(profile)
+            with locked(ROOT/'_operations'/profile):
+                if (ROOT/'_retired'/profile).exists(): continue
+                root=directory(profile)
+                intent=root/'power-intent.json'
+                # Pre-feature computers have no intent record. Opt them into
+                # recovery once; explicit shutdown persists an opt-out.
+                if intent.exists() and json.loads(intent.read_text()).get('running') is not True: continue
+                if not (root/'disk.qcow2').is_file(): continue
+                start(root,profile)
+                atomic(intent,{'running':True})
+                print('Restored bot computer '+profile,flush=True)
+        except Exception as error:
+            # One unavailable computer must not prevent other profiles booting.
+            print('Could not restore bot computer '+profile+': '+str(error),file=sys.stderr,flush=True)
+
+
 def main():
     os.umask(0o077)
+    if sys.argv[1:]==['restore']: return restore_computers()
     if len(sys.argv)!=3: raise ValueError('Expected action and profile ID')
     action,profile=sys.argv[1:]
     if action=='retire': identifier(profile)
@@ -439,6 +462,7 @@ def main():
             print(json.dumps(resize_resources(root, profile, json.loads(sys.stdin.read(4096)))));return
         if action in ('ensure','start'):
             settings=start(root,profile)
+            atomic(root/'power-intent.json',{'running':True})
             if action=='ensure':
                 deadline=time.monotonic()+1770
                 while time.monotonic()<deadline:
@@ -455,6 +479,7 @@ def main():
                 else: raise ValueError('The computer is still setting up. Wait a few minutes and retry; its disk and setup progress are preserved.')
             print(json.dumps({'state':'running','id':profile,'resources':{k:settings[k] for k in ('cpus','memory_mb','disk_gb')}}))
         else:
+            atomic(root/'power-intent.json',{'running':action!='shutdown'})
             if running(root): qmp(root,'system_powerdown' if action=='shutdown' else 'system_reset')
             if action=='shutdown':
                 # Keep the operation lock until QEMU exits. A message sent during

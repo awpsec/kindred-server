@@ -22,6 +22,36 @@ def software_fixture(root):
     shutil.copy(Path(__file__).with_name('check-codex.py'),software/'check-codex.py')
     return software
 
+class PowerIntentRecovery(unittest.TestCase):
+    def test_restore_isolated_preserves_stopped_and_retired(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary)
+            ids=['00000000-0000-4000-8000-'+str(n).zfill(12) for n in range(5)]
+            for profile in ids:
+                computer=root/profile/'computer';computer.mkdir(parents=True)
+                (computer/'computer.json').write_text('{}')
+                (computer/'disk.qcow2').write_bytes(b'preserve')
+            (root/ids[1]/'computer'/'power-intent.json').write_text('{"running":false}')
+            (root/'_retired').mkdir();(root/'_retired'/ids[2]).touch()
+            (root/ids[4]/'computer'/'power-intent.json').write_text('{"running":true}')
+            def start(computer,profile):
+                if profile==ids[3]: raise ValueError('Not enough memory')
+            with patch.object(manager,'ROOT',root),patch.object(manager,'start',side_effect=start) as launch:
+                manager.restore_computers()
+                self.assertEqual([call.args[1] for call in launch.call_args_list],[ids[0],ids[3],ids[4]])
+            self.assertTrue(json.loads((root/ids[0]/'computer'/'power-intent.json').read_text())['running'])
+            for profile in ids:self.assertEqual((root/profile/'computer'/'disk.qcow2').read_bytes(),b'preserve')
+
+    def test_explicit_shutdown_persists_opt_out_and_start_reenables(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary);profile='00000000-0000-4000-8000-000000000001'
+            with patch.object(manager,'ROOT',root),patch.object(manager,'running',return_value=False):
+                with patch.object(manager.sys,'argv',['manager','shutdown',profile]):manager.main()
+                intent=root/profile/'computer'/'power-intent.json'
+                self.assertFalse(json.loads(intent.read_text())['running'])
+                with patch.object(manager.sys,'argv',['manager','start',profile]),patch.object(manager,'start',return_value={'cpus':2,'memory_mb':2048,'disk_gb':30}):manager.main()
+                self.assertTrue(json.loads(intent.read_text())['running'])
+
 class SoftwareCache(unittest.TestCase):
     def test_retirement_stops_computer_and_prevents_restart(self):
         with tempfile.TemporaryDirectory() as temporary:
