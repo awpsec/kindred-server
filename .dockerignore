@@ -9,3 +9,5 @@ node_modules
 *.db*
 *.credentials*
 .env
+
+deploy/vendor/*.previous

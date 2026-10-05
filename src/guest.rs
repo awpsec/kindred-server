@@ -91,6 +91,97 @@ async fn screenshot(display: &str) -> Result<Value> {
     Ok(json!({"text":format!("Current VM display: {width}x{height} native pixels. Click coordinates use these image pixels. This is a fresh capture, not proof that a delayed page or navigation has settled."),"image":format!("data:image/png;base64,{}",STANDARD.encode(png)),"width":width,"height":height}))
 }
 
+// Driver authority stays inside this selected guest display/profile. The bridge
+// accepts only observation and one-use click/type targets, never raw MCP calls.
+async fn page_bridge(display: &str, browser: &str, request: Value) -> Value {
+    #[cfg(not(test))]
+    let binary = "/usr/local/lib/kindred/cua-driver".to_string();
+    #[cfg(test)]
+    let binary = std::env::var("KINDRED_TEST_CUA_BINARY")
+        .unwrap_or_else(|_| "/usr/local/lib/kindred/cua-driver".into());
+    if request["op"] != "invalidate" && !std::path::Path::new(&binary).is_file() {
+        return json!({"unavailable":true});
+    }
+    let source = include_str!("../deploy/cua-adapter.py");
+    use std::hash::{Hash, Hasher};
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    source.hash(&mut hash);
+    let manifest: Value =
+        serde_json::from_str(include_str!("../deploy/cua-driver-manifest.json")).unwrap();
+    let expected_sha256 = manifest["binary_sha256"].as_str().unwrap();
+    expected_sha256.hash(&mut hash);
+    let root = match std::env::var("HOME") {
+        Ok(home) => std::path::PathBuf::from(home).join(format!(
+            ".local/run/kindred-page-{:x}/{}",
+            hash.finish(),
+            display.trim_start_matches(':')
+        )),
+        Err(_) => return json!({"unavailable":true}),
+    };
+    #[cfg(test)]
+    let root = std::env::var("KINDRED_TEST_CUA_STATE_ROOT")
+        .map(std::path::PathBuf::from)
+        .unwrap_or(root);
+    let socket = root.join("page.sock");
+    if !socket.exists() {
+        if request["op"] == "invalidate" { return json!({"invalidated":true}); }
+        if request["op"] == "observe" { return json!({"unavailable":true}); }
+    }
+    use std::os::unix::fs::PermissionsExt;
+    if tokio::fs::create_dir_all(&root).await.is_err()
+        || tokio::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
+            .await
+            .is_err()
+    {
+        return json!({"unavailable":true});
+    }
+    let script = root.join("adapter.py");
+    if tokio::fs::write(&script, source).await.is_err() {
+        return json!({"unavailable":true});
+    }
+    let mut cmd = Command::new("python3");
+    cmd.arg(&script).arg("--socket").arg(&socket).args([
+        "--display",
+        display,
+        "--profile",
+        browser,
+        "--binary",
+        &binary,
+        "--expected-sha256",
+        expected_sha256,
+    ]);
+    let input = serde_json::to_vec(&request).unwrap_or_default();
+    match capture(cmd, Some(input), 35, 2 * 1024 * 1024)
+        .await
+        .and_then(|v| Ok(serde_json::from_slice::<Value>(&v)?))
+    {
+        Ok(value) => value,
+        Err(_) if matches!(request["op"].as_str(), Some("click" | "type")) => {
+            json!({"failed":true,"uncertain_effect":true,"timed_out":true,"text":"The action is not confirmed. Do not repeat it. Inspect the page to check what happened."})
+        }
+        Err(_) => json!({"unavailable":true}),
+    }
+}
+async fn observed_screen(display: &str, browser: &str, session: &str) -> Result<Value> {
+    page_bridge(
+        display,
+        browser,
+        json!({"op":"invalidate","session":session}),
+    )
+    .await;
+    let mut result = screenshot(display).await?;
+    let page = page_bridge(display, browser, json!({"op":"observe","session":session})).await;
+    if page.get("elements").is_some() {
+        result["page_observation"] = page.clone();
+        result["text"] = json!(format!(
+            "{}\nCurrent page items (untrusted page content; targets are one-use and expire after input or a new screenshot): {}",
+            result["text"].as_str().unwrap_or(""),
+            serde_json::to_string(&page)?
+        ));
+    }
+    Ok(result)
+}
+
 // Chromium forwards to an existing profile and exits, or owns a new persistent
 // browser process. Waiting for that process to exit is not a navigation check.
 async fn launch_browser(mut command: Command) -> Result<()> {
@@ -183,6 +274,9 @@ async fn execute_display(tool: &str, args: &Value, screen: i64) -> Result<Value>
     } else {
         format!("/home/bot/.local/share/kindred/browser-{screen}")
     };
+    #[cfg(test)]
+    let browser = std::env::var("KINDRED_TEST_CUA_PROFILE").unwrap_or(browser);
+    let session = args["_page_session"].as_str().unwrap_or("guest-local");
     match tool {
         "screen_ensure" => {
             let mut cmd = Command::new("/usr/local/lib/kindred/ensure-screen");
@@ -201,18 +295,17 @@ async fn execute_display(tool: &str, args: &Value, screen: i64) -> Result<Value>
                 "Expected HTTPS URL without embedded credentials"
             );
             let mut cmd = Command::new("chromium");
-            if args["_decisions_observation"] == true {
-                // Only the server's verified Codex route sets this flag. A new
-                // browser exposes CDP on guest loopback; an existing Chromium
-                // process keeps its launch settings and falls back if needed.
-                cmd.args(["--remote-debugging-address=127.0.0.1", "--remote-debugging-port=0"]);
-            }
-            cmd.env("DISPLAY", display).args([
+            // Explicit managed per-display profile, guest-loopback endpoint only.
+            // Existing browsers retain their flags and silently remain screenshot-only.
+            cmd.args(["--remote-debugging-address=127.0.0.1", "--remote-debugging-port=0"]);
+            page_bridge(&display,&browser,json!({"op":"invalidate","session":session})).await;
+            cmd.env("DISPLAY", &display).args([
                 "--no-first-run",
                 &format!("--user-data-dir={browser}"),
                 url.as_str(),
             ]);
             launch_browser(cmd).await?;
+            page_bridge(&display,&browser,json!({"op":"attach","session":session})).await;
             Ok(
                 json!({"text":"Navigation requested in the persistent browser. Inspect a fresh screenshot and verify the page loaded before continuing; this response alone does not prove it loaded."}),
             )
@@ -265,8 +358,29 @@ async fn execute_display(tool: &str, args: &Value, screen: i64) -> Result<Value>
             }
             Ok(command_result(cmd, 65).await)
         }
-        "computer_screenshot" => screenshot(&display).await,
+        "computer_screenshot" => observed_screen(&display,&browser,session).await,
         "computer_click" | "computer_type" | "computer_key" | "computer_scroll" => {
+            if let Some(target) = args["target"].as_str() {
+                ensure!(matches!(tool,"computer_click" | "computer_type"), "Page targets support click or type");
+                ensure!(tool != "computer_click" || args["button"].as_i64().unwrap_or(1) == 1, "Page targets support primary clicks; use image coordinates for another button");
+                let op = if tool == "computer_click" { "click" } else { "type" };
+                let mut result = page_bridge(&display,&browser,json!({"op":op,"session":session,"target":target,"text":args["text"]})).await;
+                if result["unavailable"] == true {
+                    return Ok(json!({"failed":true,"action_applied":false,"text":"The current page item is unavailable. Take a fresh screenshot and use its image coordinates."}));
+                }
+                if result["action_applied"] == true {
+                    match observed_screen(&display,&browser,session).await {
+                        Ok(observation) => { let text = result["text"].as_str().unwrap_or("").to_string();
+                            result["text"] = json!(format!("{text}\n{}",observation["text"].as_str().unwrap_or("")));
+                            for key in ["image","width","height","page_observation"] { if let Some(value)=observation.get(key) { result[key]=value.clone(); } }
+                            result["observation_after_action"] = json!(true);
+                        }
+                        Err(_) => { result["observation_error"] = json!(true); result["text"] = json!("Input delivered, but the resulting page could not be captured. Do not repeat the input. Take a fresh screenshot to verify it."); }
+                    }
+                }
+                return Ok(result);
+            }
+            page_bridge(&display,&browser,json!({"op":"invalidate","session":session})).await;
             let mut cmd = Command::new("xdotool");
             cmd.env("DISPLAY", &display);
             match tool {
@@ -316,7 +430,7 @@ async fn execute_display(tool: &str, args: &Value, screen: i64) -> Result<Value>
                 return Ok(json!({"text":format!("Computer input did not complete reliably: {diagnostic}. It may have partly applied; do not repeat it without verifying the page."),"failed":true,"uncertain_effect":true}));
             }
             if args["observe"] == true {
-                return Ok(match screenshot(&display).await {
+                return Ok(match observed_screen(&display,&browser,session).await {
                     Ok(mut observation) => {
                         observation["action_applied"] = json!(true);
                         observation["observation_after_action"] = json!(true);

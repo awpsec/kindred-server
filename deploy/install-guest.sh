@@ -6,7 +6,7 @@ set -eu
 [ -f ./kindred ] || { echo 'Put the compiled Linux kindred binary beside this script.' >&2; exit 1; }
 [ -f ./kindred-guest-desktop.service ] && [ -f ./start-desktop.sh ] || exit 1
 apt-get update
-DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends sudo openssh-server ca-certificates curl chromium openbox dbus-x11 xvfb x11-utils xdotool x11vnc imagemagick coreutils libpam-systemd tint2 python3-gi gir1.2-gtk-3.0 gir1.2-wnck-3.0 rofi feh xterm konsole fonts-dejavu-core pcmanfm librsvg2-bin librsvg2-common util-linux python3-docx python3-venv python3-pip libreoffice-writer poppler-utils fonts-liberation
+DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends sudo openssh-server ca-certificates curl libx11-6 libxi6 chromium openbox dbus-x11 xvfb x11-utils xdotool x11vnc imagemagick coreutils libpam-systemd tint2 python3-gi gir1.2-gtk-3.0 gir1.2-wnck-3.0 rofi feh xterm konsole fonts-dejavu-core pcmanfm librsvg2-bin librsvg2-common util-linux python3-docx python3-venv python3-pip libreoffice-writer poppler-utils fonts-liberation
 id bot >/dev/null 2>&1 || useradd --create-home --shell /bin/bash bot
 # The bot administers this dedicated VM. This grants no host privileges.
 install -d -m 0750 /etc/sudoers.d
@@ -17,6 +17,10 @@ install -d -o bot -g bot -m 700 /home/bot/.ssh /home/bot/.local /home/bot/.local
 install -d -o bot -g bot -m 700 /workspace
 install -d /usr/local/lib/kindred
 install -m 755 ./kindred /usr/local/lib/kindred/kindred-bin
+# Pinned payload already staged in the software media; never download at startup.
+python3 ./install-cua-driver.py --payload ./vendor/cua-driver --target /usr/local/lib/kindred/cua-driver
+install -d /usr/local/share/doc/kindred-cua-driver
+cp -a ./third-party/cua-driver/. /usr/local/share/doc/kindred-cua-driver/
 cat > /usr/local/bin/kindred <<'WRAPPER'
 #!/bin/sh
 export KINDRED_GUEST=1 DISPLAY=:1

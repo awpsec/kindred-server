@@ -144,6 +144,24 @@ async fn update_guest_runtime(app: &App) -> Result<()> {
     let output=vm::capture(command,Some(bytes),90,4096).await?;
     let receipt:Value=serde_json::from_slice(&output)?;
     ensure!(receipt["version"]==env!("CARGO_PKG_VERSION") && receipt["updated"].is_boolean(),"Guest runtime receipt did not verify");
+    // The release carries this payload offline. Existing logged-in browsers are
+    // neither restarted nor changed; without an attachable endpoint, pixel tools remain.
+    let manifest:Value=serde_json::from_str(include_str!("../deploy/cua-driver-manifest.json"))?;
+    let software=std::env::var("KINDRED_GUEST_SOFTWARE").unwrap_or_else(|_|"/opt/kindred/guest".into());
+    let payload=std::path::PathBuf::from(software).join("vendor/cua-driver");
+    if payload.is_file() {
+        let bytes=tokio::fs::read(payload).await?;
+        ensure!(bytes.len() as u64 == manifest["binary_bytes"].as_u64().unwrap_or(0),"Bundled driver size mismatch");
+        let digest=ring::digest::digest(&ring::digest::SHA256,&bytes);
+        let hash=digest.as_ref().iter().map(|b|format!("{b:02x}")).collect::<String>();
+        ensure!(Some(hash.as_str())==manifest["binary_sha256"].as_str(),"Bundled driver hash mismatch");
+        let helper=include_str!("../deploy/update-cua-driver.py").replace('\'', "'\"'\"'");
+        let mut command=vm::ssh(&app.config.vm);
+        command.arg(format!("sudo -n python3 -c '{helper}' {hash} {}",bytes.len()));
+        let output=vm::capture(command,Some(bytes),90,4096).await?;
+        let receipt:Value=serde_json::from_slice(&output)?;
+        ensure!(receipt["sha256"]==hash && receipt["updated"].is_boolean(),"Guest driver receipt did not verify");
+    }
     Ok(())
 }
 

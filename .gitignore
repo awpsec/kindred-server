@@ -21,3 +21,6 @@ __pycache__/
 /release-candidate/
 /publication-plan.json
 /publication-result.json
+
+/deploy/vendor/cua-driver
+/deploy/vendor/cua-driver.previous

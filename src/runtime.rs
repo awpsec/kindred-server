@@ -236,14 +236,14 @@ pub fn tool_specs() -> Vec<Value> {
         ),
         (
             "computer_click",
-            "Click the current VM desktop using native image pixels from a fresh observation. The result includes a fresh post-input image when available; inspect it before the next action. If the page is still changing, take another screenshot without repeating the click.",
-            json!({"x":{"type":"integer"},"y":{"type":"integer"},"button":{"type":"integer"}}),
-            vec!["x", "y"],
+            "Click a one-use page target from the latest screenshot, or use native image x/y for other desktop controls. Never retry an unconfirmed action. The result includes a fresh post-input image when available; inspect it before the next action. If the page is still changing, take another screenshot without repeating the click.",
+            json!({"x":{"type":"integer"},"y":{"type":"integer"},"button":{"type":"integer"},"target":{"type":"string","description":"One-use page item from the latest computer_screenshot. Use target OR image x/y; never invent a target."}}),
+            vec![],
         ),
         (
             "computer_type",
-            "Type text into the focused VM application. Ground the focused field in the latest image, then inspect the returned image to verify its value. Never request credentials in chat.",
-            json!({"text":{"type":"string"}}),
+            "Type into a one-use editable page target when available, or the focused VM application. Ground the field in the latest image, then inspect the returned image to verify its value. Never request credentials in chat.",
+            json!({"text":{"type":"string"},"target":{"type":"string","description":"Optional one-use editable page item from the latest screenshot; focuses this field before typing."}}),
             vec!["text"],
         ),
         (
@@ -649,15 +649,18 @@ pub async fn call_tool(app: &App, bot: &Bot, run: &Run, name: &str, args: Value)
     )?;
     let pointer_args = (name == "computer_click").then(|| args.clone());
     let outcome = call_tool_inner(app, bot, run, name, args).await;
-    let result = match outcome {
+    let mut result = match outcome {
         Ok(result) => result,
         Err(error) => tool_error_result(error),
     };
-    app.db.event(&run.id,"tool_result",json!({"tool":name,"call_id":call_id,"text":result["text"],"has_image":result["image"].as_str().is_some_and(|s|!s.trim().is_empty()),"failed":result["failed"] == true,"uncertain_effect":result["uncertain_effect"],"action_applied":result["action_applied"],"observation_after_action":result["observation_after_action"],"width":result["width"],"height":result["height"],"timed_out":result["timed_out"],"stopped":result["stopped"],"exit_code":result["exit_code"],"elapsed_seconds":result["elapsed_seconds"]}))?;
-    if let Some(args) = pointer_args.filter(|_| result["failed"] != true) {
+    app.db.event(&run.id,"tool_result",json!({"tool":name,"call_id":call_id,"text":result["text"],"has_image":result["image"].as_str().is_some_and(|s|!s.trim().is_empty()),"failed":result["failed"] == true,"uncertain_effect":result["uncertain_effect"],"page_action_receipt":result["page_action_receipt"],"action_applied":result["action_applied"],"observation_after_action":result["observation_after_action"],"width":result["width"],"height":result["height"],"timed_out":result["timed_out"],"stopped":result["stopped"],"exit_code":result["exit_code"],"elapsed_seconds":result["elapsed_seconds"]}))?;
+    if let Some(args) = pointer_args.filter(|args| result["failed"] != true && args["target"].is_null()) {
         // Visual telemetry must never turn an already executed click into a retryable failure.
         let _ = app.db.save_setting(&format!("computer-pointer:{}",bot.id), &json!({"id":call_id,"bot_id":bot.id,"x":args["x"],"y":args["y"],"button":args["button"].as_i64().unwrap_or(1),"created":db::now()}));
     }
+    // Keep the original driver receipt in scoped Activity diagnostics, without
+    // sending private routing IDs or duplicated receipt text back to the model.
+    if let Some(object) = result.as_object_mut() { object.remove("page_action_receipt"); }
     crate::conversation_updates::with_live_context(&app.db, run, result)
 }
 fn tool_error_result(error: anyhow::Error) -> Value {
@@ -865,7 +868,7 @@ async fn call_tool_inner(
         }
         "computer_release" => json!({"text":"Desktop released. Continue other work; take a fresh screenshot before further desktop actions."}),
         "computer_screenshot" => {
-            let work = vm::guest_screen(&app.config.vm, app.db.screen(&bot.id)?, name, json!({}));
+            let work = vm::guest_screen(&app.config.vm, app.db.screen(&bot.id)?, name, json!({"_page_session":run.id}));
             let mut result = desktop.as_mut().expect("desktop session").rpc(work).await?;
             if let Some(session) = &mut desktop { session.observed(&result); }
             if args["share_in_chat"] == true {
@@ -1171,6 +1174,7 @@ async fn call_tool_inner(
         }
         _ => {
             let mut args = args;
+            if name.starts_with("computer_") { args["_page_session"] = json!(run.id); }
             if name == "computer_open_url" {
                 crate::browser_use::prepare_open(app, bot, &mut args);
             }

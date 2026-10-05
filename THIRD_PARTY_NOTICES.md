@@ -116,3 +116,14 @@ Full dependency license texts are in third-party/document-preview-LICENSES.txt.
 The bundled Liberation Mono fonts are distributed under the SIL Open Font License
 1.1. The license and source/hash receipts are in ui/fonts/Liberation-LICENSE.txt
 and ui/fonts/Liberation-SOURCE.json.
+
+The bot guest uses a Kindred policy build of Cua Driver 0.33.4 (MIT), upstream tag
+`cua-driver-rs-v0.33.4`, source `ba0033a661101669c60ce05f1fe5753bf8bad748`.
+Exact selected Linux x86_64 archive/binary hashes and upstream provenance are in
+deploy/cua-driver-manifest.json. The source patch and build recipe are in
+third-party/cua-driver/. Automatic browser setup and consent input are disabled.
+The upstream MIT license and licensing boundary are in third-party/cua-driver/.
+Cua Spaces/FSL components and optional perception/model extensions are excluded.
+Driver dynamically uses system X11/libXi/libxkbcommon and glibc libraries, which
+retain the licenses of the guest Debian packages. Update checks and telemetry are disabled by the launcher.
+Optional history is not enabled. Runtime startup uses the offline payload.

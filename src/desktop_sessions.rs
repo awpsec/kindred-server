@@ -239,6 +239,45 @@ mod tests {
         assert!(!app.desktop_sessions.engaged(&run.id));
     }
     #[tokio::test]
+    async fn element_actions_respect_human_control_and_fresh_handback_observation() {
+        let app = crate::tests::app();
+        let (bot, run, slot) = run(&app);
+        let mut session = enter(&app, &run, "computer_screenshot").await.unwrap();
+        session.observed(&json!({"image":"before handoff"}));
+        drop(session);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/api/takeover", listener.local_addr().unwrap());
+        let router = crate::web::router(app.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+        let busy = client.post(&url).bearer_auth(&app.token)
+            .json(&json!({"bot_id":bot.id,"enabled":true})).send().await.unwrap();
+        assert_eq!(busy.status(), 400, "A cached bot lease must prevent manual-control grant");
+        assert!(!app.db.screen_takeover(slot).unwrap());
+        app.desktop_sessions.release(&run.id);
+        let granted = client.post(&url).bearer_auth(&app.token)
+            .json(&json!({"bot_id":bot.id,"enabled":true})).send().await.unwrap();
+        assert_eq!(granted.status(), 200);
+        assert!(app.db.screen_takeover(slot).unwrap());
+        for tool in ["computer_click", "computer_type", "computer_open_url", "computer_screenshot"] {
+            let result = crate::runtime::call_tool(&app, &bot, &run, tool,
+                json!({"target":"old-page-item","text":"fixture","url":"https://example.invalid","action_scope":"external"}))
+                .await.unwrap();
+            assert_eq!(result["failed"], true, "{tool} must stop before guest dispatch");
+        }
+        assert!(app.db.approvals().unwrap().is_empty());
+        let returned = client.post(&url).bearer_auth(&app.token)
+            .json(&json!({"bot_id":bot.id,"enabled":false})).send().await.unwrap();
+        assert_eq!(returned.status(), 200);
+        assert!(!app.db.screen_takeover(slot).unwrap());
+        assert!(enter(&app, &run, "computer_click").await.is_err());
+        let mut session = enter(&app, &run, "computer_screenshot").await.unwrap();
+        session.observed(&json!({"image":"fresh after handback"}));
+        drop(session);
+        assert!(enter(&app, &run, "computer_click").await.is_ok());
+        server.abort();
+    }
+    #[tokio::test]
     async fn model_and_context_work_continue_concurrently_while_desktops_are_locked() {
         let app = crate::tests::app();
         let (a, one, slot) = run(&app);
