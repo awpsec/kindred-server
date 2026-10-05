@@ -57,6 +57,33 @@ fn preview(markdown: &str) -> String {
     result
 }
 impl Db {
+    // Resolve only inside the authenticated workspace DB. Return routing metadata,
+    // never bot-only conversation history or authentication instructions.
+    pub fn notification_target(&self, event: &str) -> Result<Value> {
+        ensure!(!event.is_empty() && event.len() <= 32 && event.bytes().all(|b| b.is_ascii_digit()), "Invalid notification event");
+        let Ok(seq) = event.parse::<i64>() else { return Ok(json!({"unavailable":true})); };
+        let c = self.0.lock().unwrap();
+        let row: Option<(String,String,String,String,String)> = c.query_row(
+            "SELECT e.kind,e.body,r.id,r.bot_id,r.chat_id FROM events e JOIN runs r ON r.id=e.run_id WHERE e.seq=?",
+            [seq], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?;
+        let Some((kind,body,run_id,bot_id,mut chat_id)) = row else { return Ok(json!({"unavailable":true})); };
+        let body: Value = serde_json::from_str(&body)?;
+        let id = body["id"].as_str().unwrap_or("");
+        let sql = match kind.as_str() {
+            "user_action" => Some("SELECT status FROM user_tasks WHERE id=?1 AND run_id=?2"),
+            "approval" => Some("SELECT status FROM approvals WHERE id=?1 AND run_id=?2"),
+            "question" => Some("SELECT status FROM questions WHERE id=?1 AND run_id=?2"),
+            _ => None,
+        };
+        let status: Option<String> = if let Some(sql)=sql { c.query_row(sql,rusqlite::params![id,run_id],|r|r.get(0)).optional()? } else {None};
+        if kind=="question" {
+            if let Some(destination)=c.query_row("SELECT NULLIF(delivery_chat_id,'') FROM questions WHERE id=? AND run_id=?",rusqlite::params![id,run_id],|r|r.get::<_,Option<String>>(0)).optional()?.flatten(){chat_id=destination;}
+        } else if matches!(kind.as_str(),"user_action"|"approval") {
+            let hidden: bool = c.query_row("SELECT COALESCE((SELECT bot_only OR archived FROM chats WHERE id=?),1)",[&chat_id],|r|r.get(0))?;
+            if hidden {chat_id=format!("dm-{bot_id}");}
+        }
+        Ok(json!({"bot_id":bot_id,"chat_id":chat_id,"run_id":run_id,"request_kind":kind,"request_id":if sql.is_some(){id}else{""},"status":status}))
+    }
     pub fn notifications(&self, after: Option<i64>) -> Result<Value> {
         let general = self.setting("general")?.unwrap_or_default();
         let mutes = self.setting("notification_mutes")?.unwrap_or_default();
@@ -85,6 +112,7 @@ impl Db {
                 let event:Value=serde_json::from_str(&event)?;
                 if let Some(id)=event["id"].as_str(){chat_id=c.query_row("SELECT COALESCE(NULLIF(delivery_chat_id,''),chat_id) FROM questions WHERE id=?",[id],|r|r.get(0))?;}
             }
+            if matches!(kind.as_str(),"user_action"|"approval") && c.query_row("SELECT COALESCE((SELECT bot_only OR archived FROM chats WHERE id=?),1)",[&chat_id],|r|r.get::<_,bool>(0))? {chat_id=format!("dm-{bot_id}");}
             if kind=="run_finished" && status=="completed" && c.query_row("SELECT COALESCE((SELECT bot_only FROM chats WHERE id=?),0)",[&chat_id],|r|r.get::<_,bool>(0))? {continue;}
             let p: BotProfile = serde_json::from_str(&profile)?;
             if !p.notifications || p.archived || muted(&mutes, &bot_id, &chat_id) {
@@ -164,6 +192,37 @@ impl Db {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn event_target_requires_workspace_token_and_returns_only_routing_metadata() {
+        use tower::ServiceExt;
+        let app=crate::tests::app();let bot=crate::tests::bot(&app.db,"codex");app.db.queue(&bot.id,"Request",0).unwrap();let run=app.db.claim_bot(&bot.id).unwrap().unwrap();
+        let task=app.db.request_user_task(&run,"Sign in","Private instructions must not be in route metadata").unwrap();
+        let seq:i64=app.db.0.lock().unwrap().query_row("SELECT seq FROM events WHERE run_id=? AND kind='user_action'",[&run.id],|r|r.get(0)).unwrap();
+        let router=crate::web::router(app.clone());
+        for token in ["","wrong-workspace",app.token.as_str()] {
+            let response=router.clone().oneshot(axum::http::Request::builder().uri(format!("/api/notification-target/{seq}")).header("Authorization",format!("Bearer {token}")).body(axum::body::Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(response.status().as_u16(),if token==app.token{200}else{401});
+            if token==app.token {let bytes=axum::body::to_bytes(response.into_body(),4096).await.unwrap();let value:Value=serde_json::from_slice(&bytes).unwrap();assert_eq!(value["request_id"],task.id);assert_eq!(value["status"],"pending");assert!(!String::from_utf8(bytes.to_vec()).unwrap().contains("Private instructions"));}
+        }
+    }
+    #[test]
+    fn helper_request_routes_to_direct_chat_and_stale_event_keeps_receipt() {
+        let db=Db::open(":memory:").unwrap();let a=crate::tests::bot(&db,"codex");let b=crate::tests::bot(&db,"codex");
+        let parent=db.queue(&a.id,"Parent",0).unwrap();let parent=db.run(&parent).unwrap();
+        let child=db.chat_handoff(&parent,&b.id,"Help").unwrap();
+        db.0.lock().unwrap().execute("UPDATE runs SET status='running' WHERE id=?",[&child]).unwrap();
+        let task=db.request_user_task(&db.run(&child).unwrap(),"Sign in","Disposable fixture only").unwrap();
+        let seq:i64=db.0.lock().unwrap().query_row("SELECT seq FROM events WHERE kind='user_action' AND run_id=?",[&child],|r|r.get(0)).unwrap();
+        let target=db.notification_target(&seq.to_string()).unwrap();assert_eq!(target["chat_id"],format!("dm-{}",b.id));assert_eq!(target["request_id"],task.id);assert_eq!(target["status"],"pending");
+        let items=db.notifications(Some(seq-1)).unwrap();assert_eq!(items["items"][0]["chat_id"],target["chat_id"]);
+        db.0.lock().unwrap().execute("UPDATE user_tasks SET status='expired' WHERE id=?",[&task.id]).unwrap();
+        assert_eq!(db.notification_target(&seq.to_string()).unwrap()["status"],"expired");assert!(db.notifications(Some(seq-1)).unwrap()["items"].as_array().unwrap().is_empty());
+        db.0.lock().unwrap().execute("UPDATE runs SET status='running' WHERE id=?",[&child]).unwrap();
+        let approval=db.request_approval(&child,"computer_open_url",&json!({"url":"https://fixture.invalid"})).unwrap();db.event(&child,"approval",json!({"id":approval})).unwrap();
+        let approval_seq:i64=db.0.lock().unwrap().query_row("SELECT MAX(seq) FROM events WHERE run_id=?",[&child],|r|r.get(0)).unwrap();let approval_target=db.notification_target(&approval_seq.to_string()).unwrap();assert_eq!(approval_target["request_kind"],"approval");assert_eq!(approval_target["request_id"],approval);assert_eq!(approval_target["chat_id"],target["chat_id"]);db.decide(&approval,false).unwrap();assert_eq!(db.notification_target(&approval_seq.to_string()).unwrap()["status"],"denied");
+        assert_eq!(Db::open(":memory:").unwrap().notification_target(&seq.to_string()).unwrap()["unavailable"],true);
+        assert_eq!(db.notification_target("99999999999999999999999999999999").unwrap()["unavailable"],true);assert!(db.notification_target("../123").is_err());
+    }
     #[test]
     fn preview_keeps_message_without_markdown_or_link_destinations() {
         assert_eq!(

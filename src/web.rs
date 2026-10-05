@@ -128,6 +128,7 @@ pub fn router(app: Shared) -> Router {
         )
         .route("/uploads/{id}", get(download_upload).delete(remove_upload))
         .route("/notifications", get(notifications))
+        .route("/notification-target/{event}", get(notification_target))
         .route("/notification-mutes/{kind}/{id}", put(mute_notifications))
         .route("/runs/{id}/cancel", post(cancel))
         .route("/runs/{id}/continue", post(continue_task))
@@ -417,8 +418,10 @@ struct RunQuery {
     bot_id: Option<String>,
 }
 async fn runs(State(app): State<Shared>, Query(q): Query<RunQuery>) -> Result<Json<Vec<Value>>> {
+    let delegations=app.db.current_delegations()?;
     let rows = app.db.runs(q.bot_id.as_deref())?.into_iter().map(|run| {
         let mut value = serde_json::to_value(&run)?;
+        if let Some(delegation)=delegations.iter().find(|d|d["run_id"]==run.id){value["delegation"]=delegation.clone();}
         if !run.chat_id.is_empty() && !run.chat_id.starts_with("dm-") {
             value["activity_started"] = json!(app.db.group_activity_started(&run.id)?);
         }
@@ -624,6 +627,9 @@ async fn notifications(
     Query(q): Query<NotificationQuery>,
 ) -> Result<Json<Value>> {
     Ok(Json(app.db.notifications(q.after)?))
+}
+async fn notification_target(State(app): State<Shared>, Path(event): Path<String>) -> Result<Json<Value>> {
+    Ok(Json(app.db.notification_target(&event)?))
 }
 async fn approvals(State(app): State<Shared>) -> Result<Json<Vec<Value>>> {
     Ok(Json(app.db.approvals()?))

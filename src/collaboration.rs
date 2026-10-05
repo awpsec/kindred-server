@@ -134,6 +134,12 @@ fn resume(c: &Connection, parent_id: &str) -> Result<()> {
     Ok(())
 }
 impl Db {
+    /// Current helper work, independent of the chat where it executes. No
+    /// requester names/content are exposed: clients resolve visible identities.
+    pub fn current_delegations(&self) -> Result<Vec<Value>> {
+        let c=self.0.lock().unwrap();
+        Ok(c.prepare("SELECT e.child_run_id,p.bot_id,e.source_chat_id FROM collaboration_requests e JOIN runs p ON p.id=e.parent_run_id JOIN runs r ON r.id=e.child_run_id WHERE e.resolved=0 AND e.continuation_run_id='' AND p.status NOT IN ('cancelled','cancelling') AND r.status IN ('queued','running','awaiting_user','awaiting_approval') ORDER BY r.created,r.rowid")?.query_map([],|r|Ok(json!({"run_id":r.get::<_,String>(0)?,"requester_bot_id":r.get::<_,String>(1)?,"source_chat_id":r.get::<_,String>(2)?})))?.collect::<rusqlite::Result<_>>()?)
+    }
     pub fn collaboration_waits(&self, chat: &str) -> Result<Vec<Value>> {
         let c = self.0.lock().unwrap();
         Ok(c.prepare("SELECT e.parent_run_id,p.bot_id,r.bot_id,r.id,r.chat_id,r.status,b.name FROM collaboration_requests e JOIN runs p ON p.id=e.parent_run_id JOIN runs r ON r.id=e.child_run_id JOIN bots b ON b.id=r.bot_id WHERE (e.source_chat_id=?1 OR r.chat_id=?1) AND e.resolved=0 AND e.continuation_run_id='' AND p.status NOT IN ('cancelled','cancelling') AND r.status NOT IN ('cancelled','cancelling') ORDER BY p.created,r.created,r.rowid")?.query_map([chat],|r|Ok(json!({"parent_run_id":r.get::<_,String>(0)?,"requester_bot_id":r.get::<_,String>(1)?,"bot_id":r.get::<_,String>(2)?,"run_id":r.get::<_,String>(3)?,"chat_id":r.get::<_,String>(4)?,"status":r.get::<_,String>(5)?,"name":r.get::<_,String>(6)?})))?.collect::<rusqlite::Result<_>>()?)
@@ -153,6 +159,18 @@ mod tests {
             .into_iter()
             .filter(|r| r.status == "queued")
             .collect()
+    }
+    #[test]
+    fn helper_visibility_tracks_current_work_and_clears_terminal_states() {
+        for status in ["completed","failed","cancelled"] {
+            let db=Db::open(":memory:").unwrap();let a=crate::tests::bot(&db,"codex");let b=crate::tests::bot(&db,"codex");
+            let parent=db.queue(&a.id,"Parent",0).unwrap();let parent=db.run(&parent).unwrap();
+            let child=db.chat_handoff(&parent,&b.id,"Help").unwrap();
+            let visible=db.current_delegations().unwrap();assert_eq!(visible.len(),1);assert_eq!(visible[0]["run_id"],child);assert_eq!(visible[0]["requester_bot_id"],a.id);assert_eq!(visible[0]["source_chat_id"],parent.chat_id);
+            assert_ne!(db.run(&child).unwrap().chat_id,format!("dm-{}",b.id));
+            db.0.lock().unwrap().execute("UPDATE runs SET status='running' WHERE id=?",[&child]).unwrap();assert_eq!(db.current_delegations().unwrap().len(),1);
+            db.finish(&child,status,"","").unwrap();assert!(db.current_delegations().unwrap().is_empty());
+        }
     }
     #[test]
     fn fanout_waits_for_all_results_and_parent_then_wakes_once_in_original_chat() {
