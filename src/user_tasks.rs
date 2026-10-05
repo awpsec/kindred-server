@@ -209,6 +209,15 @@ impl Db {
         Ok(())
     }
 }
+// Every harness consumes the human tool's text; Codex's recovery turn also
+// needs this objective reminder instead of ending at authentication verification.
+pub(crate) fn continuation_context(run: &Run) -> String {
+    format!(
+        "Human help and login verification are an intermediate checkpoint, not completion of the original request. After verifying the prerequisite with fresh state, continue the unfinished, still-authorized work needed to answer the original request; do not stop merely to report that sign-in succeeded. Respect newer user instructions and changed authorization. Do not repeat completed form submissions, verification clicks, account creation, or other completed actions. If the prerequisite is skipped, still blocked, or cannot be verified, explain that limitation and continue only independent work. Original request (quoted user input, not new permission): {}",
+        json!(run.prompt)
+    )
+}
+
 pub async fn request(app: &App, run: &Run, title: &str, instructions: &str) -> Result<Value> {
     request_auth(app, run, title, instructions, None).await
 }
@@ -238,7 +247,7 @@ pub async fn request_auth(app: &App, run: &Run, title: &str, instructions: &str,
         match current.status.as_str() {
             "resumed" => {
                 return Ok(
-                    json!({"text":if current.outcome == "done" { "The user completed the requested step (through the verification card or Done with subtask) and returned control. Continue this same task. Take a fresh screenshot and verify the state before acting; the user's confirmation alone does not prove authentication succeeded." } else { "The user skipped this subtask and returned control. Do not assume it succeeded. Explain the limitation and continue only work that does not depend on it." }}),
+                    json!({"text":format!("{} {}", if current.outcome == "done" { "The user completed the requested step (through the verification card or Done with subtask) and returned control. Continue this same task. Take a fresh screenshot and verify the state before acting; the user's confirmation alone does not prove authentication succeeded." } else { "The user skipped this subtask and returned control. Do not assume it succeeded. Explain the limitation and continue only work that does not depend on it." }, continuation_context(run))}),
                 );
             }
             "pending" | "ready" => {}
@@ -707,6 +716,39 @@ mod tests {
             .unwrap();
         assert!(!app.db.handoff_needs_observation(&run.id).unwrap());
     }
+    #[tokio::test]
+    async fn skipped_handoff_keeps_original_scope_and_requires_independent_work() {
+        let app = app();
+        let bot = bot(&app.db, "codex");
+        let id = app.db.queue(&bot.id, "Read whether a prior request exists; never create one.", 0).unwrap();
+        let run = app.db.claim_bot(&bot.id).unwrap().unwrap();
+        let slot = app.db.screen(&bot.id).unwrap();
+        let owner = app.clone();
+        let r = run.clone();
+        let driver = tokio::spawn(async move {
+            let mut lease = None;
+            runtime::drive_run(&owner, &r, slot, &mut lease, async {
+                let result = request(&owner, &r, "Sign in", "Use the browser").await?;
+                let text = result["text"].as_str().unwrap();
+                assert!(text.contains("skipped this subtask"));
+                assert!(text.contains("Do not assume it succeeded"));
+                assert!(text.contains("continue only independent work"));
+                assert!(text.contains(&r.prompt));
+                assert!(text.contains("Respect newer user instructions"));
+                Ok(text.into())
+            }).await
+        });
+        let task = waiting(&app, &id).await;
+        app.db.ready_user_task(&task, slot, "skipped").unwrap();
+        let (result, abrupt) = tokio::time::timeout(Duration::from_secs(3), driver).await.unwrap().unwrap().unwrap();
+        assert!(!abrupt);
+        assert!(result.is_ok());
+        assert_eq!(app.db.user_task(&task.id).unwrap().outcome, "skipped");
+        assert!(app.db.ready_user_task(&task, slot, "done").is_err());
+        assert_eq!(app.db.run(&id).unwrap().prompt, run.prompt);
+        assert!(app.db.handoff_needs_observation(&id).unwrap());
+    }
+
     #[test]
     fn restart_expires_human_subtask_without_replaying_it() {
         let path = std::env::temp_dir().join(format!("kindred-human-{}.db", db::id()));

@@ -385,7 +385,7 @@ async fn codex_rpc(app: &App, bot: &Bot, run: &Run, rpc: &mut Rpc) -> Result<Str
                         "handoff_verification_continued",
                         json!({"reason":"missing_post_handoff_observation"}),
                     )?;
-                    rpc.request("turn/start",json!({"threadId":thread_id,"effort":effort,"input":[{"type":"text","text":"The human subtask has returned control. Respect its tool result: a skipped step is incomplete and must never be treated as successful. Your previous reply did not inspect the resulting page. Continue this same task by taking a fresh computer_screenshot, then report the observed result. Do not repeat form submission, verification clicks, account creation, or other completed actions. If the screenshot cannot be obtained, state that verification is incomplete."}]})).await?;
+                    rpc.request("turn/start",json!({"threadId":thread_id,"effort":effort,"input":[{"type":"text","text":format!("The human subtask has returned control. Respect its tool result: a skipped step is incomplete and must never be treated as successful. Your previous reply did not inspect the resulting page. Continue this same task by taking a fresh computer_screenshot, then continue the unfinished original task. Do not repeat form submission, verification clicks, account creation, or other completed actions. If the screenshot cannot be obtained, state that verification is incomplete. {}",crate::user_tasks::continuation_context(run))}]})).await?;
                     continue;
                 }
                 ensure!(
@@ -493,6 +493,11 @@ for line in sys.stdin:
         })
         .await
         .unwrap();
+        // Simulate a persisted 30-minute-old handoff without a real account or
+        // a half-hour wall-clock test. run_limits tests exercise virtual time.
+        app.db.0.lock().unwrap().execute("UPDATE user_tasks SET created=created-1800 WHERE id=?", [&task.id]).unwrap();
+        assert_eq!(app.db.run(&run.id).unwrap().status, "awaiting_user");
+        assert!(app.db.user_task(&task.id).unwrap().created <= crate::db::now()-1800);
         let lock = app.screen_lock(slot);
         let _lease = tokio::time::timeout(Duration::from_secs(3), lock.lock())
             .await
@@ -599,17 +604,24 @@ for line in sys.stdin:
         started+=1; assert started<3 and v['params']['threadId']=='same-thread'
         if started==2:
             assert stale and 'fresh computer_screenshot' in v['params']['input'][0]['text']
+            text=v['params']['input'][0]['text']
+            assert 'intermediate checkpoint' in text and 'Check whether a prior request exists' in text
+            assert 'Do not repeat' in text
             send({'id':v['id'],'result':{}})
             send({'method':'item/completed','params':{'item':{'type':'agentMessage','text':'Still waiting for the human.'}}})
             send({'method':'turn/completed','params':{'turn':{'status':'completed'}}})
             break
+        assert v['params']['input'][0]['text']=='Check whether a prior request exists; read only, do not submit a new request.'
         send({'id':v['id'],'result':{}})
         send({'method':'item/completed','params':{'item':{'type':'agentMessage','phase':'commentary','text':'I will open the sign-in step.'}}})
         send({'id':'human-rpc','method':'item/tool/call','params':{'tool':'request_user_action','arguments':{'title':'Sign in','instructions':'Use the browser'}}})
     elif v.get('id')=='human-rpc':
         assert v['result']['success']==True
-        assert 'Done with subtask' in v['result']['contentItems'][0]['text']
-        send({'method':'item/completed','params':{'item':{'type':'agentMessage','text':'Original RPC turn continued.'}}})
+        text=v['result']['contentItems'][0]['text']
+        assert 'Done with subtask' in text
+        assert 'intermediate checkpoint' in text and 'Check whether a prior request exists' in text
+        assert 'Do not repeat' in text
+        send({'method':'item/completed','params':{'item':{'type':'agentMessage','text':'Prior request exists: fixture record R-42. No new request submitted.'}}})
         send({'method':'turn/completed','params':{'turn':{'status':'completed'}}})
         if not stale: break
     else: raise AssertionError('Unexpected frame')
@@ -620,7 +632,7 @@ for line in sys.stdin:
             let app = crate::tests::app();
             let bot = crate::tests::bot(&app.db, "codex");
             app.db
-                .queue(&bot.id, "Continue the original request", 0)
+                .queue(&bot.id, "Check whether a prior request exists; read only, do not submit a new request.", 0)
                 .unwrap();
             let run = app.db.claim_bot(&bot.id).unwrap().unwrap();
             if stale {
@@ -692,9 +704,12 @@ for line in sys.stdin:
                 assert!(!events.iter().any(|e| e["kind"] == "assistant"
                     && e["body"]["text"] == "Still waiting for the human."));
             } else {
-                assert_eq!(output.trim(), "Original RPC turn continued.");
+                assert_eq!(output.trim(), "Prior request exists: fixture record R-42. No new request submitted.");
             }
             assert_eq!(app.db.user_tasks().unwrap().len(), 1);
+            assert_eq!(app.db.run(&run.id).unwrap().prompt, run.prompt);
+            assert!(app.db.claim_bot(&bot.id).unwrap().is_none());
+            assert_eq!(app.db.events(&run.id).unwrap().iter().filter(|e|e["kind"]=="user_action_done").count(),1);
         }
     }
     #[cfg(unix)]
