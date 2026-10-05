@@ -22,6 +22,17 @@ def archive_fixture(root, data, manifest):
         member.size = len(data)
         archive.addfile(member, io.BytesIO(data))
     manifest.update(archive_sha256=hashlib.sha256(path.read_bytes()).hexdigest(), archive_member="cua-driver", license="MIT", version="0.33.4")
+    patch_path = "third-party/cua-driver/consent.patch"
+    patch = root / patch_path
+    patch.parent.mkdir(parents=True, exist_ok=True)
+    patch.write_bytes(b"reviewed policy patch fixture")
+    manifest.update(kindred_policy="no_automatic_browser_input_v1", patch_path=patch_path,
+                    patch_sha256=hashlib.sha256(patch.read_bytes()).hexdigest(),
+                    upstream_archive_sha256="c" * 64, upstream_binary_sha256="d" * 64,
+                    build={"compiler": "rustc fixture", "command": "cargo build --locked --release -p cua-driver", "cargo_lock_sha256": "e" * 64, "required_libraries": ["libc.so.6"]})
+    manifest.update(minimum_glibc="2.39", source="https://github.com/trycua/cua", tag="cua-driver-rs-v0.33.4")
+    for name in packager.DRIVER_NOTICES:
+        (root / name).write_text(json.dumps(manifest) if name.endswith("SOURCE.json") else "license/build fixture")
     return path
 
 class DriverPayload(unittest.TestCase):
@@ -44,23 +55,81 @@ class DriverPayload(unittest.TestCase):
             payload.write_bytes(data)
             payload.chmod(0o755)
             manifest = {"schema": 1, "name": "cua-driver", "target": "x86_64-unknown-linux-gnu", "packaged_path": "deploy/vendor/cua-driver", "source_commit": "a" * 40, "binary_sha256": hashlib.sha256(data).hexdigest(), "binary_bytes": len(data)}
-            archive_input = archive_fixture(Path(folder), data, manifest)
+            archive_input = archive_fixture(root, data, manifest)
             (root / "deploy/cua-driver-manifest.json").write_text(json.dumps(manifest))
             version = packager.tomllib.loads((root / "Cargo.toml").read_text())["package"]["version"]
             def git(*args):
                 if args[0] == "status": return b""
                 if args[0] == "rev-parse": return b"b" * 40
                 if args[0] == "show": return b"1700000000"
-                return ("\0".join(resources + ["deploy/cua-driver-manifest.json"])).encode()
+                return ("\0".join(resources + ["deploy/cua-driver-manifest.json", manifest["patch_path"], *packager.DRIVER_NOTICES])).encode()
             output = Path(folder) / "candidate"
             with patch.object(packager, "ROOT", root), patch.object(packager, "git", side_effect=git), patch.object(packager.subprocess, "check_output", return_value="kindred " + version), contextlib.redirect_stdout(io.StringIO()):
                 packager.package(binary, output, payload, archive_input)
+                missing_patch = lambda *args: git(*args).replace(manifest["patch_path"].encode(), b"") if args[0] == "ls-files" else git(*args)
+                with patch.object(packager, "git", side_effect=missing_patch), self.assertRaisesRegex(ValueError, "patch must be tracked"):
+                    packager.package(binary, Path(folder) / "rejected", payload, archive_input)
             with zipfile.ZipFile(output / ("kindred-standalone-" + version + ".zip")) as archive:
                 self.assertEqual(archive.read(manifest["packaged_path"]), data)
                 self.assertEqual((archive.getinfo(manifest["packaged_path"]).external_attr >> 16) & 0o777, 0o755)
                 self.assertEqual(json.loads(archive.read("bundle.json"))["cua_driver"], manifest)
                 self.assertEqual(archive.read("kindred"), data)
             self.assertEqual(json.loads((output / "SOURCE.json").read_text())["cua_driver"], manifest)
+
+    def test_derivative_provenance_rejects_missing_or_changed_inputs(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "deploy").mkdir()
+            payload = root / "driver"
+            data = b"\x7fELF\x02" + bytes(13) + b"\x3e\x00" + b"fixture"
+            payload.write_bytes(data)
+            payload.chmod(0o755)
+            manifest = {"schema": 1, "name": "cua-driver", "target": "x86_64-unknown-linux-gnu", "packaged_path": "deploy/vendor/cua-driver", "source_commit": "a" * 40, "binary_sha256": hashlib.sha256(data).hexdigest(), "binary_bytes": len(data)}
+            archive = archive_fixture(root, data, manifest)
+            manifest_path = root / "deploy/cua-driver-manifest.json"
+            with patch.object(packager, "ROOT", root):
+                for field in ("kindred_policy", "patch_sha256", "upstream_archive_sha256", "upstream_binary_sha256", "build"):
+                    candidate = dict(manifest)
+                    candidate.pop(field)
+                    manifest_path.write_text(json.dumps(candidate))
+                    with self.subTest(field=field), self.assertRaises(ValueError):
+                        packager.driver_payload(payload, archive)
+                for field in ("compiler", "command", "cargo_lock_sha256", "required_libraries"):
+                    candidate = dict(manifest, build=dict(manifest["build"]))
+                    candidate["build"][field] = ""
+                    manifest_path.write_text(json.dumps(candidate))
+                    with self.subTest(build=field), self.assertRaises(ValueError):
+                        packager.driver_payload(payload, archive)
+                manifest_path.write_text(json.dumps(dict(manifest, kindred_policy="unsafe_policy")))
+                with self.assertRaisesRegex(ValueError, "required Cua"):
+                    packager.driver_payload(payload, archive)
+                manifest_path.write_text(json.dumps(manifest))
+                notice = root / "third-party/cua-driver/LICENSE.txt"
+                notice.unlink()
+                with self.assertRaisesRegex(ValueError, "Missing regular Cua notice"):
+                    packager.driver_payload(payload, archive)
+                notice.write_text("license fixture")
+                for name in ("../consent.patch", "third-party/cua-driver/../../consent.patch", "/tmp/consent.patch"):
+                    escaped = dict(manifest, patch_path=name)
+                    manifest_path.write_text(json.dumps(escaped))
+                    (root / "third-party/cua-driver/SOURCE.json").write_text(json.dumps(escaped))
+                    with self.assertRaisesRegex(ValueError, "Unsafe"):
+                        packager.driver_payload(payload, archive)
+                manifest_path.write_text(json.dumps(manifest))
+                (root / "third-party/cua-driver/SOURCE.json").write_text(json.dumps(manifest))
+                selected = root / manifest["patch_path"]
+                selected.write_bytes(b"tampered")
+                with self.assertRaisesRegex(ValueError, "patch differs"):
+                    packager.driver_payload(payload, archive)
+                selected.unlink()
+                original_patch = root / "original.patch"
+                original_patch.write_bytes(b"reviewed policy patch fixture")
+                selected.symlink_to(original_patch)
+                with self.assertRaisesRegex(ValueError, "patch differs"):
+                    packager.driver_payload(payload, archive)
+                selected.unlink()
+                with self.assertRaisesRegex(ValueError, "patch differs"):
+                    packager.driver_payload(payload, archive)
 
     def test_pinned_payload_and_rejections(self):
         with tempfile.TemporaryDirectory() as folder:
