@@ -82,7 +82,8 @@ impl Db {
             let hidden: bool = c.query_row("SELECT COALESCE((SELECT bot_only OR archived FROM chats WHERE id=?),1)",[&chat_id],|r|r.get(0))?;
             if hidden {chat_id=format!("dm-{bot_id}");}
         }
-        Ok(json!({"bot_id":bot_id,"chat_id":chat_id,"run_id":run_id,"request_kind":kind,"request_id":if sql.is_some(){id}else{""},"status":status}))
+        let outcome:String=if kind=="user_action" {c.query_row("SELECT outcome FROM user_tasks WHERE id=? AND run_id=?",rusqlite::params![id,run_id],|r|r.get(0)).optional()?.unwrap_or_default()} else {String::new()};
+        Ok(json!({"bot_id":bot_id,"chat_id":chat_id,"run_id":run_id,"request_kind":kind,"request_id":if sql.is_some(){id}else{""},"status":status,"outcome":outcome}))
     }
     pub fn notifications(&self, after: Option<i64>) -> Result<Value> {
         let general = self.setting("general")?.unwrap_or_default();
@@ -215,6 +216,11 @@ mod tests {
         let seq:i64=db.0.lock().unwrap().query_row("SELECT seq FROM events WHERE kind='user_action' AND run_id=?",[&child],|r|r.get(0)).unwrap();
         let target=db.notification_target(&seq.to_string()).unwrap();assert_eq!(target["chat_id"],format!("dm-{}",b.id));assert_eq!(target["request_id"],task.id);assert_eq!(target["status"],"pending");
         let items=db.notifications(Some(seq-1)).unwrap();assert_eq!(items["items"][0]["chat_id"],target["chat_id"]);
+        db.0.lock().unwrap().execute("UPDATE user_tasks SET status='expired' WHERE id=?",[&task.id]).unwrap();
+        for outcome in ["done","skipped"] {
+            db.0.lock().unwrap().execute("UPDATE user_tasks SET status='resumed',outcome=? WHERE id=?",rusqlite::params![outcome,task.id]).unwrap();
+            let receipt=db.notification_target(&seq.to_string()).unwrap();assert_eq!(receipt["status"],"resumed");assert_eq!(receipt["outcome"],outcome);
+        }
         db.0.lock().unwrap().execute("UPDATE user_tasks SET status='expired' WHERE id=?",[&task.id]).unwrap();
         assert_eq!(db.notification_target(&seq.to_string()).unwrap()["status"],"expired");assert!(db.notifications(Some(seq-1)).unwrap()["items"].as_array().unwrap().is_empty());
         db.0.lock().unwrap().execute("UPDATE runs SET status='running' WHERE id=?",[&child]).unwrap();

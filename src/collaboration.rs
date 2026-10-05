@@ -138,7 +138,24 @@ impl Db {
     /// requester names/content are exposed: clients resolve visible identities.
     pub fn current_delegations(&self) -> Result<Vec<Value>> {
         let c=self.0.lock().unwrap();
-        Ok(c.prepare("SELECT e.child_run_id,p.bot_id,e.source_chat_id FROM collaboration_requests e JOIN runs p ON p.id=e.parent_run_id JOIN runs r ON r.id=e.child_run_id WHERE e.resolved=0 AND e.continuation_run_id='' AND p.status NOT IN ('cancelled','cancelling') AND r.status IN ('queued','running','awaiting_user','awaiting_approval') ORDER BY r.created,r.rowid")?.query_map([],|r|Ok(json!({"run_id":r.get::<_,String>(0)?,"requester_bot_id":r.get::<_,String>(1)?,"source_chat_id":r.get::<_,String>(2)?})))?.collect::<rusqlite::Result<_>>()?)
+        // A completed intermediary still owns its incoming work while its
+        // children/continuation settle. Completion does not resolve that edge.
+        let rows=c.prepare("SELECT e.child_run_id,p.bot_id,e.source_chat_id,
+            EXISTS(SELECT 1 FROM collaboration_requests old WHERE old.continuation_run_id=r.id)
+            FROM collaboration_requests e JOIN runs p ON p.id=e.parent_run_id JOIN runs r ON r.id=e.child_run_id
+            WHERE e.resolved=0 AND e.continuation_run_id='' AND p.status NOT IN ('cancelled','cancelling')
+            AND (r.status IN ('queued','running','awaiting_user','awaiting_approval') OR
+                (r.status='completed' AND EXISTS(SELECT 1 FROM collaboration_requests nested WHERE nested.parent_run_id=r.id)))
+            ORDER BY r.created,r.rowid")?.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,bool>(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut current=Vec::with_capacity(rows.len());
+        for (run_id,requester_bot_id,source_chat_id,resuming) in rows {
+            let waiting_on_bot_ids=c.prepare("SELECT DISTINCT child.bot_id FROM collaboration_requests edge JOIN runs child ON child.id=edge.child_run_id
+                WHERE edge.parent_run_id=? AND edge.resolved=0 AND edge.continuation_run_id=''
+                AND child.status IN ('queued','running','awaiting_user','awaiting_approval','completed') ORDER BY child.created,child.rowid")?
+                .query_map([&run_id],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            current.push(json!({"run_id":run_id,"requester_bot_id":requester_bot_id,"source_chat_id":source_chat_id,"resuming":resuming,"waiting_on_bot_ids":waiting_on_bot_ids}));
+        }
+        Ok(current)
     }
     pub fn collaboration_waits(&self, chat: &str) -> Result<Vec<Value>> {
         let c = self.0.lock().unwrap();
@@ -211,10 +228,21 @@ mod tests {
             .unwrap();
         finish(&db, &child, "");
         assert!(queued(&db, &a.id).is_empty());
+        assert_eq!(db.claim_bot(&c.id).unwrap().unwrap().id,leaf);
+        let waiting=db.current_delegations().unwrap();
+        let intermediate=waiting.iter().find(|d|d["run_id"]==child).expect("B still works for A while waiting on C");
+        assert_eq!(intermediate["requester_bot_id"],a.id);
+        assert_eq!(intermediate["waiting_on_bot_ids"],json!([c.id]));
+        assert_eq!(db.run(&child).unwrap().status,"completed","display does not change run status");
         finish(&db, &leaf, "C evidence");
         let bnext = queued(&db, &b.id);
         assert_eq!(bnext.len(), 1);
         assert_eq!(bnext[0].reply_to, a.id);
+        let projection=db.current_delegations().unwrap();
+        assert!(!projection.iter().any(|d|d["run_id"]==child));
+        let continuation=projection.iter().find(|d|d["run_id"]==bnext[0].id).unwrap();
+        assert_eq!(continuation["resuming"],true);
+        assert_eq!(continuation["waiting_on_bot_ids"],json!([]));
         assert_eq!(
             db.collaboration_waits(&p.chat_id).unwrap()[0]["run_id"],
             bnext[0].id
@@ -223,6 +251,29 @@ mod tests {
         let anext = queued(&db, &a.id);
         assert_eq!(anext.len(), 1);
         assert!(anext[0].prompt.contains("B conclusion from C"));
+        assert!(db.current_delegations().unwrap().is_empty());
+    }
+    #[test]
+    fn nested_projection_child_cancel_drops_suffix_and_parent_or_helper_cancel_clears() {
+        for cancel in ["leaf","parent","helper"] {
+            let db=Db::open(":memory:").unwrap();
+            let a=crate::tests::bot(&db,"codex");let b=crate::tests::bot(&db,"codex");let c=crate::tests::bot(&db,"codex");
+            let parent=db.queue(&a.id,"Original task",0).unwrap();let p=db.run(&parent).unwrap();
+            let child=db.chat_handoff(&p,&b.id,"Intermediate").unwrap();finish(&db,&parent,"");
+            let leaf=db.chat_handoff(&db.run(&child).unwrap(),&c.id,"Nested help").unwrap();finish(&db,&child,"");
+            db.claim_bot(&c.id).unwrap().unwrap();
+            let projection=db.current_delegations().unwrap();
+            assert_eq!(projection.iter().find(|d|d["run_id"]==child).unwrap()["waiting_on_bot_ids"],json!([c.id]));
+            db.cancel(match cancel {"leaf"=>&leaf,"parent"=>&parent,_=>&child}).unwrap();
+            let projection=db.current_delegations().unwrap();
+            if cancel=="leaf" {
+                let helper=projection.iter().find(|d|d["run_id"]==child).expect("incoming A→B is still unresolved");
+                assert_eq!(helper["waiting_on_bot_ids"],json!([]));
+                assert_eq!(db.run(&child).unwrap().status,"completed");
+                assert!(queued(&db,&b.id).is_empty(),"display never schedules a continuation");
+                db.cancel(&parent).unwrap();assert!(db.current_delegations().unwrap().is_empty());
+            } else {assert!(projection.is_empty());}
+        }
     }
     #[test]
     fn question_answer_keeps_request_link_and_saved_decline_reaches_requester() {
