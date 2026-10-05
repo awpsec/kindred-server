@@ -51,9 +51,9 @@ impl Db {
     // observation after this run's latest computer action before a handoff.
     pub fn require_observed_handoff(&self, run: &str) -> Result<()> {
         let (action,observed):(Option<i64>,Option<i64>)=self.0.lock().unwrap().query_row(
-            "SELECT MAX(CASE WHEN json_extract(body,'$.tool') IN ('computer_open_url','computer_click','computer_type','computer_key','computer_scroll','computer_browser_task') AND COALESCE(json_extract(body,'$.failed'),0)=0 THEN seq END),MAX(CASE WHEN json_extract(body,'$.tool')='computer_screenshot' AND json_extract(body,'$.has_image')=1 AND COALESCE(json_extract(body,'$.failed'),0)=0 THEN seq END) FROM events WHERE run_id=? AND kind='tool_result'",[run],|r|Ok((r.get(0)?,r.get(1)?)))?;
+            "SELECT MAX(CASE WHEN json_extract(body,'$.tool') IN ('computer_open_url','computer_click','computer_type','computer_key','computer_scroll','computer_browser_task') AND (COALESCE(json_extract(body,'$.failed'),0)=0 OR json_extract(body,'$.uncertain_effect')=1) THEN seq END),MAX(CASE WHEN (json_extract(body,'$.tool')='computer_screenshot' OR (json_extract(body,'$.tool') IN ('computer_click','computer_type','computer_key','computer_scroll') AND json_extract(body,'$.observation_after_action')=1)) AND json_extract(body,'$.has_image')=1 AND COALESCE(json_extract(body,'$.failed'),0)=0 THEN seq END) FROM events WHERE run_id=? AND kind='tool_result'",[run],|r|Ok((r.get(0)?,r.get(1)?)))?;
         ensure!(
-            action.is_none_or(|action| observed.is_some_and(|seen| seen > action)),
+            action.is_none_or(|action| observed.is_some_and(|seen| seen >= action)),
             "Inspect a fresh computer_screenshot after your last computer action before requesting user help. Describe the actual visible page; a successful click does not prove the expected form or verification step appeared."
         );
         Ok(())
@@ -323,6 +323,24 @@ mod tests {
         })
         .await
         .unwrap()
+    }
+    #[test]
+    fn post_action_images_credit_handoff_only_after_input_and_do_not_replace_human_resume_gate() {
+        let app = app();
+        let b = bot(&app.db, "codex");
+        let id = app.db.queue(&b.id,"Fill form",0).unwrap();
+        app.db.event(&id,"tool_result",json!({"tool":"computer_type","has_image":true,"observation_after_action":true})).unwrap();
+        assert!(app.db.require_observed_handoff(&id).is_ok());
+        app.db.event(&id,"tool_result",json!({"tool":"computer_click","action_applied":true,"observation_error":true})).unwrap();
+        assert!(app.db.require_observed_handoff(&id).is_err());
+        app.db.event(&id,"tool_result",json!({"tool":"computer_screenshot","has_image":true})).unwrap();
+        assert!(app.db.require_observed_handoff(&id).is_ok());
+        app.db.event(&id,"user_action_done",json!({"outcome":"done"})).unwrap();
+        assert!(app.db.handoff_needs_observation(&id).unwrap());
+        app.db.event(&id,"tool_result",json!({"tool":"computer_click","has_image":true,"observation_after_action":true})).unwrap();
+        assert!(app.db.handoff_needs_observation(&id).unwrap());
+        app.db.event(&id,"tool_result",json!({"tool":"computer_screenshot","has_image":true})).unwrap();
+        assert!(!app.db.handoff_needs_observation(&id).unwrap());
     }
     #[test]
     fn handoffs_require_current_images_and_post_resume_verification() {

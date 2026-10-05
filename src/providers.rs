@@ -7,6 +7,12 @@ use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::time::Duration;
 
+fn codex_tool_result(result: &Value) -> Value {
+    let mut items = vec![json!({"type":"inputText","text":result["text"].as_str().unwrap_or("")})];
+    if let Some(image) = result["image"].as_str() { items.push(json!({"type":"inputImage","imageUrl":image})); }
+    json!({"contentItems":items,"success":result["failed"]!=true})
+}
+
 pub async fn codex_models(rpc: &mut Rpc) -> Result<Vec<Value>> {
     let mut models = Vec::new();
     let mut cursor = Value::Null;
@@ -265,13 +271,7 @@ async fn codex_rpc(app: &App, bot: &Bot, run: &Run, rpc: &mut Rpc) -> Result<Str
                     end_turn = result["deferred_question"] == true
                         || result["finish_quietly"] == true
                         || result["deferred_process"] == true;
-                    let mut items = vec![
-                        json!({"type":"inputText","text":result["text"].as_str().unwrap_or("")}),
-                    ];
-                    if let Some(image) = result["image"].as_str() {
-                        items.push(json!({"type":"inputImage","imageUrl":image}));
-                    }
-                    json!({"contentItems":items,"success":result["failed"]!=true})
+                    codex_tool_result(&result)
                 }
                 // All mutation should use the common guest tool policy. Don't silently approve native execution.
                 "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
@@ -423,6 +423,22 @@ mod memory_contract_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_executor_image_preserves_codex_content_and_applied_result() {
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        let Ok(path) = std::env::var("KINDRED_EXECUTOR_IMAGE_PATH") else { return; };
+        let png=std::fs::read(path).unwrap();
+        assert_eq!(u32::from_be_bytes(png[16..20].try_into().unwrap()),1440);
+        assert_eq!(u32::from_be_bytes(png[20..24].try_into().unwrap()),900);
+        let image=format!("data:image/png;base64,{}",STANDARD.encode(png));
+        let result=codex_tool_result(&json!({"text":"Input applied","image":image,"action_applied":true}));
+        assert_eq!(result["success"],true);
+        assert_eq!(result["contentItems"][1]["type"],"inputImage");
+        assert_eq!(result["contentItems"][1]["imageUrl"],image);
+        let missing=codex_tool_result(&json!({"text":"Input applied; capture unavailable","action_applied":true,"observation_error":true}));
+        assert_eq!(missing["success"],true);
+        assert_eq!(missing["contentItems"].as_array().unwrap().len(),1);
+    }
     #[cfg(unix)]
     #[tokio::test]
     async fn codex_rejects_native_tool_exposure_and_secret_chat_questions() {

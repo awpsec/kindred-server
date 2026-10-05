@@ -108,6 +108,25 @@ pub async fn capture_output(
     }
 }
 
+#[derive(Debug)]
+pub struct UncertainGuestEffect {
+    pub timed_out: bool,
+    pub detail: String,
+}
+impl std::fmt::Display for UncertainGuestEffect {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "The computer action receipt was lost: {}. Its effect is uncertain. Do not repeat it; inspect the current page to reconcile the result.", self.detail)
+    }
+}
+impl std::error::Error for UncertainGuestEffect {}
+fn guest_receipt_error(tool: &str, error: anyhow::Error) -> anyhow::Error {
+    // Missing local executable fails before dispatch, unlike a lost remote receipt.
+    if error.downcast_ref::<std::io::Error>().is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) { return error; }
+    if matches!(tool, "computer_open_url" | "computer_click" | "computer_type" | "computer_key" | "computer_scroll" | "guest_exec" | "command_start") {
+        UncertainGuestEffect { timed_out: error.to_string().contains("timed out"), detail: error.to_string() }.into()
+    } else { error }
+}
+
 pub async fn guest(config: &Vm, tool: &str, args: Value) -> Result<Value> {
     guest_screen(config, 1, tool, args).await
 }
@@ -124,10 +143,16 @@ pub async fn guest_screen(config: &Vm, screen: i64, tool: &str, mut args: Value)
     }
     let input = serde_json::to_vec(&serde_json::json!({"tool":tool,"args":args,"screen":screen}))?;
     ensure!(input.len() <= 65536, "guest request exceeds 64 KB");
-    let output = capture(cmd, Some(input), 80, 8 * 1024 * 1024).await?;
-    let value: Value = serde_json::from_slice(&output).context("guest returned invalid JSON")?;
+    let output = capture(cmd, Some(input), 80, 8 * 1024 * 1024).await.map_err(|e| guest_receipt_error(tool, e))?;
+    let value: Value = serde_json::from_slice(&output).context("guest returned invalid JSON").map_err(|e| guest_receipt_error(tool, e))?;
     if let Some(error) = value.get("error").and_then(Value::as_str) {
-        bail!("guest: {error}");
+        let rejection = anyhow::anyhow!("guest: {error}");
+        // Legacy guest input failure can follow partial xdotool execution.
+        if error.starts_with("Computer input failed:") { return Err(guest_receipt_error(tool, rejection)); }
+        return Err(rejection);
+    }
+    if matches!(tool, "computer_open_url" | "computer_click" | "computer_type" | "computer_key" | "computer_scroll") && value["text"].as_str().is_none() {
+        return Err(guest_receipt_error(tool, anyhow::anyhow!("guest returned no action receipt")));
     }
     Ok(value)
 }
@@ -223,4 +248,24 @@ pub async fn provider_unavailable(config: &Vm, provider: &str) -> Result<Option<
         "preparing":matches!(setup,"starting"|"installing"),"setup":setup,
         "data":[],"message":message}),
     ))
+}
+
+#[cfg(test)]
+mod computer_transport_tests {
+    use super::*;
+    #[tokio::test]
+    async fn dispatched_input_timeout_keeps_uncertainty_but_missing_executable_does_not() {
+        let marker = std::env::temp_dir().join(format!("kindred-effect-{}",crate::db::id()));
+        let mut cmd=Command::new("python3");
+        cmd.args(["-c","import pathlib,sys,time; pathlib.Path(sys.argv[1]).write_text('applied once'); time.sleep(5)",marker.to_str().unwrap()]);
+        let error = capture(cmd,None,1,1024).await.unwrap_err();
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(),"applied once");
+        let error = guest_receipt_error("computer_click",error);
+        assert!(error.downcast_ref::<UncertainGuestEffect>().unwrap().timed_out);
+        std::fs::remove_file(marker).unwrap();
+        let mut cmd=Command::new("/nonexistent/kindred-fixture-input");cmd.arg("unused");
+        let error=guest_receipt_error("computer_click",capture(cmd,None,1,1024).await.unwrap_err());
+        assert!(error.downcast_ref::<UncertainGuestEffect>().is_none());
+        assert!(guest_receipt_error("computer_screenshot",anyhow::anyhow!("timed out")).downcast_ref::<UncertainGuestEffect>().is_none());
+    }
 }

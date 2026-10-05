@@ -1,5 +1,6 @@
 """Protocol integration fixtures: no subscription, network or model charge."""
 import json
+import os
 import importlib.util
 from pathlib import Path
 import subprocess
@@ -85,6 +86,16 @@ else:
 '''
 
 class Bridge(unittest.TestCase):
+    @unittest.skipUnless(os.environ.get('KINDRED_EXECUTOR_IMAGE_PATH'), 'Set actual executor capture path')
+    def test_real_native_executor_image_through_claude_mcp_wire(self):
+        import base64
+        png=Path(os.environ['KINDRED_EXECUTOR_IMAGE_PATH']).read_bytes()
+        self.exercise('claude-code',image='data:image/png;base64,'+base64.b64encode(png).decode())
+    @unittest.skipUnless(os.environ.get('KINDRED_EXECUTOR_IMAGE_PATH'), 'Set actual executor capture path')
+    def test_real_native_executor_image_through_kimi_wire(self):
+        import base64
+        png=Path(os.environ['KINDRED_EXECUTOR_IMAGE_PATH']).read_bytes()
+        self.exercise('kimi-code',image='data:image/png;base64,'+base64.b64encode(png).decode())
     def test_account_inheritance_rejects_local_mcp_configuration_before_startup(self):
         with tempfile.TemporaryDirectory() as d:
             path=Path(d)/'.claude.json';env={'CLAUDE_CONFIG_DIR':d}
@@ -105,9 +116,13 @@ class Bridge(unittest.TestCase):
         for packet in [{},dict(good,tools=[]),dict(good,mcp_servers=[{'name':'kindred','status':'failed'}])]:
             with self.assertRaises(module.ToolBridgeError):module.validate_claude_tools(packet,{'remember':{}})
 
-    def exercise(self,provider,model=None,effort='',error_packet=None,bad_bridge=False,cleanup=False,tool_count=1,max_steps=4):
+    def exercise(self,provider,model=None,effort='',error_packet=None,bad_bridge=False,cleanup=False,tool_count=1,max_steps=4,image=None):
         with tempfile.TemporaryDirectory() as d:
-            binary=Path(d)/'fixture';fixture=FAKE.replace("'name':'kindred','status':'connected'","'name':'kindred','status':'failed'") if bad_bridge else FAKE;fixture=fixture.replace('    child.terminate();child.wait()',"    child.terminate();child.wait()\n    import time;time.sleep(.15)\n    from pathlib import Path\n    Path(__file__).with_name('worker-cleaned').write_text('done')") if cleanup else fixture;binary.write_text(fixture if error_packet is None else FAKE.replace("    emit({'type':'result','subtype':'success','is_error':False})", "    emit("+repr(error_packet)+")\n    emit({'type':'result','subtype':'error_during_execution','is_error':True})"));binary.chmod(0o755)
+            binary=Path(d)/'fixture';fixture=FAKE.replace("'name':'kindred','status':'connected'","'name':'kindred','status':'failed'") if bad_bridge else FAKE;fixture=fixture.replace('    child.terminate();child.wait()',"    child.terminate();child.wait()\n    import time;time.sleep(.15)\n    from pathlib import Path\n    Path(__file__).with_name('worker-cleaned').write_text('done')") if cleanup else fixture
+            if image:
+                fixture=fixture.replace("    result=read(); assert result['result']['return_value']['is_error'] is True", "    result=read(); assert result['result']['return_value']['is_error'] is True\n    import base64,struct\n    part=result['result']['return_value']['output'][1]\n    assert part['type']=='image_url'\n    png=base64.b64decode(part['image_url']['url'].split(',',1)[1]);assert struct.unpack('>II',png[16:24])==(1440,900)")
+                fixture=fixture.replace("    assert result['result']['isError'] is True", "    import base64,struct\n    part=result['result']['content'][1]\n    assert part['type']=='image' and part['mimeType']=='image/png'\n    png=base64.b64decode(part['data']);assert struct.unpack('>II',png[16:24])==(1440,900)\n    assert result['result']['isError'] is True")
+            binary.write_text(fixture if error_packet is None else FAKE.replace("    emit({'type':'result','subtype':'success','is_error':False})", "    emit("+repr(error_packet)+")\n    emit({'type':'result','subtype':'error_during_execution','is_error':True})"));binary.chmod(0o755)
             child=subprocess.Popen([sys.executable,'-c',LAUNCH,str(HELPER),str(binary),provider],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
             start={'protocol':1,'provider':provider,'model':model or ('sonnet' if provider=='claude-code' else 'kimi'),'reasoning_effort':effort,'instructions':'Use only supplied tools.','prompt':'Remember hello.','max_steps':max_steps,
                    'tools':[{'name':'remember','description':'Remember text','inputSchema':{'type':'object','properties':{'text':{'type':'string'}},'required':['text']}}]}
@@ -123,7 +138,7 @@ class Bridge(unittest.TestCase):
                     child.stdin.write(json.dumps({'type':'tool_result','id':'connector-context','result':{'preferred_source':'kindred'}})+'\n');child.stdin.flush()
                 if frame['type']=='tool_call':
                     self.assertEqual(frame['args'],{'text':'hello'})
-                    child.stdin.write(json.dumps({'type':'tool_result','id':frame['id'],'result':{'text':'Declined','failed':True}})+'\n');child.stdin.flush()
+                    child.stdin.write(json.dumps({'type':'tool_result','id':frame['id'],'result':dict({'text':'Declined','failed':True},**({'image':image} if image else {}))})+'\n');child.stdin.flush()
                 if frame['type']=='complete': break
             child.stdin.close();child.wait(timeout=10)
             errors=child.stderr.read();child.stdout.close();child.stderr.close()

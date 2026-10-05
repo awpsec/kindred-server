@@ -236,13 +236,13 @@ pub fn tool_specs() -> Vec<Value> {
         ),
         (
             "computer_click",
-            "Click the current VM desktop. Use coordinates from a fresh screenshot.",
+            "Click the current VM desktop using native image pixels from a fresh observation. The result includes a fresh post-input image when available; inspect it before the next action. If the page is still changing, take another screenshot without repeating the click.",
             json!({"x":{"type":"integer"},"y":{"type":"integer"},"button":{"type":"integer"}}),
             vec!["x", "y"],
         ),
         (
             "computer_type",
-            "Type text into the focused VM application. Never request credentials in chat.",
+            "Type text into the focused VM application. Ground the focused field in the latest image, then inspect the returned image to verify its value. Never request credentials in chat.",
             json!({"text":{"type":"string"}}),
             vec!["text"],
         ),
@@ -651,15 +651,24 @@ pub async fn call_tool(app: &App, bot: &Bot, run: &Run, name: &str, args: Value)
     let outcome = call_tool_inner(app, bot, run, name, args).await;
     let result = match outcome {
         Ok(result) => result,
-        Err(error) => json!({"text":error.to_string(),"failed":true}),
+        Err(error) => tool_error_result(error),
     };
-    app.db.event(&run.id,"tool_result",json!({"tool":name,"call_id":call_id,"text":result["text"],"has_image":result["image"].as_str().is_some_and(|s|!s.trim().is_empty()),"failed":result["failed"] == true,"timed_out":result["timed_out"],"stopped":result["stopped"],"exit_code":result["exit_code"],"elapsed_seconds":result["elapsed_seconds"]}))?;
+    app.db.event(&run.id,"tool_result",json!({"tool":name,"call_id":call_id,"text":result["text"],"has_image":result["image"].as_str().is_some_and(|s|!s.trim().is_empty()),"failed":result["failed"] == true,"uncertain_effect":result["uncertain_effect"],"action_applied":result["action_applied"],"observation_after_action":result["observation_after_action"],"width":result["width"],"height":result["height"],"timed_out":result["timed_out"],"stopped":result["stopped"],"exit_code":result["exit_code"],"elapsed_seconds":result["elapsed_seconds"]}))?;
     if let Some(args) = pointer_args.filter(|_| result["failed"] != true) {
         // Visual telemetry must never turn an already executed click into a retryable failure.
         let _ = app.db.save_setting(&format!("computer-pointer:{}",bot.id), &json!({"id":call_id,"bot_id":bot.id,"x":args["x"],"y":args["y"],"button":args["button"].as_i64().unwrap_or(1),"created":db::now()}));
     }
     crate::conversation_updates::with_live_context(&app.db, run, result)
 }
+fn tool_error_result(error: anyhow::Error) -> Value {
+    let mut result = json!({"text":error.to_string(),"failed":true});
+    if let Some(uncertain) = error.downcast_ref::<vm::UncertainGuestEffect>() {
+        result["uncertain_effect"] = json!(true);
+        result["timed_out"] = json!(uncertain.timed_out);
+    }
+    result
+}
+
 async fn call_tool_inner(
     app: &App,
     bot: &Bot,
@@ -668,6 +677,9 @@ async fn call_tool_inner(
     args: Value,
 ) -> Result<Value> {
     crate::provider_inbox::guard_tool(&app.db, run, name, &args)?;
+    if matches!(name, "computer_open_url" | "computer_click" | "computer_type" | "computer_key" | "computer_scroll" | "computer_browser_task" | "guest_exec" | "command_start") {
+        crate::provider_retry::require_certain_guest_effect(app, run)?;
+    }
     ensure!(
         name == "computer_browser_task" || tool_specs()
             .into_iter()
@@ -1167,8 +1179,17 @@ async fn call_tool_inner(
                     args["timezone"] = json!(zone.name());
                 }
             }
+            let input_action = matches!(name, "computer_click" | "computer_type" | "computer_key" | "computer_scroll");
+            if input_action { args["observe"] = json!(true); }
             let work = vm::guest_screen(&app.config.vm, app.db.screen(&bot.id)?, name, args);
-            if let Some(session) = &mut desktop { session.rpc(work).await? } else { work.await? }
+            if let Some(session) = &mut desktop {
+                // Invalidate the preceding image before dispatch. Failed capture
+                // or transport must not leave the old observation usable.
+                if input_action { session.observed(&json!({})); }
+                let result = session.rpc(work).await?;
+                if input_action { session.observed(&result); }
+                result
+            } else { work.await? }
         }
     };
     Ok(result)
@@ -1525,5 +1546,19 @@ pub(crate) async fn drive_run<F: std::future::Future<Output = Result<String>>>(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod computer_receipt_tests {
+    use super::*;
+    #[test]
+    fn transport_uncertainty_survives_tool_error_serialization() {
+        let result = tool_error_result(vm::UncertainGuestEffect{timed_out:true,detail:"fixture receipt timeout".into()}.into());
+        assert_eq!(result["uncertain_effect"],true);
+        assert_eq!(result["timed_out"],true);
+        assert_eq!(result["failed"],true);
+        let rejection = tool_error_result(anyhow::anyhow!("x outside supported range"));
+        assert!(rejection["uncertain_effect"].is_null());
     }
 }

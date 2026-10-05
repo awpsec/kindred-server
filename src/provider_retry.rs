@@ -32,11 +32,19 @@ fn can_resume(app: &App, run: &Run) -> Result<bool> {
     // A disconnected provider is not evidence that an external write failed.
     // Do not replay a turn while a tool lacks a durable execution receipt.
     let c = app.db.0.lock().unwrap();
-    let uncertain: bool=c.query_row("SELECT EXISTS(SELECT 1 FROM events WHERE run_id=? AND kind='tool_result' AND (json_extract(body,'$.timed_out')=1 OR json_extract(body,'$.stopped')=1))",[&run.id],|r|r.get(0))?;
+    let uncertain: bool=c.query_row("SELECT EXISTS(SELECT 1 FROM events WHERE run_id=? AND kind='tool_result' AND (json_extract(body,'$.uncertain_effect')=1 OR json_extract(body,'$.timed_out')=1 OR json_extract(body,'$.stopped')=1))",[&run.id],|r|r.get(0))?;
     if uncertain {
         return Ok(false);
     }
     Ok(!c.query_row("SELECT EXISTS(SELECT 1 FROM events requested WHERE requested.run_id=? AND requested.kind='tool_requested' AND NOT EXISTS(SELECT 1 FROM events result WHERE result.run_id=requested.run_id AND result.kind='tool_result' AND result.seq>requested.seq AND json_extract(result.body,'$.call_id')=json_extract(requested.body,'$.call_id'))) OR EXISTS(SELECT 1 FROM connector_artifacts WHERE run_id=? AND status IN ('preparing','pending','approved','ready','executing','interrupted','failed'))",[&run.id,&run.id],|r|r.get::<_,bool>(0))?)
+}
+
+pub fn require_certain_guest_effect(app: &App, run: &Run) -> Result<()> {
+    let uncertain: bool = app.db.0.lock().unwrap().query_row(
+        "SELECT EXISTS(SELECT 1 FROM events WHERE run_id=? AND kind='tool_result' AND json_extract(body,'$.uncertain_effect')=1)",
+        [&run.id], |r| r.get(0))?;
+    ensure!(!uncertain, "An earlier computer action has an uncertain effect. Further actions in this run are blocked to avoid duplicates. Inspect a fresh screenshot or other readback, report what is verified and what remains uncertain; do not repeat the action.");
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -146,6 +154,26 @@ mod tests {
     use super::*;
     use crate::tests;
     use std::{cell::Cell, future::ready};
+    #[tokio::test]
+    async fn lost_computer_receipt_blocks_provider_replay_and_more_input_but_not_readback() {
+        let app = tests::app();
+        let bot = tests::bot(&app.db, "codex");
+        app.db.queue(&bot.id, "Submit once", 0).unwrap();
+        let run = app.db.claim_bot(&bot.id).unwrap().unwrap();
+        app.db.event(&run.id, "tool_result", json!({"tool":"computer_click","call_id":"submit","failed":true,"uncertain_effect":true,"timed_out":false})).unwrap();
+        assert!(!can_resume(&app, &run).unwrap());
+        assert!(require_certain_guest_effect(&app, &run).is_err());
+        let result = crate::runtime::call_tool(&app, &bot, &run, "computer_click", json!({"x":1,"y":1,"action_scope":"external"})).await.unwrap();
+        assert_eq!(result["failed"], true);
+        assert!(result["text"].as_str().unwrap().contains("avoid duplicates"));
+        let result = crate::runtime::call_tool(&app, &bot, &run, "computer_release", json!({})).await.unwrap();
+        assert_ne!(result["failed"], true);
+        assert!(!app.db.events(&run.id).unwrap().iter().any(|e|e["kind"]=="tool_started" && e["body"]["tool"]=="computer_click"));
+        // Known pre-dispatch rejection does not poison an otherwise safe run.
+        let id = app.db.queue(&bot.id, "Invalid coordinates", 0).unwrap();
+        app.db.event(&id,"tool_result",json!({"tool":"computer_click","failed":true,"text":"x outside supported range"})).unwrap();
+        assert!(require_certain_guest_effect(&app, &app.db.run(&id).unwrap()).is_ok());
+    }
     fn blip() -> anyhow::Error {
         anyhow::anyhow!("Subscription provider timed out")
     }

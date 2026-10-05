@@ -71,6 +71,26 @@ fn keyboard_shortcut(key: &str) -> Result<String> {
         .collect::<Result<Vec<String>>>()
         .map(|parts| parts.join("+"))
 }
+async fn display_geometry(display: &str) -> Result<(i64, i64)> {
+    let mut cmd = Command::new("xdotool");
+    cmd.env("DISPLAY", display).arg("getdisplaygeometry");
+    let output = capture(cmd, None, 5, 128).await?;
+    let dimensions = std::str::from_utf8(&output)?.split_whitespace()
+        .map(str::parse::<i64>).collect::<std::result::Result<Vec<_>, _>>()?;
+    ensure!(dimensions.len() == 2 && dimensions.iter().all(|n| (1..=16384).contains(n)), "Invalid display geometry");
+    Ok((dimensions[0], dimensions[1]))
+}
+async fn screenshot(display: &str) -> Result<Value> {
+    let mut cmd = Command::new("import");
+    cmd.args(["-display", display, "-window", "root", "png:-"]);
+    let png = capture(cmd, None, 10, 5 * 1024 * 1024).await?;
+    ensure!(png.len() >= 24 && &png[..8] == b"\x89PNG\r\n\x1a\n" && &png[12..16] == b"IHDR", "Invalid screenshot PNG");
+    let width = u32::from_be_bytes(png[16..20].try_into()?);
+    let height = u32::from_be_bytes(png[20..24].try_into()?);
+    ensure!(width > 0 && height > 0, "Empty screenshot");
+    Ok(json!({"text":format!("Current VM display: {width}x{height} native pixels. Click coordinates use these image pixels. This is a fresh capture, not proof that a delayed page or navigation has settled."),"image":format!("data:image/png;base64,{}",STANDARD.encode(png)),"width":width,"height":height}))
+}
+
 // Chromium forwards to an existing profile and exits, or owns a new persistent
 // browser process. Waiting for that process to exit is not a navigation check.
 async fn launch_browser(mut command: Command) -> Result<()> {
@@ -146,12 +166,18 @@ pub async fn execute_screen(tool: &str, args: &Value, screen: i64) -> Result<Val
         std::env::var("KINDRED_GUEST").as_deref() == Ok("1"),
         "guest tools require KINDRED_GUEST=1 inside the dedicated VM"
     );
-    let display = format!(":{screen}");
     if tool.starts_with("computer_") && tool != "computer_resources" {
         let mut cmd = Command::new("/usr/local/lib/kindred/ensure-screen");
         cmd.arg(screen.to_string());
         capture(cmd, None, 30, 4096).await?;
     }
+    execute_display(tool, args, screen).await
+}
+
+// Shared executor; the local fixture supplies an already-running disposable X11
+// display instead of invoking the VM-only ensure-screen lifecycle helper.
+async fn execute_display(tool: &str, args: &Value, screen: i64) -> Result<Value> {
+    let display = format!(":{screen}");
     let browser = if screen == 1 {
         "/home/bot/.local/share/kindred/browser".to_string()
     } else {
@@ -239,29 +265,15 @@ pub async fn execute_screen(tool: &str, args: &Value, screen: i64) -> Result<Val
             }
             Ok(command_result(cmd, 65).await)
         }
-        "computer_screenshot" => {
-            let mut cmd = Command::new("import");
-            cmd.args([
-                "-display",
-                &display,
-                "-window",
-                "root",
-                "-resize",
-                "1280x800>",
-                "png:-",
-            ]);
-            let png = capture(cmd, None, 10, 5 * 1024 * 1024).await?;
-            Ok(
-                json!({"text":"Current shared VM display. Coordinates refer to the 1280x800 screen.","image":format!("data:image/png;base64,{}",STANDARD.encode(png))}),
-            )
-        }
+        "computer_screenshot" => screenshot(&display).await,
         "computer_click" | "computer_type" | "computer_key" | "computer_scroll" => {
             let mut cmd = Command::new("xdotool");
-            cmd.env("DISPLAY", display);
+            cmd.env("DISPLAY", &display);
             match tool {
                 "computer_click" => {
-                    let x = number(args, "x", 1279)?;
-                    let y = number(args, "y", 799)?;
+                    let (width, height) = display_geometry(&display).await?;
+                    let x = number(args, "x", width - 1)?;
+                    let y = number(args, "y", height - 1)?;
                     let b = args["button"].as_i64().unwrap_or(1);
                     ensure!((1..=3).contains(&b), "button must be 1..3");
                     cmd.args(["mousemove", "--sync", &x, &y, "click", &b.to_string()]);
@@ -293,15 +305,28 @@ pub async fn execute_screen(tool: &str, args: &Value, screen: i64) -> Result<Val
                     ]);
                 }
             }
-            let output = crate::vm::capture_output(cmd, None, 30, 4096).await?;
+            // Input may have been partly applied even when the process or its
+            // receipt fails. Never turn that uncertainty into an ordinary retry.
+            let output = match crate::vm::capture_output(cmd, None, 30, 4096).await {
+                Ok(output) => output,
+                Err(error) => return Ok(json!({"text":format!("Computer input outcome is uncertain: {error}. Do not repeat it. Inspect the current page and reconcile the effect first."),"failed":true,"uncertain_effect":true,"timed_out":error.to_string().contains("timed out")})),
+            };
             let diagnostic = String::from_utf8_lossy(&output.stderr);
-            ensure!(
-                output.status.success() && !diagnostic.contains("No such key name"),
-                "Computer input failed: {diagnostic}"
-            );
-            Ok(
-                json!({"text":"Action completed. Inspect a fresh screenshot before the next action."}),
-            )
+            if !output.status.success() || diagnostic.contains("No such key name") {
+                return Ok(json!({"text":format!("Computer input did not complete reliably: {diagnostic}. It may have partly applied; do not repeat it without verifying the page."),"failed":true,"uncertain_effect":true}));
+            }
+            if args["observe"] == true {
+                return Ok(match screenshot(&display).await {
+                    Ok(mut observation) => {
+                        observation["action_applied"] = json!(true);
+                        observation["observation_after_action"] = json!(true);
+                        observation["text"] = json!(format!("Input applied. {} Verify the intended target and result before continuing; do not repeat a submission to get a clearer receipt.", observation["text"].as_str().unwrap()));
+                        observation
+                    }
+                    Err(error) => json!({"text":format!("Input applied, but its post-action screenshot is unavailable: {error}. Do not repeat the input. Take a fresh computer_screenshot to verify the result."),"action_applied":true,"observation_error":true}),
+                });
+            }
+            Ok(json!({"text":"Input applied. Inspect a fresh screenshot to verify the target and result.","action_applied":true}))
         }
         _ => bail!("unknown guest tool"),
     }
@@ -310,6 +335,30 @@ pub async fn execute_screen(tool: &str, args: &Value, screen: i64) -> Result<Val
 #[cfg(all(test, unix))]
 mod browser_tests {
     use super::*;
+    #[tokio::test]
+    #[ignore = "explicit disposable X11 browser fixture only"]
+    async fn local_executor_fixture() {
+        use tokio::net::TcpListener;
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let address = std::env::var("KINDRED_EXECUTOR_FIXTURE_ADDRESS").unwrap();
+        let screen: i64 = std::env::var("KINDRED_EXECUTOR_FIXTURE_SCREEN").unwrap().parse().unwrap();
+        assert!((1..=32).contains(&screen));
+        let listener = TcpListener::bind(&address).await.unwrap();
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            let request: Value = serde_json::from_str(&line).unwrap();
+            if request["tool"] == "fixture_stop" { break; }
+            let result = match execute_display(request["tool"].as_str().unwrap(), &request["args"], screen).await {
+                Ok(value) => value,
+                Err(error) => json!({"failed":true,"text":error.to_string()}),
+            };
+            let output = format!("{}\n", serde_json::to_string(&result).unwrap());
+            reader.get_mut().write_all(output.as_bytes()).await.unwrap();
+        }
+    }
     #[test]
     fn keyboard_aliases_match_linux_keysyms() {
         for (input, expected) in [

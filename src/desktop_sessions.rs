@@ -182,6 +182,20 @@ mod tests {
         (bot, run, slot)
     }
     #[tokio::test]
+    async fn missing_post_input_observation_invalidates_previous_image() {
+        let app = crate::tests::app();
+        let (_, run, _) = run(&app);
+        let mut session = enter(&app, &run, "computer_screenshot").await.unwrap();
+        session.observed(&json!({"image":"fixture"}));
+        session.observed(&json!({"action_applied":true,"observation_error":true}));
+        drop(session);
+        assert!(enter(&app,&run,"computer_type").await.is_err());
+        let mut session = enter(&app,&run,"computer_screenshot").await.unwrap();
+        session.observed(&json!({"image":"new fixture"}));
+        drop(session);
+        assert!(enter(&app,&run,"computer_type").await.is_ok());
+    }
+    #[tokio::test]
     async fn desktop_sequences_are_exclusive_and_release_requires_new_observation() {
         let app = crate::tests::app();
         let (bot, run, slot) = run(&app);
