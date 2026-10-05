@@ -16,6 +16,9 @@ import tomllib
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[2]
+DRIVER_NOTICES = tuple("third-party/cua-driver/" + name for name in (
+    "LICENSE.txt", "UPSTREAM-LICENSING.md", "UPSTREAM-THIRD-PARTY-NOTICES.md",
+    "BUILD.md", "SOURCE.json", "RUST-DEPENDENCIES.json", "RUST-DEPENDENCY-NOTICES.txt"))
 
 
 def git(*args):
@@ -41,6 +44,46 @@ def driver_payload(payload, archive=None):
             or type(manifest.get("binary_bytes")) is not int
             or manifest["binary_bytes"] <= 0):
         raise ValueError("Invalid pinned Cua driver manifest")
+    if manifest.get("kindred_policy") != "no_automatic_browser_input_v1":
+        raise ValueError("Missing required Cua no-automatic-input policy")
+    for field in ("patch_sha256", "upstream_archive_sha256", "upstream_binary_sha256"):
+        if not isinstance(manifest.get(field), str) or not re.fullmatch(r"[0-9a-f]{64}", manifest[field]):
+            raise ValueError("Missing or invalid Cua provenance: " + field)
+    build = manifest.get("build")
+    if (not isinstance(build, dict)
+            or not isinstance(build.get("compiler"), str) or not build["compiler"].strip()
+            or not isinstance(build.get("command"), str) or not build["command"].strip()
+            or not isinstance(build.get("cargo_lock_sha256"), str)
+            or not re.fullmatch(r"[0-9a-f]{64}", build["cargo_lock_sha256"])):
+        raise ValueError("Missing or invalid Cua build provenance")
+    libraries = build.get("required_libraries")
+    if (not isinstance(libraries, list) or not libraries
+            or any(not isinstance(lib, str) or not re.fullmatch(r"lib[A-Za-z0-9_.+-]+\.so(?:\.[0-9]+)*", lib) for lib in libraries)
+            or not isinstance(manifest.get("minimum_glibc"), str)
+            or not re.fullmatch(r"[0-9]+\.[0-9]+", manifest["minimum_glibc"])):
+        raise ValueError("Missing or invalid Cua runtime library requirements")
+    if (manifest["archive_sha256"] == manifest["upstream_archive_sha256"]
+            or manifest["binary_sha256"] == manifest["upstream_binary_sha256"]
+            or manifest.get("source") != "https://github.com/trycua/cua"
+            or manifest.get("tag") != "cua-driver-rs-v" + manifest["version"]):
+        raise ValueError("Derivative Cua identity must be distinct from upstream baseline")
+    for name in DRIVER_NOTICES:
+        notice = ROOT / name
+        if (notice.is_symlink() or not notice.is_file() or not notice.stat().st_size
+                or not notice.resolve().is_relative_to(ROOT.resolve())):
+            raise ValueError("Missing regular Cua notice: " + name)
+    if json.loads((ROOT / "third-party/cua-driver/SOURCE.json").read_text()) != manifest:
+        raise ValueError("Cua notice provenance differs from driver manifest")
+    patch_name = manifest.get("patch_path")
+    if (not isinstance(patch_name, str) or "\\" in patch_name
+            or not patch_name.startswith("third-party/cua-driver/")
+            or any(part in ("", ".", "..") for part in patch_name.split("/"))):
+        raise ValueError("Unsafe Cua policy patch path")
+    patch = ROOT / patch_name
+    if (patch.is_symlink() or not patch.is_file()
+            or not patch.resolve().is_relative_to(ROOT.resolve())
+            or hashlib.sha256(patch.read_bytes()).hexdigest() != manifest["patch_sha256"]):
+        raise ValueError("Cua policy patch differs from pinned manifest")
     payload = payload if payload is not None else ROOT / manifest["packaged_path"]
     if payload.is_symlink() or not payload.is_file():
         raise ValueError("Missing regular Cua driver payload; supply --cua-driver")
@@ -96,6 +139,10 @@ def package(binary, output, cua_driver=None, cua_driver_archive=None):
         manifest, driver_data = driver
         if "deploy/cua-driver-manifest.json" not in tracked:
             raise ValueError("Cua driver manifest must be tracked in Git")
+        if any(name not in tracked for name in DRIVER_NOTICES):
+            raise ValueError("Cua required notices must be tracked in Git")
+        if manifest["patch_path"] not in tracked:
+            raise ValueError("Cua policy patch must be tracked in Git")
         if manifest["packaged_path"] in tracked:
             raise ValueError("Generated driver binary must not be tracked in Git")
         metadata["cua_driver"] = manifest
