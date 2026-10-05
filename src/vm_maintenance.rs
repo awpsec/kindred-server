@@ -143,7 +143,23 @@ async fn update_guest_runtime(app: &App) -> Result<()> {
     command.arg(format!("sudo -n python3 -c '{helper}' {hash} {}",env!("CARGO_PKG_VERSION")));
     let output=vm::capture(command,Some(bytes),90,4096).await?;
     let receipt:Value=serde_json::from_slice(&output)?;
-    ensure!(receipt["version"]==env!("CARGO_PKG_VERSION") && receipt["updated"].is_boolean(),"Guest runtime receipt did not verify");
+    verified_runtime_update(&receipt, update_optional_driver(app)).await
+}
+
+async fn verified_runtime_update(
+    receipt: &Value,
+    optional_driver: impl std::future::Future<Output = Result<()>>,
+) -> Result<()> {
+    ensure!(receipt["version"] == env!("CARGO_PKG_VERSION") && receipt["updated"].is_boolean(), "Guest runtime receipt did not verify");
+    if let Err(error) = optional_driver.await {
+        // The mandatory runtime is already verified. An optional component
+        // must not report that it was retained or prevent normal maintenance.
+        eprintln!("Optional computer page component unavailable: {error}");
+    }
+    Ok(())
+}
+
+async fn update_optional_driver(app: &App) -> Result<()> {
     // The release carries this payload offline. Existing logged-in browsers are
     // neither restarted nor changed; without an attachable endpoint, pixel tools remain.
     let manifest:Value=serde_json::from_str(include_str!("../deploy/cua-driver-manifest.json"))?;
@@ -455,6 +471,39 @@ mod tests {
         assert_eq!(&bytes[..4], b"RIFF");
         assert_eq!(bytes.len(), 20204);
         server.abort();
+    }
+    #[tokio::test]
+    async fn optional_driver_failure_does_not_fail_verified_runtime_update() {
+        let app = crate::tests::app();
+        let db = &app.db;
+        request(&db).unwrap();
+        assert!(due(&db, db::now(), true).unwrap());
+        let root = std::env::temp_dir().join(format!("kindred-optional-driver-{}", db::id()));
+        std::fs::create_dir(&root).unwrap();
+        let target = root.join("driver");
+        std::fs::write(&target, b"previous optional driver").unwrap();
+        let source = serde_json::to_string(include_str!("../deploy/update-cua-driver.py")).unwrap();
+        let destination = serde_json::to_string(target.to_str().unwrap()).unwrap();
+        let mut helper = tokio::process::Command::new("python3");
+        helper.arg("-c").arg(format!("import io; scope={{'__name__':'fixture'}}; exec({source}, scope); scope['install'](io.BytesIO(b'bad'), {destination}, '0'*64, 1)"));
+        verified_runtime_update(&serde_json::json!({"version":env!("CARGO_PKG_VERSION"),"updated":true}), async {
+            vm::capture(helper, None, 5, 4096).await?;
+            anyhow::bail!("Expected actual helper transfer failure")
+        }).await.expect("Real failed driver helper must not fail the verified runtime update");
+        assert_eq!(std::fs::read(&target).unwrap(), b"previous optional driver");
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1, "Failed staged transfer must clean up");
+        std::fs::remove_dir_all(root).unwrap();
+        for reason in ["Bundled driver size mismatch", "Bundled driver hash mismatch", "SSH/helper failed", "Guest driver receipt did not verify"] {
+            verified_runtime_update(&serde_json::json!({"version":env!("CARGO_PKG_VERSION"),"updated":true}), async { Err(anyhow::anyhow!(reason)) })
+                .await.expect("Optional driver failure must not report that the verified runtime was retained");
+            assert_eq!(state(&db).unwrap().phase, "starting");
+            assert!(state(&db).unwrap().error.is_empty());
+        }
+        // The following real maintenance projection can complete normally.
+        apply(&db, &serde_json::json!({"phase":"completed","finished":db::now(),"error":""}), db::now()).unwrap();
+        assert_eq!(state(&db).unwrap().phase, "completed");
+        assert!(state(&db).unwrap().error.is_empty());
+        assert!(verified_runtime_update(&serde_json::json!({"version":"wrong","updated":true}), async { panic!("Invalid runtime receipt must not start optional installation") }).await.is_err());
     }
     #[test]
     fn manual_updates_bypass_schedule_but_wait_for_work_and_preserve_preference() {

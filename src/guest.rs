@@ -360,6 +360,9 @@ async fn execute_display(tool: &str, args: &Value, screen: i64) -> Result<Value>
         }
         "computer_screenshot" => observed_screen(&display,&browser,session).await,
         "computer_click" | "computer_type" | "computer_key" | "computer_scroll" => {
+            if let Some(target) = args.get("target") {
+                ensure!(target.is_string(), "Page target must be a string; omit it to use native input");
+            }
             if let Some(target) = args["target"].as_str() {
                 ensure!(matches!(tool,"computer_click" | "computer_type"), "Page targets support click or type");
                 ensure!(tool != "computer_click" || args["button"].as_i64().unwrap_or(1) == 1, "Page targets support primary clicks; use image coordinates for another button");
