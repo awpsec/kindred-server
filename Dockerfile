@@ -5,6 +5,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY deploy ./deploy
 COPY ui ./ui
+COPY harness ./harness
 RUN cargo build --locked --release --jobs 1
 
 FROM debian:trixie-slim
