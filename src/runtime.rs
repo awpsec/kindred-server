@@ -10,8 +10,9 @@ use std::{sync::Arc, time::Duration};
 use tokio::sync::Mutex;
 
 pub struct App {
-    // None until a supported official Decisions transport/auth adapter exists.
+    // Test selector override. Production credentials are account-scoped and read live.
     pub decisions: Option<Arc<dyn crate::browser_use::Decisions>>,
+    pub decisions_account: std::sync::OnceLock<(std::sync::Weak<crate::profiles::Profiles>, String)>,
     pub desktop_sessions: crate::desktop_sessions::Sessions,
     pub profile_portal: std::sync::OnceLock<(std::sync::Weak<crate::profiles::Profiles>, String)>,
     pub mail_lock: Mutex<()>,
@@ -43,6 +44,7 @@ impl App {
         crate::vm_maintenance::touch(&db.0.lock().unwrap())?;
         let app = Arc::new(Self {
             decisions: None,
+            decisions_account: Default::default(),
             desktop_sessions: Default::default(),
             profile_portal: Default::default(),
             mail_lock: Mutex::new(()),

@@ -25,9 +25,10 @@ impl GuestBrowser {
         };
         let mut command = vm::ssh(config);
         command.arg(format!(
-            "python3 -u -c '{}' '{}'",
+            "python3 -u -c '{}' '{}' ':{}'",
             source.replace('\'', "'\"'\"'"),
-            profile
+            profile,
+            screen
         ));
         command
             .stdin(Stdio::piped())
@@ -49,6 +50,31 @@ impl GuestBrowser {
             hello["protocol"] == 1,
             "Browser observer protocol unavailable"
         );
+        Ok(driver)
+    }
+    #[cfg(test)]
+    pub async fn local_fixture(profile: &str, display: Option<&str>) -> Result<Self> {
+        let mut command = tokio::process::Command::new("python3");
+        command
+            .arg("-u")
+            .arg("-c")
+            .arg(include_str!("../../deploy/browser-driver.py"))
+            .arg(profile);
+        if let Some(display) = display {
+            command.arg(display);
+        }
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let mut child = command.spawn()?;
+        let mut driver = Self {
+            input: child.stdin.take().unwrap(),
+            output: BufReader::new(child.stdout.take().unwrap()),
+            _child: child,
+        };
+        ensure!(driver.request(json!({"op":"hello","protocol":1,"observer":include_str!("../../deploy/browser-observer.js")})).await?["protocol"]==1,"Fixture browser handshake failed");
         Ok(driver)
     }
     async fn request(&mut self, request: Value) -> Result<Value> {

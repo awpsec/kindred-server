@@ -36,8 +36,8 @@ PAGE = b'''<!doctype html><title>Local assessment fixture</title>
 BOOTSTRAP = '''const {chromium} = require(process.argv[1]);
 (async () => {
   const context = await chromium.launchPersistentContext(process.argv[2], {
-    executablePath: process.argv[3], headless: true, timeout: 10000,
-    args: ['--remote-debugging-address=127.0.0.1', '--remote-debugging-port=0']
+    executablePath: process.argv[3], headless: !process.env.KINDRED_BROWSER_FIXTURE_DISPLAY, timeout: 10000,
+    args: ['--remote-debugging-address=127.0.0.1', '--remote-debugging-port=0', '--ozone-platform=x11']
   });
   const stop = async () => { await context.close(); process.exit(0); };
   process.once('SIGTERM', stop);
@@ -45,6 +45,13 @@ BOOTSTRAP = '''const {chromium} = require(process.argv[1]);
   process.stdin.resume();
   process.stdin.once('end', stop);
   await context.pages()[0].goto(process.argv[4], {timeout: 10000});
+  // Wait for the actual compositor surface, not only DOM navigation.
+  let surface=false;
+  for(let attempt=0;attempt<40;attempt++){
+    try{await context.pages()[0].screenshot({timeout:1000});surface=true;break;}
+    catch(error){console.error('Fixture compositor not ready: '+error.message);await new Promise(resolve=>setTimeout(resolve,50));}
+  }
+  if(!surface)throw Error('Fixture compositor did not become ready');
   console.log('ready');
 })().catch(error => { console.error(error.message); process.exitCode = 1; });'''
 
@@ -80,7 +87,7 @@ class BrowserTests(unittest.TestCase):
         threading.Thread(target=lambda: ready.put(cls.browser.stdout.readline()), daemon=True).start()
         if ready.get(timeout=25).strip() != 'ready':
             raise RuntimeError('Isolated Chromium did not start')
-        cls.driver = module.Driver(cls.directory.name, (ROOT / 'deploy/browser-observer.js').read_text())
+        cls.driver = module.Driver(cls.directory.name, (ROOT / 'deploy/browser-observer.js').read_text(), __import__('os').environ.get('KINDRED_BROWSER_FIXTURE_DISPLAY'))
         cls.addClassCleanup(cls.driver.ws.socket.close)
         observation = cls.driver.observe(cls.origin, {})
         if 'Safe checks' not in observation['text']:
@@ -135,6 +142,31 @@ class BrowserTests(unittest.TestCase):
         observation = self.driver.observe(self.origin, {})
         self.assertTrue(self.action(observation, 'Click \u201cSave configuration\u201d')['applied'])
         self.assertEqual(self.driver.evaluate('document.getElementById("result").textContent'), 'Saved locally')
+
+    def test_copied_endpoint_foreign_profile_cannot_connect_or_mutate(self):
+        before = self.driver.evaluate('document.getElementById("safe").checked')
+        with tempfile.TemporaryDirectory(prefix='kindred-foreign-profile-') as other:
+            Path(other, 'DevToolsActivePort').write_bytes(Path(self.directory.name, 'DevToolsActivePort').read_bytes())
+            with self.assertRaises(ValueError):
+                module.Driver(other, (ROOT / 'deploy/browser-observer.js').read_text())
+        self.assertEqual(self.driver.evaluate('document.getElementById("safe").checked'), before)
+
+    def test_endpoint_swap_after_observation_refuses_before_input(self):
+        observation = self.driver.observe(self.origin, {})
+        path = Path(self.directory.name) / 'DevToolsActivePort'
+        original = path.read_bytes()
+        try:
+            path.write_text('1\n/devtools/browser/foreign\n')
+            receipt=self.action(observation, 'Set checkbox \u201cSafe checks\u201d')
+            self.assertFalse(receipt['applied'])
+            self.assertFalse(receipt['uncertain'])
+            self.assertFalse(self.driver.evaluate('document.getElementById("safe").checked'))
+        finally:
+            path.write_bytes(original)
+        display=__import__('os').environ.get('KINDRED_BROWSER_FIXTURE_DISPLAY')
+        if display:
+            with self.assertRaises(ValueError):
+                module.Driver(self.directory.name, (ROOT / 'deploy/browser-observer.js').read_text(), ':65530')
 
     def test_stale_page_and_replayed_choices_are_rejected(self):
         observation = self.driver.observe(self.origin, {})

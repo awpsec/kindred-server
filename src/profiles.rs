@@ -158,6 +158,7 @@ impl Profiles {
         });
         let _ = portal.self_ref.set(Arc::downgrade(&portal));
         if let Some(app) = legacy {
+            let _=app.decisions_account.set((Arc::downgrade(&portal),"legacy".into()));
             portal.apps.lock().unwrap().insert("legacy".into(), app);
         }
         let ids: Vec<String> = portal
@@ -187,6 +188,16 @@ impl Profiles {
         Ok(portal)
     }
 
+    pub(crate) fn legacy_credential_path(&self,profile:&str)->Result<Option<PathBuf>> {
+        let owns:bool=self.registry.lock().unwrap().query_row("SELECT EXISTS(SELECT 1 FROM profiles p JOIN profiles old ON old.account_id=p.account_id AND old.id='legacy' JOIN accounts a ON a.id=p.account_id WHERE p.id=? AND a.disabled=0)",[profile],|r|r.get(0))?;
+        Ok(owns.then(||PathBuf::from(format!("{}.credentials",self.config.database))))
+    }
+    pub(crate) fn account_credential_path(&self, profile: &str) -> Result<PathBuf> {
+        let account: String = self.registry.lock().unwrap().query_row(
+            "SELECT p.account_id FROM profiles p JOIN accounts a ON a.id=p.account_id WHERE p.id=? AND a.disabled=0", [profile], |r|r.get(0))?;
+        anyhow::ensure!(uuid::Uuid::parse_str(&account).is_ok(), "Unknown account");
+        Ok(Path::new(&self.config.profiles.directory).join(format!(".account-{account}.credentials")))
+    }
     fn app(&self, id: &str) -> Result<Shared> {
         let mut apps = self.apps.lock().unwrap();
         if let Some(app) = apps.get(id) {
@@ -1218,6 +1229,8 @@ async fn remove_account(
     tx.execute("DELETE FROM profiles WHERE account_id=?", [&user])?;
     tx.execute("DELETE FROM password_resets WHERE account=?", [&user])?;
     tx.execute("DELETE FROM accounts WHERE id=?", [&user])?;
+    let credential_path=Path::new(&p.config.profiles.directory).join(format!(".account-{user}.credentials"));
+    if credential_path.exists() { std::fs::remove_file(credential_path)?; }
     tx.execute(
         "DELETE FROM controls WHERE key=?",
         [format!("removing:{user}")],

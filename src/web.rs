@@ -193,6 +193,7 @@ pub fn router(app: Shared) -> Router {
             post(crate::local_access::poll).layer(DefaultBodyLimit::max(12 * 1024 * 1024)),
         )
         .route("/connections/openrouter", post(save_openrouter))
+        .route("/connections/decisions", get(decisions_status).post(save_decisions).delete(remove_decisions))
         .route("/opencode/{id}/key", post(crate::opencode::save_key))
         .route("/opencode/{id}/models", get(crate::opencode::models))
         .route(
@@ -1885,4 +1886,14 @@ async fn delete_archived_bot(State(app): State<Shared>, Path(id): Path<String>, 
     if v["confirmed"] != true { return Err(anyhow::anyhow!("Confirm permanent deletion first").into()); }
     app.db.delete_archived_bot(&id, runtime::string(&v,"name")?)?;
     Ok(Json(json!({"deleted":true})))
+}
+
+async fn decisions_status(State(app):State<Shared>)->Result<Json<Value>> {Ok(Json(crate::connections::decisions_status(&app)))}
+async fn save_decisions(State(app):State<Shared>,Json(v):Json<Value>)->Result<Json<Value>> {
+    crate::connections::save_decisions(&app,Some(runtime::string(&v,"key")?))?;
+    Ok(Json(crate::connections::decisions_status(&app)))
+}
+async fn remove_decisions(State(app):State<Shared>)->Result<Json<Value>> {
+    crate::connections::save_decisions(&app,None)?;
+    Ok(Json(crate::connections::decisions_status(&app)))
 }

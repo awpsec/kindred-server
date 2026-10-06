@@ -6,6 +6,9 @@ Uses the standard library so existing guests need no new Python dependencies.
 import base64
 import hashlib
 import json
+import os
+import shlex
+import subprocess
 from pathlib import Path
 import secrets
 import socket
@@ -95,14 +98,60 @@ class WebSocket:
                 return json.loads(result)
 
 
+def bound_browser(profile, display, port):
+    profile = Path(profile)
+    if profile.is_symlink() or str(profile.resolve()) != str(profile):
+        raise ValueError('Browser profile must be exact and unlinked')
+    matches = []
+    for entry in Path('/proc').iterdir():
+        if not entry.name.isdecimal():
+            continue
+        try:
+            args = [a for a in (entry / 'cmdline').read_bytes().split(b'\0') if a]
+            if len(args) == 1:
+                args = [a.encode() for a in shlex.split(args[0].decode())]
+            env = (entry / 'environ').read_bytes().split(b'\0')
+            if not (args and [a for a in args if a.startswith(b'--user-data-dir=')] == [f'--user-data-dir={profile}'.encode()]
+                    and not any(a.startswith((b'--type=', b'--app=')) for a in args)
+                    and os.path.abspath(os.fsdecode(args[0])) == os.path.abspath(os.readlink(entry / 'exe'))
+                    and Path(os.readlink(entry / 'exe')).name in ('chrome', 'chromium', 'chromium-browser')
+                    and entry.stat().st_uid == os.getuid()):
+                continue
+            if display:
+                if [e for e in env if e.startswith(b'DISPLAY=')] not in ([], [f'DISPLAY={display}'.encode()]):
+                    continue
+                # Chromium may clear its environment. Require a native window
+                # for this exact parent on the server-selected X11 display.
+                windows = subprocess.run(['xdotool', 'search', '--onlyvisible', '--pid', entry.name],
+                    env={**os.environ, 'DISPLAY':display}, capture_output=True, timeout=3)
+                if windows.returncode or not windows.stdout.strip():
+                    continue
+            inodes = set()
+            for line in (entry / 'net/tcp').read_text().splitlines()[1:]:
+                fields = line.split()
+                if fields[1] == f'0100007F:{port:04X}' and fields[3] == '0A':
+                    inodes.add(fields[9])
+            owned = {os.readlink(fd) for fd in (entry / 'fd').iterdir()}
+            if not any(f'socket:[{inode}]' in owned for inode in inodes):
+                continue
+            matches.append((int(entry.name), (entry / 'stat').read_text().split(') ',1)[1].split()[19]))
+        except (OSError, ValueError, subprocess.SubprocessError):
+            continue
+    if len(matches) != 1:
+        raise ValueError('Browser endpoint does not match the selected profile/process/display')
+    return matches[0]
+
+
 class Driver:
-    def __init__(self, profile, observer):
+    def __init__(self, profile, observer, display=None):
         lines = (Path(profile) / 'DevToolsActivePort').read_text().splitlines()
         if len(lines) != 2 or not lines[0].isdigit() or not lines[1].startswith('/devtools/browser/'):
             raise ValueError('No supported debugging connection for this browser profile')
         port = int(lines[0])
         if not 1 <= port <= 65535:
             raise ValueError('Invalid browser port')
+        self.profile, self.display, self.port, self.endpoint_lines = str(profile), display, port, lines
+        self.binding = bound_browser(self.profile, display, port)
         self.ws = WebSocket(f'ws://127.0.0.1:{port}{lines[1]}')
         self.next_id = 0
         self.session = None
@@ -137,8 +186,14 @@ class Driver:
             raise RuntimeError('Browser observation or element operation failed')
         return result['result'].get('value')
 
+    def binding_current(self):
+        return (Path(self.profile, 'DevToolsActivePort').read_text().splitlines() == self.endpoint_lines
+                and bound_browser(self.profile, self.display, self.port) == self.binding)
+
     def observe(self, origin, values):
         self.snapshot = None
+        if not self.binding_current():
+            raise RuntimeError('Browser identity changed')
         # Identify the focused visible tab from this browser profile. Never
         # switch tabs or select another bot's browser to obtain an observation.
         tabs = self.call('Target.getTargets')['targetInfos']
@@ -174,6 +229,8 @@ class Driver:
         image = self.call('Page.captureScreenshot', {'format': 'png', 'captureBeyondViewport': False}, self.session)['data']
         if not self.evaluate(capture_check, self.context):
             raise RuntimeError('Browser changed while capturing its observation')
+        if not self.binding_current():
+            raise RuntimeError('Browser identity changed during observation')
         result['image'] = 'data:image/png;base64,' + image
         self.snapshot = result['snapshot_id']
         return result
@@ -184,6 +241,8 @@ class Driver:
             return {'applied': False, 'uncertain': False, 'detail': 'Stale browser snapshot; no action attempted'}
         args = json.dumps(snapshot) + ',' + json.dumps(choice)
         try:
+            if not self.binding_current():
+                return {'applied': False, 'uncertain': False, 'detail': 'Browser identity changed; no action attempted'}
             if not self.evaluate('document.hasFocus() && document.visibilityState === "visible"', self.context):
                 return {'applied': False, 'uncertain': False, 'detail': 'Browser tab lost focus; no action attempted'}
             action = self.evaluate('kindredBrowser.prepare(' + args + ')', self.context)
@@ -215,7 +274,7 @@ class Driver:
             self.snapshot = None
 
 
-def serve(profile):
+def serve(profile, display=None):
     driver = None
     for line in iter(lambda: sys.stdin.buffer.readline(65537), b''):
         try:
@@ -225,7 +284,7 @@ def serve(profile):
             if request['op'] == 'hello':
                 if driver or request['protocol'] != 1 or not isinstance(request['observer'], str) or len(request['observer']) > 32000:
                     raise ValueError('Invalid browser handshake')
-                driver = Driver(profile, request['observer'])
+                driver = Driver(profile, request['observer'], display)
                 response = {'protocol': 1}
             elif driver and request['op'] == 'observe':
                 response = driver.observe(request['origin'], request['values'])
@@ -245,4 +304,4 @@ def serve(profile):
 
 
 if __name__ == '__main__':
-    serve(sys.argv[1])
+    serve(sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else None)

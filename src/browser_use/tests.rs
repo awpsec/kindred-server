@@ -354,6 +354,7 @@ async fn runtime_guard_preserves_real_approval_receipts_and_budget() {
         app: &app,
         bot: &bot,
         run: &run,
+        credential: None,
     };
     let candidate = Candidate {
         id: "check".into(),
@@ -412,4 +413,258 @@ async fn runtime_guard_preserves_real_approval_receipts_and_budget() {
             .iter()
             .any(|e| e["kind"] == "tool_result" && e["body"]["call_id"] == id)
     );
+}
+
+#[tokio::test]
+async fn foreign_run_bot_cannot_acquire_browser_or_send_observations() {
+    let app = crate::tests::app();
+    let bot = crate::tests::bot(&app.db, "codex");
+    let other = crate::tests::bot(&app.db, "codex");
+    app.db.queue(&other.id, "Other task", 0).unwrap();
+    let run = app.db.claim_bot(&other.id).unwrap().unwrap();
+    let guard = RuntimeGuard {
+        app: &app,
+        bot: &bot,
+        run: &run,
+        credential: None,
+    };
+    assert!(guard.check().is_err());
+}
+#[tokio::test]
+async fn finish_is_only_a_report_from_fresh_observation_not_success_receipt() {
+    let mut browser = FixtureBrowser::new();
+    let outcome = drive(
+        &Selector::new(&[Some("finish")]),
+        &mut browser,
+        &FixtureGuard::new(true),
+        &task(),
+    )
+    .await;
+    assert_eq!(outcome.status, "reported_finished");
+    assert_eq!(browser.actions, 0);
+    assert_eq!(browser.observations, 1);
+    let result = outcome.result();
+    let body: Value = serde_json::from_str(result["text"].as_str().unwrap()).unwrap();
+    assert!(
+        body["continuation"]
+            .as_str()
+            .unwrap()
+            .contains("not independent confirmation")
+    );
+}
+struct StalledBrowser {
+    action: bool,
+}
+impl Browser for StalledBrowser {
+    fn observe<'a>(&'a mut self, task: &'a Task) -> Work<'a, Observation> {
+        Box::pin(async move {
+            if self.action {
+                FixtureBrowser::new().observe(task).await
+            } else {
+                std::future::pending().await
+            }
+        })
+    }
+    fn act<'a>(&'a mut self, _o: &'a Observation, _c: &'a Candidate) -> Work<'a, ActionReceipt> {
+        Box::pin(std::future::pending())
+    }
+}
+#[tokio::test]
+async fn total_deadline_read_and_dispatched_write_are_distinguished_without_replay() {
+    for action in [false, true] {
+        let mut browser = StalledBrowser { action };
+        let outcome = drive_until(
+            &Selector::new(&[Some("check")]),
+            &mut browser,
+            &FixtureGuard::new(true),
+            &task(),
+            tokio::time::Instant::now() + Duration::from_millis(20),
+        )
+        .await;
+        assert_eq!(outcome.actions.len(), usize::from(action));
+        assert_eq!(outcome.uncertain, action);
+        assert_eq!(outcome.result()["timed_out"] == true, action);
+    }
+}
+
+/// Runs the production HTTP chooser, Rust loop and real Python/CDP driver on a
+/// disposable profile. The harness distinguishes live API results from local
+/// schema/fault fixtures; no selected choice is replaced on the live path.
+#[tokio::test]
+#[ignore = "explicit disposable browser and supported API-key/local wire fixture"]
+async fn actual_browser_decisions_worker() {
+    let profile = std::env::var("KINDRED_BROWSER_FIXTURE_PROFILE").unwrap();
+    let task: Task =
+        serde_json::from_str(&std::env::var("KINDRED_BROWSER_FIXTURE_TASK").unwrap()).unwrap();
+    task.validate().unwrap();
+    let display = std::env::var("KINDRED_BROWSER_FIXTURE_DISPLAY").ok();
+    let mut browser = driver::GuestBrowser::local_fixture(&profile, display.as_deref())
+        .await
+        .unwrap();
+    let selector: Arc<dyn Decisions> =
+        if let Ok(endpoint) = std::env::var("KINDRED_BROWSER_FIXTURE_ENDPOINT") {
+            Arc::new(
+                transport::OpenAiDecisions::local_fixture(
+                    "sk-fixture-only-not-valid-live".into(),
+                    endpoint,
+                )
+                .unwrap(),
+            )
+        } else {
+            transport::OpenAiDecisions::configured(&crate::config::Decisions {
+                enabled: true,
+                ..Default::default()
+            })
+            .expect("A legitimately provisioned Decisions API key is required")
+        };
+    struct Measured {
+        inner: Arc<dyn Decisions>,
+        calls: Mutex<Vec<Value>>,
+    }
+    impl Decisions for Measured {
+        fn choose<'a>(&'a self, input: &'a DecisionInput) -> Work<'a, String> {
+            Box::pin(async move {
+                let start = std::time::Instant::now();
+                let result = self.inner.choose(input).await;
+                self.calls.lock().unwrap().push(json!({"milliseconds":start.elapsed().as_millis(),"choice":result.as_ref().ok(),"failed":result.is_err(),"snapshot_id":input.observation.snapshot_id}));
+                result
+            })
+        }
+    }
+    let measured = Measured {
+        inner: selector,
+        calls: Mutex::new(vec![]),
+    };
+    let start = std::time::Instant::now();
+    let outcome = drive(&measured, &mut browser, &FixtureGuard::new(true), &task).await;
+    let mut result = outcome.result();
+    result["fixture_metrics"] = json!({"requests":measured.calls.lock().unwrap().clone(),"total_milliseconds":start.elapsed().as_millis(),"live_api":std::env::var("KINDRED_BROWSER_FIXTURE_ENDPOINT").is_err()});
+    std::fs::write(
+        std::env::var("KINDRED_BROWSER_FIXTURE_RESULT").unwrap(),
+        serde_json::to_vec(&result).unwrap(),
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+async fn unchanged_submit_click_cannot_be_dispatched_twice() {
+    struct ClickBrowser(FixtureBrowser);
+    impl Browser for ClickBrowser {
+        fn observe<'a>(&'a mut self, task: &'a Task) -> Work<'a, Observation> {
+            Box::pin(async move {
+                let mut o = self.0.observe(task).await?;
+                o.candidates[0].kind = "click".into();
+                o.candidates[0].label = "Confirm submission".into();
+                Ok(o)
+            })
+        }
+        fn act<'a>(&'a mut self, o: &'a Observation, c: &'a Candidate) -> Work<'a, ActionReceipt> {
+            self.0.act(o, c)
+        }
+    }
+    let mut browser = ClickBrowser(FixtureBrowser::new());
+    let outcome = drive(
+        &Selector::new(&[Some("check"), Some("check")]),
+        &mut browser,
+        &FixtureGuard::new(true),
+        &task(),
+    )
+    .await;
+    assert_eq!(browser.0.actions, 1);
+    assert_eq!(browser.0.observations, 2);
+    assert!(outcome.uncertain);
+    assert_eq!(outcome.result()["timed_out"], true);
+}
+
+#[tokio::test]
+async fn human_return_requires_desktop_observation_before_browser_lease() {
+    let mut app = crate::tests::app();
+    Arc::get_mut(&mut app).unwrap().decisions = Some(Arc::new(Selector::new(&[])));
+    let bot = crate::tests::bot(&app.db, "codex");
+    app.db.queue(&bot.id, "Continue after sign-in", 0).unwrap();
+    let run = app.db.claim_bot(&bot.id).unwrap().unwrap();
+    app.db
+        .event(&run.id, "user_action_done", json!({"outcome":"done"}))
+        .unwrap();
+    let error = call(&app, &bot, &run, serde_json::to_value(task()).unwrap())
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("fresh computer_screenshot"));
+    assert!(!app.desktop_sessions.engaged(&run.id));
+    assert!(app.db.approvals().unwrap().is_empty());
+    app.db
+        .event(
+            &run.id,
+            "tool_result",
+            json!({"tool":"computer_screenshot","has_image":true,"failed":false}),
+        )
+        .unwrap();
+    assert!(!app.db.handoff_needs_observation(&run.id).unwrap());
+}
+
+#[test]
+fn saved_credential_change_revokes_selected_action_before_input() {
+    let mut app = crate::tests::app();
+    let root = std::env::temp_dir().join(format!("kindred-decisions-revoke-{}", db::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    Arc::get_mut(&mut app).unwrap().config.database =
+        root.join("fixture.db").to_string_lossy().into_owned();
+    let bot = crate::tests::bot(&app.db, "codex");
+    app.db.queue(&bot.id, "Fixture", 0).unwrap();
+    let run = app.db.claim_bot(&bot.id).unwrap().unwrap();
+    let key = "sk-synthetic-revoke-123456789";
+    crate::connections::save_decisions(&app, Some(key)).unwrap();
+    let credential = std::sync::Mutex::new(Some(
+        ring::digest::digest(&ring::digest::SHA256, key.as_bytes())
+            .as_ref()
+            .to_vec(),
+    ));
+    let guard = RuntimeGuard {
+        app: &app,
+        bot: &bot,
+        run: &run,
+        credential: Some(&credential),
+    };
+    assert!(guard.check().is_ok());
+    crate::connections::save_decisions(&app, Some("sk-synthetic-replacement-12345")).unwrap();
+    assert!(
+        guard
+            .check()
+            .unwrap_err()
+            .to_string()
+            .contains("key changed")
+    );
+    crate::connections::save_decisions(&app, None).unwrap();
+    assert!(guard.check().is_err());
+    assert!(app.db.approvals().unwrap().is_empty());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+#[ignore = "Requires the explicitly supplied synthetic fixture environment"]
+fn environment_key_is_legacy_only_and_removal_never_resurrects_it() {
+    let mut app = crate::tests::app();
+    let root = std::env::temp_dir().join(format!("kindred-decisions-env-{}", db::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let config = &mut Arc::get_mut(&mut app).unwrap().config;
+    config.database = root.join("fixture.db").to_string_lossy().into_owned();
+    config.decisions.enabled = true;
+    config.decisions.api_key_env = "KINDRED_TEST_DECISIONS_ENV_KEY".into();
+    assert!(crate::connections::decisions_key(&app).is_some());
+    assert_eq!(
+        crate::connections::decisions_status(&app)["source"],
+        "environment"
+    );
+    Arc::get_mut(&mut app).unwrap().config.vm.managed_id = db::id();
+    assert!(crate::connections::decisions_key(&app).is_none());
+    Arc::get_mut(&mut app).unwrap().config.vm.managed_id.clear();
+    crate::connections::save_decisions(&app, Some("sk-synthetic-saved-123456789")).unwrap();
+    assert_eq!(
+        crate::connections::decisions_status(&app)["source"],
+        "saved"
+    );
+    crate::connections::save_decisions(&app, None).unwrap();
+    assert!(crate::connections::decisions_key(&app).is_none());
+    assert_eq!(crate::connections::decisions_status(&app)["source"], "none");
+    std::fs::remove_dir_all(root).unwrap();
 }

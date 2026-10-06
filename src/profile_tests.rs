@@ -1390,3 +1390,43 @@ async fn mobile_pairing_rejects_local_addresses_and_untrusted_browser_claims() {
     assert_ne!(router(f.p.clone()).oneshot(request).await.unwrap().status(),200);
     assert_eq!(f.request("POST","/identity/mobile-pairing/claim","",body).await.0,200);
 }
+
+#[tokio::test]
+async fn decisions_key_is_account_scoped_persistent_private_and_live() {
+    let f=Fixture::new(false);
+    let one=f.register("decisions-owner").await;let two=f.register("decisions-other").await;
+    let token=one["token"].as_str().unwrap();let outsider=two["token"].as_str().unwrap();
+    let profile=f.p.identity(token).unwrap().profile;let app=f.p.app(&profile).unwrap();
+    let key="sk-synthetic-one-123456789";let replacement="sk-synthetic-two-123456789";
+    let (status,_)=f.request("POST","/api/connections/decisions","",json!({"key":key})).await;assert_eq!(status,401);
+    let (status,result)=f.request("POST","/api/connections/decisions",token,json!({"key":key})).await;assert_eq!(status,200,"{result}");assert_eq!(result["configured"],true);assert!(!result.to_string().contains(key));
+    assert_eq!(crate::connections::decisions_key(&app).as_deref(),Some(key));
+    let path=f.p.account_credential_path(&profile).unwrap();
+    #[cfg(unix)] {use std::os::unix::fs::PermissionsExt;assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode()&0o777,0o600);}
+    let (_,foreign)=f.request("GET","/api/connections/decisions",outsider,Value::Null).await;assert_eq!(foreign["configured"],false);assert!(!foreign.to_string().contains(key));
+    let (status,_)=f.request("POST","/api/connections/decisions",token,json!({"key":""})).await;assert_eq!(status,400);assert_eq!(crate::connections::decisions_key(&app).as_deref(),Some(key));
+    let (status,second)=f.request("POST","/identity/profiles",token,json!({"name":"Second"})).await;assert_eq!(status,200,"{second}");
+    let (_,login)=f.request("POST","/identity/login","",json!({"login":"decisions-owner","password":"test password for profiles","profile_id":second["id"]})).await;
+    let second_token=login["token"].as_str().unwrap();let second_app=f.p.app(&f.p.identity(second_token).unwrap().profile).unwrap();assert_eq!(crate::connections::decisions_key(&second_app).as_deref(),Some(key));
+    let (status,_)=f.request("POST","/api/connections/decisions",second_token,json!({"key":replacement})).await;assert_eq!(status,200);assert_eq!(crate::connections::decisions_key(&app).as_deref(),Some(replacement));
+    // Failure before atomic rename preserves the previous working bytes.
+    let stored=std::fs::read(&path).unwrap();
+    let broken=f.p.account_credential_path(&profile).unwrap();std::fs::rename(&broken,broken.with_extension("saved")).unwrap();std::fs::create_dir(&broken).unwrap();
+    let (status,result)=f.request("POST","/api/connections/decisions",second_token,json!({"key":key})).await;assert_eq!(status,400);assert!(result["error"].as_str().unwrap().contains("previous key was retained"));assert!(!result.to_string().contains(key));
+    std::fs::remove_dir(&broken).unwrap();std::fs::rename(broken.with_extension("saved"),&broken).unwrap();assert_eq!(std::fs::read(&broken).unwrap(),stored);
+    drop(app);drop(second_app);f.p.apps.lock().unwrap().clear();
+    let app=f.p.app(&profile).unwrap();assert_eq!(crate::connections::decisions_key(&app).as_deref(),Some(replacement));
+    let (status,result)=f.request("DELETE","/api/connections/decisions",second_token,Value::Null).await;assert_eq!(status,200);assert_eq!(result["configured"],false);assert!(crate::connections::decisions_key(&app).is_none());
+    assert!(!crate::browser_use::preferred(&app,&crate::tests::bot(&app.db,"codex")));
+}
+
+#[tokio::test]
+async fn decisions_key_claimed_standalone_is_shared_only_with_its_account() {
+    let f=Fixture::new(true);let legacy=f.p.legacy.as_ref().unwrap().clone();
+    crate::connections::save_decisions(&legacy,Some("sk-synthetic-legacy-123456789")).unwrap();
+    let (status,owner)=f.request("POST","/identity/register",&legacy.token,json!({"login":"legacy-decisions","name":"Owner","password":"test password for profiles","claim_legacy":true})).await;assert_eq!(status,200,"{owner}");
+    let token=owner["token"].as_str().unwrap();let (status,second)=f.request("POST","/identity/profiles",token,json!({"name":"Second"})).await;assert_eq!(status,200);
+    let second_app=f.p.app(second["id"].as_str().unwrap()).unwrap();assert!(crate::connections::decisions_key(&second_app).is_some());
+    let other=f.register("legacy-decisions-other").await;let (_,status)=f.request("GET","/api/connections/decisions",other["token"].as_str().unwrap(),Value::Null).await;assert_eq!(status["configured"],false);
+    crate::connections::save_decisions(&second_app,None).unwrap();assert!(crate::connections::decisions_key(&legacy).is_none());assert!(crate::connections::decisions_key(&second_app).is_none());
+}

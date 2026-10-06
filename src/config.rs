@@ -14,6 +14,7 @@ pub struct Config {
     pub vm: Vm,
     pub openrouter: OpenRouter,
     pub pi: Pi,
+    pub decisions: Decisions,
     pub max_steps: usize,
     pub max_parallel_runs: usize,
     /// Legacy blanket run timer. Only a customized value still caps tasks;
@@ -75,6 +76,19 @@ pub struct OpenRouter {
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
+pub struct Decisions {
+    /// Explicit opt-in: screenshots and supplied values are sent to OpenAI.
+    pub enabled: bool,
+    pub api_key_env: String,
+}
+impl Default for Decisions {
+    fn default() -> Self {
+        Self { enabled: false, api_key_env: "KINDRED_DECISIONS_API_KEY".into() }
+    }
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct Pi {
     pub node_binary: String,
     pub worker_script: String,
@@ -126,6 +140,7 @@ impl Default for Config {
             vm: Vm::default(),
             openrouter: OpenRouter::default(),
             pi: Pi::default(),
+            decisions: Decisions::default(),
             max_steps: 0,
             max_parallel_runs: 4,
             run_timeout_seconds: 0,
@@ -195,6 +210,9 @@ impl Config {
         Ok(config)
     }
     pub fn validate(&self) -> Result<()> {
+        ensure!(self.decisions.api_key_env.len() <= 128 && !self.decisions.api_key_env.is_empty()
+            && self.decisions.api_key_env.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'),
+            "Decisions api_key_env must name a server environment variable");
         ensure!(
             (1..=1024).contains(&self.profiles.max_users)
                 && (1..=32).contains(&self.profiles.max_profiles_per_user),

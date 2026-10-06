@@ -235,6 +235,7 @@ pub fn bot(db: &Db, provider: &str) -> Bot {
 pub fn app() -> Shared {
     Arc::new(App {
         decisions: None,
+        decisions_account: Default::default(),
         desktop_sessions: Default::default(),
         profile_portal: Default::default(),
         mail_lock: Mutex::new(()),

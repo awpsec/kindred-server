@@ -1,8 +1,9 @@
-//! Codex browser worker. The selector contract here belongs to Kindred, not
-//! OpenAI. Install a verified Decisions adapter before advertising this tool.
+//! Codex browser worker. Kindred owns candidates and action arguments; the
+//! official Decisions transport selects only a grounded current choice.
 mod driver;
 #[cfg(test)]
 mod tests;
+pub mod transport;
 
 use crate::{
     db::{self, Bot, Run},
@@ -15,7 +16,7 @@ use std::{collections::BTreeMap, future::Future, pin::Pin, time::Duration};
 
 pub type Work<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
 
-/// A future official adapter must own supported authentication and return only
+/// The official adapter owns supported API-key authentication and returns only
 /// a choice ID. Never import Codex subscription tokens into a guessed endpoint.
 pub trait Decisions: Send + Sync {
     fn choose<'a>(&'a self, input: &'a DecisionInput) -> Work<'a, String>;
@@ -161,6 +162,7 @@ pub struct DecisionInput {
     pub goal: String,
     pub values: BTreeMap<String, String>,
     pub observation: Observation,
+    pub previous_actions: Vec<Value>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -235,7 +237,24 @@ async fn drive<D: Decisions + ?Sized, B: Browser, G: Guard>(
     guard: &G,
     task: &Task,
 ) -> Outcome {
+    drive_until(
+        selector,
+        browser,
+        guard,
+        task,
+        tokio::time::Instant::now() + Duration::from_secs(120),
+    )
+    .await
+}
+async fn drive_until<D: Decisions + ?Sized, B: Browser, G: Guard>(
+    selector: &D,
+    browser: &mut B,
+    guard: &G,
+    task: &Task,
+    deadline: tokio::time::Instant,
+) -> Outcome {
     let mut outcome = Outcome::new("fallback", "Browser worker action limit reached");
+    let mut applied_clicks = std::collections::HashSet::new();
     // One final observation/decision is allowed after the last permitted action.
     for step in 0..=task.max_actions {
         if let Err(error) = guard.check() {
@@ -243,7 +262,21 @@ async fn drive<D: Decisions + ?Sized, B: Browser, G: Guard>(
             outcome.reason = error.to_string();
             break;
         }
-        let observation = match browser.observe(task).await.and_then(|o| {
+        if tokio::time::Instant::now() >= deadline {
+            outcome.reason = "Browser worker time limit reached; inspect current state".into();
+            break;
+        }
+        let observation = match tokio::time::timeout_at(
+            deadline.min(tokio::time::Instant::now() + Duration::from_secs(30)),
+            browser.observe(task),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(anyhow::anyhow!(
+                "Browser observation timed out; no action attempted"
+            ))
+        })
+        .and_then(|o| {
             o.validate(task)?;
             Ok(o)
         }) {
@@ -258,13 +291,24 @@ async fn drive<D: Decisions + ?Sized, B: Browser, G: Guard>(
             goal: task.goal.clone(),
             values: task.values.clone(),
             observation,
+            previous_actions: outcome.actions.clone(),
         };
-        let choice = match tokio::time::timeout(Duration::from_secs(15), selector.choose(&input))
-            .await
+        let choice = match tokio::time::timeout_at(
+            deadline.min(tokio::time::Instant::now() + Duration::from_secs(15)),
+            selector.choose(&input),
+        )
+        .await
         {
             Ok(Ok(choice)) => choice,
-            _ => {
-                outcome.reason = "Decisions unavailable; continue from the observed state".into();
+            Ok(Err(error)) => {
+                outcome.reason = format!(
+                    "Decisions unavailable: {error}. Continue from the observed state; no new input was dispatched"
+                );
+                break;
+            }
+            Err(_) => {
+                outcome.reason =
+                    "Decisions timed out; continue from the observed state without replay".into();
                 break;
             }
         };
@@ -279,22 +323,40 @@ async fn drive<D: Decisions + ?Sized, B: Browser, G: Guard>(
         };
         if candidate.terminal() {
             outcome.status = if candidate.kind == "finish" {
-                "finished"
+                "reported_finished"
             } else {
                 "fallback"
             };
             outcome.reason = if candidate.kind == "finish" {
-                "Worker finished; verify the final observed result"
+                "The selector reports the goal satisfied; verify the final observed result. No independent success confirmation was made"
             } else {
                 "Browser needs Codex planning or human assistance"
             }
             .into();
             break;
         }
+        // A successful CDP click is dispatch confirmation, not proof a delayed
+        // submission settled. Never repeat it on an unchanged observed page.
+        let click_key = (
+            input.observation.url.clone(),
+            input.observation.text.clone(),
+            candidate.label.clone(),
+        );
+        if candidate.kind == "click" && applied_clicks.contains(&click_key) {
+            outcome.reason = "This click was already dispatched on the same observed state. Its remote result is not confirmed; inspect current state without replay".into();
+            outcome.uncertain = true;
+            break;
+        }
         if step == task.max_actions {
             break;
         }
-        match guard.authorize(task, candidate).await {
+        match tokio::time::timeout_at(deadline, guard.authorize(task, candidate))
+            .await
+            .unwrap_or_else(|_| {
+                Err(anyhow::anyhow!(
+                    "Browser task timed out before input authorization"
+                ))
+            }) {
             Ok(true) => {}
             Ok(false) => {
                 outcome.status = "denied";
@@ -314,6 +376,10 @@ async fn drive<D: Decisions + ?Sized, B: Browser, G: Guard>(
             outcome.reason = error.to_string();
             break;
         }
+        if tokio::time::Instant::now() >= deadline {
+            outcome.reason = "Browser worker time limit reached before input".into();
+            break;
+        }
         let id = match guard.requested(candidate) {
             Ok(id) => id,
             Err(error) => {
@@ -323,15 +389,20 @@ async fn drive<D: Decisions + ?Sized, B: Browser, G: Guard>(
         };
         // After dispatch a broken connection is an uncertain effect, never an
         // invitation to repeat the action or switch to the legacy executor.
-        let receipt = browser
-            .act(&input.observation, candidate)
-            .await
-            .unwrap_or(ActionReceipt {
-                applied: false,
-                uncertain: true,
-                detail: "Browser action response lost; inspect current state before continuing"
-                    .into(),
-            });
+        let receipt = tokio::time::timeout_at(
+            deadline.min(tokio::time::Instant::now() + Duration::from_secs(30)),
+            browser.act(&input.observation, candidate),
+        )
+        .await
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("Browser input timed out")))
+        .unwrap_or(ActionReceipt {
+            applied: false,
+            uncertain: true,
+            detail: "Browser action response lost; inspect current state before continuing".into(),
+        });
+        if candidate.kind == "click" && receipt.applied {
+            applied_clicks.insert(click_key);
+        }
         outcome.uncertain |= receipt.uncertain;
         outcome.actions.push(
             json!({"call_id":id,"choice_id":candidate.id,"label":candidate.label,
@@ -356,9 +427,27 @@ struct RuntimeGuard<'a> {
     app: &'a App,
     bot: &'a Bot,
     run: &'a Run,
+    credential: Option<&'a std::sync::Mutex<Option<Vec<u8>>>>,
 }
 impl Guard for RuntimeGuard<'_> {
     fn check(&self) -> Result<()> {
+        if let Some(credential) = self.credential {
+            if let Some(expected) = credential.lock().unwrap().as_ref() {
+                let current = crate::connections::decisions_key(self.app).map(|key| {
+                    ring::digest::digest(&ring::digest::SHA256, key.as_bytes())
+                        .as_ref()
+                        .to_vec()
+                });
+                ensure!(
+                    current.as_ref() == Some(expected),
+                    "Decisions key changed or was removed; no further browser input authorized"
+                );
+            }
+        }
+        ensure!(
+            self.run.bot_id == self.bot.id,
+            "Browser run belongs to another bot"
+        );
         ensure!(
             !self.app.account_disabled() && !self.app.db.cancelled(&self.run.id),
             "Run cancelled"
@@ -382,7 +471,7 @@ impl Guard for RuntimeGuard<'_> {
     fn authorize<'a>(&'a self, task: &'a Task, candidate: &'a Candidate) -> Work<'a, bool> {
         Box::pin(async move {
             crate::runtime::approve(self.app, self.bot, self.run, "computer_browser_task",
-                &json!({"origin":task.origin,"action":candidate,"value":candidate.value_key.as_ref().and_then(|key|task.values.get(key)),"action_scope":candidate.scope()})).await
+                &json!({"goal":task.goal,"origin":task.origin,"action":candidate,"value":candidate.value_key.as_ref().and_then(|key|task.values.get(key)),"action_scope":candidate.scope()})).await
         })
     }
     fn requested(&self, candidate: &Candidate) -> Result<String> {
@@ -403,7 +492,8 @@ impl Guard for RuntimeGuard<'_> {
 }
 
 pub fn preferred(app: &App, bot: &Bot) -> bool {
-    bot.provider == "codex" && app.decisions.is_some()
+    bot.provider == "codex"
+        && (app.decisions.is_some() || crate::connections::decisions_key(app).is_some())
 }
 pub fn prepare_open(app: &App, bot: &Bot, args: &mut Value) {
     // This flag is server-owned and never part of a model's tool schema.
@@ -416,7 +506,7 @@ pub fn prepare_open(app: &App, bot: &Bot, args: &mut Value) {
 }
 pub fn spec() -> Value {
     json!({"type":"function","name":"computer_browser_task",
-        "description":"Preferred browser worker for Codex bots with a supported Decisions connection. Uses your existing VM browser profile and focused tab; first open the site with normal computer tools. Supply an exact origin, goal and named exact form values. Selects grounded page actions, uses Kindred approvals and verifies fields. Never supply secrets. On fallback inspect current state and preserve completed/uncertain receipts with ordinary computer tools; never replay them or bypass denial. A finish selection is not independent proof of remote success.",
+        "description":"Preferred browser worker for Codex bots with an explicitly configured OpenAI Decisions API-key connection. Uses your existing VM browser profile and focused tab; first open the site with normal computer tools. Supply an exact origin, goal and named exact form values. Selects grounded page actions, uses Kindred approvals and verifies fields. Never supply secrets. On fallback inspect current state and preserve completed/uncertain receipts with ordinary computer tools; never replay them or bypass denial. A finish selection is not independent proof of remote success.",
         "inputSchema":{"type":"object","properties":{
             "goal":{"type":"string","maxLength":8000},
             "origin":{"type":"string","description":"Exact HTTP(S) origin without a path or credentials"},
@@ -431,7 +521,7 @@ pub fn instructions(app: &App, bot: &Bot) -> &'static str {
     if preferred(app, bot) {
         "\nBrowser execution: prefer computer_browser_task on your existing Bot Computer for browser work. Supply the exact origin, goal and named values. On fallback, continue from current observations and completed action receipts with normal computer tools; never replay completed or uncertain actions or bypass a denial.\n"
     } else {
-        "\nBrowser execution: Decisions is preferred when a supported connection is available. This runtime has no verified Decisions adapter; use your existing computer tools. Ordinary Luna access does not establish Decisions access.\n"
+        "\nBrowser execution: Decisions is preferred when a supported connection is available. This runtime has no configured OpenAI Decisions API-key connection; use your existing computer tools. Subscription OAuth and ordinary Luna access do not establish Decisions API access.\n"
     }
 }
 pub async fn call(app: &App, bot: &Bot, run: &Run, args: Value) -> Result<Value> {
@@ -441,10 +531,20 @@ pub async fn call(app: &App, bot: &Bot, run: &Run, args: Value) -> Result<Value>
     );
     let task: Task = serde_json::from_value(args)?;
     task.validate()?;
-    let Some(selector) = app.decisions.as_ref() else {
-        return Ok(Outcome::new("unavailable", "No supported Decisions connection. Use the existing computer tools; no browser action was attempted.").result());
+    if !preferred(app, bot) {
+        return Ok(Outcome::new("unavailable", "OpenAI Decisions is not configured. Save an API key under Settings → Connections → Codex → Browser helper; Kindred supports the documented API-key route and does not use subscription OAuth for Decisions. Use the existing computer tools; no browser action was attempted.").result());
+    }
+    let configured = ConfiguredDecisions {
+        app,
+        last_key: Default::default(),
     };
-    let guard = RuntimeGuard { app, bot, run };
+    let selector: &dyn Decisions = app.decisions.as_deref().unwrap_or(&configured);
+    let guard = RuntimeGuard {
+        app,
+        bot,
+        run,
+        credential: app.decisions.is_none().then_some(&configured.last_key),
+    };
     guard.check()?;
     // Preserve the existing post-handoff screenshot requirement. Browser page
     // screenshots do not replace observation of the whole desktop/login flow.
@@ -466,14 +566,32 @@ pub async fn call(app: &App, bot: &Bot, run: &Run, args: Value) -> Result<Value>
         }
     };
     let outcome = session
-        .rpc(async {
-            Ok(drive(selector.as_ref(), &mut browser, &guard, &task)
-                .await
-                .result())
-        })
+        .rpc(async { Ok(drive(selector, &mut browser, &guard, &task).await.result()) })
         .await;
     drop(browser);
     drop(session);
     app.desktop_sessions.release(&run.id);
     outcome
+}
+
+struct ConfiguredDecisions<'a> {
+    app: &'a App,
+    last_key: std::sync::Mutex<Option<Vec<u8>>>,
+}
+impl Decisions for ConfiguredDecisions<'_> {
+    fn choose<'a>(&'a self, input: &'a DecisionInput) -> Work<'a, String> {
+        Box::pin(async move {
+            let key = crate::connections::decisions_key(self.app).ok_or_else(|| {
+                anyhow::anyhow!("Decisions key was removed or is unavailable; no action selected")
+            })?;
+            *self.last_key.lock().unwrap() = Some(
+                ring::digest::digest(&ring::digest::SHA256, key.as_bytes())
+                    .as_ref()
+                    .to_vec(),
+            );
+            let result = transport::OpenAiDecisions::new(key)?.choose(input).await;
+            let _=self.app.db.save_setting("decisions_last_use",&json!({"fingerprint":self.last_key.lock().unwrap().clone(),"error":result.as_ref().err().map(|e|e.to_string())}));
+            result
+        })
+    }
 }
