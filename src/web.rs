@@ -1482,6 +1482,8 @@ pub fn assets() -> Router {
 }
 fn static_assets<S: Clone + Send + Sync + 'static>() -> Router<S> {
     Router::new()
+        .route("/standalone-access.js", get(|| async { ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8"), (header::CACHE_CONTROL, "no-store")], include_str!("../ui/standalone-access.js")) }))
+        .route("/startup.js", get(|| async { ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8"), (header::CACHE_CONTROL, "no-store")], include_str!("../ui/startup.js")) }))
         .route("/artifact-frame.html", get(|| async { Html(include_str!("../ui/artifact-frame.html")) }))
         .route("/artifacts", get(|| async { Html(include_str!("../ui/index.html")) }))
         .route("/artifacts/{id}", get(|| async { Html(include_str!("../ui/index.html")) }))

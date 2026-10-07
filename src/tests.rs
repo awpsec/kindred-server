@@ -1001,3 +1001,17 @@ fn single_chat_lookup_matches_sidebar_projection() {
     }
     assert!(db.chat("missing").is_err());
 }
+
+#[tokio::test]
+async fn startup_module_graph_is_served_by_the_actual_router() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(axum::serve(listener, web::assets()).into_future());
+    let result = tokio::process::Command::new("node")
+        .args(["--experimental-vm-modules", "--no-warnings"])
+        .arg(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tools/frontend/test-server-module-graph.cjs"))
+        .arg(&base).output().await.expect("Node is required for the actual JavaScript module graph test");
+    println!("{}", String::from_utf8_lossy(&result.stdout));
+    assert!(result.status.success(), "actual module graph failed: {}", String::from_utf8_lossy(&result.stderr));
+    server.abort();
+}
