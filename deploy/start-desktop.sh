@@ -29,8 +29,10 @@ dbus-run-session -- sh -c '
     openbox-session &
     /usr/local/lib/kindred/start-desktop-shell &
     # New computers begin on the desktop. Existing browsers restore their session.
+    # Match computer_open_url: an ephemeral guest-loopback endpoint lets the
+    # worker attach to this exact profile without restarting a running browser.
     if [ -f "$KINDRED_BROWSER_PROFILE/Local State" ]; then
-        chromium --user-data-dir="$KINDRED_BROWSER_PROFILE" --no-first-run --window-size=1120,680 --restore-last-session &
+        chromium --remote-debugging-address=127.0.0.1 --remote-debugging-port=0 --user-data-dir="$KINDRED_BROWSER_PROFILE" --no-first-run --window-size=1120,680 --restore-last-session &
     fi
     wait
 '
