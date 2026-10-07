@@ -16,9 +16,13 @@ pub fn routes() -> Router<Portal> {
         .route("/identity/mobile-pairing/{id}", get(status).delete(cancel))
 }
 fn phone_origin(value: &str) -> Result<String> {
-    ensure!(value.len()<=512 && !value.chars().any(char::is_control), "Enter the server's HTTPS address reachable from your phone");
-    let url = reqwest::Url::parse(value).map_err(|_|anyhow::anyhow!("Enter the server’s full HTTPS address, such as https://kindred.example.com"))?;
-    ensure!(url.scheme()=="https" && url.username().is_empty() && url.password().is_none() && url.query().is_none() && url.fragment().is_none() && matches!(url.path(),""|"/"), "Use an HTTPS server address without a path");
+    ensure!(value.len()<=512 && !value.chars().any(char::is_control), "Enter the complete server address reachable from your phone");
+    let url = reqwest::Url::parse(value).map_err(|_|anyhow::anyhow!("Enter a complete HTTPS address or a private IP address with http://"))?;
+    let private_literal=url.host_str().unwrap_or("").trim_matches(['[',']']).parse::<std::net::IpAddr>().is_ok_and(|ip|match ip {
+        std::net::IpAddr::V4(v)=>v.is_private() || (v.octets()[0]==100 && (64..=127).contains(&v.octets()[1])),
+        std::net::IpAddr::V6(v)=>(v.segments()[0]&0xff00)==0xfd00 && v.to_ipv4().is_none(),
+    });
+    ensure!((url.scheme()=="https" || (url.scheme()=="http" && private_literal)) && url.username().is_empty() && url.password().is_none() && url.query().is_none() && url.fragment().is_none() && matches!(url.path(),""|"/"), "Use HTTPS, or HTTP to a private IP address, without a path or credentials");
     ensure!(!url.host_str().unwrap_or("").ends_with('.'), "Use the server address without a trailing dot");
     let host=url.host_str().unwrap_or("").trim_matches(['[',']']).trim_end_matches('.');
     ensure!(!host.is_empty() && host!="localhost" && !host.ends_with(".localhost") && !host.parse::<std::net::IpAddr>().is_ok_and(|ip|ip.is_loopback()||ip.is_unspecified()||matches!(ip,std::net::IpAddr::V6(v) if v.to_ipv4().is_some_and(|v|v.is_loopback()||v.is_unspecified()))), "A phone cannot connect to this computer's localhost address. Enter its reachable HTTPS address.");
@@ -29,7 +33,7 @@ async fn issue(State(p): State<Portal>, headers: HeaderMap, Json(v): Json<Value>
     let identity=p.identity(bearer(&headers))?;
     ensure!(!identity.legacy, "Set up your Kindred account before connecting the mobile app");
     let server=phone_origin(v["server"].as_str().unwrap_or(&p.config.public_url))?;
-    ensure!(p.config.allows_origin(&server), "This address is not enabled for this server. In Standalone, add its HTTPS address under Server admin → Network → Connection addresses, then restart when ready. For a hosted server, ask its administrator to configure this connection address.");
+    ensure!(p.config.allows_origin(&server), "This address is not enabled for this server. In Standalone, select its network under Server admin → Phone & remote access, then restart when ready. For a hosted server, ask its administrator to configure this connection address.");
     let code=secret();
     let mut link=reqwest::Url::parse("kindred://pair")?;
     link.query_pairs_mut().append_pair("server",&server);
@@ -73,4 +77,19 @@ async fn cancel(State(p): State<Portal>, headers: HeaderMap, RoutePath(id): Rout
     p.origin(&headers)?;let user=p.identity(bearer(&headers))?;
     p.registry.lock().unwrap().execute("DELETE FROM mobile_pairings WHERE id=? AND account_id=? AND issuer=?",params![id,user.account,hash(bearer(&headers))])?;
     Ok(Json(json!({"ok":true})))
+}
+
+#[cfg(test)]
+mod origin_tests {
+    use super::*;
+    #[test]
+    fn private_http_pairing_requires_canonical_literal_origin() {
+        for address in ["http://10.1.2.3:9444","http://172.16.0.1:9444","http://192.168.1.20:9444","http://100.64.1.2:9444","http://[fd7a:115c::5]:9444"] {
+            assert_eq!(phone_origin(address).unwrap(),address);
+        }
+        assert_eq!(phone_origin("https://Computer.tailnet.ts.net:443/").unwrap(),"https://computer.tailnet.ts.net");
+        for address in ["http://127.0.0.1:9444","http://[::1]:9444","http://0.0.0.0:9444","http://8.8.8.8:9444","http://100.128.1.2:9444","http://172.32.1.2:9444","http://[fc00::1]:9444","http://[2001:4860::1]:9444","http://169.254.1.2:9444","http://[fe80::5]:9444","http://computer.tailnet.ts.net:9444","http://computer.local:9444","http://[::ffff:192.168.1.2]:9444","http://user@192.168.1.2:9444","http://192.168.1.2:9444/path","http://192.168.1.2:9444?token=x","http://192.168.1.2:9444#x","192.168.1.2:9444","http://192.168.1.2:65536"] {
+            assert!(phone_origin(address).is_err(),"{address}");
+        }
+    }
 }
