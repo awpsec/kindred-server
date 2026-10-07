@@ -473,7 +473,7 @@ async fn meta(State(p): State<Portal>) -> ApiResult {
         r.get(0)
     })?;
     Ok(Json(
-        json!({"profiles":true,"server_chats":true,"mobile_pairing":true,"deployment":if std::env::var("KINDRED_DEPLOYMENT").as_deref()==Ok("standalone"){"standalone"}else{"hosted"},"first_user":first,"legacy_claim":first&&p.legacy.is_some(),"registration":p.registration_open(&c)?,"version":env!("CARGO_PKG_VERSION")}),
+        json!({"profiles":true,"server_chats":true,"mobile_pairing":true,"mobile_pairing_private_http":true,"deployment":if std::env::var("KINDRED_DEPLOYMENT").as_deref()==Ok("standalone"){"standalone"}else{"hosted"},"first_user":first,"legacy_claim":first&&p.legacy.is_some(),"registration":p.registration_open(&c)?,"version":env!("CARGO_PKG_VERSION")}),
     ))
 }
 async fn register(State(p): State<Portal>, headers: HeaderMap, Json(v): Json<Value>) -> ApiResult {

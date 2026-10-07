@@ -1392,6 +1392,27 @@ async fn mobile_pairing_rejects_local_addresses_and_untrusted_browser_claims() {
 }
 
 #[tokio::test]
+async fn mobile_pairing_private_http_keeps_exact_origin_account_and_workspace() {
+    let mut f=mobile_pairing_fixture();let mut config=f.p.config.clone();config.allowed_origins.extend(["http://192.168.1.20:9444".into(),"http://[fd7a:115c::5]:9444".into()]);f.p=Profiles::open(config,None,false).unwrap();
+    let one=f.register("private-owner").await;let two=f.register("private-other").await;let token=one["token"].as_str().unwrap();let other=two["token"].as_str().unwrap();
+    let (_,profile)=f.request("POST","/identity/profiles",token,json!({"name":"Private work"})).await;let (_,switched)=f.request("POST","/identity/switch",token,json!({"profile_id":profile["id"]})).await;let token=switched["token"].as_str().unwrap();
+    assert_eq!(f.request("GET","/identity/meta","",Value::Null).await.1["mobile_pairing_private_http"],true);
+    for server in ["http://192.168.1.20:9444","http://[fd7a:115c::5]:9444"] {
+        let (status,issued)=f.request("POST","/identity/mobile-pairing",token,json!({"server":server})).await;assert_eq!(status,200,"{issued}");assert_eq!(issued["server"],server);let url=reqwest::Url::parse(issued["url"].as_str().unwrap()).unwrap();assert_eq!(url.query_pairs().find(|(k,_)|k=="server").unwrap().1,server);
+        let path=format!("/identity/mobile-pairing/{}",issued["id"].as_str().unwrap());assert_eq!(f.request("GET",&path,other,Value::Null).await.1["status"],"expired");
+        let code=mobile_pairing_code(&issued);
+        for bad_origin in ["https://192.168.1.20:9444","http://192.168.1.20:9445","http://192.168.1.21:9444","http://8.8.8.8:9444"] {
+            let request=Request::builder().method("POST").uri("/identity/mobile-pairing/claim").header("content-type","application/json").header("origin",bad_origin).body(Body::from(json!({"code":code}).to_string())).unwrap();
+            assert_ne!(router(f.p.clone()).oneshot(request).await.unwrap().status(),200,"{bad_origin}");
+        }
+        assert_eq!(f.request("GET",&path,token,Value::Null).await.1["status"],"pending","Denied origins must not consume the code");
+        let (status,phone)=f.request("POST","/identity/mobile-pairing/claim","",json!({"code":code})).await;assert_eq!(status,200,"{phone}");let identity=f.p.identity(phone["token"].as_str().unwrap()).unwrap();assert_eq!(identity.account,f.p.identity(token).unwrap().account);assert_eq!(identity.profile,profile["id"].as_str().unwrap());assert_ne!(identity.account,f.p.identity(other).unwrap().account);
+        assert_ne!(f.request("POST","/identity/mobile-pairing/claim","",json!({"code":code})).await.0,200);
+    }
+    for server in ["http://192.168.1.20:9445","https://192.168.1.20:9444","http://10.1.2.3:9444","http://8.8.8.8:9444","http://computer.tailnet.ts.net:9444"] {assert_ne!(f.request("POST","/identity/mobile-pairing",token,json!({"server":server})).await.0,200,"{server}");}
+}
+
+#[tokio::test]
 async fn decisions_key_is_account_scoped_persistent_private_and_live() {
     let f=Fixture::new(false);
     let one=f.register("decisions-owner").await;let two=f.register("decisions-other").await;
