@@ -33,7 +33,7 @@ async fn issue(State(p): State<Portal>, headers: HeaderMap, Json(v): Json<Value>
     let identity=p.identity(bearer(&headers))?;
     ensure!(!identity.legacy, "Set up your Kindred account before connecting the mobile app");
     let server=phone_origin(v["server"].as_str().unwrap_or(&p.config.public_url))?;
-    ensure!(p.config.allows_origin(&server), "This address is not enabled for this server. In Standalone, select its network under Server admin → Phone & remote access, then restart when ready. For a hosted server, ask its administrator to configure this connection address.");
+    ensure!(p.config.allows_origin(&server), "This address is not enabled for this server. In Standalone, select its network under Server admin → Networking, then choose Save to apply it. For a hosted server, ask its administrator to configure this connection address.");
     let code=secret();
     let mut link=reqwest::Url::parse("kindred://pair")?;
     link.query_pairs_mut().append_pair("server",&server);
