@@ -4,6 +4,12 @@ use anyhow::{Result,ensure,Context};
 use rusqlite::{Connection,OptionalExtension,params};
 use serde_json::{Value,json};
 use axum::{Json,extract::{State,Path}};
+// Semantic budgets use UTF-8 bytes, not characters or JSON wire length.
+pub const SOURCE_MAX_BYTES:usize=4*1024*1024;
+pub const STATE_MAX_BYTES:usize=2*1024*1024;
+// JSON can encode each source/state byte as a six-byte Unicode escape.
+// This allowance is applied only to artifact create/update routes.
+pub const REQUEST_MAX_BYTES:usize=6*(SOURCE_MAX_BYTES+STATE_MAX_BYTES)+1024*1024;
 const IDLE:i64=14*24*60*60;
 pub fn migrate(c:&Connection)->Result<()> {
  c.execute_batch("CREATE INDEX IF NOT EXISTS chat_workspace_artifact_events ON chat_messages(body,seq) WHERE kind='workspace_artifact';")?;
@@ -24,14 +30,10 @@ fn folders(c:&Connection)->Result<Value>{
 fn validate(v:&Value)->Result<()> {
  ensure!(v["title"].as_str().is_some_and(|s|!s.trim().is_empty()&&s.len()<=200),"Title must contain 1–200 bytes");
  ensure!(matches!(v["language"].as_str(),Some("markdown"|"html"|"jsx")),"Use markdown, html or jsx");
- ensure!(v["source"].as_str().is_some_and(|s|s.len()<=64000),"Source must be text up to 64 KB");
+ ensure!(v["source"].as_str().is_some_and(|s|s.len()<=SOURCE_MAX_BYTES),"This artifact is too large to save (limit about 4 MB of text). Split it into smaller artifacts.");
  ensure!(v.get("kind").is_none()||matches!(v["kind"].as_str(),Some("document"|"slides"|"sheet"|"app")),"Use document, slides, sheet or app");
  ensure!(v.get("folder").is_none()||v["folder"].as_str().is_some_and(|s|s.len()<=120&&!s.chars().any(char::is_control)),"Folder must be text up to 120 bytes");
- // Rich document state includes the structured editing model as well as its
- // rendered HTML. Keep ordinary shared state bounded independently.
- let rich=v["kind"]=="document" && v["language"]=="html" && v["source"].as_str().is_some_and(|s|s.starts_with("<!--kindred-document-v1-->"));
- if rich {let mut shared=v["state"].clone();if let Some(object)=shared.as_object_mut(){object.remove("kindredDocument");}ensure!(shared.to_string().len()<=32000,"Shared state exceeds 32 KB");ensure!(v["state"].to_string().len()<=256000,"Formatted document exceeds 256 KB");}
- else {ensure!(v["state"].to_string().len()<=32000,"Shared state exceeds 32 KB");}Ok(())
+ ensure!(v["state"].to_string().len()<=STATE_MAX_BYTES,"This artifact's saved data is too large (limit about 2 MB). Clear old entries and try again.");Ok(())
 }
 fn record(c:&Connection,id:&str)->Result<Value> {
  let (body,chat,bot,revision,updated,archived):(String,String,String,i64,i64,bool)=c.query_row("SELECT body,chat_id,bot_id,revision,updated,archived FROM workspace_artifacts WHERE id=?",[id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).context("Artifact not found in this workspace")?;
@@ -116,15 +118,62 @@ pub async fn create(State(app):State<Shared>,Json(args):Json<Value>)->Result<Jso
 pub async fn get(State(app):State<Shared>,Path(id):Path<String>)->Result<Json<Value>,crate::web::Error>{Ok(Json(app.db.workspace_artifact_read(&id)?))}
 pub async fn update(State(app):State<Shared>,Path(id):Path<String>,Json(patch):Json<Value>)->Result<Json<Value>,crate::web::Error>{Ok(Json(app.db.workspace_artifact_update(&id,&patch)?))}
 #[cfg(test)] mod tests {
- #[test] fn native_document_state_has_a_separate_bounded_budget(){
-  let mut v=serde_json::json!({"title":"Doc","kind":"document","language":"html","source":"<!--kindred-document-v1--><main></main>","state":{"kindredDocument":{"version":1,"html":"a".repeat(40000)}}});
-  assert!(super::validate(&v).is_ok());
-  v["state"]["ordinary"]=serde_json::json!("a".repeat(33000));assert!(super::validate(&v).is_err());
-  v["state"].as_object_mut().unwrap().remove("ordinary");v["source"]=serde_json::json!("<main></main>");assert!(super::validate(&v).is_err());
-  v["source"]=serde_json::json!("<!--kindred-document-v1--><main></main>");v["state"]["kindredDocument"]["html"]=serde_json::json!("a".repeat(256001));assert!(super::validate(&v).is_err());
+ use super::*;
+ #[test]
+ fn capacity_utf8_limits_preserve_saved_revision_and_reopen() {
+  use base64::Engine;
+  let dir=std::env::temp_dir().join(format!("capacity-{}",db::id()));std::fs::create_dir_all(&dir).unwrap();let path=dir.join("db.sqlite");
+  let db=Db::open(path.to_str().unwrap()).unwrap();let bot=crate::tests::bot(&db,"codex");let rid=db.queue(&bot.id,"capacity",0).unwrap();let run=db.run(&rid).unwrap();
+  let source="é".repeat(SOURCE_MAX_BYTES/2);let state=json!({"value":"é".repeat((STATE_MAX_BYTES-12)/2)});assert_eq!(state.to_string().len(),STATE_MAX_BYTES);
+  let v=db.workspace_artifact_create(&run,&json!({"key":"max","title":"Max","language":"jsx","source":source,"state":state})).unwrap();let id=v["id"].as_str().unwrap().to_owned();
+  for patch in [json!({"expected_revision":1,"source":source.clone()+"x"}),json!({"expected_revision":1,"state":{"value":state["value"].as_str().unwrap().to_owned()+"x"}})] {
+   assert!(db.workspace_artifact_update(&id,&patch).is_err());assert_eq!(db.workspace_artifact_read(&id).unwrap(),v);
+  }
+  assert_eq!(db.0.lock().unwrap().query_row("SELECT COUNT(*) FROM workspace_artifact_versions WHERE artifact_id=?",[&id],|r|r.get::<_,i64>(0)).unwrap(),1);
+  let changed=db.workspace_artifact_update(&id,&json!({"expected_revision":1,"title":"Updated"})).unwrap();assert_eq!(changed["source"],source);assert_eq!(changed["state"],state);
+  let export=crate::artifact_export::export(&changed).unwrap();let bytes=base64::engine::general_purpose::STANDARD.decode(export["data_base64"].as_str().unwrap()).unwrap();let decoded:Value=serde_json::from_slice(&bytes).unwrap();assert_eq!(decoded["source"],source);assert_eq!(decoded["state"],state);
+  drop(db);let db=Db::open(path.to_str().unwrap()).unwrap();assert_eq!(db.workspace_artifact_read(&id).unwrap()["revision"],2);assert_eq!(db.workspace_artifact_read(&id).unwrap()["state"],state);drop(db);std::fs::remove_dir_all(dir).unwrap();
+ }
+ #[tokio::test]
+ async fn capacity_real_router_escaped_maximum_and_rejection() {
+  use std::future::IntoFuture;
+  let app=crate::tests::app();let bot=crate::tests::bot(&app.db,"codex");let rid=app.db.queue(&bot.id,"capacity",0).unwrap();let run=app.db.run(&rid).unwrap();
+  let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let root=format!("http://{}",listener.local_addr().unwrap());let server=tokio::spawn(axum::serve(listener,crate::web::router(app.clone())).into_future());let client=reqwest::Client::new();
+  let url=format!("{root}/api/workspace-artifacts");
+  // Every source character uses the maximum JSON escape expansion. State uses
+  // a valid alternative escaped representation; semantic budgets stay exact.
+  let raw=format!("{{\"chat_id\":{},\"key\":\"escaped\",\"title\":\"Escaped maximum\",\"language\":\"html\",\"source\":\"{}\",\"state\":{{\"value\":\"{}\"}}}}",json!(run.chat_id),"\\u000a".repeat(SOURCE_MAX_BYTES),"\\u0061".repeat(STATE_MAX_BYTES-12));assert!(raw.len()>30*1024*1024);assert!(raw.len()<REQUEST_MAX_BYTES);
+  let response=client.post(&url).bearer_auth(&app.token).header("Content-Type","application/json").body(raw).send().await.unwrap();let status=response.status();let v=response.json::<Value>().await.unwrap();assert!(status.is_success(),"{status} {v}");assert_eq!(v["source"].as_str().unwrap().len(),SOURCE_MAX_BYTES);assert_eq!(v["state"].to_string().len(),STATE_MAX_BYTES);
+  let item=format!("{url}/{}",v["id"].as_str().unwrap());let patched=client.patch(&item).bearer_auth(&app.token).json(&json!({"expected_revision":1,"source":"é".repeat(SOURCE_MAX_BYTES/2),"state":v["state"]})).send().await.unwrap();assert!(patched.status().is_success());let saved=patched.json::<Value>().await.unwrap();
+  let rejected=client.patch(&item).bearer_auth(&app.token).json(&json!({"expected_revision":2,"source":"é".repeat(SOURCE_MAX_BYTES/2)+"x"})).send().await.unwrap();assert_eq!(rejected.status(),400);assert_eq!(app.db.workspace_artifact_read(saved["id"].as_str().unwrap()).unwrap(),saved);
+  let too_large=client.patch(&item).bearer_auth(&app.token).header("Content-Type","application/json").body(" ".repeat(REQUEST_MAX_BYTES+1)).send().await.unwrap();assert_eq!(too_large.status(),413);
+  let unrelated=client.put(format!("{root}/api/settings")).bearer_auth(&app.token).header("Content-Type","application/json").body(" ".repeat(128*1024+1)).send().await.unwrap();assert_eq!(unrelated.status(),413);server.abort();
+ }
+ #[tokio::test]
+ async fn capacity_existing_pi_frame_accepts_plain_combined_budget() {
+  use tokio::io::AsyncReadExt;
+  let saved=json!({"source":"x".repeat(SOURCE_MAX_BYTES),"state":{"value":"x".repeat(STATE_MAX_BYTES-12)}});let frame=json!({"type":"tool_result","id":"capacity","result":{"text":saved.to_string()}});
+  let bytes=serde_json::to_vec(&frame).unwrap().len();assert!(bytes<8*1024*1024);
+  let mut child=tokio::process::Command::new("python3").args(["-c","import json,sys; v=json.loads(json.loads(sys.stdin.readline())['result']['text']); assert len(v['source'])==4194304; assert len(v['state']['value'])==2097140; print('accepted')"]).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).spawn().unwrap();
+  crate::pi::send(child.stdin.as_mut().unwrap(),frame).await.unwrap();let mut out=String::new();child.stdout.take().unwrap().read_to_string(&mut out).await.unwrap();assert!(child.wait().await.unwrap().success());assert_eq!(out.trim(),"accepted");
+  let mut child=tokio::process::Command::new("cat").stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::null()).spawn().unwrap();assert!(crate::pi::send(child.stdin.as_mut().unwrap(),json!({"source":"\n".repeat(SOURCE_MAX_BYTES),"state":{"value":"x".repeat(STATE_MAX_BYTES-12)}})).await.is_err());child.kill().await.unwrap();
+ }
+ #[test]
+ fn capacity_rich_document_uses_same_total_state_budget() {
+  let mut v=json!({"title":"Document","kind":"document","language":"html","source":"<!--kindred-document-v1--><main></main>","state":{"kindredDocument":{"html":"é".repeat(300000)}}});assert!(validate(&v).is_ok());
+  v["state"]["ordinary"]=json!("x".repeat(STATE_MAX_BYTES));assert!(validate(&v).is_err());
  }
 
- use super::*;
+ #[test]
+ fn capacity_representative_dashboard_above_legacy_ceiling() {
+  let db=Db::open(":memory:").unwrap();let bot=crate::tests::bot(&db,"codex");let rid=db.queue(&bot.id,"Synthetic capacity",0).unwrap();let run=db.run(&rid).unwrap();
+  let mut source=String::from("import React from 'react';export default function App(){return <main><h1>Operations dashboard</h1>");
+  for i in 0..700 {source.push_str(&format!("<section><h2>Team {i}</h2><p>Scheduled reviews, work queue, metrics and project updates</p><button>Review</button></section>"));}
+  source.push_str("</main>}");assert!(source.len()>64000);
+  let saved=db.workspace_artifact_create(&run,&json!({"key":"capacity","title":"Operations","language":"jsx","source":source,"state":{"rows":vec!["Synthetic dashboard data";4000]}})).unwrap();
+  assert_eq!(saved["source"],source);assert_eq!(saved["revision"],1);
+ }
+
  #[test]fn folders_survive_reopen_migrate_and_reorder_without_losing_new_folders(){
   let dir=std::env::temp_dir().join(format!("kindred-folder-test-{}",db::id()));std::fs::create_dir_all(&dir).unwrap();let path=dir.join("workspace.db");let db=Db::open(path.to_str().unwrap()).unwrap();
   assert_eq!(db.workspace_artifact_folder_create(" Empty ").unwrap(),json!(["Empty"]));
@@ -255,7 +304,7 @@ pub async fn update(State(app):State<Shared>,Path(id):Path<String>,Json(patch):J
   crate::runtime::call_tool(&app,&bot,&run,"artifact_update",json!({"id":ids[0],"expected_revision":2,"source":"# Updated by bot"})).await.unwrap();
   let after=client.get(&url).bearer_auth(&app.token).send().await.unwrap().json::<Value>().await.unwrap();assert_eq!(after["state"],read["state"]);assert_eq!(after["revision"],3);
   // Invalid and unauthorized writes must not create revisions or destroy content.
-  for patch in [json!({"expected_revision":3,"source":"x".repeat(64001)}),json!({"expected_revision":3,"state":{"large":"x".repeat(32001)}}),json!({"expected_revision":3,"kind":"unknown"}),json!({"source":"missing revision"})]{
+  for patch in [json!({"expected_revision":3,"source":"x".repeat(SOURCE_MAX_BYTES+1)}),json!({"expected_revision":3,"state":{"large":"x".repeat(STATE_MAX_BYTES+1)}}),json!({"expected_revision":3,"kind":"unknown"}),json!({"source":"missing revision"})]{
    assert!(!client.patch(&url).bearer_auth(&app.token).json(&patch).send().await.unwrap().status().is_success());
   }
   assert_eq!(client.get(&url).bearer_auth("wrong-token").send().await.unwrap().status(),401);

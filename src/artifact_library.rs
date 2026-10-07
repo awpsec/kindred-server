@@ -157,28 +157,31 @@ fn snippets(body: &str) -> Vec<Value> {
     let mut fence = None;
     let mut language = String::new();
     let mut source = String::new();
+    let mut source_lines = 0usize;
     let mut too_large = false;
     for line in body.lines() {
         let trimmed = line.trim();
         if let Some((marker, count)) = fence {
             if trimmed.chars().count() >= count && trimmed.chars().all(|c| c == marker) {
                 if !language.is_empty() {
-                    out.push(if too_large {json!({"error":"This shard exceeds the 256 KB rendering limit. Ask the bot to share it as a file."})}else{json!({"language":language,"source":source})});
+                    out.push(if too_large {json!({"error":"This shard exceeds the 4 MB rendering limit. Ask the bot to share it as a file."})}else{json!({"language":language,"source":source})});
                 }
                 fence = None;
                 source.clear();
+                source_lines = 0;
                 language.clear();
                 too_large = false;
                 if out.len() >= 8 {
                     break;
                 }
             } else if !language.is_empty() && !too_large {
-                if source.len() + line.len() + 1 > 256 * 1024 {
+                if source.len() + line.len() + usize::from(source_lines > 0) > crate::workspace_artifacts::SOURCE_MAX_BYTES {
                     too_large = true;
                     source.clear();
                 } else {
+                    if source_lines > 0 {source.push('\n');}
                     source.push_str(line);
-                    source.push('\n');
+                    source_lines += 1;
                 }
             }
         } else if let Some(marker) = trimmed.chars().next().filter(|c| matches!(c, '`' | '~')) {
@@ -338,7 +341,7 @@ mod tests {
         assert!(snippets("```html-source\n<p>Code only</p>\n```").is_empty());
         assert_eq!(snippets("```shard-jsx\nexport default function App(){return <p>View</p>}\n```")[0]["language"], "jsx");
         assert!(
-            snippets(&format!("```html\n{}\n```", "x".repeat(256 * 1024 + 1)))[0]
+            snippets(&format!("```html\n{}\n```", "x".repeat(crate::workspace_artifacts::SOURCE_MAX_BYTES + 1)))[0]
                 .get("error")
                 .is_some()
         );
@@ -360,4 +363,14 @@ mod tests {
                 .is_empty()
         );
     }
+}
+
+#[cfg(test)]
+mod capacity_tests {
+ #[test] fn shard_utf8_boundary_does_not_invent_a_trailing_newline(){
+  let limit=crate::workspace_artifacts::SOURCE_MAX_BYTES;
+  let source="é".repeat(limit/2);let rows=super::snippets(&format!("```jsx\n{source}\n```"));assert_eq!(rows[0]["source"],source);
+  assert!(super::snippets(&format!("```jsx\n{source}x\n```"))[0].get("error").is_some());
+  assert_eq!(super::snippets("```html\n\nhello\n```")[0]["source"],"\nhello");
+ }
 }
