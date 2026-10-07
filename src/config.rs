@@ -8,6 +8,8 @@ pub struct Config {
     pub listen: SocketAddr,
     pub public_url: String,
     pub allowed_origins: Vec<String>,
+    /// Exact HTTP origins approved by the managed Connection access Save flow.
+    pub confirmed_http_origins: Vec<String>,
     pub database: String,
     pub token_env: String,
     pub profiles: Profiles,
@@ -134,6 +136,7 @@ impl Default for Config {
             listen: "127.0.0.1:7340".parse().unwrap(),
             public_url: "http://127.0.0.1:7340".into(),
             allowed_origins: Vec::new(),
+            confirmed_http_origins: Vec::new(),
             database: "data/kindred.db".into(),
             token_env: "KINDRED_TOKEN".into(),
             profiles: Profiles::default(),
@@ -181,7 +184,11 @@ impl Config {
             || self
                 .allowed_origins
                 .iter()
-                .any(|v| origin == v.trim_end_matches('/'))
+                .any(|v| origin == v.trim_end_matches('/') && reqwest::Url::parse(origin).is_ok_and(|u| u.scheme()!="http" || private_network_host(u.host_str().unwrap_or("")) || self.confirmed_http_origins.iter().any(|s|s==origin)))
+    }
+    pub fn connection_policy_digest(&self) -> String {
+        let bytes=serde_json::to_vec(&(&self.allowed_origins,&self.confirmed_http_origins)).unwrap();
+        ring::digest::digest(&ring::digest::SHA256,&bytes).as_ref().iter().map(|b|format!("{b:02x}")).collect()
     }
     /// Active-time cap for one task in seconds; 0 means no total cap.
     /// An explicit `task_timeout_seconds` wins. The old shipped default
@@ -289,13 +296,20 @@ impl Config {
             self.allowed_origins.len() <= 8,
             "at most eight extra origins are allowed"
         );
+        ensure!(self.confirmed_http_origins.len()<=8,"At most eight unencrypted connection addresses can be confirmed");
+        for origin in &self.confirmed_http_origins {
+            let address=reqwest::Url::parse(origin)?;
+            ensure!(address.scheme()=="http" && address.username().is_empty() && address.password().is_none() && address.query().is_none() && address.fragment().is_none() && address.path()=="/" && address.origin().ascii_serialization()==*origin,"Confirmed addresses must be complete HTTP addresses without a path or credentials");
+            ensure!(self.allowed_origins.iter().any(|s|s.trim_end_matches('/')==origin),"Confirmed HTTP addresses must also be selected connection addresses");
+        }
         for origin in &self.allowed_origins {
             let mut single = self.clone();
             single.allowed_origins.clear();
+            single.confirmed_http_origins.clear();
             let mut address=reqwest::Url::parse(origin)?;
-            // Explicitly listed private-network origins may use HTTP. Public
-            // origins still require HTTPS, and the runtime allowlist stays exact.
-            if address.scheme()=="http" && private_network_host(address.host_str().unwrap_or("")) {
+            // Preserve legacy private HTTP. Other HTTP is accepted only by an
+            // explicit exact consent list; authentication remains unchanged.
+            if address.scheme()=="http" && (private_network_host(address.host_str().unwrap_or("")) || self.confirmed_http_origins.iter().any(|s|s==origin.trim_end_matches('/'))) {
                 address.set_scheme("https").map_err(|_|anyhow::anyhow!("Invalid origin scheme"))?;
             }
             single.public_url = address.to_string();
@@ -396,5 +410,24 @@ mod tests {
         assert!(c.validate().is_err());
         c.public_url = "https://server.example".into();
         assert!(c.validate().is_ok());
+    }
+}
+
+#[cfg(test)]
+mod connection_access_tests {
+    #[test]
+    fn connection_access_confirmed_http_is_exact_bounded_and_revocable() {
+        use super::Config;
+        let origin="http://203.0.113.7:9444";
+        let mut value=serde_json::to_value(Config::default()).unwrap();
+        value["allowed_origins"]=serde_json::json!([origin]);
+        assert!(serde_json::from_value::<Config>(value.clone()).unwrap().validate().is_err());
+        value["confirmed_http_origins"]=serde_json::json!([origin]);
+        let c:Config=serde_json::from_value(value.clone()).unwrap();c.validate().unwrap();
+        assert!(c.allows_origin(origin));assert!(!c.allows_origin("http://203.0.113.8:9444"));assert!(!c.allows_origin("https://203.0.113.7:9444"));
+        value["confirmed_http_origins"]=serde_json::json!(["http://203.0.113.8:9444"]);
+        assert!(serde_json::from_value::<Config>(value.clone()).unwrap().validate().is_err());
+        value["allowed_origins"]=serde_json::json!([]);value["confirmed_http_origins"]=serde_json::json!([]);
+        let revoked:Config=serde_json::from_value(value).unwrap();revoked.validate().unwrap();assert!(!revoked.allows_origin(origin));
     }
 }

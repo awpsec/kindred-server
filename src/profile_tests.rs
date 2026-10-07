@@ -1451,3 +1451,23 @@ async fn decisions_key_claimed_standalone_is_shared_only_with_its_account() {
     let other=f.register("legacy-decisions-other").await;let (_,status)=f.request("GET","/api/connections/decisions",other["token"].as_str().unwrap(),Value::Null).await;assert_eq!(status["configured"],false);
     crate::connections::save_decisions(&second_app,None).unwrap();assert!(crate::connections::decisions_key(&legacy).is_none());assert!(crate::connections::decisions_key(&second_app).is_none());
 }
+
+#[tokio::test]
+async fn connection_access_actual_identity_auth_origin_and_revoke() {
+    async fn req(p:Portal,origin:&str,path:&str,token:&str,body:Value)->(StatusCode,Value){
+        let method=if path=="/identity/login" {"POST"}else{"GET"};
+        let response=router(p).oneshot(Request::builder().method(method).uri(path).header("content-type","application/json").header("origin",origin).header("authorization",format!("Bearer {token}")).body(Body::from(body.to_string())).unwrap()).await.unwrap();
+        let status=response.status();let bytes=to_bytes(response.into_body(),1024*1024).await.unwrap();(status,serde_json::from_slice(&bytes).unwrap())
+    }
+    let mut f=Fixture::new(false);let origin="http://203.0.113.7:9444";
+    let (_,owner)=f.request("POST","/identity/register","",json!({"login":"owner","name":"Owner","password":"synthetic-password"})).await;let token=owner["token"].as_str().unwrap();
+    assert!(!req(f.p.clone(),origin,"/identity/login","",json!({"login":"owner","password":"synthetic-password"})).await.0.is_success());
+    let mut c=f.p.config.clone();c.allowed_origins=vec![origin.into()];c.confirmed_http_origins=vec![origin.into()];f.p.apps.lock().unwrap().clear();f.p=Profiles::open(c.clone(),None,false).unwrap();
+    assert_eq!(req(f.p.clone(),origin,"/identity/login","",json!({"login":"owner","password":"synthetic-password"})).await.0,200);
+    assert_eq!(req(f.p.clone(),origin,"/identity/profiles",token,json!({})).await.0,200);
+    assert!(!req(f.p.clone(),"http://203.0.113.8:9444","/identity/profiles",token,json!({})).await.0.is_success());
+    assert!(!req(f.p.clone(),origin,"/identity/profiles","wrong-token",json!({})).await.0.is_success());
+    let (_,meta)=req(f.p.clone(),origin,"/identity/meta","",json!({})).await;assert_eq!(meta["connection_policy_digest"],c.connection_policy_digest());assert_eq!(meta["connection_access"],true);
+    c.allowed_origins.clear();c.confirmed_http_origins.clear();f.p.apps.lock().unwrap().clear();f.p=Profiles::open(c,None,false).unwrap();assert!(!req(f.p.clone(),origin,"/identity/profiles",token,json!({})).await.0.is_success());
+    assert_eq!(f.request("GET","/identity/profiles",token,json!({})).await.0,200,"Revocation preserves existing accounts and local sessions");
+}

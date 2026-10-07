@@ -473,7 +473,7 @@ async fn meta(State(p): State<Portal>) -> ApiResult {
         r.get(0)
     })?;
     Ok(Json(
-        json!({"profiles":true,"server_chats":true,"mobile_pairing":true,"mobile_pairing_private_http":true,"deployment":if std::env::var("KINDRED_DEPLOYMENT").as_deref()==Ok("standalone"){"standalone"}else{"hosted"},"first_user":first,"legacy_claim":first&&p.legacy.is_some(),"registration":p.registration_open(&c)?,"version":env!("CARGO_PKG_VERSION")}),
+        json!({"profiles":true,"server_chats":true,"mobile_pairing":true,"mobile_pairing_private_http":true,"connection_access":true,"connection_policy_digest":p.config.connection_policy_digest(),"deployment":if std::env::var("KINDRED_DEPLOYMENT").as_deref()==Ok("standalone"){"standalone"}else{"hosted"},"first_user":first,"legacy_claim":first&&p.legacy.is_some(),"registration":p.registration_open(&c)?,"version":env!("CARGO_PKG_VERSION")}),
     ))
 }
 async fn register(State(p): State<Portal>, headers: HeaderMap, Json(v): Json<Value>) -> ApiResult {
@@ -825,6 +825,7 @@ async fn directory(State(p): State<Portal>, headers: HeaderMap, Json(v): Json<Va
     let mut check = p.config.clone();
     check.public_url = server.into();
     check.allowed_origins.clear();
+    check.confirmed_http_origins.clear();
     check.validate()?;
     let c = p.registry.lock().unwrap();
     if v["remove"] == true {

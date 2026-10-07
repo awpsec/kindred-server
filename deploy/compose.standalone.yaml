@@ -9,9 +9,11 @@ services:
       - "${KINDRED_BIND:-127.0.0.1}:${KINDRED_PORT:-9444}:9444"
     labels:
       io.kindred.network-origins: '${KINDRED_ALLOWED_ORIGINS:-[]}'
+      io.kindred.network-confirmed-http: '${KINDRED_CONFIRMED_HTTP_ORIGINS:-[]}'
     environment:
       KINDRED_DEPLOYMENT: standalone
       KINDRED_ALLOWED_ORIGINS: '${KINDRED_ALLOWED_ORIGINS:-[]}'
+      KINDRED_CONFIRMED_HTTP_ORIGINS: '${KINDRED_CONFIRMED_HTTP_ORIGINS:-[]}'
       KINDRED_PUBLIC_URL: "${KINDRED_PUBLIC_URL:-http://127.0.0.1:9444}"
       KINDRED_OPEN_REGISTRATION: "${KINDRED_OPEN_REGISTRATION:-true}"
       KINDRED_MAX_USERS: "${KINDRED_MAX_USERS:-128}"
