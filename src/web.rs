@@ -1633,6 +1633,15 @@ fn static_assets<S: Clone + Send + Sync + 'static>() -> Router<S> {
             get(|| async { ([(header::CONTENT_TYPE, "text/javascript")], include_str!("../ui/mobile.js")) }),
         )
         .route(
+            "/mobile-messages.js",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+                    include_str!("../ui/mobile-messages.js"),
+                )
+            }),
+        )
+        .route(
             "/profiles.js",
             get(|| async {
                 (
