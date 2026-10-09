@@ -3898,11 +3898,11 @@ function resizeComposer() {
   if(!form.getClientRects().length||form.matches('.is-replying,.has-files,.is-dictating')){
     form.classList.remove('is-multiline');return;
   }
-  const css=getComputedStyle(editor),line=parseFloat(css.lineHeight)+parseFloat(css.paddingTop)+parseFloat(css.paddingBottom);
-  // A draft that still wraps at full width cannot fit the compact layout. Keep
-  // the live scrolling editor stable instead of narrowing it on every keystroke.
+  const css=getComputedStyle(editor),line=Math.max(parseFloat(css.minHeight)||0,parseFloat(css.lineHeight)+parseFloat(css.paddingTop)+parseFloat(css.paddingBottom));
+  // Keep the live scrolling editor stable on each keystroke. The minimum
+  // writing height includes the breathing room in an empty composer.
   if(form.classList.contains('is-multiline')&&editor.scrollHeight>Math.ceil(line)+1)return;
-  // Only short drafts need a compact-width measurement at the wrap boundary.
+  // Recheck the multiline state when the draft returns to a single line.
   form.classList.remove('is-multiline');
   form.classList.toggle('is-multiline',editor.scrollHeight>Math.ceil(line)+1);
 }
