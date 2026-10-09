@@ -53,7 +53,6 @@ fn decide_record(
     raw_id: &str,
     action: &str,
     actor: DecisionActor<'_>,
-    now: i64,
 ) -> Result<Value> {
     anyhow::ensure!(
         matches!(action, "approve" | "deny"),
@@ -62,6 +61,9 @@ fn decide_record(
     // Do not echo an invalid CLI argument: it could accidentally be a token.
     let id = uuid::Uuid::parse_str(raw_id).ok().map(|id| id.to_string());
     let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    // Lock acquisition can wait: expiry and the decision window use the time
+    // at which this transaction can actually decide the request.
+    let now = db::now();
     let row: Option<(String, i64, Option<String>, Option<bool>)> = if let Some(id) = &id {
         tx.query_row("SELECT r.state,r.expires,r.account,a.disabled FROM password_resets r LEFT JOIN accounts a ON a.id=r.account WHERE r.id=?",[id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?
     } else {
@@ -144,7 +146,7 @@ pub(super) fn host_list(config: &Config) -> Result<Value> {
 }
 pub(super) fn host_decide(config: &Config, id: &str, action: &str) -> Result<Value> {
     let mut c = host_registry(config)?;
-    decide_record(&mut c, id, action, DecisionActor::LocalHost, db::now())
+    decide_record(&mut c, id, action, DecisionActor::LocalHost)
 }
 
 pub(super) async fn request(
@@ -254,7 +256,6 @@ pub(super) async fn decide(
         id,
         action,
         DecisionActor::WebAdmin(&actor.account),
-        db::now(),
     )?))
 }
 pub(super) async fn finish(
@@ -300,6 +301,55 @@ pub(super) async fn finish(
 #[cfg(test)]
 mod host_tests {
     use super::*;
+    #[test]
+    fn password_reset_expiry_is_rechecked_after_waiting_for_sqlite_writer() {
+        let path = std::env::temp_dir().join(format!("kindred-reset-clock-{}.db", db::id()));
+        let writer = Connection::open(&path).unwrap();
+        writer.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE accounts(id TEXT PRIMARY KEY,disabled INTEGER); INSERT INTO accounts VALUES('owner',0);").unwrap();
+        migrate(&writer).unwrap();
+        let id = db::id();
+        let now = db::now();
+        writer.execute("INSERT INTO password_resets(id,digest,account,created,expires,ip,state) VALUES(?,X'01','owner',?,?,'127.0.0.1','pending')",params![id,now,now+1]).unwrap();
+        writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let (started, ready) = std::sync::mpsc::channel();
+        let copy = path.clone();
+        let request = id.clone();
+        let worker = std::thread::spawn(move || {
+            let mut c = Connection::open(copy).unwrap();
+            c.busy_timeout(std::time::Duration::from_secs(5)).unwrap();
+            started.send(db::now()).unwrap();
+            decide_record(&mut c, &request, "approve", DecisionActor::LocalHost)
+        });
+        assert!(
+            ready.recv().unwrap() < now + 1,
+            "Fixture request must still be pending before the lock wait"
+        );
+        let elapsed = std::time::Instant::now();
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        writer.execute_batch("COMMIT").unwrap();
+        let result = worker.join().unwrap();
+        let state: String = writer
+            .query_row("SELECT state FROM password_resets WHERE id=?", [&id], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let outcome: String = writer
+            .query_row(
+                "SELECT outcome FROM password_reset_audit WHERE request_id=?",
+                [&id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        drop(writer);
+        let _ = std::fs::remove_file(path);
+        assert!(elapsed.elapsed() >= std::time::Duration::from_secs(2));
+        assert!(
+            result.is_err(),
+            "Expired request was approved after waiting for another SQLite writer"
+        );
+        assert_eq!(state, "pending");
+        assert_eq!(outcome, "expired");
+    }
     #[test]
     fn password_reset_log_metadata_excludes_controls_bidi_links_and_secrets() {
         let v = incoming_record(
