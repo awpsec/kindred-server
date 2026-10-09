@@ -610,6 +610,7 @@ pub fn update(app: &App, id: &str, v: &Value) -> Result<Value> {
         let key = input_key(&args);
         args[key] = next.clone();
         card["title"] = json!(title(&args));
+        if card["kind"] == "email" { crate::email_contacts::remember(&tx, &next)?; }
         card["input"] = next;
         card["edited_by_user"] = json!(true);
         tx.execute(

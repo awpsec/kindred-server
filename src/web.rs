@@ -134,6 +134,7 @@ pub fn router(app: Shared) -> Router {
         .route("/runs/{id}/continue", post(continue_task))
         .route("/runs/{id}/steer", post(steer_run))
         .route("/approvals", get(approvals))
+        .route("/email-contacts", get(crate::email_contacts::search))
         .route("/approvals/{id}", post(decide))
         .route(
             "/connector-artifacts/{id}",
@@ -1512,6 +1513,7 @@ fn static_assets<S: Clone + Send + Sync + 'static>() -> Router<S> {
                 )
             }),
         )
+        .route("/email-recipients.js", get(|| async { ([(header::CONTENT_TYPE,"text/javascript; charset=utf-8")], include_str!("../ui/email-recipients.js")) }))
         .route("/settings-header-art.js", get(|| async { ([(header::CONTENT_TYPE,"text/javascript")], include_str!("../ui/settings-header-art.js")) }))
         .route("/artifact-editors.js", get(|| async { ([(header::CONTENT_TYPE,"text/javascript")], include_str!("../ui/artifact-editors.js")) }))
         .route("/editor-vendor.js", get(|| async { ([(header::CONTENT_TYPE,"text/javascript")], include_str!("../ui/editor-vendor.js")) }))
