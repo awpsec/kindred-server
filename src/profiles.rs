@@ -1425,3 +1425,8 @@ impl Profiles {
         server_chats::bot_edit(self, profile, app, actor, run, args, approved)
     }
 }
+
+/// Trusted console capability: opens only the configured existing registry.
+pub fn host_password_resets(config: &Config, decision: Option<(&str,&str)>) -> Result<Value> {
+    match decision {Some((id,action))=>password_reset::host_decide(config,id,action),None=>password_reset::host_list(config)}
+}

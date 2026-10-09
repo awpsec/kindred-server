@@ -140,6 +140,17 @@ enum Action {
     Serve,
     /// Guest-only JSON stdin/stdout tool bridge. Install this binary inside the bot VM too.
     GuestRpc,
+    /// Manage password-reset requests from the trusted server console.
+    PasswordReset { #[command(subcommand)] command: PasswordResetAction },
+}
+#[derive(Subcommand)]
+enum PasswordResetAction {
+    /// List retained requests without requester tokens or passwords.
+    List,
+    /// Approve a pending request; its browser must still prove the request token.
+    Approve { id: String },
+    /// Deny a pending request.
+    Deny { id: String },
 }
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -170,6 +181,16 @@ async fn main() -> Result<()> {
             println!("Configuration is valid. Provider and VM connectivity were not tested.");
         }
         Action::GuestRpc => guest::rpc().await?,
+        Action::PasswordReset { command } => {
+            let config=config::Config::load(&cli.config)
+                .map_err(|_|anyhow::anyhow!("Could not load the selected configuration; check its path and settings"))?;
+            let result=match command {
+                PasswordResetAction::List=>profiles::host_password_resets(&config,None)?,
+                PasswordResetAction::Approve { id }=>profiles::host_password_resets(&config,Some((&id,"approve")))?,
+                PasswordResetAction::Deny { id }=>profiles::host_password_resets(&config,Some((&id,"deny")))?,
+            };
+            println!("{}",serde_json::to_string_pretty(&result)?);
+        },
         Action::Serve => {
             let config = config::Config::load(&cli.config)?;
             let listen = config.listen;

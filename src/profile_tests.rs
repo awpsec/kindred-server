@@ -1471,3 +1471,64 @@ async fn connection_access_actual_identity_auth_origin_and_revoke() {
     c.allowed_origins.clear();c.confirmed_http_origins.clear();f.p.apps.lock().unwrap().clear();f.p=Profiles::open(c,None,false).unwrap();assert!(!req(f.p.clone(),origin,"/identity/profiles",token,json!({})).await.0.is_success());
     assert_eq!(f.request("GET","/identity/profiles",token,json!({})).await.0,200,"Revocation preserves existing accounts and local sessions");
 }
+#[tokio::test]
+async fn host_password_reset_sole_admin_keeps_web_self_denial_and_token_bound_completion() {
+    let f=Fixture::new(false);let owner=f.register("only-admin").await;let session=owner["token"].as_str().unwrap();
+    let identity=f.p.identity(session).unwrap();let config=f.p.config.clone();
+    f.p.registry.lock().unwrap().execute("INSERT INTO device_links(digest,account_id,profile_id,expires) VALUES(?,?,?,?)",params![hash("device-proof-do-not-log"),identity.account,identity.profile,db::now()+86400]).unwrap();
+    let sentinel=f.root.join("vm-sentinel");std::fs::write(&sentinel,b"preserved computer data").unwrap();
+    let (_,request)=f.request("POST","/identity/password-reset/request","",json!({"login":"only-admin"})).await;let id=request["id"].as_str().unwrap();let proof=request["token"].as_str().unwrap();
+    assert_ne!(f.request("POST","/identity/admin/password-resets","",json!({"id":id,"action":"approve"})).await.0,200);
+    assert_ne!(f.request("POST","/identity/admin/password-resets",session,json!({"id":id,"action":"approve"})).await.0,200);
+    let list=password_reset::host_list(&config).unwrap();assert_eq!(list["requests"][0]["username"],"only-admin");assert!(!list.to_string().contains(proof));
+    assert_eq!(password_reset::host_decide(&config,id,"approve").unwrap()["state"],"approved");
+    assert_eq!(f.request("POST","/identity/password-reset/status","",json!({"token":proof})).await.1["state"],"approved");
+    let save=json!({"token":proof,"password":"synthetic replacement","confirm_password":"synthetic replacement"});
+    let mut wrong=save.clone();wrong["token"]=json!("wrong-proof");assert_ne!(f.request("POST","/identity/password-reset/finish","",wrong).await.0,200);
+    assert_eq!(f.request("POST","/identity/password-reset/finish","",save.clone()).await.0,200);
+    assert_ne!(f.request("POST","/identity/password-reset/finish","",save).await.0,200);
+    assert!(f.p.identity(session).is_err());assert_eq!(f.request("POST","/identity/login","",json!({"login":"only-admin","password":"synthetic replacement"})).await.0,200);
+    let c=f.p.registry.lock().unwrap();assert_eq!(c.query_row("SELECT COUNT(*) FROM device_links WHERE account_id=?",[&identity.account],|r|r.get::<_,i64>(0)).unwrap(),0);
+    assert_eq!(c.query_row("SELECT COUNT(*) FROM profiles WHERE account_id=?",[&identity.account],|r|r.get::<_,i64>(0)).unwrap(),1);
+    let records:Vec<(String,String)>=c.prepare("SELECT source,outcome FROM password_reset_audit ORDER BY rowid").unwrap().query_map([],|r|Ok((r.get(0)?,r.get(1)?))).unwrap().collect::<rusqlite::Result<_>>().unwrap();assert_eq!(records,vec![("web-admin".into(),"self-approval-denied".into()),("local-host".into(),"approved".into())]);
+    assert_eq!(std::fs::read(sentinel).unwrap(),b"preserved computer data");
+}
+#[tokio::test]
+async fn host_password_reset_expiry_denial_disabled_and_unknown_stay_unusable() {
+    let f=Fixture::new(false);let account=f.register("reset-user").await;let config=f.p.config.clone();
+    for mode in ["expired-pending","denied","expired-approved","disabled"] {
+        let (_,r)=f.request("POST","/identity/password-reset/request","",json!({"login":"reset-user"})).await;let id=r["id"].as_str().unwrap();
+        match mode {
+            "expired-pending"=>{f.p.registry.lock().unwrap().execute("UPDATE password_resets SET expires=0 WHERE id=?",[id]).unwrap();assert!(password_reset::host_decide(&config,id,"approve").is_err());},
+            "denied"=>{password_reset::host_decide(&config,id,"deny").unwrap();},
+            "expired-approved"=>{password_reset::host_decide(&config,id,"approve").unwrap();f.p.registry.lock().unwrap().execute("UPDATE password_resets SET expires=0 WHERE id=?",[id]).unwrap();},
+            _=>{f.p.registry.lock().unwrap().execute("UPDATE accounts SET disabled=1",[]).unwrap();assert!(password_reset::host_decide(&config,id,"approve").is_err());}
+        }
+        assert_ne!(f.request("POST","/identity/password-reset/finish","",json!({"token":r["token"],"password":"must-not-apply","confirm_password":"must-not-apply"})).await.0,200);
+        assert!(password_reset::host_decide(&config,id,"approve").is_err());
+    }
+    for login in ["unknown-user","reset-user"] {let (status,r)=f.request("POST","/identity/password-reset/request","",json!({"login":login})).await;assert_eq!(status,200);assert_eq!(r["state"],"pending");assert!(r["token"].is_string());assert!(password_reset::host_decide(&config,r["id"].as_str().unwrap(),"approve").is_err());}
+    assert!(password_reset::host_decide(&config,&db::id(),"approve").is_err());assert!(password_reset::host_decide(&config,"invalid-DO-NOT-LOG","approve").is_err());
+    // Re-enable solely to verify the original credential was never changed.
+    f.p.registry.lock().unwrap().execute("UPDATE accounts SET disabled=0",[]).unwrap();assert!(f.p.identity(account["token"].as_str().unwrap()).is_ok());
+}
+
+#[tokio::test]
+#[ignore = "requires freshly built KINDRED_TEST_RESET_CLI binary"]
+async fn host_password_reset_real_cli_to_http_sole_admin_finish() {
+    let binary=std::env::var("KINDRED_TEST_RESET_CLI").expect("Set KINDRED_TEST_RESET_CLI to this source's compiled kindred binary");
+    let f=Fixture::new(false);let owner=f.register("cli-http-owner").await;let old_session=owner["token"].as_str().unwrap();
+    let mut config=f.p.config.clone();config.profiles.import_legacy=true;let path=f.root.join("selected.toml");std::fs::write(&path,toml::to_string(&config).unwrap()).unwrap();
+    let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let origin=format!("http://{}",listener.local_addr().unwrap());
+    let (stop,stopped)=tokio::sync::oneshot::channel();let app=router(f.p.clone());let server=tokio::spawn(async move {axum::serve(listener,app.into_make_service_with_connect_info::<std::net::SocketAddr>()).with_graceful_shutdown(async {let _=stopped.await;}).await.unwrap();});
+    let client=reqwest::Client::builder().timeout(std::time::Duration::from_secs(10)).build().unwrap();
+    let response=client.post(format!("{origin}/identity/password-reset/request")).json(&json!({"login":"cli-http-owner"})).send().await.unwrap();assert_eq!(response.status(),200);let request:Value=response.json().await.unwrap();
+    let self_approval=client.post(format!("{origin}/identity/admin/password-resets")).bearer_auth(old_session).json(&json!({"id":request["id"],"action":"approve"})).send().await.unwrap();assert_ne!(self_approval.status(),200);
+    let output=std::process::Command::new(binary).args(["--config",path.to_str().unwrap(),"password-reset","approve",request["id"].as_str().unwrap()]).env_remove("KINDRED_TOKEN").output().unwrap();assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));
+    for bytes in [&output.stdout,&output.stderr] {let text=String::from_utf8_lossy(bytes);assert!(!text.contains(request["token"].as_str().unwrap()));assert!(!text.contains("digest"));}
+    let status:Value=client.post(format!("{origin}/identity/password-reset/status")).json(&json!({"token":request["token"]})).send().await.unwrap().json().await.unwrap();assert_eq!(status["state"],"approved");
+    let body=json!({"token":request["token"],"password":"CLI HTTP replacement","confirm_password":"CLI HTTP replacement"});let response=client.post(format!("{origin}/identity/password-reset/finish")).json(&body).send().await.unwrap();assert_eq!(response.status(),200);
+    assert_ne!(client.post(format!("{origin}/identity/password-reset/finish")).json(&body).send().await.unwrap().status(),200);assert!(f.p.identity(old_session).is_err());
+    assert_eq!(client.post(format!("{origin}/identity/login")).json(&json!({"login":"cli-http-owner","password":"CLI HTTP replacement"})).send().await.unwrap().status(),200);
+    stop.send(()).unwrap();server.await.unwrap();
+}
