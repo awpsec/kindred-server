@@ -105,7 +105,7 @@ fn resume(c: &Connection, parent_id: &str) -> Result<()> {
         },
     )?;
     let prompt = format!(
-        "Your teammates returned results for your request. Continue the user's task from these results, respecting any saved user decisions. A failed or empty result is not success. Do not exchange courtesy acknowledgements or repeat completed actions. Preserve your own role and existing action approval policy. If these results supply your own assigned role or lasting responsibilities, call remember to merge them into your memory before replying. Facts about another teammate do not become your own role. Saving their role in your memory does not save it for them; only say they retained it when their result confirms they saved it.\nOriginal task: {}\nTeammate results: {}",
+        "Your teammates returned results for your request. Continue the user's task from these results, respecting any saved user decisions. A failed or empty result is not success. Do not exchange courtesy acknowledgements or repeat completed actions. Preserve your own role and existing action approval policy. If these results supply your own assigned role or lasting responsibilities, call remember with mode=append and only the new facts before replying; Kindred preserves existing memory without requiring memory_read or a separate DM. Facts about another teammate do not become your own role. Saving their role in your memory does not save it for them; only say they retained it when their result confirms they saved it.\nOriginal task: {}\nTeammate results: {}",
         crate::runtime::bounded(&parent.prompt, 16000),
         crate::runtime::bounded(&json!(results).to_string(), 32000)
     );

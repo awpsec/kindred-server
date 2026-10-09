@@ -262,8 +262,8 @@ pub fn tool_specs() -> Vec<Value> {
         ),
         (
             "remember",
-            "Save durable memory across your chats. Required before acknowledging an ongoing role, responsibility or preference assigned specifically to YOU, including assignments relayed by a teammate. Merge new facts into the existing memory; this replaces its full contents (64,000 UTF-8 bytes maximum). Keep detailed historical records in their existing sources and retrieve prior conversations with chat_read. A rejected save preserves previous memory and chat history. A fact about another named teammate must retain that person's name, never become your first-person role. Do not store passwords.",
-            json!({"text":{"type":"string"}}),
+            "Save your own durable memory from any conversation, including bot-to-bot rooms. For new lasting rules, responsibilities or preferences, use mode=append with only the new facts: Kindred preserves existing memory without exposing it, so memory_read and a separate DM are not required. Required before acknowledging a responsibility assigned to YOU, including one relayed by a teammate. mode=replace is allowed only in your owner DM: read the full current memory first and preserve unrelated facts. Omitting mode retains legacy behavior (replacement in your DM, server-side merge elsewhere). Total memory is limited to 64,000 UTF-8 bytes; rejected saves preserve prior memory. Keep detailed work in continuity notes. Preserve attribution for facts about teammates. Never store passwords or treat saved rules as permission to act.",
+            json!({"text":{"type":"string"},"mode":{"type":"string","enum":["append","replace"]}}),
             vec!["text"],
         ),
         (
@@ -425,7 +425,7 @@ pub fn tool_specs() -> Vec<Value> {
         ),
         (
             "memory_read",
-            "Read this bot's private durable memory in the owner's DM. Offset is a UTF-8 byte position; follow next_offset. Invalidated memory is withheld pending reconstruction from sources. Private memory cannot be read into a shared destination.",
+            "Read this bot's private durable memory in the owner's DM. Offset is a UTF-8 byte position; follow next_offset. Invalidated memory is withheld pending reconstruction from sources. Private memory cannot be read into a shared destination. To save new facts there, use remember with mode=append; it preserves existing memory without requiring this read.",
             json!({"offset":{"type":"integer","minimum":0}}),
             vec![],
         ),
@@ -953,7 +953,18 @@ async fn call_tool_inner(
             ensure!(!invalid || run.chat_id==format!("dm-{}",bot.id),"Private memory needs reconstruction in the owner DM; save current shared facts with continuity_save");
             let current=app.db.bot(&bot.id)?;
             let proposed=string(&args,"text")?;
-            let merged=if run.chat_id==format!("dm-{}",bot.id) || current.memory.is_empty() || proposed.contains(&current.memory) {proposed.to_owned()} else {format!("{}\n{}",current.memory,proposed)};
+            let mode=args.get("mode").map(|value| value.as_str().unwrap_or("")).unwrap_or("legacy");
+            ensure!(matches!(mode,"legacy"|"append"|"replace"),"Memory mode must be append or replace");
+            ensure!(mode!="replace" || run.chat_id==format!("dm-{}",bot.id),"Memory replacement requires your owner DM. Use remember with mode=append to save new facts here without reading private memory");
+            let merged=if mode=="append" {
+                ensure!(!invalid,"Private memory needs reconstruction before appending; save current facts with continuity_save");
+                let addition=proposed.trim();
+                ensure!(!addition.is_empty(),"Memory addition must not be empty");
+                // Exact retained blocks are idempotent. Never return prior memory to the caller.
+                if current.memory.is_empty() { addition.to_owned() }
+                else if format!("\n\n{}\n\n",current.memory).contains(&format!("\n\n{addition}\n\n")) { current.memory.clone() }
+                else { format!("{}\n\n{addition}",current.memory) }
+            } else if run.chat_id==format!("dm-{}",bot.id) || current.memory.is_empty() || proposed.contains(&current.memory) {proposed.to_owned()} else {format!("{}\n{}",current.memory,proposed)};
             // Shared contexts never receive the private prior text. Merge locally
             // instead of letting a replacement discard facts the model cannot see.
             app.db.save_bot_text(&bot.id,"memory",&merged,Some(&current.memory))?;

@@ -874,3 +874,67 @@ fn review_obligations_cannot_reintroduce_invalidated_derived_evidence() {
         .is_err()
     );
 }
+
+#[tokio::test]
+async fn room_memory_append_preserves_private_facts_without_a_dm_or_read() {
+    let app = app();
+    let (b, dm) = setup(&app.db);
+    let teammate = bot(&app.db, "codex");
+    app.db.save_bot_text(&b.id, "memory", "PRIVATE_EXISTING_FACT", None).unwrap();
+    app.db.save_bot_text(&teammate.id, "memory", "TEAMMATE_PRIVATE_FACT", None).unwrap();
+    let mut expected = "PRIVATE_EXISTING_FACT".to_owned();
+    // Owner bot coordination, owner group chat and server-shared destinations
+    // retain the same read boundary while allowing self-only additive saves.
+    for (i, (bot_only, prefix)) in [(true, "team-"), (false, "group-"), (false, "server-")].into_iter().enumerate() {
+        let room = crate::chats::Chat {
+            id: format!("{prefix}{}", db::id()), name: "Coordination".into(),
+            members: vec![b.id.clone(), teammate.id.clone()], archived: false,
+            description: String::new(), bot_only, pinned: false, last_message: None,
+        };
+        app.db.save_chat(&room).unwrap();
+        let run_id = app.db.chat_send(&room.id, "Retain the requested rule", &[b.id.clone()]).unwrap().remove(0);
+        let run = app.db.run(&run_id).unwrap();
+        let addition = format!("Rule {i}: autopilot requires explicit opt-in; plain requests use the normal pipeline.");
+        let read = crate::runtime::call_tool(&app, &b, &run, "memory_read", json!({})).await.unwrap();
+        assert_eq!(read["failed"], true);
+        assert!(!read.to_string().contains("PRIVATE_EXISTING_FACT"));
+        for _ in 0..2 {
+            let result = crate::runtime::call_tool(&app, &b, &run, "remember", json!({"mode":"append","text":addition})).await.unwrap();
+            assert_ne!(result["failed"], true, "{result}");
+            assert!(!result.to_string().contains("PRIVATE_EXISTING_FACT"));
+        }
+        expected.push_str(&format!("\n\n{addition}"));
+        assert_eq!(app.db.bot(&b.id).unwrap().memory, expected);
+        let replace = crate::runtime::call_tool(&app, &b, &run, "remember", json!({"mode":"replace","text":"discard everything"})).await.unwrap();
+        assert_eq!(replace["failed"], true);
+        assert_eq!(app.db.bot(&b.id).unwrap().memory, expected);
+        assert_eq!(app.db.bot(&teammate.id).unwrap().memory, "TEAMMATE_PRIVATE_FACT");
+    }
+    let read = crate::runtime::call_tool(&app, &b, &dm, "memory_read", json!({})).await.unwrap();
+    let content: Value = serde_json::from_str(read["text"].as_str().unwrap()).unwrap();
+    assert_eq!(content["memory"], expected);
+    let specs = crate::runtime::tool_specs();
+    let remember = specs.iter().find(|s| s["name"] == "remember").unwrap();
+    assert!(remember.to_string().contains("append"));
+    let chapter = crate::instructions::chapter("memory_team").unwrap();
+    assert!(chapter["text"].as_str().unwrap().contains("mode=\"append\""));
+}
+
+#[tokio::test]
+async fn memory_append_rejections_preserve_prior_memory_and_invalidation() {
+    let app = app();
+    let (b, run) = setup(&app.db);
+    let prior = "x".repeat(crate::db::BOT_MEMORY_MAX_BYTES - 2);
+    app.db.save_bot_text(&b.id, "memory", &prior, None).unwrap();
+    for args in [json!({"mode":"append","text":"too large"}), json!({"mode":"append","text":"  "}), json!({"mode":"bogus","text":"replace"})] {
+        let result = crate::runtime::call_tool(&app, &b, &run, "remember", args).await.unwrap();
+        assert_eq!(result["failed"], true);
+        assert_eq!(app.db.bot(&b.id).unwrap().memory, prior);
+    }
+    app.db.save_bot_text(&b.id, "memory", "Stale fact", None).unwrap();
+    app.db.0.lock().unwrap().execute("INSERT INTO continuity_memory_guard(bot_id,invalidated) VALUES(?,1)", [&b.id]).unwrap();
+    let result = crate::runtime::call_tool(&app, &b, &run, "remember", json!({"mode":"append","text":"New fact"})).await.unwrap();
+    assert_eq!(result["failed"], true);
+    assert_eq!(app.db.bot(&b.id).unwrap().memory, "Stale fact");
+    assert!(store::memory(&app.db, &run, "Stale fact").unwrap().is_null());
+}

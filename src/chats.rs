@@ -673,7 +673,7 @@ impl Db {
             &chat,
             target,
             &format!(
-                "Request from {} ({}), addressed to {} ({}):\n{}\nAnswer the request about the named person or task; you are {}, not the requester. If this message gives you an ongoing role, responsibility or preference assigned by the user, call remember to save it in YOUR durable memory before replying. Merge it with your existing memory and keep facts about other teammates separate from your own role. A conversational acknowledgement alone will not persist across chats. Only say you saved it after remember succeeds. Do not turn temporary requests into permanent responsibilities or replace an explicit user assignment with a teammate's speculation. Your final result will wake {} automatically. Do not send a separate acknowledgement or duplicate reply.",
+                "Request from {} ({}), addressed to {} ({}):\n{}\nAnswer the request about the named person or task; you are {}, not the requester. If this message gives you an ongoing role, responsibility or preference assigned by the user, call remember to save it in YOUR durable memory before replying. Use mode=append with only the new facts: Kindred preserves existing memory without memory_read or a separate DM. Keep facts about other teammates separate from your own role. A conversational acknowledgement alone will not persist across chats. Only say you saved it after remember succeeds. Do not turn temporary requests into permanent responsibilities or replace an explicit user assignment with a teammate's speculation. Your final result will wake {} automatically. Do not send a separate acknowledgement or duplicate reply.",
                 sender.name,
                 sender.id,
                 recipient.name,
@@ -792,7 +792,7 @@ impl Db {
             // Only the requester sees their original DM task on continuation.
             let original: String = tx.query_row("SELECT prompt FROM runs WHERE round_id=? AND bot_id=? ORDER BY depth ASC,rowid ASC LIMIT 1",params![run.round_id,run.reply_to],|r|r.get(0)).unwrap_or_default();
             let prompt = format!(
-                "{} ({}) returned a result:\n{}\nYour original task: {}\nContinue the user's task using this result. If it supplies your own assigned role or lasting responsibilities, call remember to merge them into your memory before replying. Facts about another teammate do not become your own role. Saving their role in your memory does not save it for them; only say they retained it when their result confirms they saved it. Ask another teammate only if more work is needed; do not exchange courtesy acknowledgements.",
+                "{} ({}) returned a result:\n{}\nYour original task: {}\nContinue the user's task using this result. If it supplies your own assigned role or lasting responsibilities, call remember with mode=append and only the new facts before replying; Kindred preserves existing memory without requiring memory_read or a separate DM. Facts about another teammate do not become your own role. Saving their role in your memory does not save it for them; only say they retained it when their result confirms they saved it. Ask another teammate only if more work is needed; do not exchange courtesy acknowledgements.",
                 bot.name,
                 bot.id,
                 text.chars().take(24000).collect::<String>(),
