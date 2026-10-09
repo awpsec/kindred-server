@@ -5,9 +5,14 @@ use anyhow::{Result, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 
+pub fn simple_approval(tool:&str,args:&Value)->bool {
+    args["artifact_id"].is_null() && matches!(tool,"guest_exec"|"computer_open_url"|"computer_click"|"computer_type"|"computer_key"|"computer_scroll"|"computer_browser_task"|"routine_create"|"routine_update"|"routine_control"|"inbox_monitor_save"|"share_file")
+}
 pub fn migrate(c: &Connection) -> Result<()> {
     c.execute_batch("CREATE TABLE IF NOT EXISTS run_steering(source_run_id TEXT PRIMARY KEY REFERENCES runs(id),run_id TEXT NOT NULL REFERENCES runs(id),created INTEGER NOT NULL);CREATE INDEX IF NOT EXISTS steering_owner ON run_steering(run_id);")?;
     c.execute_batch("CREATE TABLE IF NOT EXISTS steering_requests(source_run_id TEXT PRIMARY KEY REFERENCES runs(id),run_id TEXT NOT NULL REFERENCES runs(id),created INTEGER NOT NULL);")?;
+    c.execute_batch("CREATE TABLE IF NOT EXISTS message_send_modes(message_seq INTEGER PRIMARY KEY REFERENCES chat_messages(seq),mode TEXT NOT NULL);CREATE TABLE IF NOT EXISTS queued_message_claims(request_id TEXT PRIMARY KEY,chat_id TEXT NOT NULL,message_seq INTEGER NOT NULL,payload TEXT NOT NULL);")?;
+    c.execute_batch("CREATE TABLE IF NOT EXISTS message_progress(message_seq INTEGER PRIMARY KEY REFERENCES chat_messages(seq),run_id TEXT NOT NULL REFERENCES runs(id),mode TEXT NOT NULL,phase TEXT NOT NULL,group_id TEXT NOT NULL);")?;
     Ok(())
 }
 impl Db {
@@ -28,6 +33,102 @@ impl Db {
         }
         tx.execute("UPDATE chat_messages SET body=? WHERE seq=?",params![text,seq])?;
         tx.commit()?;Ok(())
+    }
+
+    /// Claim an unconsumed user send for editing. Retries return the same payload;
+    /// no recipient is withdrawn once any delivery has started.
+    pub fn restore_queued_message(
+        &self,
+        chat: &str,
+        seq: i64,
+        expected: &str,
+        request: &str,
+    ) -> Result<Value> {
+        ensure!(
+            uuid::Uuid::parse_str(request).is_ok(),
+            "Invalid edit request ID"
+        );
+        let mut c = self.0.lock().unwrap();
+        let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if let Some((old_chat, old_seq, payload)) = tx
+            .query_row(
+                "SELECT chat_id,message_seq,payload FROM queued_message_claims WHERE request_id=?",
+                [request],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+        {
+            ensure!(
+                old_chat == chat && old_seq == seq,
+                "This edit belongs to another message"
+            );
+            ensure!(
+                serde_json::from_str::<Value>(&payload)?["text"] == expected,
+                "This edit belongs to a different revision"
+            );
+            return Ok(serde_json::from_str(&payload)?);
+        }
+        ensure!(
+            !crate::workspace_transfer::frozen(&tx)?,
+            "This workspace is being moved"
+        );
+        let original:Option<String>=tx.query_row("SELECT body FROM chat_messages WHERE seq=? AND chat_id=? AND sender='user' AND kind='message' AND suppressed=0",params![seq,chat],|r|r.get(0)).optional()?;
+        ensure!(
+            original.as_deref() == Some(expected),
+            "This message changed or already reached the bot"
+        );
+        let deliveries:Vec<(String,String,String)>=tx.prepare("SELECT r.id,r.status,r.bot_id FROM runs r JOIN run_message_sources s ON s.run_id=r.id WHERE s.message_seq=?")?.query_map([seq],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?.collect::<rusqlite::Result<_>>()?;
+        ensure!(
+            !deliveries.is_empty() && deliveries.iter().all(|(_, status, _)| status == "queued"),
+            "This message already reached the bot"
+        );
+        let originals: Vec<(String, String, i64, Vec<u8>)> = tx
+            .prepare(
+                "SELECT id,name,length(bytes),substr(bytes,1,12) FROM uploads WHERE message_seq=? ORDER BY rowid",
+            )?
+            .query_map([seq], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        let pending:i64=tx.query_row("SELECT COUNT(*) FROM uploads WHERE message_seq IS NULL",[],|r|r.get(0))?;
+        ensure!(pending+originals.len() as i64<=50,"Too many pending attachments. Remove unused files before editing this message");
+        let mut files = vec![];
+        // Keep historical attachments intact; editable copies are bound only by a
+        // fresh Send. This happens once per successful idempotent claim.
+        for (old, name, size, prefix) in originals {
+            let id = db::id();
+            tx.execute("INSERT INTO uploads(id,name,bytes,chat_id,created) SELECT ?,name,bytes,chat_id,? FROM uploads WHERE id=?",params![id,db::now(),old])?;
+            files.push(json!({"id":id,"name":name,"size":size,"mime":crate::uploads::image_mime(&prefix)}));
+        }
+        let reply: Option<i64> = tx
+            .query_row(
+                "SELECT reply_to_seq FROM message_replies WHERE message_seq=?",
+                [seq],
+                |r| r.get(0),
+            )
+            .optional()?;
+        for (id, _, _) in &deliveries {
+            tx.execute("DELETE FROM steering_requests WHERE source_run_id=?", [id])?;
+            tx.execute(
+                "UPDATE runs SET status='withdrawn' WHERE id=? AND status='queued'",
+                [id],
+            )?;
+        }
+        tx.execute(
+            "UPDATE chat_messages SET kind='withdrawn' WHERE seq=?",
+            [seq],
+        )?;
+        let payload = json!({"text":expected,"files":files,"mentions":deliveries.iter().map(|(_,_,bot)|bot).collect::<Vec<_>>(),"reply_to":reply,"message_seq":seq,"chat_id":chat});
+        tx.execute(
+            "INSERT INTO queued_message_claims VALUES(?,?,?,?)",
+            params![request, chat, seq, payload.to_string()],
+        )?;
+        tx.commit()?;
+        Ok(payload)
     }
 
     pub fn request_steering(&self, source: &str, target: &str) -> Result<Value> {
@@ -110,8 +211,8 @@ impl Db {
         Ok(updates)
     }
     pub fn followup_delivery(&self, seq: i64) -> Result<Vec<Value>> {
-        Ok(self.0.lock().unwrap().prepare("SELECT r.bot_id,r.status,s.run_id,p.status,r.id,EXISTS(SELECT 1 FROM steering_requests q JOIN runs active ON active.id=q.run_id WHERE q.source_run_id=r.id AND active.status IN ('running','awaiting_approval','awaiting_user')) FROM run_message_sources m JOIN runs r ON r.id=m.run_id LEFT JOIN run_steering s ON s.source_run_id=r.id LEFT JOIN runs p ON p.id=s.run_id WHERE m.message_seq=?")?
-            .query_map([seq],|r|Ok(json!({"bot_id":r.get::<_,String>(0)?,"status":r.get::<_,String>(1)?,"into_run_id":r.get::<_,Option<String>>(2)?,"task_status":r.get::<_,Option<String>>(3)?,"run_id":r.get::<_,String>(4)?,"steer_requested":r.get::<_,bool>(5)?})))?.collect::<rusqlite::Result<_>>()?)
+        Ok(self.0.lock().unwrap().prepare("SELECT r.bot_id,r.status,s.run_id,p.status,r.id,EXISTS(SELECT 1 FROM steering_requests q JOIN runs active ON active.id=q.run_id WHERE q.source_run_id=r.id AND active.status IN ('running','awaiting_approval','awaiting_user')),COALESCE((SELECT mode FROM message_send_modes WHERE message_seq=m.message_seq),'queue') FROM run_message_sources m JOIN runs r ON r.id=m.run_id LEFT JOIN run_steering s ON s.source_run_id=r.id LEFT JOIN runs p ON p.id=s.run_id WHERE m.message_seq=?")?
+            .query_map([seq],|r|Ok(json!({"bot_id":r.get::<_,String>(0)?,"status":r.get::<_,String>(1)?,"into_run_id":r.get::<_,Option<String>>(2)?,"task_status":r.get::<_,Option<String>>(3)?,"run_id":r.get::<_,String>(4)?,"steer_requested":r.get::<_,bool>(5)?,"mode":r.get::<_,String>(6)?})))?.collect::<rusqlite::Result<_>>()?)
     }
 }
 
@@ -119,6 +220,152 @@ impl Db {
 mod tests {
     use super::*;
     use crate::{runtime, tests};
+
+    #[tokio::test]
+    async fn router_settings_queue_restore_and_request_receipts_are_authenticated_and_durable() {
+        use std::future::IntoFuture;
+        let app=tests::app();let bot=tests::bot(&app.db,"codex");let chat=format!("dm-{}",bot.id);
+        app.db.queue(&bot.id,"Active task",0).unwrap();let run=app.db.claim_bot(&bot.id).unwrap().unwrap();
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let base=format!("http://{}/api",listener.local_addr().unwrap());
+        let server=tokio::spawn(axum::serve(listener,crate::web::router(app.clone())).into_future());let client=reqwest::Client::new();
+        let settings=crate::db::general_settings(None);let mut updated=settings.clone();updated["message_delivery"]=json!("queue");updated["progress_updates"]=json!("summaries");
+        assert_eq!(client.put(format!("{base}/settings")).json(&updated).send().await.unwrap().status(),401);
+        let saved:Value=client.put(format!("{base}/settings")).bearer_auth(&app.token).json(&updated).send().await.unwrap().json().await.unwrap();assert_eq!(saved["message_delivery"],"queue");assert_eq!(saved["progress_updates"],"summaries");
+        updated["message_delivery"]=json!("bogus");assert!(!client.put(format!("{base}/settings")).bearer_auth(&app.token).json(&updated).send().await.unwrap().status().is_success());assert_eq!(app.db.setting("general").unwrap().unwrap()["message_delivery"],"queue");
+        let payload=json!({"prompt":"Queued","delivery_mode":"queue","request_id":db::id()});
+        assert!(client.post(format!("{base}/chats/{chat}/messages")).bearer_auth(&app.token).json(&payload).send().await.unwrap().status().is_success());
+        let messages=app.db.chat_messages(&chat).unwrap();let seq=messages.iter().find(|m|m["text"]=="Queued").unwrap()["seq"].as_i64().unwrap();let claim=json!({"restore_to_composer":true,"request_id":db::id(),"expected_text":"Queued"});let url=format!("{base}/chats/{chat}/messages/{seq}");
+        assert_eq!(client.patch(&url).json(&claim).send().await.unwrap().status(),401);
+        let original:Value=client.patch(&url).bearer_auth(&app.token).json(&claim).send().await.unwrap().json().await.unwrap();assert_eq!(original["text"],"Queued");
+        let retry:Value=client.patch(&url).bearer_auth(&app.token).json(&claim).send().await.unwrap().json().await.unwrap();assert_eq!(retry,original);assert!(app.db.take_followups(&run).unwrap().is_empty());
+        let approval=app.db.request_approval(&run.id,"computer_click",&json!({"x":10,"y":20})).unwrap();
+        let before=app.db.chat_messages(&chat).unwrap();let position=before.iter().find(|m|m["approval"]["id"]==approval).unwrap()["seq"].clone();assert_eq!(before.iter().find(|m|m["seq"]==position).unwrap()["approval"]["status"],"pending");
+        assert_eq!(client.post(format!("{base}/approvals/{approval}")).json(&json!({"approved":true})).send().await.unwrap().status(),401);
+        assert!(client.post(format!("{base}/approvals/{approval}")).bearer_auth(&app.token).json(&json!({"approved":true})).send().await.unwrap().status().is_success());
+        let after=app.db.chat_messages(&chat).unwrap();assert_eq!(after.iter().find(|m|m["seq"]==position).unwrap()["approval"]["status"],"approved");assert!(!after.iter().any(|m|m["kind"]=="result"));
+        assert!(!client.post(format!("{base}/approvals/{approval}")).bearer_auth(&app.token).json(&json!({"approved":true})).send().await.unwrap().status().is_success());
+        assert_eq!(client.get(format!("{base}/questions")).send().await.unwrap().status(),401);
+        server.abort();
+    }
+
+    #[test]
+    fn composer_restore_claim_is_atomic_idempotent_and_keeps_attachments() {
+        let app = tests::app();
+        let bot = tests::bot(&app.db, "codex");
+        let chat = format!("dm-{}", bot.id);
+        let first = vec![app.db.queue(&bot.id, "Working", 0).unwrap()];
+        let run = app.db.claim_bot(&bot.id).unwrap().unwrap();
+        let file = app.db.upload_file(&chat, "image.png", "iVBORw0KGgoAAAANSUhEUg==").unwrap();
+        let ids = app
+            .db
+            .chat_send_request_mode(
+                &chat,
+                "Original",
+                &[],
+                &[file["id"].as_str().unwrap().into()],
+                None,
+                Some(&db::id()),
+                "steer",
+            )
+            .unwrap();
+        let m = app
+            .db
+            .chat_messages(&chat)
+            .unwrap()
+            .into_iter()
+            .find(|m| m["text"] == "Original")
+            .unwrap();
+        let seq = m["seq"].as_i64().unwrap();
+        let claim = db::id();
+        let payload = app
+            .db
+            .restore_queued_message(&chat, seq, "Original", &claim)
+            .unwrap();
+        assert_eq!(payload["text"], "Original");
+        assert_eq!(payload["files"][0]["name"], "image.png");
+        assert_eq!(payload["files"][0]["mime"], "image/png");
+        assert_eq!(
+            payload,
+            app.db
+                .restore_queued_message(&chat, seq, "Original", &claim)
+                .unwrap()
+        );
+        assert!(
+            app.db
+                .restore_queued_message("wrong", seq, "Original", &claim)
+                .is_err()
+        );
+        assert!(
+            app.db
+                .restore_queued_message(&chat, seq, "changed", &claim)
+                .is_err()
+        );
+        assert_eq!(app.db.run(&ids[0]).unwrap().status, "withdrawn");
+        assert!(app.db.take_followups(&run).unwrap().is_empty());
+        assert_eq!(app.db.message_uploads(seq).unwrap()[0]["id"], file["id"]);
+        app.db.finish(&first[0], "completed", "Done", "").unwrap();
+        assert!(app.db.claim_bot(&bot.id).unwrap().is_none());
+        let fresh_file = payload["files"][0]["id"].as_str().unwrap().to_string();
+        app.db
+            .chat_send_request_mode(&chat, "Edited", &[], &[fresh_file], None, None, "queue")
+            .unwrap();
+        assert_eq!(app.db.claim_bot(&bot.id).unwrap().unwrap().prompt, "Edited");
+    }
+    #[test]
+    fn composer_restore_refuses_partially_consumed_multi_recipient_send() {
+        let app = tests::app();
+        let a = tests::bot(&app.db, "codex");
+        let b = tests::bot(&app.db, "codex");
+        let chat: crate::chats::Chat = serde_json::from_value(
+            json!({"id":"restore-team","name":"Team","members":[a.id,b.id]}),
+        )
+        .unwrap();
+        app.db.save_chat(&chat).unwrap();
+        let ids = app
+            .db
+            .chat_send(&chat.id, "Original", &[a.id.clone(), b.id.clone()])
+            .unwrap();
+        let seq = app.db.chat_messages(&chat.id).unwrap()[0]["seq"]
+            .as_i64()
+            .unwrap();
+        app.db.claim_bot(&a.id).unwrap().unwrap();
+        assert!(
+            app.db
+                .restore_queued_message(&chat.id, seq, "Original", &db::id())
+                .is_err()
+        );
+        assert_eq!(app.db.run(&ids[1]).unwrap().status, "queued");
+        assert_eq!(
+            app.db.chat_messages(&chat.id).unwrap()[0]["kind"],
+            "message"
+        );
+    }
+    #[test]
+    fn selected_send_mode_only_steers_new_eligible_messages_at_tool_boundary() {
+        let app = tests::app();
+        let bot = tests::bot(&app.db, "codex");
+        let chat = format!("dm-{}", bot.id);
+        app.db.queue(&bot.id, "Working", 0).unwrap();
+        let run = app.db.claim_bot(&bot.id).unwrap().unwrap();
+        let key = db::id();
+        let queued = app
+            .db
+            .chat_send_request_mode(&chat, "Next", &[], &[], None, Some(&key), "queue")
+            .unwrap();
+        let steer = app
+            .db
+            .chat_send_request_mode(&chat, "Clarification", &[], &[], None, None, "steer")
+            .unwrap();
+        assert!(
+            app.db
+                .chat_send_request_mode(&chat, "Next", &[], &[], None, Some(&key), "steer")
+                .is_err()
+        );
+        let followups = app.db.take_followups(&run).unwrap();
+        assert_eq!(followups.len(), 1);
+        assert_eq!(followups[0]["source_run_id"], steer[0]);
+        assert_eq!(app.db.run(&queued[0]).unwrap().status, "queued");
+    }
 
     #[test]
     fn queued_message_edits_group_recipients_are_all_or_nothing() {

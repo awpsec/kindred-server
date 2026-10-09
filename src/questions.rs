@@ -75,6 +75,9 @@ pub fn migrate(c: &Connection) -> Result<()> {
     Ok(())
 }
 impl Db {
+    pub fn pending_questions(&self)->Result<Vec<Question>> {
+        Ok(self.0.lock().unwrap().prepare("SELECT * FROM questions WHERE status='pending' ORDER BY created,rowid")?.query_map([],row)?.collect::<rusqlite::Result<_>>()?)
+    }
     pub fn question(&self, id: &str) -> Result<Question> {
         Ok(self
             .0

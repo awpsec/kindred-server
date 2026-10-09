@@ -206,6 +206,7 @@ pub fn record(c: &Connection, id: &str) -> Result<Value> {
     // sends, without executing or changing the recorded action.
     value["email_send"] = json!(email_send(&json!({"toolkit":value["connector"],"tool_name":value["tool"]})));
     value["email"] = email_fields(&value["input"]);
+    value["review_requested"]=json!(c.query_row("SELECT EXISTS(SELECT 1 FROM chat_send_receipts WHERE request_id=?)",[id],|r|r.get::<_,bool>(0))?);
     if crate::connector_edits::read_only(&value) {
         if let Some(fields) = value["email"].as_object_mut() {
             for field in fields.values_mut() {
@@ -227,7 +228,7 @@ pub fn create(db: &Db, run: &Run, args: &Value) -> Result<String> {
         "Connector input too large for review"
     );
     let id = db::id();
-    let body = json!({"connector":service(args),"connection":str_at(args,&["connection","toolkit"]),"source":match args["origin"].as_str(){Some("claude-account")=>"Claude",Some("codex-account")=>"Codex",_=>"Kindred"},"tool":tool_name(args),"kind":kind(args),"title":title(args),"email_send":email_send(args),"account":str_at(args,&["account_name","account_id"]),"original_input":input(args),"input":input(args),"records":[],"forced":args["forced"]==true,"read_only":args["read_only"]==true,"display_read_only":args["read_only"]==true || (args["origin"]=="claude-account" && read_only_hint(args))});
+    let body = json!({"connector":service(args),"connection":str_at(args,&["connection","toolkit"]),"source":match args["origin"].as_str(){Some("claude-account")=>"Claude",Some("codex-account")=>"Codex",_=>"Kindred"},"tool":tool_name(args),"kind":kind(args),"title":title(args),"email_send":email_send(args),"retry_unknown":run.prompt.starts_with("Prepare a NEW email revision for my review.") && run.prompt.contains("This may already have been sent"),"account":str_at(args,&["account_name","account_id"]),"original_input":input(args),"input":input(args),"records":[],"forced":args["forced"]==true,"read_only":args["read_only"]==true,"display_read_only":args["read_only"]==true || (args["origin"]=="claude-account" && read_only_hint(args))});
     let mut c = db.0.lock().unwrap();
     let tx = c.transaction()?;
     tx.execute("INSERT INTO connector_artifacts(id,run_id,chat_id,bot_id,body,status,created) VALUES(?,?,?,?,?,'preparing',?)",params![id,run.id,run.chat_id,run.bot_id,body.to_string(),db::now()])?;
@@ -556,6 +557,10 @@ pub fn complete(db: &Db, id: &str, result: &Value, failed: bool) -> Result<()> {
     }
     // Also publish receipts for calls created by an older server before upgrade.
     tx.execute("INSERT INTO chat_messages(chat_id,sender,body,kind,run_id,created) SELECT ?,?,?,'connector_artifact',?,? WHERE NOT EXISTS(SELECT 1 FROM chat_messages WHERE kind='connector_artifact' AND body=?)",params![value["chat_id"].as_str(),value["bot_id"].as_str(),id,value["run_id"].as_str(),value["created"].as_i64().unwrap_or_else(db::now),id])?;
+    if value["email_send"]==true {
+        value["delivery_state"]=json!(if failed {if value["status"]=="executing" {"unknown"} else {"not_sent"}} else {"sent"});
+        value["completed_at"]=json!(db::now());
+    }
     value["records"] = json!(records);
     value["outcome"] = json!(if failed {
         "The connector returned an error. Verify external state before retrying a change."
@@ -582,6 +587,21 @@ pub fn update(app: &App, id: &str, v: &Value) -> Result<Value> {
         .as_i64()
         .context("Review the current card before changing it")?;
     let action = v["action"].as_str().unwrap_or("");
+    if action=="review_again" {
+        let card=record(&app.db.0.lock().unwrap(),id)?;
+        ensure!(card["revision"]==revision,"This draft changed. Review the current version.");
+        ensure!(card["email_send"]==true && matches!(card["status"].as_str(),Some("failed"|"interrupted")),"Only an unsuccessful email can be reviewed again");
+        let unknown=card["delivery_state"]!="not_sent";
+        ensure!(!unknown||v["confirm_unknown"]==true,"This may already have been sent. Check your Sent folder before requesting another review.");
+        // One new review task per terminal revision, stable across clients and
+        // lost responses. The source card UUID owns this send receipt.
+        let request=id;
+        let next=if v["fields"].as_object().is_some_and(|o|!o.is_empty()){crate::connector_edits::apply(&card,&v["fields"])?}else{card["input"].clone()};
+        let prompt=format!("Prepare a NEW email revision for my review. Do not send it without my new explicit approval. The earlier call is terminal and must not be replayed. {} Source card {} revision {}, connection {}, tool {}. Use these saved draft inputs, preserving attachments and recipients: {}",if unknown{"This may already have been sent; I checked the Sent folder and requested a fresh review."}else{"The earlier call did not dispatch."},id,revision,card["connection"].as_str().unwrap_or(""),card["tool"].as_str().unwrap_or(""),next);
+        ensure!(prompt.len()<=64000,"This email is too large to request another review here. Ask your bot to prepare a new draft.");
+        let runs=app.db.chat_send_request_mode(card["chat_id"].as_str().unwrap_or(""),&prompt,&[card["bot_id"].as_str().unwrap_or("").into()],&[],None,Some(request),"queue")?;
+        return Ok(json!({"review_requested":true,"run_ids":runs,"source_artifact_id":id,"source_revision":revision,"delivery_unknown":unknown}));
+    }
     if matches!(action, "edit" | "remove_attachments") {
         let mut c = app.db.0.lock().unwrap();
         let tx = c.transaction()?;
@@ -699,6 +719,71 @@ mod tests {
         .unwrap()["revision"]
             .as_i64()
             .unwrap()
+    }
+    #[tokio::test]
+    async fn synthetic_email_adapter_counts_success_refusal_and_lost_receipt_without_replay() {
+        for outcome in ["success","refused","lost"] {
+            let (app,bot,run,mut args,id)=fixture();
+            let (a,b,r,mut review_args)=(app.clone(),bot.clone(),run.clone(),args.clone());
+            let waiting=tokio::spawn(async move {assert!(review(&a,&b,&r,"claude_connector",&mut review_args,false).await.unwrap());review_args});
+            tokio::time::timeout(std::time::Duration::from_secs(3),async {while app.db.approvals().unwrap().is_empty(){tokio::time::sleep(std::time::Duration::from_millis(10)).await;}}).await.unwrap();
+            let revision=record(&app.db.0.lock().unwrap(),&id).unwrap()["revision"].as_i64().unwrap();
+            update(&app,&id,&json!({"action":"approve","revision":revision})).unwrap();
+            args=waiting.await.unwrap();
+            let effects=std::sync::atomic::AtomicUsize::new(0);
+            let adapter=||->Result<Value>{
+                if outcome=="refused" {anyhow::bail!("Synthetic validation refused before dispatch");}
+                dispatch(&app.db,&run,&args)?;
+                effects.fetch_add(1,std::sync::atomic::Ordering::SeqCst);
+                if outcome=="lost" {anyhow::bail!("Synthetic receipt lost after effect");}
+                Ok(json!({"id":"synthetic-provider-success"}))
+            };
+            let receipt=adapter();let failed=receipt.is_err();
+            complete(&app.db,&id,&receipt.unwrap_or_else(|e|json!({"error":e.to_string()})),failed).unwrap();
+            let card=record(&app.db.0.lock().unwrap(),&id).unwrap();
+            assert_eq!(card["delivery_state"],match outcome {"success"=>"sent","refused"=>"not_sent",_=>"unknown"});
+            assert_eq!(effects.load(std::sync::atomic::Ordering::SeqCst),if outcome=="refused" {0}else{1});
+            assert!(adapter().is_err());assert_eq!(effects.load(std::sync::atomic::Ordering::SeqCst),if outcome=="refused" {0}else{1});
+            assert_eq!(card["input"]["body"],"Original body");
+            assert_eq!(card["input"]["attachments"][0]["id"],"preserve-attachment");
+        }
+    }
+    #[test]
+    fn unsuccessful_email_requests_a_fresh_review_once_without_replaying() {
+        for dispatched in [false, true] {
+            let (app, bot, run, args, id)=fixture();
+            pending(&app,&run,&args);
+            if dispatched {app.db.0.lock().unwrap().execute("UPDATE connector_artifacts SET status='executing' WHERE id=?",[&id]).unwrap();}
+            complete(&app.db,&id,&json!({"error":"Synthetic lost receipt"}),true).unwrap();
+            app.db.finish(&run.id,"failed","Synthetic stopped call","").unwrap();
+            let old=record(&app.db.0.lock().unwrap(),&id).unwrap();
+            assert_eq!(old["delivery_state"],if dispatched {"unknown"} else {"not_sent"});
+            let mut request=json!({"action":"review_again","revision":old["revision"],"fields":{"body":"Fresh reviewed body"}});
+            if dispatched {assert!(update(&app,&id,&request).is_err());request["confirm_unknown"]=json!(true);}
+            let response=update(&app,&id,&request).unwrap();
+            assert_eq!(response,update(&app,&id,&request).unwrap());
+            request["fields"]["body"]=json!("Different body");
+            assert!(update(&app,&id,&request).is_err());
+            let next=app.db.run(response["run_ids"][0].as_str().unwrap()).unwrap();
+            assert_eq!(next.status,"queued");assert_eq!(next.bot_id,bot.id);
+            assert!(email_review_requested(&next.prompt));
+            assert!(next.prompt.contains("Fresh reviewed body"));
+            assert!(next.prompt.contains("preserve-attachment"));
+            assert!(next.prompt.contains("preserve-thread"));
+            assert_eq!(response["delivery_unknown"],dispatched);
+            let retained=record(&app.db.0.lock().unwrap(),&id).unwrap();
+            assert_eq!(retained["status"],"failed");assert_eq!(retained["revision"],old["revision"]);
+            assert_eq!(retained["input"],old["input"]);assert_eq!(retained["review_requested"],true);
+            let claimed=app.db.claim_bot(&bot.id).unwrap().unwrap();assert_eq!(claimed.id,next.id);
+            let new_id=create(&app.db,&claimed,&args).unwrap();
+            let mut fresh_args=args.clone();fresh_args["artifact_id"]=json!(new_id);
+            pending(&app,&claimed,&fresh_args);
+            let fresh=record(&app.db.0.lock().unwrap(),&new_id).unwrap();
+            assert_ne!(new_id,id);assert_eq!(fresh["status"],"pending");
+            assert!(dispatch(&app.db,&claimed,&fresh_args).is_err(),"Fresh review cannot send before its own approval");
+            assert_eq!(fresh["retry_unknown"],dispatched);
+            assert!(update(&app,&id,&json!({"action":"approve","revision":old["revision"]})).is_err());
+        }
     }
     #[tokio::test]
     async fn edited_review_dispatches_exact_input_once_and_survives_chat_readback() {

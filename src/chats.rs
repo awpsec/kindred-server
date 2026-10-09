@@ -33,16 +33,15 @@ pub(crate) fn record_recipient(c: &Connection, run: &str) -> Result<()> {
 pub fn migrate(c: &Connection) -> Result<()> {
     let transaction = c.unchecked_transaction()?;
     let c = &*transaction;
-    for column in ["chat_id", "round_id", "reply_to"] {
+    for column in ["chat_id", "round_id", "reply_to", "progress_mode", "progress_started"] {
         let exists = c
             .prepare("PRAGMA table_info(runs)")?
             .query_map([], |r| r.get::<_, String>(1))?
             .collect::<rusqlite::Result<Vec<_>>>()?
             .contains(&column.to_string());
         if !exists {
-            c.execute_batch(&format!(
-                "ALTER TABLE runs ADD COLUMN {column} TEXT NOT NULL DEFAULT '';"
-            ))?;
+            let spec=if column=="progress_started" {"INTEGER NOT NULL DEFAULT 0"}else{"TEXT NOT NULL DEFAULT ''"};
+            c.execute_batch(&format!("ALTER TABLE runs ADD COLUMN {column} {spec};"))?;
         }
     }
     c.execute_batch("CREATE TABLE IF NOT EXISTS chats(id TEXT PRIMARY KEY,name TEXT NOT NULL,members TEXT NOT NULL,archived INTEGER NOT NULL DEFAULT 0);
@@ -359,6 +358,11 @@ impl Db {
                 } else {
                     planning["message"].clone()
                 };
+                if table=="reminders" && planning["batch_id"].as_str().is_some_and(|id|!id.is_empty()) {
+                    let c=self.0.lock().unwrap();let batch=planning["batch_id"].as_str().unwrap();
+                    let ids:Vec<String>=c.prepare("SELECT id FROM reminders WHERE chat_id=? AND json_extract(body,'$.batch_id')=? ORDER BY run_at,created,id")?.query_map(params![planning["chat_id"].as_str(),batch],|r|r.get(0))?.collect::<rusqlite::Result<_>>()?;
+                    row["planning_batch"]=json!(ids.iter().map(|id|crate::plans::record(&c,"reminders",id)).collect::<Result<Vec<_>>>()?);
+                }
                 row["planning"] = planning;
             }
             if row["kind"] == "workspace_artifact" {
@@ -397,6 +401,10 @@ impl Db {
                     }
                 }
             }
+            if row["kind"] == "approval" {
+                let approval=self.run_approvals(row["run_id"].as_str().unwrap_or(""))?.into_iter().find(|a|a["id"]==row["text"]);
+                if let Some(a)=approval {row["text"]=a["tool"].clone();row["approval"]=a;}
+            }
             if row["kind"] == "question" {
                 row["question"] = json!(self.question(row["text"].as_str().unwrap_or(""))?);
                 row["text"] = row["question"]["question"].clone();
@@ -404,6 +412,7 @@ impl Db {
             if row["kind"] == "result" {
                 row["attachments"] = json!(self.attachments(row["run_id"].as_str().unwrap_or(""))?);
             }
+            row["progress"] = crate::progress_updates::message(&self.0.lock().unwrap(), row["seq"].as_i64().unwrap())?;
             self.decorate_chat_status(row)?;
             row["reactions"] = json!(
                 self.0
@@ -519,13 +528,30 @@ impl Db {
         reply_to: Option<i64>,
         request_id: Option<&str>,
     ) -> Result<Vec<String>> {
+        self.chat_send_request_mode(id, prompt, mentions, files, reply_to, request_id, "queue")
+    }
+    pub fn chat_send_request_mode(
+        &self,
+        id: &str,
+        prompt: &str,
+        mentions: &[String],
+        files: &[String],
+        reply_to: Option<i64>,
+        request_id: Option<&str>,
+        mode: &str,
+    ) -> Result<Vec<String>> {
+        ensure!(matches!(mode, "steer" | "queue"), "Choose Steer or Queue");
         if let Some(key) = request_id {
             ensure!(
                 uuid::Uuid::parse_str(key).is_ok(),
                 "Invalid message request ID"
             );
         }
-        let body = serde_json::to_vec(&json!([id, prompt, mentions, files, reply_to]))?;
+        let body = serde_json::to_vec(&if mode == "queue" {
+            json!([id, prompt, mentions, files, reply_to])
+        } else {
+            json!([id, prompt, mentions, files, reply_to, mode])
+        })?;
         let digest = ring::digest::digest(&ring::digest::SHA256, &body);
         let chat = self.chat(id)?;
         let mut c = self.0.lock().unwrap();
@@ -581,7 +607,13 @@ impl Db {
         } else {
             let recent = tx.prepare("SELECT sender FROM chat_messages WHERE chat_id=? AND kind IN ('message','assistant','result') AND sender!='user' AND suppressed=0 ORDER BY seq DESC LIMIT 12")?
                 .query_map([id], |r| r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
-            crate::team_chats::default_recipient_with_primary(prompt, &chat.description, &crate::team_chats::members(&tx, &chat)?, &recent, crate::primary_bot::selected(&tx)?.as_deref())
+            crate::team_chats::default_recipient_with_primary(
+                prompt,
+                &chat.description,
+                &crate::team_chats::members(&tx, &chat)?,
+                &recent,
+                crate::primary_bot::selected(&tx)?.as_deref(),
+            )
         };
         ensure!(targets.len() <= 6, "Too many mentions");
         let round = db::id();
@@ -590,7 +622,9 @@ impl Db {
         for target in targets {
             if seen.insert(target.clone()) {
                 let run = insert_run(&tx, &chat, &target, effective_prompt, &round, "", 0)?;
-                if !id.starts_with("dm-") { record_recipient(&tx, &run)?; }
+                if !id.starts_with("dm-") {
+                    record_recipient(&tx, &run)?;
+                }
                 if let Some(command) = &command {
                     tx.execute(
                         "INSERT INTO run_commands(run_id,receipt) VALUES(?,?)",
@@ -602,6 +636,10 @@ impl Db {
         }
         tx.execute("INSERT INTO chat_messages(chat_id,sender,body,kind,created) VALUES(?,'user',?,'message',?)",params![id,prompt,db::now()])?;
         let message_seq = tx.last_insert_rowid();
+        tx.execute(
+            "INSERT INTO message_send_modes VALUES(?,?)",
+            params![message_seq, mode],
+        )?;
         crate::uploads::bind(&tx, id, message_seq, files)?;
         if let Some(target) = reply_to {
             tx.execute(
@@ -615,6 +653,13 @@ impl Db {
                     "INSERT INTO run_message_sources VALUES(?,?)",
                     params![run, message_seq],
                 )?;
+            }
+        }
+        if mode == "steer" && command.is_none() {
+            for source in &runs {
+                // Only a running task can accept a fresh followup at a tool boundary.
+                // Waiting/finished tasks retain the ordinary queued send.
+                tx.execute("INSERT INTO steering_requests(source_run_id,run_id,created) SELECT s.id,t.id,? FROM runs s JOIN runs t ON s.bot_id=t.bot_id AND s.chat_id=t.chat_id WHERE s.id=? AND t.status='running' AND t.id<>s.id ORDER BY t.rowid DESC LIMIT 1",params![db::now(),source])?;
             }
         }
         if let Some(key) = request_id {

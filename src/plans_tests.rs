@@ -430,10 +430,13 @@ async fn runtime_contract_has_contextual_tools_and_live_user_revisions() {
     let r = run(&app.db);
     let b = app.db.bot(&r.bot_id).unwrap();
     let tools = runtime::tool_specs();
-    let prompt = instructions::build(&app, &b, &r, &tools, Some(32000)).unwrap();
-    assert!(prompt.contains("Resolve names"));
+    // This test checks live planning context, not the smallest supported model budget.
+    // The complete current tool contract no longer fits a 32k fixture window.
+    let prompt = instructions::build(&app, &b, &r, &tools, Some(64000)).unwrap();
+    let chapter=instructions::chapter("decisions_routines").unwrap();
+    assert!(chapter["text"].as_str().unwrap().contains("Resolve client names"));
     assert!(prompt.contains("reminder_set"));
-    assert!(prompt.contains("checkbox"));
+    assert!(chapter["text"].as_str().unwrap().contains("checkbox"));
     let result = runtime::call_tool(&app, &b, &r, "checklist_create", list())
         .await
         .unwrap();
@@ -462,7 +465,7 @@ async fn runtime_contract_has_contextual_tools_and_live_user_revisions() {
         wrapped["kindred_live_context"]["planning_revisions"][0]["revision"],
         2
     );
-    let fresh = instructions::build(&app, &b, &r, &tools, Some(32000)).unwrap();
+    let fresh = instructions::build(&app, &b, &r, &tools, Some(64000)).unwrap();
     assert!(fresh.contains("conversation_checklists"));
     // A constrained context may omit optional checklist records, but must
     // declare the omission and leave the complete records retrievable.
@@ -597,4 +600,19 @@ fn edited_list_moves_to_latest_position_without_a_second_visible_card() {
     assert_eq!(latest["planning"]["id"],a["id"]);
     assert!(latest["seq"].as_i64().unwrap()>old["seq"].as_i64().unwrap());
     assert_eq!(latest["text"],"Refreshed objectives");
+}
+
+#[test]
+fn reminder_batches_use_creation_run_and_keep_cancelled_records_across_readback() {
+    let db=Db::open(":memory:").unwrap();let r=run(&db);
+    let mut ids=vec![];
+    for index in 0..10 {let mut v=reminder();v["key"]=json!(format!("batch-{index}"));v["message"]=json!(format!("Reminder {index}"));v["local_time"]=json!(format!("2099-09-10T{:02}:00",12+index));v["batch_id"]=json!("untrusted-adjacency");let saved=db.reminder_set(&r,v).unwrap();assert_eq!(saved["batch_id"],r.id);ids.push(saved["id"].as_str().unwrap().to_owned());}
+    let other_id=db.queue(&r.bot_id,"Another creation task",0).unwrap();let other=db.run(&other_id).unwrap();let mut v=reminder();v["key"]=json!("separate-task");db.reminder_set(&other,v).unwrap();
+    db.reminder_update(&r.chat_id,None,&ids[2],json!({"expected_revision":1,"cancel":true})).unwrap();
+    let rows=db.chat_messages(&r.chat_id).unwrap();let creation:Vec<_>=rows.iter().filter(|m|m["kind"]=="reminder_card"&&m["planning"]["batch_id"]==r.id).collect();assert_eq!(creation.len(),10);
+    for message in creation {let batch=message["planning_batch"].as_array().unwrap();assert_eq!(batch.len(),10);assert!(batch.iter().all(|v|v["batch_id"]==r.id));assert_eq!(batch.iter().find(|v|v["id"]==ids[2]).unwrap()["status"],"cancelled");assert_eq!(batch[0]["id"],ids[0]);}
+    assert_eq!(rows.iter().find(|m|m["planning"]["batch_id"]==other_id).unwrap()["planning_batch"].as_array().unwrap().len(),1);
+    // Historical rows without an explicit creation tag remain ungrouped.
+    {let c=db.0.lock().unwrap();let raw:String=c.query_row("SELECT body FROM reminders WHERE id=?",[&ids[0]],|r|r.get(0)).unwrap();let mut legacy:Value=serde_json::from_str(&raw).unwrap();legacy.as_object_mut().unwrap().remove("batch_id");c.execute("UPDATE reminders SET body=? WHERE id=?",rusqlite::params![legacy.to_string(),ids[0]]).unwrap();}
+    assert!(db.chat_messages(&r.chat_id).unwrap().iter().find(|m|m["planning"]["id"]==ids[0]).unwrap()["planning_batch"].is_null());
 }

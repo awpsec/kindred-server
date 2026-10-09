@@ -143,6 +143,7 @@ pub fn router(app: Shared) -> Router {
         .route("/user-tasks", get(user_tasks))
         .route("/user-tasks/{id}/complete", post(complete_user_task))
         .route("/user-tasks/{id}/code", post(enter_user_task_code))
+        .route("/questions",get(pending_questions))
         .route("/questions/{id}/answer", post(answer_question))
         .route("/questions/{id}/dismiss", post(dismiss_question))
         .route("/skills", get(skills).post(save_skill))
@@ -580,8 +581,25 @@ async fn cancel(State(app): State<Shared>, Path(id): Path<String>) -> Result<Jso
     app.db.cancel(&id)?;
     Ok(Json(json!({"ok":true})))
 }
-async fn edit_queued_message(State(app): State<Shared>, Path((chat,seq)): Path<(String,i64)>, Json(input): Json<Value>) -> Result<Json<Value>> {
-    app.db.edit_queued_message(&chat,seq,crate::runtime::string(&input,"expected_text")?,crate::runtime::string(&input,"text")?)?;
+async fn edit_queued_message(
+    State(app): State<Shared>,
+    Path((chat, seq)): Path<(String, i64)>,
+    Json(input): Json<Value>,
+) -> Result<Json<Value>> {
+    if input["restore_to_composer"] == true {
+        return Ok(Json(app.db.restore_queued_message(
+            &chat,
+            seq,
+            crate::runtime::string(&input, "expected_text")?,
+            crate::runtime::string(&input, "request_id")?,
+        )?));
+    }
+    app.db.edit_queued_message(
+        &chat,
+        seq,
+        crate::runtime::string(&input, "expected_text")?,
+        crate::runtime::string(&input, "text")?,
+    )?;
     Ok(Json(json!({"ok":true})))
 }
 
@@ -762,6 +780,9 @@ async fn save_settings(State(app): State<Shared>, Json(v): Json<Value>) -> Resul
     require!(v.get("progress_updates").is_none_or(Value::is_string), "Invalid progress updates setting");
     let progress_updates = v["progress_updates"].as_str().or_else(||prior["progress_updates"].as_str()).unwrap_or("balanced");
     require!(crate::progress_updates::valid(progress_updates), "Invalid progress updates setting");
+    require!(v.get("message_delivery").is_none_or(Value::is_string), "Invalid message delivery setting");
+    let message_delivery=v["message_delivery"].as_str().or_else(||prior["message_delivery"].as_str()).unwrap_or("steer");
+    require!(matches!(message_delivery,"steer"|"queue"), "Invalid message delivery setting");
     let default_provider = v.get("default_provider").unwrap_or(&prior["default_provider"]);
     require!(default_provider.as_str().is_some_and(crate::provider_accounts::valid_id), "Invalid default provider");
     let model_defaults = v.get("model_defaults").unwrap_or(&prior["model_defaults"]);
@@ -773,7 +794,7 @@ async fn save_settings(State(app): State<Shared>, Json(v): Json<Value>) -> Resul
         let effort = selection["reasoning_effort"].as_str().unwrap_or("");
         require!(model.len() <= 200 && !model.chars().any(char::is_control) && effort.len() <= 40 && effort.bytes().all(|b| b.is_ascii_lowercase() || b == b'_'), "Invalid default model selection");
     }
-    let settings = json!({"progress_updates":progress_updates,"default_provider":default_provider,"model_defaults":model_defaults,"local_access":local_access,"approval_mode":approval,"name":name,"identity":identity,"theme":theme,"reduced_motion":v["reduced_motion"]==true,"notifications":notifications,"show_activity":show_activity,"separate_bot_chats":separate_bot_chats,"timezone":timezone,"timezone_mode":timezone_mode});
+    let settings = json!({"message_delivery":message_delivery,"progress_updates":progress_updates,"default_provider":default_provider,"model_defaults":model_defaults,"local_access":local_access,"approval_mode":approval,"name":name,"identity":identity,"theme":theme,"reduced_motion":v["reduced_motion"]==true,"notifications":notifications,"show_activity":show_activity,"separate_bot_chats":separate_bot_chats,"timezone":timezone,"timezone_mode":timezone_mode});
     app.db.save_setting("general", &settings)?;
     let mut settings=settings;
     settings["primary_bot_id"]=json!(crate::primary_bot::get(&app.db)?);
@@ -828,6 +849,9 @@ async fn routines(State(app): State<Shared>) -> Result<Json<Vec<Value>>> {
 async fn run_routine_now(State(app): State<Shared>, Path(id): Path<String>) -> Result<Json<Value>> {
     ensure_routine_workspace(&app)?;
     Ok(Json(json!({"run_id":app.db.run_routine_now(&id)?})))
+}
+async fn pending_questions(State(app):State<Shared>)->Result<Json<Vec<crate::questions::Question>>> {
+    Ok(Json(app.db.pending_questions()?))
 }
 async fn dismiss_question(
     State(app): State<Shared>,
@@ -1232,6 +1256,8 @@ struct ChatMessage {
     reply_to: Option<i64>,
     #[serde(default)]
     request_id: Option<String>,
+    #[serde(default)]
+    delivery_mode: Option<String>,
 }
 async fn chat_send(
     State(app): State<Shared>,
@@ -1239,7 +1265,7 @@ async fn chat_send(
     Json(v): Json<ChatMessage>,
 ) -> Result<Json<Value>> {
     Ok(Json(
-        json!({"runs":app.db.chat_send_request(&id,&v.prompt,&v.mentions,&v.files,v.reply_to,v.request_id.as_deref())?}),
+        json!({"runs":app.db.chat_send_request_mode(&id,&v.prompt,&v.mentions,&v.files,v.reply_to,v.request_id.as_deref(),v.delivery_mode.as_deref().unwrap_or("queue"))?}),
     ))
 }
 async fn message_reaction(

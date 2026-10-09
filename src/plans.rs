@@ -320,6 +320,7 @@ impl Db {
         {
             return record(&tx, "reminders", &id);
         }
+        v["batch_id"] = json!(run.id);
         v["message"] = json!(text(&v, "message", 2000)?);
         sources(&mut v)?;
         let at = reminder_time(&v)?;

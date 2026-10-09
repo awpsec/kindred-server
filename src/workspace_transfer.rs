@@ -37,6 +37,9 @@ const TABLES: &[&str] = &[
     "run_message_sources",
     "run_steering",
     "steering_requests",
+    "message_send_modes",
+    "message_progress",
+    "queued_message_claims",
     "bot_chat_posts",
     "group_wakeups",
     "run_chat_reads",
@@ -273,7 +276,7 @@ impl Db {
             tables.keys().all(|t| TABLES.contains(&t.as_str()))
                 && TABLES.iter().all(|t| matches!(
                     *t,
-                    "connector_artifacts"
+                    "message_send_modes" | "message_progress" | "queued_message_claims" | "connector_artifacts"
                         | "visual_panels"
                     | "workspace_artifacts"
                     | "workspace_artifact_versions"
@@ -307,7 +310,7 @@ impl Db {
         for table in TABLES {
             if matches!(
                 *table,
-                "connector_artifacts"
+                "message_send_modes" | "message_progress" | "queued_message_claims" | "connector_artifacts"
                     | "visual_panels"
                     | "workspace_artifacts"
                     | "workspace_artifact_versions"

@@ -32,7 +32,7 @@ pub fn valid_approval(mode: &str) -> bool {
 pub fn general_settings(saved: Option<Value>) -> Value {
     let mut settings = json!({"name":"You","identity":"","theme":"dark",
         "reduced_motion":false,"approval_mode":"ask","show_activity":false,"separate_bot_chats":true,
-        "default_provider":"codex","model_defaults":{},"local_access":false,"notifications":"all","timezone":"","timezone_mode":"auto","progress_updates":"balanced"});
+        "default_provider":"codex","model_defaults":{},"local_access":false,"notifications":"all","timezone":"","timezone_mode":"auto","progress_updates":"balanced","message_delivery":"steer"});
     if let Some(Value::Object(saved)) = saved {
         settings.as_object_mut().unwrap().extend(saved);
     }
@@ -113,6 +113,10 @@ pub struct Run {
     pub chat_id: String,
     pub round_id: String,
     pub reply_to: String,
+    #[serde(default)]
+    pub progress_mode: String,
+    #[serde(default)]
+    pub progress_started: i64,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Routine {
@@ -168,6 +172,8 @@ pub(crate) fn run_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
         chat_id: r.get(8)?,
         round_id: r.get(9)?,
         reply_to: r.get(10)?,
+        progress_mode: r.get("progress_mode")?,
+        progress_started: r.get("progress_started")?,
     })
 }
 impl Db {
@@ -521,8 +527,9 @@ impl Db {
         if crate::workspace_transfer::frozen(&tx)? || crate::vm_maintenance::busy(&tx)? {
             return Ok(None);
         }
-        let run=tx.query_row("SELECT * FROM runs WHERE status='queued' AND bot_id=?1 AND EXISTS(SELECT 1 FROM bots WHERE id=?1 AND COALESCE(json_extract(profile,'$.archived'),0)=0) AND NOT EXISTS(SELECT 1 FROM runs WHERE bot_id=?1 AND status IN ('running','awaiting_user','awaiting_approval','cancelling')) ORDER BY created,rowid LIMIT 1",[bot],run_row).optional()?;
-        if let Some(r) = &run {
+        let mut run=tx.query_row("SELECT * FROM runs WHERE status='queued' AND bot_id=?1 AND EXISTS(SELECT 1 FROM bots WHERE id=?1 AND COALESCE(json_extract(profile,'$.archived'),0)=0) AND NOT EXISTS(SELECT 1 FROM runs WHERE bot_id=?1 AND status IN ('running','awaiting_user','awaiting_approval','cancelling')) ORDER BY created,rowid LIMIT 1",[bot],run_row).optional()?;
+        if let Some(r) = &mut run {
+            crate::progress_updates::start(&tx, r)?;
             tx.execute("UPDATE runs SET status='running' WHERE id=?", [&r.id])?;
         }
         tx.commit()?;
@@ -532,14 +539,15 @@ impl Db {
     pub fn claim(&self) -> Result<Option<Run>> {
         let mut c = self.0.lock().unwrap();
         let tx = c.transaction()?;
-        let run = tx
+        let mut run = tx
             .query_row(
                 "SELECT * FROM runs WHERE status='queued' ORDER BY created,rowid LIMIT 1",
                 [],
                 run_row,
             )
             .optional()?;
-        if let Some(r) = &run {
+        if let Some(r) = &mut run {
+            crate::progress_updates::start(&tx, r)?;
             tx.execute("UPDATE runs SET status='running' WHERE id=?", [&r.id])?;
         }
         tx.commit()?;
@@ -697,6 +705,7 @@ impl Db {
             if let Some(text) = body["text"].as_str().filter(|text| !text.trim().is_empty()) {
                 let event_seq = tx.last_insert_rowid();
                 tx.execute("INSERT INTO chat_messages(chat_id,sender,body,kind,run_id,created,source_event_seq) SELECT r.chat_id,r.bot_id,?,'assistant',r.id,?,? FROM runs r JOIN chats c ON c.id=r.chat_id WHERE r.id=?",params![text,created,event_seq,run])?;
+                crate::progress_updates::record_message(&tx, tx.last_insert_rowid(), run, body["phase"].as_str().unwrap_or(""))?;
             }
         }
         tx.commit()?;
@@ -729,7 +738,8 @@ impl Db {
     }
     pub fn request_approval(&self, run: &str, tool: &str, args: &Value) -> Result<String> {
         let id = id();
-        let c = self.0.lock().unwrap();
+        let mut c = self.0.lock().unwrap();
+        let c = c.transaction()?;
         c.execute(
             "INSERT INTO approvals(id,run_id,tool,args) VALUES(?,?,?,?)",
             params![id, run, tool, args.to_string()],
@@ -743,6 +753,10 @@ impl Db {
             c.execute("UPDATE connector_artifacts SET body=json_set(body,'$.forced',json(?)),revision=revision+1 WHERE id=?",params![if args["forced"]==true{"true"}else{"false"},artifact])?;
             c.execute("INSERT INTO chat_messages(chat_id,sender,body,kind,run_id,created) SELECT chat_id,bot_id,id,'connector_artifact',run_id,created FROM connector_artifacts WHERE id=? AND NOT EXISTS(SELECT 1 FROM chat_messages WHERE kind='connector_artifact' AND body=?)",params![artifact,artifact])?;
         }
+        if crate::conversation_updates::simple_approval(tool,args) {
+            c.execute("INSERT INTO chat_messages(chat_id,sender,body,kind,run_id,created) SELECT chat_id,bot_id,?,'approval',id,? FROM runs WHERE id=?",params![id,now(),run])?;
+        }
+        c.commit()?;
         Ok(id)
     }
     pub fn approval(&self, id: &str) -> Result<String> {
@@ -760,10 +774,10 @@ impl Db {
         Ok(())
     }
     pub fn approvals(&self) -> Result<Vec<Value>> {
-        Ok(self.0.lock().unwrap().prepare("SELECT id,run_id,tool,args FROM approvals WHERE status='pending'")?.query_map([], |r| Ok(json!({"id":r.get::<_,String>(0)?,"run_id":r.get::<_,String>(1)?,"tool":r.get::<_,String>(2)?,"args":serde_json::from_str::<Value>(&r.get::<_,String>(3)?).unwrap_or(Value::Null)})))?.collect::<rusqlite::Result<_>>()?)
+        Ok(self.0.lock().unwrap().prepare("SELECT id,run_id,tool,args,(SELECT MIN(seq) FROM chat_messages WHERE kind='approval' AND body=approvals.id),(SELECT MIN(created) FROM chat_messages WHERE kind='approval' AND body=approvals.id) FROM approvals WHERE status='pending'")?.query_map([], |r| Ok(json!({"id":r.get::<_,String>(0)?,"run_id":r.get::<_,String>(1)?,"tool":r.get::<_,String>(2)?,"args":serde_json::from_str::<Value>(&r.get::<_,String>(3)?).unwrap_or(Value::Null),"message_seq":r.get::<_,Option<i64>>(4)?,"created":r.get::<_,Option<i64>>(5)?})))?.collect::<rusqlite::Result<_>>()?)
     }
     pub fn run_approvals(&self, run: &str) -> Result<Vec<Value>> {
-        Ok(self.0.lock().unwrap().prepare("SELECT id,run_id,tool,args,status FROM approvals WHERE run_id=? ORDER BY rowid LIMIT 1000")?.query_map([run], |r| Ok(json!({"id":r.get::<_,String>(0)?,"run_id":r.get::<_,String>(1)?,"tool":r.get::<_,String>(2)?,"args":serde_json::from_str::<Value>(&r.get::<_,String>(3)?).unwrap_or(Value::Null),"status":r.get::<_,String>(4)?})))?.collect::<rusqlite::Result<_>>()?)
+        Ok(self.0.lock().unwrap().prepare("SELECT id,run_id,tool,args,status,(SELECT MIN(seq) FROM chat_messages WHERE kind='approval' AND body=approvals.id) FROM approvals WHERE run_id=? ORDER BY rowid LIMIT 1000")?.query_map([run], |r| Ok(json!({"id":r.get::<_,String>(0)?,"run_id":r.get::<_,String>(1)?,"tool":r.get::<_,String>(2)?,"args":serde_json::from_str::<Value>(&r.get::<_,String>(3)?).unwrap_or(Value::Null),"status":r.get::<_,String>(4)?,"message_seq":r.get::<_,Option<i64>>(5)?})))?.collect::<rusqlite::Result<_>>()?)
     }
     pub fn routines(&self) -> Result<Vec<Routine>> {
         Ok(self
