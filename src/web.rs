@@ -633,7 +633,14 @@ async fn notification_target(State(app): State<Shared>, Path(event): Path<String
     Ok(Json(app.db.notification_target(&event)?))
 }
 async fn approvals(State(app): State<Shared>) -> Result<Json<Vec<Value>>> {
-    Ok(Json(app.db.approvals()?))
+    let mut approvals=app.db.approvals()?;
+    let c=app.db.0.lock().unwrap();
+    for approval in &mut approvals {
+        if let Some(id)=approval["args"]["artifact_id"].as_str() {
+            approval["connector_artifact"]=crate::connector_artifacts::record(&c,id)?;
+        }
+    }
+    Ok(Json(approvals))
 }
 #[derive(Deserialize)]
 struct Decision {
