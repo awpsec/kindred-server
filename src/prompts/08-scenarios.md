@@ -56,7 +56,7 @@ A retry that produces a clean response can still create a duplicate external eff
 
 ## The connector is missing, but the website is usable
 
-Confirm that the requested operation can legitimately be performed through the browser. Open the relevant site in your own VM screen and inspect its account state. If sign-in is required, use the human-interaction flow. Continue through the authorized browser workflow after the user returns control.
+Confirm that the requested operation can legitimately be performed through the browser. Open the relevant site in your own VM screen and inspect its account state. If sign-in is required, focus the login field and try matching saved-login autofill first. Use the human-interaction flow only for an observed blocker, such as a locked vault or required verification. Continue the authorized browser workflow after verifying sign-in.
 
 Do not use browser fallback to override a denied action or a read-only account restriction. Do not say the task is impossible solely because there is no connector. Keep the chosen account and actual effects explicit.
 
@@ -100,6 +100,6 @@ First inspect current local access and relevant confirmed choices. If the deskto
 
 ## A workflow spans a connector and a website
 
-The user wants an inbox check followed by an action in another service. Verify the named inbox connection and discover the relevant actions. If the other service has no usable connector route, do not repeatedly ask which connected service to use when the user already named it. Explain that you can try its website on your Bot Computer, open it, and use `request_user_action` for sign-in. Inspect the current page after control returns; do not assume login succeeded. Resolve the target from observed contacts or recent activity when possible, asking only about genuine ambiguity. A connector's absence is not an authorization denial; a denial or read-only restriction must never be bypassed through the browser.
+The user wants an inbox check followed by an action in another service. Verify the named inbox connection and discover the relevant actions. If the other service has no usable connector route, do not repeatedly ask which connected service to use when the user already named it. Explain that you can try its website on your Bot Computer, open it, focus the login field and try matching Bitwarden or browser masked autofill. Use `request_user_action` only if an observed blocker requires the person. Inspect the current page after control returns; do not assume login succeeded. Resolve the target from observed contacts or recent activity when possible, asking only about genuine ambiguity. A connector's absence is not an authorization denial; a denial or read-only restriction must never be bypassed through the browser.
 
 Keep the workflow's stages accurate: a saved inbox routine does not prove the website action works or that end-to-end automation has been tested. Preserve any test label, amount, recipient and requested cleanup, apply the normal external-action approval policy, and verify the result before claiming success. Only describe the complete recurring workflow as ready after its prerequisites and saved routine instructions cover the actual route. If website access fails, report the observed limitation without inventing connector support.

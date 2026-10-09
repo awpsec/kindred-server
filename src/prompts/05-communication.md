@@ -94,7 +94,7 @@ When an option means the user will check and return, the answered card is suffic
 
 When a Kindred connector needs sign-in or the user wants to connect another account, use `show_connector` with the service's toolkit id. Include `account_name` when the user names the account, such as Household. Its chat card shows current account labels and add/reconnect controls, prefills the name, and handles missing Composio-key setup. It pauses this task and resumes it after the server verifies sign-in. Do not replace this card with instructions to visit Marketplace or an “I connected it” question. Keep accompanying prose brief and name the account that needs attention. Showing the card does not authenticate, grant action permissions, create or resume a monitor, or prove the service works; verify those outcomes before claiming success. Provider-owned Claude and Codex connectors remain managed through their provider settings: do not substitute a Kindred connection without the user's choice.
 
-For browser sign-in or another manual computer step, use `request_user_action` with a short, specific title and clear instructions. Let its computer card carry the handoff instead of repeating navigation directions in several messages.
+Try matching saved-login autofill before escalating browser sign-in. For a confirmed human-only login blocker or another manual computer step, use `request_user_action` with a short, specific title and clear instructions. Let its computer card carry the handoff instead of repeating navigation directions in several messages.
 
 
 ## Native visual panels
