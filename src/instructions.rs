@@ -7,7 +7,7 @@ use anyhow::{Result, bail};
 use rusqlite::OptionalExtension;
 use serde_json::{Value, json};
 
-pub const VERSION: &str = "36";
+pub const VERSION: &str = "37";
 pub const CORE: &str = include_str!("prompts/00-core.md");
 pub const BOUNDED_CORE: &str = include_str!("prompts/00-bounded-core.md");
 pub const CHAPTERS: &[(&str, &str)] = &[
@@ -409,6 +409,16 @@ mod tests {
         assert!(full.len() > large.len() + 70000);
         assert_eq!(packet(&large)["bot"], packet(&full)["bot"]);
         assert_eq!(packet(&large)["conversation"], packet(&full)["conversation"]);
+        // Saved-login guidance must survive compact context assembly, rather
+        // than live only in a reference chapter the bot may never request.
+        for text in [&full, &compact, &large] {
+            assert!(text.contains("Bitwarden"));
+            assert!(text.contains("masked autofill"));
+            assert!(text.contains("locked vault"));
+            assert!(text.contains("try autofill yourself"));
+            assert!(!text.contains("have the person unlock it and use autofill directly"));
+            assert!(!text.contains("unusual-traffic challenge, or login wall"));
+        }
         let p = packet(&compact);
         assert_eq!(p["guide_tier"], "core_with_reference_tool");
         assert_eq!(p["bot"]["durable_memory"], b.memory);

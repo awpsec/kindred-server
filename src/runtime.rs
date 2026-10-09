@@ -143,7 +143,7 @@ pub fn tool_specs() -> Vec<Value> {
         ),
         (
             "request_user_action",
-            "Pause this task so the user can sign in, unlock a password manager, or complete verification on your computer. First open and inspect the relevant page. Ask the person to enter credentials directly, use autofill if appropriate, then close any vault or revealed-secret view and return to the destination app before pressing Done with subtask. Never ask for secrets in chat or read/export the vault. For expired sessions or MFA, supply authentication with service, method and an observed masked destination (never invent a sent code or destination). For sms/email/authenticator, focus the code field and inspect the page first; the card accepts a code privately from the user, types it, submits with Return and resumes this task without takeover. Set authentication.submission=automatic if the site submits when the code is entered; do not send an extra Return in that case. Push and security_key show a waiting handoff. Set authentication.code_length to the exact character count shown by the service when known; omit it when unknown. Never put a code in tool arguments. This call waits for returned control and continues the same task. Take a fresh screenshot before acting; Done does not prove sign-in succeeded and Skipped remains incomplete.",
+            "Pause for an observed human-only blocker on an inspected page. For authorized sign-in, focus the field and try matching Bitwarden/browser masked autofill first. A locked vault needs user unlocking; after handback try autofill yourself. Never reveal/copy/export passwords or request secrets in chat. Supply authentication service/method and the observed masked destination; never invent code delivery. For sms/email/authenticator, focus the code field first: the private card types the user's code, submits with Return and resumes without takeover. Set submission=automatic if the site auto-submits, to avoid another Return. Set code_length only when observed. Never put codes in tool arguments. Push/security_key use a waiting handoff. Have the person close vault/secret views and return to the app before Done with subtask. This call waits and continues the same task. Verify a fresh screenshot after handback; Done is not proof of sign-in and Skipped is incomplete.",
             json!({"title":{"type":"string","maxLength":120},"instructions":{"type":"string","maxLength":4000},"authentication":{"type":"object","properties":{"service":{"type":"string","maxLength":120},"method":{"type":"string","enum":["signin","sms","email","authenticator","push","security_key"]},"destination":{"type":"string","maxLength":160},"submission":{"type":"string","enum":["enter","automatic"]},"code_length":{"type":"integer","minimum":4,"maximum":16}},"required":["service","method"],"additionalProperties":false}}),
             vec!["title", "instructions"],
         ),
@@ -191,7 +191,7 @@ pub fn tool_specs() -> Vec<Value> {
         ),
         (
             "apps_list",
-            "List app bookmarks on the shared computer. Browser sign-in is managed by the user; entries do not prove an app is signed in.",
+            "List app bookmarks on the shared computer. Entries do not prove an app is signed in. For authorized browser sign-in, try matching saved-login autofill before requesting human help.",
             json!({}),
             vec![],
         ),
