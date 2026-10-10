@@ -127,3 +127,10 @@ Cua Spaces/FSL components and optional perception/model extensions are excluded.
 Driver dynamically uses system X11/libXi/libxkbcommon and glibc libraries, which
 retain the licenses of the guest Debian packages. Update checks and telemetry are disabled by the launcher.
 Optional history is not enabled. Runtime startup uses the offline payload.
+
+## DM Sans and Manrope
+
+The optional desktop interface fonts DM Sans and Manrope are bundled under the
+SIL Open Font License 1.1. Full licenses and pinned source/hash receipts are in
+ui/fonts/DMSans-LICENSE.txt, ui/fonts/DMSans-SOURCE.json,
+ui/fonts/Manrope-LICENSE.txt and ui/fonts/Manrope-SOURCE.json.
