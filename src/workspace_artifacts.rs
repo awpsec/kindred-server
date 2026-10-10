@@ -72,6 +72,33 @@ impl Db {
   tx.commit()?;Ok(json!(names))
  }
 
+ /// Folder organization changes metadata atomically and advances revisions so
+ /// an already-open editor cannot silently restore the previous folder name.
+ pub fn workspace_artifact_folder_rename(&self,name:&str,new_name:&str)->Result<Value>{
+  let new_name=new_name.trim();
+  ensure!(!new_name.is_empty()&&new_name.len()<=120&&!new_name.chars().any(char::is_control),"Folder name must contain 1–120 bytes");
+  ensure!(!new_name.eq_ignore_ascii_case("All"),"Choose a folder name other than All");
+  let mut c=self.0.lock().unwrap();let tx=c.transaction()?;
+  ensure!(!crate::workspace_transfer::frozen(&tx)?,"Workspace transfer is in progress");
+  ensure!(tx.query_row("SELECT EXISTS(SELECT 1 FROM workspace_artifact_folders WHERE name=?)",[name],|r|r.get::<_,bool>(0))?,"Folder not found");
+  if name==new_name{return folders(&tx);}
+  ensure!(!tx.query_row("SELECT EXISTS(SELECT 1 FROM workspace_artifact_folders WHERE name=?)",[new_name],|r|r.get::<_,bool>(0))?,"A folder with this name already exists");
+  let records={let mut q=tx.prepare("SELECT id,body,revision FROM workspace_artifacts WHERE json_extract(body,'$.folder')=?")?;q.query_map([name],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?)))?.collect::<rusqlite::Result<Vec<_>>>()?};
+  for(id,body,revision)in records{let mut body:Value=serde_json::from_str(&body)?;body["folder"]=json!(new_name);let serialized=body.to_string();
+   tx.execute("UPDATE workspace_artifacts SET body=?,revision=revision+1 WHERE id=?",params![serialized,id])?;
+   tx.execute("INSERT INTO workspace_artifact_versions VALUES(?,?,?,?)",params![id,revision+1,serialized,db::now()])?;
+  }
+  tx.execute("UPDATE workspace_artifact_folders SET name=? WHERE name=?",params![new_name,name])?;
+  let result=folders(&tx)?;tx.commit()?;Ok(result)
+ }
+ pub fn workspace_artifact_folder_remove(&self,name:&str)->Result<Value>{
+  let mut c=self.0.lock().unwrap();let tx=c.transaction()?;
+  ensure!(!crate::workspace_transfer::frozen(&tx)?,"Workspace transfer is in progress");
+  ensure!(!tx.query_row("SELECT EXISTS(SELECT 1 FROM workspace_artifacts WHERE json_extract(body,'$.folder')=?)",[name],|r|r.get::<_,bool>(0))?,"Move the artifacts out of this folder before removing it");
+  ensure!(tx.execute("DELETE FROM workspace_artifact_folders WHERE name=?",[name])?==1,"Folder not found");
+  let result=folders(&tx)?;tx.commit()?;Ok(result)
+ }
+
  pub fn workspace_artifact_read(&self,id:&str)->Result<Value>{record(&self.0.lock().unwrap(),id)}
  pub fn workspace_artifact_list(&self)->Result<Value>{
   let c=self.0.lock().unwrap();let cutoff=db::now()-IDLE;
@@ -106,8 +133,14 @@ impl Db {
 pub async fn folder_list(State(app):State<Shared>)->Result<Json<Value>,crate::web::Error>{Ok(Json(app.db.workspace_artifact_folders()?))}
 pub async fn folder_create(State(app):State<Shared>,Json(args):Json<Value>)->Result<Json<Value>,crate::web::Error>{Ok(Json(app.db.workspace_artifact_folder_create(args["name"].as_str().context("Folder name is required")?)?))}
 pub async fn folder_move(State(app):State<Shared>,Json(args):Json<Value>)->Result<Json<Value>,crate::web::Error>{
+ if let Some(new_name)=args.get("new_name") {
+  return Ok(Json(app.db.workspace_artifact_folder_rename(args["name"].as_str().context("Folder name is required")?,new_name.as_str().context("New folder name must be text")?)?));
+ }
  if !args.get("before").is_some_and(|v|v.is_null()||v.is_string()){return Err(anyhow::anyhow!("Destination must be a folder name or null").into());}
  Ok(Json(app.db.workspace_artifact_folder_move(args["name"].as_str().context("Folder name is required")?,args["before"].as_str())?))
+}
+pub async fn folder_remove(State(app):State<Shared>,Json(args):Json<Value>)->Result<Json<Value>,crate::web::Error>{
+ Ok(Json(app.db.workspace_artifact_folder_remove(args["name"].as_str().context("Folder name is required")?)?))
 }
 pub async fn list(State(app):State<Shared>)->Result<Json<Value>,crate::web::Error>{Ok(Json(app.db.workspace_artifact_list()?))}
 pub async fn create(State(app):State<Shared>,Json(args):Json<Value>)->Result<Json<Value>,crate::web::Error>{
@@ -327,3 +360,23 @@ pub async fn update(State(app):State<Shared>,Path(id):Path<String>,Json(patch):J
 }
 
 pub async fn export(State(app):State<Shared>,Path(id):Path<String>)->Result<Json<Value>,crate::web::Error>{Ok(Json(crate::artifact_export::export(&app.db.workspace_artifact_read(&id)?)?))}
+
+#[cfg(test)]
+mod office_folder_tests {
+ use super::*;
+ #[test]
+ fn office_folder_rename_is_atomic_keeps_content_and_blocks_stale_saves(){
+  let app=crate::tests::app();let db=&app.db;let bot=crate::tests::bot(db,"codex");let rid=db.queue(&bot.id,"Folder test",0).unwrap();let run=db.run(&rid).unwrap();
+  let v=db.workspace_artifact_create(&run,&json!({"key":"report","title":"Report","kind":"document","folder":"Reports","language":"markdown","source":"Keep this report","state":{"important":true}})).unwrap();let id=v["id"].as_str().unwrap();
+  db.workspace_artifact_folder_create("Existing").unwrap();assert!(db.workspace_artifact_folder_rename("Reports","Existing").is_err());assert_eq!(db.workspace_artifact_read(id).unwrap()["revision"],1);
+  assert!(db.workspace_artifact_folder_remove("Reports").is_err());assert_eq!(db.workspace_artifact_folder_rename("Reports","Client reports").unwrap(),json!(["Client reports","Existing"]));
+  let next=db.workspace_artifact_read(id).unwrap();assert_eq!(next["source"],v["source"]);assert_eq!(next["state"],v["state"]);assert_eq!(next["updated"],v["updated"]);assert_eq!(next["revision"],2);assert_eq!(next["folder"],"Client reports");
+  assert!(db.workspace_artifact_update(id,&json!({"expected_revision":1,"folder":"Reports","source":"stale"})).is_err());
+  assert_eq!(db.workspace_artifact_folder_remove("Existing").unwrap(),json!(["Client reports"]));assert!(db.workspace_artifact_folder_rename("Client reports"," All ").is_err());assert!(db.workspace_artifact_folder_remove("Missing").is_err());
+ }
+ #[tokio::test]
+ async fn office_folder_mutations_require_authentication(){
+  use tower::ServiceExt;use axum::{body::Body,http::Request};let app=crate::tests::app();
+  for method in ["PATCH","DELETE"]{let response=crate::web::router(app.clone()).oneshot(Request::builder().method(method).uri("/api/workspace-artifact-folders").header("content-type","application/json").body(Body::from(r#"{"name":"Reports","new_name":"Renamed"}"#)).unwrap()).await.unwrap();assert_eq!(response.status(),401);}
+ }
+}
