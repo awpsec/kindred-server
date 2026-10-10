@@ -33,7 +33,7 @@ pub(crate) fn record_recipient(c: &Connection, run: &str) -> Result<()> {
 pub fn migrate(c: &Connection) -> Result<()> {
     let transaction = c.unchecked_transaction()?;
     let c = &*transaction;
-    for column in ["chat_id", "round_id", "reply_to", "progress_mode", "progress_started"] {
+    for column in ["chat_id", "round_id", "reply_to", "progress_mode", "progress_started", "task_title"] {
         let exists = c
             .prepare("PRAGMA table_info(runs)")?
             .query_map([], |r| r.get::<_, String>(1))?

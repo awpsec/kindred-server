@@ -66,15 +66,57 @@ pub fn record_message(c:&rusqlite::Connection,seq:i64,run:&str,phase:&str)->Resu
     c.execute("INSERT INTO message_progress(message_seq,run_id,mode,phase,group_id) VALUES(?,?,?,?,?)",rusqlite::params![seq,run,mode,phase,group])?;
     Ok(())
 }
+pub fn set_task_title(db: &Db, run: &crate::db::Run, title: &str) -> Result<Value> {
+    let title = title.trim();
+    anyhow::ensure!(!title.is_empty() && title.chars().count() <= 80 && !title.chars().any(char::is_control), "Task title must be a single line of 1-80 characters");
+    let changed = db.0.lock().unwrap().execute(
+        "UPDATE runs SET task_title=? WHERE id=? AND bot_id=? AND status='running'",
+        rusqlite::params![title, run.id, run.bot_id],
+    )?;
+    anyhow::ensure!(changed == 1, "Only the current running task can be named");
+    Ok(json!({"title":title,"text":"Task title saved."}))
+}
+
 pub fn message(c:&rusqlite::Connection,seq:i64)->Result<Value> {
     use rusqlite::OptionalExtension;
-    Ok(c.query_row("SELECT run_id,mode,phase,group_id FROM message_progress WHERE message_seq=?",[seq],|r|Ok(json!({"run_id":r.get::<_,String>(0)?,"mode":r.get::<_,String>(1)?,"phase":r.get::<_,String>(2)?,"group_id":r.get::<_,String>(3)?}))).optional()?.unwrap_or(Value::Null))
+    Ok(c.query_row("SELECT p.run_id,p.mode,p.phase,p.group_id,r.task_title FROM message_progress p JOIN runs r ON r.id=p.run_id WHERE p.message_seq=?",[seq],|r|Ok(json!({"run_id":r.get::<_,String>(0)?,"mode":r.get::<_,String>(1)?,"phase":r.get::<_,String>(2)?,"group_id":r.get::<_,String>(3)?,"task_title":r.get::<_,String>(4)?}))).optional()?.unwrap_or(Value::Null))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{conversation_updates, tests};
+
+    #[tokio::test]
+    async fn model_task_title_is_scoped_persistent_and_available_in_history() {
+        let mut app = tests::app();
+        let path = std::env::temp_dir().join(format!("kindred-task-title-{}.db", crate::db::id()));
+        std::sync::Arc::get_mut(&mut app).unwrap().db = Db::open(path.to_str().unwrap()).unwrap();
+        let bot = tests::bot(&app.db, "codex");
+        let id = app.db.queue(&bot.id, "Please do a long multi-step workflow with Gmail filters", 0).unwrap();
+        let run = app.db.claim_bot(&bot.id).unwrap().unwrap();
+        let result = crate::runtime::call_tool(&app, &bot, &run, "set_task_title", json!({"title":"Set up Gmail bill filters"})).await.unwrap();
+        assert_ne!(result["failed"], true, "{result}");
+        assert_eq!(app.db.run(&id).unwrap().task_title, "Set up Gmail bill filters");
+        assert_eq!(app.db.run(&id).unwrap().prompt, run.prompt);
+        app.db.event(&id, "assistant", json!({"text":"Checking the existing filters.","phase":"commentary"})).unwrap();
+        let other = tests::bot(&app.db, "codex");
+        let mut foreign = run.clone(); foreign.bot_id = other.id;
+        assert!(set_task_title(&app.db, &foreign, "Wrong task").is_err());
+        for bad in ["".to_string(), "  ".into(), "x".repeat(81), "Two\nlines".into()] {
+            assert!(set_task_title(&app.db, &run, &bad).is_err());
+        }
+        assert_eq!(app.db.run(&id).unwrap().task_title, "Set up Gmail bill filters");
+        app.db.finish(&id, "completed", "Done", "").unwrap();
+        assert!(set_task_title(&app.db, &run, "Late change").is_err());
+        drop(app);
+        let db = Db::open(path.to_str().unwrap()).unwrap();
+        assert_eq!(db.run(&id).unwrap().task_title, "Set up Gmail bill filters");
+        let messages = db.chat_messages(&run.chat_id).unwrap();
+        assert!(messages.iter().any(|m| m["progress"]["task_title"] == "Set up Gmail bill filters"));
+        drop(db);
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn live_mode_changes_only_affect_future_messages_and_separate_segments() {

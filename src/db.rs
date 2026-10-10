@@ -117,6 +117,8 @@ pub struct Run {
     pub progress_mode: String,
     #[serde(default)]
     pub progress_started: i64,
+    #[serde(default)]
+    pub task_title: String,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Routine {
@@ -174,6 +176,7 @@ pub(crate) fn run_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
         reply_to: r.get(10)?,
         progress_mode: r.get("progress_mode")?,
         progress_started: r.get("progress_started")?,
+        task_title: r.get("task_title")?,
     })
 }
 impl Db {
@@ -723,7 +726,7 @@ impl Db {
     /// Unassigned context reads stay quiet; assigned human work is already participation.
     pub fn group_activity_started(&self, run: &str) -> Result<bool> {
         Ok(self.0.lock().unwrap().query_row(
-            "SELECT EXISTS(SELECT 1 FROM events WHERE run_id=? AND (kind='recipient_selected' OR (kind='assistant' AND length(trim(COALESCE(json_extract(body,'$.text'),'')))>0) OR (kind='tool_started' AND COALESCE(json_extract(body,'$.tool'),'') NOT IN ('','finish_quietly','chat_read','chats_list','bots_list','bot_instructions_get','memory_search','memory_read','recall','remember','instructions_read','kindred_guide','skills_list'))))",
+            "SELECT EXISTS(SELECT 1 FROM events WHERE run_id=? AND (kind='recipient_selected' OR (kind='assistant' AND length(trim(COALESCE(json_extract(body,'$.text'),'')))>0) OR (kind='tool_started' AND COALESCE(json_extract(body,'$.tool'),'') NOT IN ('','set_task_title','finish_quietly','chat_read','chats_list','bots_list','bot_instructions_get','memory_search','memory_read','recall','remember','instructions_read','kindred_guide','skills_list'))))",
             [run], |r| r.get(0))?)
     }
 
