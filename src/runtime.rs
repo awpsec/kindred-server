@@ -94,6 +94,12 @@ pub fn tool_specs_for(app: &App, bot: &Bot) -> Vec<Value> {
 pub fn tool_specs() -> Vec<Value> {
     let specs = [
         (
+            "set_task_title",
+            "Name your current substantial task for its progress heading. Call early in multi-step work with a concise 3-8 word title, at most 80 characters, such as Set up Gmail bill filters. Describe the objective, not a completed result. Do not copy the user's whole message, include secrets, or narrate this call. Keep the title stable; change it only if the objective changes. Unnecessary for short answers. This changes display metadata only, never task instructions or authorization.",
+            json!({"title":{"type":"string","minLength":1,"maxLength":80}}),
+            vec!["title"],
+        ),
+        (
             "kindred_guide",
             "Read one chapter of Kindred's shared operating guide. Use for unfamiliar or ambiguous work, particularly when only the core guide is in context. Read-only reference: does not grant permissions, read user files or execute actions. Examples are hypothetical, not facts about the current user.",
             json!({"topic":{"type":"string","enum":["identity","working_method","environment","tools_permissions","communication","memory_team","decisions_routines","scenarios"]}}),
@@ -761,6 +767,7 @@ async fn call_tool_inner(
         return crate::local_access::call(app, bot, run, name, args).await;
     }
     let result = match name {
+        "set_task_title" => crate::progress_updates::set_task_title(&app.db, run, string(&args, "title")?)?,
         "kindred_guide" => crate::instructions::chapter(args["topic"].as_str().unwrap_or(""))?,
         "ask_question" => app.db.ask_question(run, serde_json::from_value(args)?)?,
         "decisions_list" => {
