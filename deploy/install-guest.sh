@@ -27,7 +27,7 @@ export KINDRED_GUEST=1 DISPLAY=:1
 exec /usr/local/lib/kindred/kindred-bin "$@"
 WRAPPER
 chmod 755 /usr/local/bin/kindred
-install -m 755 ./start-desktop.sh ./start-desktop-shell ./kindred-dock ./desktop-launch ./ensure-screen ./wait-screen-ready /usr/local/lib/kindred/
+install -m 755 ./start-desktop.sh ./browser-launch.py ./start-desktop-shell ./kindred-dock ./desktop-launch ./ensure-screen ./wait-screen-ready /usr/local/lib/kindred/
 install -d /usr/local/share/kindred/desktop
 install -m 644 ./desktop/* /usr/local/share/kindred/desktop/
 install -d /usr/local/share/konsole

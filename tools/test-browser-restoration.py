@@ -8,10 +8,10 @@ from pathlib import Path
 ROOT=Path(__file__).resolve().parents[1]
 spec=importlib.util.spec_from_file_location('browser_fixture',ROOT/'tools/test-browser-worker.py')
 f=importlib.util.module_from_spec(spec);spec.loader.exec_module(f)
-# Read the actual restoration argv, not a parallel set of debugging flags.
-line=next(s.strip() for s in (ROOT/'deploy/start-desktop.sh').read_text().splitlines() if s.strip().startswith('chromium '))
-args=shlex.split(line)[1:]
-assert args.pop()=='&'
+# Read the shared production policy used by all three launch paths.
+launch_spec=importlib.util.spec_from_file_location('browser_launch',ROOT/'deploy/browser-launch.py')
+launch=importlib.util.module_from_spec(launch_spec);launch_spec.loader.exec_module(launch)
+args=launch.browser_arguments('$KINDRED_BROWSER_PROFILE')
 assert args.count('--user-data-dir=$KINDRED_BROWSER_PROFILE')==1
 args.remove('--user-data-dir=$KINDRED_BROWSER_PROFILE')
 assert f.BOOTSTRAP.count("args: ['--remote-debugging-address=127.0.0.1', '--remote-debugging-port=0', '--ozone-platform=x11']")==1

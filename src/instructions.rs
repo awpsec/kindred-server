@@ -7,7 +7,7 @@ use anyhow::{Result, bail};
 use rusqlite::OptionalExtension;
 use serde_json::{Value, json};
 
-pub const VERSION: &str = "37";
+pub const VERSION: &str = "38";
 pub const CORE: &str = include_str!("prompts/00-core.md");
 pub const BOUNDED_CORE: &str = include_str!("prompts/00-bounded-core.md");
 pub const CHAPTERS: &[(&str, &str)] = &[
@@ -416,6 +416,9 @@ mod tests {
             assert!(text.contains("masked autofill"));
             assert!(text.contains("locked vault"));
             assert!(text.contains("try autofill yourself"));
+            assert!(text.contains("Reuse your assigned profile"));
+            assert!(text.contains("never reset/switch"));
+            assert!(text.contains("Sites can revoke preserved logins"));
             assert!(!text.contains("have the person unlock it and use autofill directly"));
             assert!(!text.contains("unusual-traffic challenge, or login wall"));
         }

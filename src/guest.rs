@@ -294,16 +294,22 @@ async fn execute_display(tool: &str, args: &Value, screen: i64) -> Result<Value>
                     && url.as_str().len() <= 2000,
                 "Expected HTTPS URL without embedded credentials"
             );
+            // Embed the shared policy: runtime-only updates do not need a new
+            // installed helper. It selects the assigned desktop's existing bus.
+            let mut prepare = Command::new("python3");
+            prepare.env_remove("KINDRED_DESKTOP_STARTING");
+            prepare.args(["-c", include_str!("../deploy/browser-launch.py"),
+                "--prepare", "--screen", &screen.to_string(), "--mode", "url", "--url", url.as_str()]);
+            let launch: Value = serde_json::from_slice(&capture(prepare, None, 5, 8192).await?)?;
             let mut cmd = Command::new("chromium");
-            // Explicit managed per-display profile, guest-loopback endpoint only.
-            // Existing browsers retain their flags and silently remain screenshot-only.
-            cmd.args(["--remote-debugging-address=127.0.0.1", "--remote-debugging-port=0"]);
+            for arg in launch["args"].as_array().ok_or_else(|| anyhow::anyhow!("Invalid browser launch policy"))? {
+                cmd.arg(arg.as_str().ok_or_else(|| anyhow::anyhow!("Invalid browser argument"))?);
+            }
+            for (key, value) in launch["env"].as_object().ok_or_else(|| anyhow::anyhow!("Invalid browser context"))? {
+                cmd.env(key, value.as_str().ok_or_else(|| anyhow::anyhow!("Invalid browser environment"))?);
+            }
+            cmd.env_remove("KINDRED_DESKTOP_STARTING");
             page_bridge(&display,&browser,json!({"op":"invalidate","session":session})).await;
-            cmd.env("DISPLAY", &display).args([
-                "--no-first-run",
-                &format!("--user-data-dir={browser}"),
-                url.as_str(),
-            ]);
             launch_browser(cmd).await?;
             page_bridge(&display,&browser,json!({"op":"attach","session":session})).await;
             Ok(

@@ -138,7 +138,15 @@ async fn update_guest_runtime(app: &App) -> Result<()> {
     let bytes=tokio::fs::read(source).await?;
     let digest=ring::digest::digest(&ring::digest::SHA256,&bytes);
     let hash=digest.as_ref().iter().map(|b|format!("{b:02x}")).collect::<String>();
-    let helper=include_str!("../deploy/update-guest-runtime.py").replace('\'', "'\"'\"'");
+    // Only known managed launcher bytes are replaced. Custom launchers fail
+    // before the runtime switches; existing browsers/profiles are untouched.
+    let launchers=serde_json::json!({
+        "browser-launch.py":{"source":include_str!("../deploy/browser-launch.py"),"previous_sha256":null},
+        "desktop-launch":{"source":include_str!("../deploy/desktop-launch"),"previous_sha256":"8cae9194cb3d1dc53606cb52aa254a531364bce3c006c0444d93088def9c2ba3"},
+        "start-desktop.sh":{"source":include_str!("../deploy/start-desktop.sh"),"previous_sha256":"3d10321fd71359ceac432daa657b299d346aeb6142d07fe33a42d372733803d4"}
+    });
+    let declaration=format!("LAUNCHERS = json.loads({})",serde_json::to_string(&serde_json::to_string(&launchers)?)?);
+    let helper=include_str!("../deploy/update-guest-runtime.py").replace("LAUNCHERS = None", &declaration).replace('\'', "'\"'\"'");
     let mut command=vm::ssh(&app.config.vm);
     command.arg(format!("sudo -n python3 -c '{helper}' {hash} {}",env!("CARGO_PKG_VERSION")));
     let output=vm::capture(command,Some(bytes),90,4096).await?;
@@ -146,11 +154,25 @@ async fn update_guest_runtime(app: &App) -> Result<()> {
     verified_runtime_update(&receipt, update_optional_driver(app)).await
 }
 
+fn managed_launcher_hashes() -> Value {
+    let mut values=serde_json::Map::new();
+    for (name, source) in [
+        ("browser-launch.py",include_str!("../deploy/browser-launch.py")),
+        ("desktop-launch",include_str!("../deploy/desktop-launch")),
+        ("start-desktop.sh",include_str!("../deploy/start-desktop.sh"))
+    ] {
+        let digest=ring::digest::digest(&ring::digest::SHA256,source.as_bytes());
+        values.insert(name.into(),Value::String(digest.as_ref().iter().map(|b|format!("{b:02x}")).collect()));
+    }
+    Value::Object(values)
+}
+
 async fn verified_runtime_update(
     receipt: &Value,
     optional_driver: impl std::future::Future<Output = Result<()>>,
 ) -> Result<()> {
     ensure!(receipt["version"] == env!("CARGO_PKG_VERSION") && receipt["updated"].is_boolean(), "Guest runtime receipt did not verify");
+    ensure!(receipt["launchers_updated"].is_boolean() && receipt["launcher_hashes"] == managed_launcher_hashes(), "Guest browser launchers did not verify");
     if let Err(error) = optional_driver.await {
         // The mandatory runtime is already verified. An optional component
         // must not report that it was retained or prevent normal maintenance.
@@ -486,7 +508,7 @@ mod tests {
         let destination = serde_json::to_string(target.to_str().unwrap()).unwrap();
         let mut helper = tokio::process::Command::new("python3");
         helper.arg("-c").arg(format!("import io; scope={{'__name__':'fixture'}}; exec({source}, scope); scope['install'](io.BytesIO(b'bad'), {destination}, '0'*64, 1)"));
-        verified_runtime_update(&serde_json::json!({"version":env!("CARGO_PKG_VERSION"),"updated":true}), async {
+        verified_runtime_update(&serde_json::json!({"version":env!("CARGO_PKG_VERSION"),"updated":true,"launchers_updated":true,"launcher_hashes":managed_launcher_hashes()}), async {
             vm::capture(helper, None, 5, 4096).await?;
             anyhow::bail!("Expected actual helper transfer failure")
         }).await.expect("Real failed driver helper must not fail the verified runtime update");
@@ -494,7 +516,7 @@ mod tests {
         assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1, "Failed staged transfer must clean up");
         std::fs::remove_dir_all(root).unwrap();
         for reason in ["Bundled driver size mismatch", "Bundled driver hash mismatch", "SSH/helper failed", "Guest driver receipt did not verify"] {
-            verified_runtime_update(&serde_json::json!({"version":env!("CARGO_PKG_VERSION"),"updated":true}), async { Err(anyhow::anyhow!(reason)) })
+            verified_runtime_update(&serde_json::json!({"version":env!("CARGO_PKG_VERSION"),"updated":true,"launchers_updated":true,"launcher_hashes":managed_launcher_hashes()}), async { Err(anyhow::anyhow!(reason)) })
                 .await.expect("Optional driver failure must not report that the verified runtime was retained");
             assert_eq!(state(&db).unwrap().phase, "starting");
             assert!(state(&db).unwrap().error.is_empty());
@@ -505,6 +527,15 @@ mod tests {
         assert!(state(&db).unwrap().error.is_empty());
         assert!(verified_runtime_update(&serde_json::json!({"version":"wrong","updated":true}), async { panic!("Invalid runtime receipt must not start optional installation") }).await.is_err());
     }
+    #[tokio::test]
+    async fn verified_runtime_requires_exact_launcher_receipt_before_optional_driver() {
+        for hashes in [serde_json::json!({}),serde_json::json!({"browser-launch.py":"wrong"})] {
+            let receipt=serde_json::json!({"version":env!("CARGO_PKG_VERSION"),"updated":true,"launchers_updated":false,"launcher_hashes":hashes});
+            assert!(verified_runtime_update(&receipt, async { panic!("Unverified launchers must not start optional driver installation") }).await.is_err());
+        }
+        assert!(verified_runtime_update(&serde_json::json!({"version":env!("CARGO_PKG_VERSION"),"updated":true}), async { panic!("Binary-only receipt must not imply launcher installation") }).await.is_err());
+    }
+
     #[test]
     fn manual_updates_bypass_schedule_but_wait_for_work_and_preserve_preference() {
         let db = Db::open(":memory:").unwrap();

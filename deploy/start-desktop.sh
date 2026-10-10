@@ -24,7 +24,7 @@ if [ "$screen" -gt 1 ]; then
 fi
 # Independent browser profiles prevent Chromium from forwarding a new window
 # to another bot's existing process. Files and connected API apps remain shared.
-export KINDRED_BROWSER_PROFILE="$browser"
+export KINDRED_BROWSER_PROFILE="$browser" KINDRED_DESKTOP_SCREEN="$screen"
 dbus-run-session -- sh -c '
     openbox-session &
     /usr/local/lib/kindred/start-desktop-shell &
@@ -32,7 +32,7 @@ dbus-run-session -- sh -c '
     # Match computer_open_url: an ephemeral guest-loopback endpoint lets the
     # worker attach to this exact profile without restarting a running browser.
     if [ -f "$KINDRED_BROWSER_PROFILE/Local State" ]; then
-        chromium --remote-debugging-address=127.0.0.1 --remote-debugging-port=0 --user-data-dir="$KINDRED_BROWSER_PROFILE" --no-first-run --window-size=1120,680 --restore-last-session &
+        KINDRED_DESKTOP_STARTING=1 /usr/local/lib/kindred/browser-launch.py --screen "$KINDRED_DESKTOP_SCREEN" --mode restore &
     fi
     wait
 '
