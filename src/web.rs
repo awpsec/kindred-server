@@ -1896,6 +1896,51 @@ fn static_assets<S: Clone + Send + Sync + 'static>() -> Router<S> {
                 )
             }),
         )
+        .route(
+            "/fonts/DMSans-VariableItalic.ttf",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "font/ttf")],
+                    include_bytes!("../ui/fonts/DMSans-VariableItalic.ttf").as_slice(),
+                )
+            }),
+        )
+        .route(
+            "/fonts/DMSans-Variable.ttf",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "font/ttf")],
+                    include_bytes!("../ui/fonts/DMSans-Variable.ttf").as_slice(),
+                )
+            }),
+        )
+        .route(
+            "/fonts/Manrope-Variable.ttf",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "font/ttf")],
+                    include_bytes!("../ui/fonts/Manrope-Variable.ttf").as_slice(),
+                )
+            }),
+        )
+        .route(
+            "/fonts/DMSans-LICENSE.txt",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                    include_str!("../ui/fonts/DMSans-LICENSE.txt"),
+                )
+            }),
+        )
+        .route(
+            "/fonts/Manrope-LICENSE.txt",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                    include_str!("../ui/fonts/Manrope-LICENSE.txt"),
+                )
+            }),
+        )
         .route("/health", get(|| async { Json(json!({"status":"ok"})) }))
         .route(
             "/vendor.js",
@@ -1942,4 +1987,27 @@ async fn save_decisions(State(app):State<Shared>,Json(v):Json<Value>)->Result<Js
 async fn remove_decisions(State(app):State<Shared>)->Result<Json<Value>> {
     crate::connections::save_decisions(&app,None)?;
     Ok(Json(crate::connections::decisions_status(&app)))
+}
+
+#[cfg(test)]
+mod font_assets_tests {
+    use super::*;
+    use axum::{body::{Body, to_bytes}, http::Request};
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn interface_fonts_and_licenses_are_bundled() {
+        for name in ["DMSans-Variable.ttf", "DMSans-VariableItalic.ttf", "Manrope-Variable.ttf", "DMSans-LICENSE.txt", "Manrope-LICENSE.txt"] {
+            let response = assets().oneshot(Request::builder().uri(format!("/fonts/{name}")).body(Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(response.status(), 200, "{name}");
+            let is_font = name.ends_with(".ttf");
+            assert_eq!(response.headers()[header::CONTENT_TYPE], if is_font { "font/ttf" } else { "text/plain; charset=utf-8" });
+            let body = to_bytes(response.into_body(), 2_000_000).await.unwrap();
+            if is_font {
+                assert!(body.starts_with(&[0, 1, 0, 0]), "{name}");
+            } else {
+                assert!(std::str::from_utf8(&body).unwrap().contains("SIL OPEN FONT LICENSE"));
+            }
+        }
+    }
 }
