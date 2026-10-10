@@ -125,6 +125,8 @@ def package(binary, output, cua_driver=None, cua_driver_archive=None):
                  "harness/pi/package.json", "harness/pi/package-lock.json",
                  "harness/pi/worker.mjs", "harness/pi/session.mjs", "harness/pi/opencode-models.json",
                  "ui/fonts/LICENSE.txt", "ui/fonts/SOURCE.json",
+                 "ui/fonts/DMSans-LICENSE.txt", "ui/fonts/DMSans-SOURCE.json",
+                 "ui/fonts/Manrope-LICENSE.txt", "ui/fonts/Manrope-SOURCE.json",
                  "ui/fonts/Liberation-LICENSE.txt", "ui/fonts/Liberation-SOURCE.json",
                  "docs/PROVIDER_MARKS.md", "docs/PROVIDER_MARKS_LICENSE.txt"]:
         files[name] = ROOT / name
