@@ -93,3 +93,9 @@ Cards and their reviewed content survive history readback and profile transfers.
 Regression coverage includes exact edited HTTP connector payloads, no dispatch before approval, stale/double approval rejection, feedback and cancellation, per-bot/account/source email policy isolation, immediate revocation, forced review, read-only restrictions, Gmail/Outlook normalization, invoice fields, quoted context and transfer compatibility. Browser tests exercise editing, failed saves, feedback, double clicks, permission controls, safe source links and typed records in Edge and WebKit. Connector writes use controlled fixtures; this verification sends no real email and modifies no customer accounting or task records.
 
 The 34-service fixture suite exercises schema-shaped responses through backend card completion and browser rendering in Edge and WebKit. These are synthetic controlled records, not evidence of live authentication or successful real-world operations against all 34 services. Free-form responses, unsupported record variants and content omitted by the connector retain the generic fallback.
+
+## Inline call details
+
+Non-email execution receipts begin as a compact service/tool row. Expanding the row shows plain status, provider and bot context followed by the actual available fields. IDs stay in those fields. Nested values use field disclosures; long text can be expanded without widening the chat. Secret keys remain masked. “Chat about this” uses the existing reply composer and does not send a message by itself.
+
+Pending approvals and email review retain their existing controls and saved-revision checks. Grouped call stacks preserve their paging and live state. Keyboard toggles preserve focus, collapsed details are inert, and reduced-motion settings make expansion immediate.
