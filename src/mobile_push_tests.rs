@@ -292,7 +292,7 @@ async fn invalid_tokens_remove_only_the_failed_registration() {
 
 #[test]
 fn payloads_are_generic_and_carry_only_routing_identifiers() {
-    let push = Push { installation: db::id(), platform: "ios".into(), token: IOS_TOKEN.into(), environment: "production".into(), account_id: ACCOUNT.into(), profile_id: PROFILE.into(), chat_id: "dm-bot".into(), event_id: 42 };
+    let push = Push { installation: db::id(), platform: "ios".into(), token: IOS_TOKEN.into(), environment: "production".into(), account_id: ACCOUNT.into(), profile_id: PROFILE.into(), chat_id: "dm-bot".into(), event_id: 42, reminder_alert: None };
     let apns = apns_payload(&push);
     assert_eq!(apns["aps"]["sound"], "kindred-pop.wav");
     assert_eq!(apns["installation_uuid"], push.installation);
@@ -486,4 +486,32 @@ fn own_bot_results_in_shared_rooms_are_pushed_from_the_private_feed() {
     db.event(&run, "run_finished", json!({})).unwrap();
     assert_eq!(collect(&db, &live, BOTH).unwrap(), 1);
     assert_eq!(due(&db, BOTH).unwrap()[0].chat_id, room);
+}
+
+#[test]
+fn reminders_push_text_and_schedule_once_and_dismissal_cancels_unsent_pushes() {
+    let db=Db::open(":memory:").unwrap();
+    let b=bot(&db,"codex");
+    device(&db,&db::id(),"ios",IOS_TOKEN,b"session");
+    device(&db,&db::id(),"android","android-reminder-test-token",b"session");
+    collect(&db,&live,BOTH).unwrap();
+    let id=db.queue(&b.id,"Set a reminder",0).unwrap();
+    let run=db.run(&id).unwrap();
+    let a=db.reminder_set(&run,json!({"key":"push-test","message":"Leave for the station","local_time":"2099-09-10T12:00","timezone":"America/New_York"})).unwrap();
+    db.tick_reminders(a["run_at"].as_i64().unwrap()).unwrap();
+    // Delivery is simulated in the future; the push collection wall clock is now.
+    assert_eq!(collect(&db,&live,BOTH).unwrap(),2);
+    assert_eq!(collect(&db,&live,BOTH).unwrap(),0);
+    let pushes=due(&db,BOTH).unwrap();
+    assert_eq!(pushes.len(),2);
+    for push in &pushes {
+        let apns=apns_payload(push);
+        assert_eq!(apns["aps"]["alert"]["title"],"Kindred reminder");
+        assert_eq!(apns["aps"]["alert"]["body"],"Reminder · Sep 10, 12:00 PM EDT\nLeave for the station");
+        assert_eq!(fcm_message(push)["message"]["notification"],apns["aps"]["alert"]);
+        assert!(still_eligible(&db,push.event_id).unwrap());
+    }
+    db.reminder_update(&run.chat_id,None,a["id"].as_str().unwrap(),json!({"expected_revision":2,"dismiss":true})).unwrap();
+    assert!(due(&db,BOTH).unwrap().is_empty());
+    assert!(outbox(&db).is_empty());
 }

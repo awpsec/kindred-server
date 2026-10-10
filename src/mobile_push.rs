@@ -1,8 +1,8 @@
 //! Native mobile push. Registrations live in each profile database and are bound
 //! to the account session that created them. One gateway worker turns the
-//! profile's existing notification feed into a bounded outbox and delivers generic
-//! alerts directly to APNs or FCM. Push payloads never carry chat content or the
-//! server address; native clients map `account_id` to their saved backend.
+//! profile's existing notification feed into a bounded outbox. Reminders carry
+//! their scheduled time and text; other alerts stay generic. Payloads never carry
+//! server addresses; native clients map `account_id` to their saved backend.
 use crate::db::{Db, now};
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -245,6 +245,7 @@ pub struct Push {
     pub profile_id: String,
     pub chat_id: String,
     pub event_id: i64,
+    pub reminder_alert: Option<(String, String)>,
 }
 impl Push {
     pub fn data(&self) -> Value {
@@ -374,29 +375,33 @@ pub fn due(db: &Db, platforms: Platforms) -> Result<Vec<Push>> {
         }
         c.prepare("SELECT o.installation,d.platform,d.token,d.environment,d.account_id,o.chat_id,o.event_id,o.attempts,d.profile_id FROM mobile_push_outbox o JOIN mobile_devices d ON d.installation=o.installation WHERE o.next_attempt<=? ORDER BY o.next_attempt,o.event_id LIMIT ?")?
             .query_map(params![now(), SENDS_PER_TICK], |r| {
-                Ok((Push { installation: r.get(0)?, platform: r.get(1)?, token: r.get(2)?, environment: r.get(3)?, account_id: r.get(4)?, profile_id: r.get(8)?, chat_id: r.get(5)?, event_id: r.get(6)? }, r.get::<_, i64>(7)?))
+                Ok((Push { installation: r.get(0)?, platform: r.get(1)?, token: r.get(2)?, environment: r.get(3)?, account_id: r.get(4)?, profile_id: r.get(8)?, chat_id: r.get(5)?, event_id: r.get(6)?, reminder_alert: None }, r.get::<_, i64>(7)?))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?
     };
-    let mut checked = std::collections::HashMap::new();
+    let mut checked: std::collections::HashMap<i64, Option<Value>> = std::collections::HashMap::new();
     let mut pushes = Vec::new();
-    for (push, attempts) in rows {
+    for (mut push, _attempts) in rows {
         if !platforms.supports(&push.platform) {
             continue;
         }
-        if attempts > 0 {
-            let eligible = match checked.get(&push.event_id) {
-                Some(eligible) => *eligible,
-                None => {
-                    let eligible = still_eligible(db, push.event_id)?;
-                    checked.insert(push.event_id, eligible);
-                    eligible
-                }
-            };
-            if !eligible {
-                db.0.lock().unwrap().execute("DELETE FROM mobile_push_outbox WHERE installation=? AND event_id=?", params![push.installation, push.event_id])?;
-                continue;
-            }
+        // Re-read even a first attempt: a reminder can be dismissed between
+        // collection and delivery. Reuse the result for multiple devices.
+        let item = if let Some(item) = checked.get(&push.event_id) {
+            item.clone()
+        } else {
+            let feed = db.notifications(Some(push.event_id - 1))?;
+            let item = feed["items"].as_array().into_iter().flatten()
+                .find(|item| item["id"].as_i64() == Some(push.event_id)).cloned();
+            checked.insert(push.event_id, item.clone());
+            item
+        };
+        let Some(item) = item else {
+            db.0.lock().unwrap().execute("DELETE FROM mobile_push_outbox WHERE installation=? AND event_id=?", params![push.installation, push.event_id])?;
+            continue;
+        };
+        if item["kind"] == "reminder" {
+            push.reminder_alert = Some(("Kindred reminder".into(), item["body"].as_str().unwrap_or("").to_owned()));
         }
         pushes.push(push);
     }
@@ -615,14 +620,21 @@ pub fn apns_host(environment: &str) -> &'static str {
     if environment == "sandbox" { "api.sandbox.push.apple.com" } else { "api.push.apple.com" }
 }
 
+fn alert(push: &Push) -> Value {
+    match &push.reminder_alert {
+        Some((title, body)) => json!({"title":title,"body":body}),
+        None => json!({"title":ALERT_TITLE,"body":ALERT_BODY}),
+    }
+}
+
 pub fn apns_payload(push: &Push) -> Value {
-    json!({"aps":{"alert":{"title":ALERT_TITLE,"body":ALERT_BODY},"sound":"kindred-pop.wav","thread-id":push.chat_id},
+    json!({"aps":{"alert":alert(push),"sound":"kindred-pop.wav","thread-id":push.chat_id},
         "account_id":push.account_id,"profile_id":push.profile_id,"installation_uuid":push.installation,"chat_id":push.chat_id,"event_id":push.event_id.to_string()})
 }
 
 pub fn fcm_message(push: &Push) -> Value {
     json!({"message":{"token":push.token,
-        "notification":{"title":ALERT_TITLE,"body":ALERT_BODY},
+        "notification":alert(push),
         "data":push.data(),
         "android":{"priority":"HIGH","ttl":"3600s","notification":{"channel_id":"kindred_updates"}}}})
 }
