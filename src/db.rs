@@ -343,6 +343,10 @@ impl Db {
         validate_bot(b)?;
         let mut c = self.0.lock().unwrap();
         let tx = c.transaction()?;
+        let previous: Option<(String, String)> = tx.query_row(
+            "SELECT provider,model FROM bots WHERE id=?", [&b.id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        ).optional()?;
         let already_archived: bool = tx.query_row(
             "SELECT COALESCE((SELECT json_extract(profile,'$.archived') FROM bots WHERE id=?),0)",
             [&b.id],
@@ -353,6 +357,22 @@ impl Db {
 
         }
         write_bot(&tx, b, preserve_text)?;
+        if let Some((provider, model)) = previous {
+            if provider != b.provider || model != b.model {
+                // Save the configuration and its notice atomically. No notice on creation,
+                // retries of the same save, or changes to unrelated preferences.
+                let chat_id = format!("dm-{}", b.id);
+                tx.execute("INSERT OR IGNORE INTO chats(id,name,members) VALUES(?,?,?)",
+                    params![chat_id,b.name,serde_json::to_string(&vec![&b.id])?])?;
+                let change = json!({"from":{"provider":provider,"model":model},
+                    "to":{"provider":b.provider,"model":b.model}});
+                let model_name = |m: &str| if m.is_empty() { "Default model" } else { m }.to_owned();
+                let text = format!("Model changed from {} ({}) to {} ({}).",
+                    model_name(&model),provider,model_name(&b.model),b.provider);
+                tx.execute("INSERT INTO chat_messages(chat_id,sender,body,kind,created,model_change) VALUES(?,'system',?,'model_change',?,?)",
+                    params![chat_id,text,now(),serde_json::to_string(&change)?])?;
+            }
+        }
         if b.profile.archived {
             tx.execute("DELETE FROM settings WHERE key='primary_bot' AND json_extract(value,'$')=?",[&b.id])?;
             crate::routine_controls::remove_archived_bot_schedules(&tx)?;

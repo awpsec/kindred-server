@@ -59,6 +59,7 @@ pub fn migrate(c: &Connection) -> Result<()> {
         ("chats", "description", "TEXT NOT NULL DEFAULT ''"),
         ("chat_messages", "source_event_seq", "INTEGER"),
         ("chat_messages", "history_order", "TEXT"),
+        ("chat_messages", "model_change", "TEXT"),
         ("chat_messages", "suppressed", "INTEGER NOT NULL DEFAULT 0"),
         (
             "chat_messages",
@@ -187,7 +188,7 @@ impl Db {
             .0
             .lock()
             .unwrap()
-            .prepare(&format!("SELECT c.id,c.name,c.members,c.archived,c.pinned,(SELECT json_object('sender',m.sender,'text',CASE WHEN m.kind='connection_card' THEN 'Connect account' WHEN m.kind='workspace_artifact' THEN COALESCE((SELECT json_extract(body,'$.title') FROM workspace_artifacts WHERE id=m.body),'Shared document') WHEN m.kind='checklist' THEN COALESCE((SELECT json_extract(body,'$.title') FROM checklists WHERE id=m.body),m.body) WHEN m.kind IN ('reminder_card','reminder') THEN COALESCE((SELECT json_extract(body,'$.message') FROM reminders WHERE id=m.body),m.body) WHEN m.kind='question' THEN COALESCE((SELECT CASE WHEN q.status='answered' THEN q.question||' '||q.answer ELSE q.question END FROM questions q WHERE q.id=m.body),m.body) ELSE m.body END,'created',m.created,'kind',m.kind) FROM chat_messages m WHERE m.chat_id=c.id AND m.suppressed=0 AND trim(m.body)!='' AND m.kind NOT IN ('notice','collaboration','connector_artifact') ORDER BY m.created DESC,COALESCE(m.history_order,printf('%020d:%020d',m.seq,0)) DESC LIMIT 1),c.description,c.bot_only FROM chats c WHERE {} ORDER BY c.rowid DESC", if id.is_some() { "c.id=?1" } else { "?1 IS NULL" }))?
+            .prepare(&format!("SELECT c.id,c.name,c.members,c.archived,c.pinned,(SELECT json_object('sender',m.sender,'text',CASE WHEN m.kind='connection_card' THEN 'Connect account' WHEN m.kind='workspace_artifact' THEN COALESCE((SELECT json_extract(body,'$.title') FROM workspace_artifacts WHERE id=m.body),'Shared document') WHEN m.kind='checklist' THEN COALESCE((SELECT json_extract(body,'$.title') FROM checklists WHERE id=m.body),m.body) WHEN m.kind IN ('reminder_card','reminder') THEN COALESCE((SELECT json_extract(body,'$.message') FROM reminders WHERE id=m.body),m.body) WHEN m.kind='question' THEN COALESCE((SELECT CASE WHEN q.status='answered' THEN q.question||' '||q.answer ELSE q.question END FROM questions q WHERE q.id=m.body),m.body) ELSE m.body END,'created',m.created,'kind',m.kind) FROM chat_messages m WHERE m.chat_id=c.id AND m.suppressed=0 AND trim(m.body)!='' AND m.kind NOT IN ('notice','model_change','collaboration','connector_artifact') ORDER BY m.created DESC,COALESCE(m.history_order,printf('%020d:%020d',m.seq,0)) DESC LIMIT 1),c.description,c.bot_only FROM chats c WHERE {} ORDER BY c.rowid DESC", if id.is_some() { "c.id=?1" } else { "?1 IS NULL" }))?
             .query_map([id], |r| {
                 Ok(Chat {
                     bot_only: r.get(7)?,
@@ -335,6 +336,15 @@ impl Db {
     }
     fn decorate_chat_messages(&self, mut rows: Vec<Value>) -> Result<Vec<Value>> {
         for row in &mut rows {
+            if row["kind"] == "model_change" {
+                let metadata: Option<String> = self.0.lock().unwrap().query_row(
+                    "SELECT model_change FROM chat_messages WHERE seq=?",
+                    [row["seq"].as_i64().unwrap()], |r| r.get(0),
+                )?;
+                if let Some(change) = metadata.and_then(|v| serde_json::from_str::<Value>(&v).ok()) {
+                    row["model_change"] = change;
+                }
+            }
             if row["sender"] == "user" {
                 row["delivery"] = json!(self.followup_delivery(row["seq"].as_i64().unwrap())?);
             }
