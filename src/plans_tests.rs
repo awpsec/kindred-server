@@ -191,7 +191,7 @@ fn reminder_delivers_once_while_bot_busy_without_queue_or_vm_and_notifies() {
     assert_eq!(feed["items"].as_array().unwrap().len(), 1);
     assert_eq!(
         feed["items"][0]["body"],
-        "Reminder: Start scans for Northwind"
+        "Reminder · Sep 10, 12:00 PM EDT\nStart scans for Northwind"
     );
     assert_eq!(feed["items"][0]["chat_id"], r.chat_id);
     assert!(
@@ -615,4 +615,39 @@ fn reminder_batches_use_creation_run_and_keep_cancelled_records_across_readback(
     // Historical rows without an explicit creation tag remain ungrouped.
     {let c=db.0.lock().unwrap();let raw:String=c.query_row("SELECT body FROM reminders WHERE id=?",[&ids[0]],|r|r.get(0)).unwrap();let mut legacy:Value=serde_json::from_str(&raw).unwrap();legacy.as_object_mut().unwrap().remove("batch_id");c.execute("UPDATE reminders SET body=? WHERE id=?",rusqlite::params![legacy.to_string(),ids[0]]).unwrap();}
     assert!(db.chat_messages(&r.chat_id).unwrap().iter().find(|m|m["planning"]["id"]==ids[0]).unwrap()["planning_batch"].is_null());
+}
+
+#[test]
+fn delivered_reminder_dismissal_is_user_owned_persistent_and_stops_notifications() {
+    let root = std::env::temp_dir().join(format!("kindred-dismiss-{}", db::id()));
+    let path = root.join("reminders.sqlite");
+    let db = Db::open(path.to_str().unwrap()).unwrap();
+    let r = run(&db);
+    let mut input=reminder();input["dismissed_at"]=json!(1);
+    let a = db.reminder_set(&r, input).unwrap();
+    assert!(a["dismissed_at"].is_null());
+    let id = a["id"].as_str().unwrap();
+    assert!(db.reminder_update(&r.chat_id,None,id,json!({"expected_revision":1,"dismiss":true})).is_err());
+    let cursor = db.notifications(None).unwrap()["cursor"].as_i64().unwrap();
+    db.tick_reminders(a["run_at"].as_i64().unwrap()).unwrap();
+    assert!(db.reminder_update(&r.chat_id,Some(&r.bot_id),id,json!({"expected_revision":2,"dismiss":true})).is_err());
+    assert!(db.reminder_update(&r.chat_id,None,id,json!({"expected_revision":1,"dismiss":true})).is_err());
+    assert!(db.reminder_update("other-chat",None,id,json!({"expected_revision":2,"dismiss":true})).is_err());
+    assert_eq!(db.notifications(Some(cursor)).unwrap()["items"].as_array().unwrap().len(),1);
+    let b=db.reminder_update(&r.chat_id,None,id,json!({"expected_revision":2,"dismiss":true})).unwrap();
+    assert!(b["dismissed_at"].as_i64().unwrap()>0);
+    assert_eq!(b["status"],"delivered");
+    assert_eq!(b["run_at"],a["run_at"]);
+    assert_eq!(b["revision"],3);
+    assert!(db.notifications(Some(cursor)).unwrap()["items"].as_array().unwrap().is_empty());
+    drop(db);
+    let reopened=Db::open(path.to_str().unwrap()).unwrap();
+    assert_eq!(saved(&reopened,"reminders",&a["id"]),b);
+    reopened.tick_reminders(a["run_at"].as_i64().unwrap()+60).unwrap();
+    let rows=reopened.chat_messages(&r.chat_id).unwrap();
+    let delivered:Vec<_>=rows.iter().filter(|m|m["kind"]=="reminder").collect();
+    assert_eq!(delivered.len(),1);
+    assert_eq!(delivered[0]["planning"]["dismissed_at"],b["dismissed_at"]);
+    drop(reopened);
+    std::fs::remove_dir_all(root).unwrap();
 }

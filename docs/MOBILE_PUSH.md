@@ -7,9 +7,13 @@ relay. Push is off until credentials are configured.
 
 ## What a push contains
 
-Every alert is generic: title `Kindred`, body `You have a new update.` Chat
-text, bot names, previews and the server address are never sent to Apple or
-Google. The custom data has five strings:
+Bot update alerts remain generic: title `Kindred`, body `You have a new update.`
+Reminder alerts contain the reminder text and scheduled date/time in its saved time
+zone. Normal OS notification-preview and lock-screen settings apply. Payloads
+include account/profile/chat/event routing identifiers, never credentials or a
+server address. Dismissing a delivered reminder persists across clients and removes
+unsent reminders from the push outbox before delivery (already delivered system
+notifications are managed by the OS).
 
 | Key                 | Value                                               |
 |---------------------|-----------------------------------------------------|

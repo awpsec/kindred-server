@@ -320,6 +320,7 @@ impl Db {
         {
             return record(&tx, "reminders", &id);
         }
+        v.as_object_mut().unwrap().remove("dismissed_at");
         v["batch_id"] = json!(run.id);
         v["message"] = json!(text(&v, "message", 2000)?);
         sources(&mut v)?;
@@ -362,6 +363,18 @@ impl Db {
             patch["expected_revision"].as_i64() == v["revision"].as_i64(),
             "This reminder changed. Refresh its state before editing"
         );
+        if patch["dismiss"] == true {
+            ensure!(bot.is_none(), "Only the user can dismiss a reminder");
+            ensure!(v["status"] == "delivered", "Only a delivered reminder can be dismissed");
+            ensure!(patch.as_object().is_some_and(|p| p.keys().all(|key| matches!(key.as_str(), "dismiss" | "expected_revision"))), "Dismiss this reminder separately from edits");
+            if v["dismissed_at"].is_null() {
+                v["dismissed_at"] = json!(db::now());
+                tx.execute("UPDATE reminders SET body=?,revision=revision+1 WHERE id=?", params![v.to_string(), id])?;
+            }
+            let saved = record(&tx, "reminders", id)?;
+            tx.commit()?;
+            return Ok(saved);
+        }
         ensure!(
             v["status"] != "delivered",
             "This reminder has already been delivered. Create a new reminder for another occurrence"

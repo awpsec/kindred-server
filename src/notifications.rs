@@ -121,10 +121,14 @@ impl Db {
             }
             let body = if kind == "reminder" {
                 let event: Value = serde_json::from_str(&event)?;
-                preview(&format!(
-                    "Reminder: {}",
-                    event["message"].as_str().unwrap_or("")
-                ))
+                let reminder = crate::plans::record(&c, "reminders", event["id"].as_str().unwrap_or(""))?;
+                if reminder["status"] != "delivered" || !reminder["dismissed_at"].is_null() {
+                    continue;
+                }
+                let at = reminder["run_at"].as_i64().and_then(|at| chrono::DateTime::from_timestamp(at, 0));
+                let zone = crate::timezone::parse(reminder["timezone"].as_str().unwrap_or("UTC"))?;
+                let when = at.map(|at| at.with_timezone(&zone).format("%b %-d, %-I:%M %p %Z").to_string()).unwrap_or_default();
+                format!("Reminder · {when}\n{}", preview(reminder["message"].as_str().unwrap_or("")))
             } else if kind == "run_finished" {
                 if status == "completed" {
                     if frequency == "input_needed" {
@@ -184,7 +188,7 @@ impl Db {
                 .iter()
                 .map(|v| format!("{v:02x}"))
                 .collect::<String>();
-            items.push(json!({"id":seq,"run_id":run_id,"bot_id":bot_id,"chat_id":chat_id,"title":name,"body":body,"avatar_key":avatar_key,"avatar":{"name":name,"shape":p.shape,"color":p.color,"eyes":p.eyes,"animated":p.animated},"reduced_motion":general["reduced_motion"]==true}));
+            items.push(json!({"kind":kind,"id":seq,"run_id":run_id,"bot_id":bot_id,"chat_id":chat_id,"title":name,"body":body,"avatar_key":avatar_key,"avatar":{"name":name,"shape":p.shape,"color":p.color,"eyes":p.eyes,"animated":p.animated},"reduced_motion":general["reduced_motion"]==true}));
         }
         Ok(json!({"cursor":cursor,"items":items}))
     }
