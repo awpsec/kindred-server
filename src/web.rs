@@ -18,16 +18,19 @@ use serde_json::{Value, json};
 
 use subtle::ConstantTimeEq;
 
-pub struct Error(anyhow::Error);
+pub struct Error(anyhow::Error, StatusCode);
+impl Error {
+    pub(crate) fn with_status(status: StatusCode, message: &str) -> Self { Self(anyhow::anyhow!("{message}"), status) }
+}
 impl<E: Into<anyhow::Error>> From<E> for Error {
     fn from(e: E) -> Self {
-        Self(e.into())
+        Self(e.into(), StatusCode::BAD_REQUEST)
     }
 }
 impl IntoResponse for Error {
     fn into_response(self) -> Response {
         (
-            StatusCode::BAD_REQUEST,
+            self.1,
             Json(json!({"error":self.0.to_string()})),
         )
             .into_response()
