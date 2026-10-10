@@ -49,7 +49,7 @@ pub fn router(app: Shared) -> Router {
     let api = Router::new()
         .route("/status", get(status))
         .route("/continuity/sources/{seq}", axum::routing::patch(crate::continuity::store::source_update))
-        .route("/workspace-artifact-folders", get(crate::workspace_artifacts::folder_list).post(crate::workspace_artifacts::folder_create).patch(crate::workspace_artifacts::folder_move))
+        .route("/workspace-artifact-folders", get(crate::workspace_artifacts::folder_list).post(crate::workspace_artifacts::folder_create).patch(crate::workspace_artifacts::folder_move).delete(crate::workspace_artifacts::folder_remove))
         .route("/workspace-artifacts", get(crate::workspace_artifacts::list).post(crate::workspace_artifacts::create).layer(DefaultBodyLimit::max(crate::workspace_artifacts::REQUEST_MAX_BYTES)))
         .route("/workspace-artifacts/{id}/export", get(crate::workspace_artifacts::export))
         .route("/workspace-artifacts/{id}", get(crate::workspace_artifacts::get).patch(crate::workspace_artifacts::update).layer(DefaultBodyLimit::max(crate::workspace_artifacts::REQUEST_MAX_BYTES)))
@@ -1944,6 +1944,8 @@ fn static_assets<S: Clone + Send + Sync + 'static>() -> Router<S> {
                 )
             }),
         )
+        .route("/sheet-editor.js", get(|| async { ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8")], include_str!("../ui/sheet-editor.js")) }))
+        .route("/sheet-calculation.js", get(|| async { ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8")], include_str!("../ui/sheet-calculation.js")) }))
         .route("/health", get(|| async { Json(json!({"status":"ok"})) }))
         .route(
             "/vendor.js",
