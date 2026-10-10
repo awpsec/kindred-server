@@ -407,3 +407,68 @@ async fn message_pages_are_bounded_stable_and_chat_scoped() {
     }
     server.abort();
 }
+
+#[tokio::test]
+async fn model_changes_are_durable_chat_notices_for_actual_saved_changes_only() {
+    let app = app();
+    let mut b = bot(&app.db, "claude-code");
+    let other = bot(&app.db, "codex");
+    let chat = format!("dm-{}", b.id);
+    // Creation alone must not manufacture a switch.
+    assert_eq!(app.db.0.lock().unwrap().query_row("SELECT count(*) FROM chat_messages WHERE kind='model_change'", [], |r|r.get::<_,i64>(0)).unwrap(), 0);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(axum::serve(listener, web::router(app.clone())).into_future());
+    let client = reqwest::Client::new();
+    b.model = "claude-opus-5-5".into();
+    let url = format!("{base}/api/bots/{}", b.id);
+    assert_eq!(client.put(&url).json(&b).send().await.unwrap().status(),401);
+    for _ in 0..2 {
+        assert!(client.put(&url).bearer_auth(&app.token).json(&b).send().await.unwrap().status().is_success());
+    }
+    b.name = "Renamed".into(); b.reasoning_effort = "high".into();
+    app.db.save_bot_preferences(&b,true).unwrap();
+    let messages = app.db.chat_messages(&chat).unwrap();
+    assert_eq!(messages.len(),1);
+    assert_eq!(messages[0]["model_change"]["from"]["model"],"test/model");
+    assert_eq!(messages[0]["model_change"]["to"]["model"],"claude-opus-5-5");
+    assert_eq!(messages[0]["sender"],"system");
+    assert_eq!(messages[0]["run_id"],"");
+    assert!(messages[0]["text"].as_str().unwrap().starts_with("Model changed from"));
+    // Provider-only and default selections are distinct changes too.
+    b.provider = "codex".into(); app.db.save_bot_preferences(&b,true).unwrap();
+    b.model.clear(); app.db.save_bot_preferences(&b,true).unwrap();
+    let messages = app.db.chat_messages(&chat).unwrap();
+    assert_eq!(messages.len(),3);
+    assert_eq!(messages[1]["model_change"]["to"]["provider"],"codex");
+    assert_eq!(messages[2]["model_change"]["to"]["model"],"");
+    b.model = "gpt-next".into(); b.name.clear();
+    assert!(app.db.save_bot_preferences(&b,true).is_err());
+    assert_eq!(app.db.chat_messages(&chat).unwrap().len(),3);
+    assert_eq!(app.db.bot(&b.id).unwrap().model,"");
+    assert_eq!(app.db.0.lock().unwrap().query_row("SELECT count(*) FROM chat_messages WHERE chat_id=?",[format!("dm-{}",other.id)],|r|r.get::<_,i64>(0)).unwrap(),0);
+    let result: Value = client.get(format!("{base}/api/chats/{chat}")).bearer_auth(&app.token).send().await.unwrap().json().await.unwrap();
+    assert_eq!(result["messages"].as_array().unwrap().len(),3);
+    assert_eq!(result["messages"][2]["model_change"]["to"]["model"],"");
+    server.abort();
+}
+
+#[test]
+fn model_changes_survive_database_reopen_and_failed_notice_rolls_back_the_setting() {
+    let dir = std::env::temp_dir().join(format!("kindred-model-change-{}",crate::db::id()));
+    let path = dir.join("data.db");
+    let db = crate::db::Db::open(path.to_str().unwrap()).unwrap();
+    let mut b = bot(&db,"codex");
+    b.model = "gpt-next".into(); db.save_bot_preferences(&b,true).unwrap();
+    let chat = format!("dm-{}",b.id);
+    let first = db.chat_messages(&chat).unwrap();
+    drop(db);
+    let db = crate::db::Db::open(path.to_str().unwrap()).unwrap();
+    assert_eq!(db.chat_messages(&chat).unwrap(),first);
+    db.0.lock().unwrap().execute_batch("CREATE TRIGGER reject_model_notice BEFORE INSERT ON chat_messages WHEN NEW.kind='model_change' BEGIN SELECT RAISE(ABORT,'fixture write failure'); END;").unwrap();
+    b.model = "gpt-after".into();
+    assert!(db.save_bot_preferences(&b,true).is_err());
+    assert_eq!(db.bot(&b.id).unwrap().model,"gpt-next");
+    assert_eq!(db.chat_messages(&chat).unwrap(),first);
+    drop(db); std::fs::remove_dir_all(dir).unwrap();
+}
