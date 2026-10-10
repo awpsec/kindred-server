@@ -143,6 +143,8 @@ enum Action {
     GuestRpc,
     /// Manage password-reset requests from the trusted server console.
     PasswordReset { #[command(subcommand)] command: PasswordResetAction },
+    /// Inspect or confirm the fixed Owner of an existing registry from its trusted host.
+    Owner { #[command(subcommand)] command: OwnerAction },
 }
 #[derive(Subcommand)]
 enum PasswordResetAction {
@@ -152,6 +154,13 @@ enum PasswordResetAction {
     Approve { id: String },
     /// Deny a pending request.
     Deny { id: String },
+}
+#[derive(Subcommand)]
+enum OwnerAction {
+    /// Show non-secret account IDs, names and role flags. Does not select an Owner.
+    Status,
+    /// Explicitly confirm an enabled administrator. Cannot transfer an established Owner.
+    Confirm { #[arg(long)] account_id: String, #[arg(long)] confirm_username: String },
 }
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -182,6 +191,11 @@ async fn main() -> Result<()> {
             println!("Configuration is valid. Provider and VM connectivity were not tested.");
         }
         Action::GuestRpc => guest::rpc().await?,
+        Action::Owner { command } => {
+            let config= config::Config::load(&cli.config).map_err(|_|anyhow::anyhow!("Could not load the selected configuration; check its path and settings"))?;
+            let result=match command {OwnerAction::Status=>profiles::host_owner(&config,None)?,OwnerAction::Confirm{account_id,confirm_username}=>profiles::host_owner(&config,Some((&account_id,&confirm_username)))?};
+            println!("{}",serde_json::to_string_pretty(&result)?);
+        },
         Action::PasswordReset { command } => {
             let config=config::Config::load(&cli.config)
                 .map_err(|_|anyhow::anyhow!("Could not load the selected configuration; check its path and settings"))?;

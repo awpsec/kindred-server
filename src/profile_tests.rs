@@ -1532,3 +1532,108 @@ async fn host_password_reset_real_cli_to_http_sole_admin_finish() {
     assert_eq!(client.post(format!("{origin}/identity/login")).json(&json!({"login":"cli-http-owner","password":"CLI HTTP replacement"})).send().await.unwrap().status(),200);
     stop.send(()).unwrap();server.await.unwrap();
 }
+
+#[tokio::test]
+async fn account_management_fresh_owner_is_durable_and_fixed() {
+    let f=Fixture::new(false);let owner=f.register("original-owner").await;
+    let token=owner["token"].as_str().unwrap();
+    let (_,identity)=f.request("GET","/identity/profiles",token,Value::Null).await;
+    assert_eq!(identity["role"],"owner","{identity}");
+    assert_eq!(identity["owner_resolved"],true);
+    let other=f.register("ordinary-user").await;
+    let target=f.p.identity(other["token"].as_str().unwrap()).unwrap().account;
+    let (status,result)=f.request("POST","/identity/admin",token,json!({"action":"role","user_id":target,"role":"admin","expected_role":"user"})).await;
+    assert_eq!(status,200,"{result}");
+}
+#[tokio::test]
+async fn account_management_rename_preserves_scoped_session_and_private_data() {
+    let f=Fixture::new(false);let owner=f.register("rename-before").await;
+    let token=owner["token"].as_str().unwrap();let id=f.p.identity(token).unwrap();
+    let app=f.p.app(&id.profile).unwrap();app.db.save_setting("rename-sentinel",&json!({"files":"unchanged"})).unwrap();
+    let (status,result)=f.request("POST","/identity/account",token,json!({"account_id":id.account,"expected_username":"rename-before","username":" Rename.After "})).await;
+    assert_eq!(status,200,"{result}");assert_eq!(result["username"],"rename.after");assert_eq!(result["account_id"],id.account);
+    assert_eq!(f.p.identity(token).unwrap().profile,id.profile);
+    assert_eq!(app.db.setting("rename-sentinel").unwrap(),Some(json!({"files":"unchanged"})));
+}
+#[tokio::test]
+async fn account_management_existing_registry_owner_is_unresolved() {
+    let f=Fixture::new(false);let owner=f.register("legacy-admin").await;
+    f.p.registry.lock().unwrap().execute("DELETE FROM controls WHERE key='owner_account_id'",[]).unwrap();
+    let token=owner["token"].as_str().unwrap();let (_,value)=f.request("GET","/identity/admin",token,Value::Null).await;
+    assert_eq!(value["owner_resolved"],false,"{value}");
+    assert_eq!(value["can_manage_roles"],false);
+}
+#[tokio::test]
+async fn account_management_owner_only_roles_and_existing_admin_capabilities() {
+ let f=Fixture::new(false);let a=f.register("fixed-owner").await;let b=f.register("new-admin").await;let c=f.register("member").await;
+ let at=a["token"].as_str().unwrap();let bt=b["token"].as_str().unwrap();let ct=c["token"].as_str().unwrap();let aid=f.p.identity(at).unwrap().account;let bid=f.p.identity(bt).unwrap().account;let cid=f.p.identity(ct).unwrap().account;
+ assert_eq!(f.request("POST","/identity/admin",at,json!({"action":"role","user_id":bid,"role":"admin","expected_role":"user"})).await.0,200);
+ assert!(f.p.identity(bt).unwrap().admin);
+ assert_eq!(f.request("POST","/identity/admin",bt,json!({"action":"role","user_id":cid,"role":"admin","expected_role":"user"})).await.0,403);
+ assert_eq!(f.request("POST","/identity/admin",ct,json!({"action":"role","user_id":cid,"role":"admin","expected_role":"user"})).await.0,400);
+ assert_eq!(f.request("POST","/identity/admin",bt,json!({"action":"registration","open":true})).await.0,200);
+ for action in ["disable","role"] {
+   assert_ne!(f.request("POST","/identity/admin",bt,json!({"action":action,"user_id":aid,"disabled":true,"role":"user","expected_role":"owner"})).await.0,200);
+ }
+ assert_ne!(f.request("POST","/identity/admin/remove",bt,json!({"user_id":aid,"confirm":"fixed-owner"})).await.0,200);
+ assert_eq!(f.request("POST","/identity/admin",at,json!({"action":"role","user_id":aid,"role":"admin","expected_role":"owner"})).await.0,400);
+ assert_eq!(f.request("POST","/identity/admin",at,json!({"action":"role","user_id":bid,"role":"user","expected_role":"admin"})).await.0,200);
+ assert!(!f.p.identity(bt).unwrap().admin);
+ assert_eq!(f.request("GET","/identity/admin",bt,Value::Null).await.0,400);
+ let (_,me)=f.request("GET","/identity/profiles",bt,Value::Null).await;assert_eq!(me["role"],"user");assert_eq!(me["owner_resolved"],true);
+ assert_eq!(f.p.identity(at).unwrap().account,aid);
+}
+#[tokio::test]
+async fn account_management_rename_validation_conflict_and_isolation() {
+ let f=Fixture::new(false);let a=f.register("self-original").await;let b=f.register("other-login").await;
+ let at=a["token"].as_str().unwrap();let bt=b["token"].as_str().unwrap();let id=f.p.identity(at).unwrap();let other=f.p.identity(bt).unwrap();
+ for (name,status) in [("other-login",409),("bad/name",400),("bad\nname",400),("",400),("é",400)] {
+  let (code,_)=f.request("POST","/identity/account",at,json!({"account_id":id.account,"expected_username":"self-original","username":name})).await;assert_eq!(code,status,"{name}");
+ }
+ assert_eq!(f.request("POST","/identity/account",bt,json!({"account_id":id.account,"expected_username":"self-original","username":"attacked"})).await.0,403);
+ let (left,right)=tokio::join!(f.request("POST","/identity/account",at,json!({"account_id":id.account,"expected_username":"self-original","username":"winner-one"})),f.request("POST","/identity/account",at,json!({"account_id":id.account,"expected_username":"self-original","username":"winner-two"})));
+ let mut codes=vec![left.0.as_u16(),right.0.as_u16()];codes.sort();assert_eq!(codes,vec![200,409]);
+ let (_,current)=f.request("GET","/identity/profiles",at,Value::Null).await;
+ assert_eq!(current["account_id"],id.account);assert_eq!(current["active"],id.profile);assert_eq!(current["role"],"owner");
+ let (_,unchanged)=f.request("GET","/identity/profiles",bt,Value::Null).await;assert_eq!(unchanged["username"],"other-login");assert_eq!(unchanged["account_id"],other.account);
+ assert_ne!(f.request("POST","/identity/login","",json!({"login":"self-original","password":"test password for profiles"})).await.0,200);
+ assert_eq!(f.request("POST","/identity/login","",json!({"login":current["username"],"password":"test password for profiles"})).await.0,200);
+ let response=router(f.p.clone()).oneshot(Request::builder().method("POST").uri("/identity/account").header("origin","https://foreign.invalid").header("authorization",format!("Bearer {at}")).header("content-type","application/json").body(Body::from(json!({"account_id":id.account,"expected_username":current["username"],"username":"foreign-origin"}).to_string())).unwrap()).await.unwrap();assert_eq!(response.status(),400);
+}
+#[tokio::test]
+async fn account_management_unresolved_host_confirmation_fixed_and_no_provisioning() {
+ let f=Fixture::new(false);let a=f.register("old-original").await;let b=f.register("later-admin").await;let at=a["token"].as_str().unwrap();let bt=b["token"].as_str().unwrap();let aid=f.p.identity(at).unwrap().account;let bid=f.p.identity(bt).unwrap().account;
+ {let c=f.p.registry.lock().unwrap();c.execute("DELETE FROM controls WHERE key=?",[account_management::OWNER]).unwrap();c.execute("UPDATE accounts SET admin=1 WHERE id=?",[&bid]).unwrap();}
+ let config=&f.p.config;
+ let status=account_management::host_owner(config,None).unwrap();assert_eq!(status["owner_resolved"],false);assert!(status["owner_account_id"].is_null());
+ assert_eq!(f.request("POST","/identity/admin",at,json!({"action":"role","user_id":bid,"role":"user","expected_role":"admin"})).await.0,403);
+ assert_eq!(f.request("POST","/identity/admin",bt,json!({"action":"disable","user_id":aid,"disabled":true})).await.0,400);
+ assert!(account_management::host_owner(config,Some((&aid,"wrong-name"))).is_err());
+ assert!(account_management::host_owner(config,Some((&aid,"old-original"))).unwrap()["owner_resolved"]==true);
+ assert!(account_management::host_owner(config,Some((&aid,"old-original"))).is_ok());
+ assert!(account_management::host_owner(config,Some((&bid,"later-admin"))).is_err());
+ let (_,me)=f.request("GET","/identity/profiles",at,Value::Null).await;assert_eq!(me["role"],"owner");
+ assert!(!Path::new(&config.profiles.vm_manager).exists());
+ let mut missing=config.clone();missing.profiles.directory=f.root.join("must-not-create").to_string_lossy().into();assert!(account_management::host_owner(&missing,None).is_err());assert!(!Path::new(&missing.profiles.directory).exists());
+}
+#[tokio::test]
+async fn account_management_legacy_claim_and_disabled_roles_keep_fixed_owner() {
+ let f=Fixture::new(true);
+ let (status,a)=f.request("POST","/identity/register","legacy-owner-token-12345678901234567890",json!({"login":"legacy-owner","name":"Keep","password":"test password for profiles","claim_legacy":true})).await;assert_eq!(status,200,"{a}");
+ let at=a["token"].as_str().unwrap();let aid=f.p.identity(at).unwrap().account;
+ let (_,me)=f.request("GET","/identity/profiles",at,Value::Null).await;assert_eq!(me["role"],"owner");assert_eq!(me["active"],"legacy");
+ let b=f.register("disabled-member").await;let bid=f.p.identity(b["token"].as_str().unwrap()).unwrap().account;
+ f.p.registry.lock().unwrap().execute("UPDATE accounts SET disabled=1 WHERE id=?",[&bid]).unwrap();
+ assert_eq!(f.request("POST","/identity/admin",at,json!({"action":"role","user_id":bid,"role":"admin","expected_role":"user"})).await.0,200);
+ let c=f.p.registry.lock().unwrap();let flags:(bool,bool)=c.query_row("SELECT admin,disabled FROM accounts WHERE id=?",[bid],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();assert_eq!(flags,(true,true));assert_eq!(account_management::owner_id(&c).unwrap(),Some(aid));
+}
+#[tokio::test]
+async fn account_management_rechecks_admin_after_external_writer_lock() {
+ let f=Fixture::new(false);let a=f.register("lock-owner").await;let b=f.register("lock-admin").await;let d=f.register("lock-member").await;
+ let at=a["token"].as_str().unwrap();let bt=b["token"].as_str().unwrap();let bid=f.p.identity(bt).unwrap().account;let target=f.p.identity(d["token"].as_str().unwrap()).unwrap().account;
+ assert_eq!(f.request("POST","/identity/admin",at,json!({"action":"role","user_id":bid,"role":"admin","expected_role":"user"})).await.0,200);
+ let writer=Connection::open(f.root.join("accounts.db")).unwrap();writer.execute_batch("BEGIN IMMEDIATE").unwrap();writer.execute("UPDATE accounts SET admin=0 WHERE id=?",[&bid]).unwrap();
+ let release=std::thread::spawn(move||{std::thread::sleep(std::time::Duration::from_millis(150));writer.execute_batch("COMMIT").unwrap();});
+ let (status,_)=f.request("POST","/identity/admin",bt,json!({"action":"disable","user_id":target,"disabled":true})).await;release.join().unwrap();assert_eq!(status,400);
+ let disabled:bool=f.p.registry.lock().unwrap().query_row("SELECT disabled FROM accounts WHERE id=?",[target],|r|r.get(0)).unwrap();assert!(!disabled);
+}

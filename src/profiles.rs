@@ -48,6 +48,9 @@ macro_rules! ensure {
     };
 }
 
+#[path = "account_management.rs"]
+mod account_management;
+
 pub struct Profiles {
     self_ref: std::sync::OnceLock<std::sync::Weak<Profiles>>,
     config: Config,
@@ -135,6 +138,7 @@ impl Profiles {
             CREATE TABLE IF NOT EXISTS invites(digest BLOB PRIMARY KEY, expires INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS controls(key TEXT PRIMARY KEY,value TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS sessions_expiry ON sessions(expires);")?;
+        registry.busy_timeout(std::time::Duration::from_secs(5))?;
         server_chats::migrate(&registry)?;
         password_reset::migrate(&registry)?;
         mobile_pairing::migrate(&registry)?;
@@ -251,13 +255,7 @@ impl Profiles {
                 });
             }
         }
-        ensure!(
-            (32..=256).contains(&token.len()),
-            "Sign in to your Kindred account"
-        );
-        let c = self.registry.lock().unwrap();
-        let row = c.query_row("SELECT s.account_id,s.profile_id,a.admin FROM sessions s JOIN accounts a ON a.id=s.account_id JOIN profiles p ON p.id=s.profile_id AND p.account_id=a.id WHERE s.digest=? AND s.expires>? AND a.disabled=0", params![hash(token),db::now()], |r| Ok(Identity { account:r.get(0)?, profile:r.get(1)?, admin:r.get(2)?, legacy:false })).optional()?;
-        row.ok_or_else(|| anyhow::anyhow!("Your session expired. Sign in again."))
+        account_management::identity_in(&self.registry.lock().unwrap(),token)
     }
     fn session(c: &Connection, account: &str, profile: &str) -> Result<String> {
         ensure!(
@@ -366,13 +364,12 @@ impl Profiles {
                 Ok(json!({"server":r.get::<_,String>(0)?,"name":r.get::<_,String>(1)?}))
             })?
             .collect::<rusqlite::Result<_>>()?;
-        let username: String = self.registry.lock().unwrap().query_row(
-            "SELECT login FROM accounts WHERE id=?",
-            [&id.account],
-            |r| r.get(0),
-        )?;
+        let c=self.registry.lock().unwrap();
+        let (username,admin):(String,bool)=c.query_row("SELECT login,admin FROM accounts WHERE id=? AND disabled=0",[&id.account],|r|Ok((r.get(0)?,r.get(1)?)))?;
+        let role=account_management::role(&c,&id.account,admin)?;
+        let owner_resolved=account_management::owner_resolved(&c)?;
         Ok(
-            json!({"active":id.profile,"account_id":id.account,"username":username,"admin":id.admin,"profiles":profiles,"directory":directory,"legacy":false}),
+            json!({"active":id.profile,"account_id":id.account,"username":username,"admin":admin,"role":role,"owner_resolved":owner_resolved,"account_management":true,"profiles":profiles,"directory":directory,"legacy":false}),
         )
     }
     fn unread(&self, app: &Shared) -> Result<i64> {
@@ -418,6 +415,7 @@ pub fn router(portal: Portal) -> Router {
         )
         .route("/identity/directory", post(directory))
         .route("/identity/password", post(change_password))
+        .route("/identity/account", post(account_management::rename))
         .route("/identity/password-reset/request", post(password_reset::request))
         .route("/identity/password-reset/status", post(password_reset::status))
         .route("/identity/password-reset/finish", post(password_reset::finish))
@@ -506,13 +504,14 @@ async fn register(State(p): State<Portal>, headers: HeaderMap, Json(v): Json<Val
     .await?;
     let (token, profile) = {
         let mut c = p.registry.lock().unwrap();
-        let tx = c.transaction()?;
+        let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let count: usize = tx.query_row("SELECT COUNT(*) FROM accounts", [], |r| r.get(0))?;
         ensure!(
             count < p.config.profiles.max_users,
             "This server has reached its user limit"
         );
         let first = count == 0;
+        ensure!(!first || account_management::owner_id(&tx)?.is_none(),"The fixed Owner account is unavailable; restore this registry on the host before creating accounts");
         let invite = v["invite"].as_str().unwrap_or("");
         if !first && (!invite.is_empty() || !p.registration_open(&tx)?) {
             ensure!(
@@ -554,6 +553,7 @@ async fn register(State(p): State<Portal>, headers: HeaderMap, Json(v): Json<Val
             "INSERT INTO accounts(id,login,salt,password,admin,created) VALUES(?,?,?,?,?,?)",
             params![account, login, salt, digest, first, db::now()],
         )?;
+        if first {tx.execute("INSERT INTO controls VALUES(?,?)",params![account_management::OWNER,account])?;}
         tx.execute(
             "INSERT INTO profiles VALUES(?,?,?,?,?)",
             params![profile, account, name, import, db::now()],
@@ -1035,13 +1035,14 @@ async fn server_update_start(
 
 async fn admin(State(p): State<Portal>, headers: HeaderMap) -> ApiResult {
     p.origin(&headers)?;
-    let id = p.identity(bearer(&headers))?;
-    ensure!(id.admin, "Administrator access required");
-    let c = p.registry.lock().unwrap();
-    let users:Vec<Value>=c.prepare("SELECT id,login,admin,disabled,(SELECT COUNT(*) FROM profiles p WHERE p.account_id=a.id) FROM accounts a ORDER BY created,rowid")?.query_map([],|r|Ok(json!({"id":r.get::<_,String>(0)?,"username":r.get::<_,String>(1)?,"admin":r.get::<_,bool>(2)?,"disabled":r.get::<_,bool>(3)?,"profile_count":r.get::<_,i64>(4)?})))?.collect::<rusqlite::Result<_>>()?;
-    Ok(Json(
-        json!({"users":users,"registration":p.registration_open(&c)?,"max_users":p.config.profiles.max_users,"max_profiles_per_user":p.config.profiles.max_profiles_per_user}),
-    ))
+    let c=p.registry.lock().unwrap();let id=account_management::identity_in(&c,bearer(&headers))?;
+    ensure!(id.admin,"Administrator access required");
+    let owner_resolved=account_management::owner_resolved(&c)?;let owner=account_management::owner_id(&c)?;
+    let users:Vec<Value>=c.prepare("SELECT id,login,admin,disabled,(SELECT COUNT(*) FROM profiles p WHERE p.account_id=a.id) FROM accounts a ORDER BY created,rowid")?.query_map([],|r|{
+        let account:String=r.get(0)?;let admin:bool=r.get(2)?;
+        Ok(json!({"id":account,"username":r.get::<_,String>(1)?,"admin":admin,"role":if owner_resolved && owner.as_deref()==Some(account.as_str()) && admin {"owner"}else if admin{"admin"}else{"user"},"disabled":r.get::<_,bool>(3)?,"profile_count":r.get::<_,i64>(4)?}))
+    })?.collect::<rusqlite::Result<_>>()?;
+    Ok(Json(json!({"users":users,"owner_resolved":owner_resolved,"can_manage_roles":owner_resolved&&owner.as_deref()==Some(id.account.as_str()),"registration":p.registration_open(&c)?,"max_users":p.config.profiles.max_users,"max_profiles_per_user":p.config.profiles.max_profiles_per_user})))
 }
 async fn admin_update(
     State(p): State<Portal>,
@@ -1049,10 +1050,10 @@ async fn admin_update(
     Json(v): Json<Value>,
 ) -> ApiResult {
     p.origin(&headers)?;
-    let id = p.identity(bearer(&headers))?;
-    ensure!(id.admin, "Administrator access required");
     let mut c = p.registry.lock().unwrap();
-    let tx = c.transaction()?;
+    let tx=c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let id=account_management::identity_in(&tx,bearer(&headers))?;
+    ensure!(id.admin,"Administrator access required");
     match v["action"].as_str().unwrap_or("") {
         "registration" => {
             let value = if v["open"] == true { "open" } else { "closed" };
@@ -1071,8 +1072,10 @@ async fn admin_update(
             tx.commit()?;
             return Ok(Json(json!({"invite":code,"expires_at":expiry})));
         }
+        "role" => account_management::change_role(&tx,&id,&v)?,
         "disable" => {
             let user = field(&v, "user_id", 64)?;
+            if v["disabled"] == true {account_management::protect_owner(&tx,user)?;}
             ensure!(user != id.account, "You cannot disable your own account");
             ensure!(
                 !tx.query_row(
@@ -1139,7 +1142,9 @@ async fn remove_account(
     ensure!(p.identity(bearer(&headers))?.admin,"Administrator access required");
     let profiles: Vec<String> = {
         let mut c = p.registry.lock().unwrap();
-        let tx = c.transaction()?;
+        let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        ensure!(account_management::identity_in(&tx,bearer(&headers))?.admin,"Administrator access required");
+        account_management::protect_owner(&tx,&user)?;
         let name: String = tx.query_row("SELECT login FROM accounts WHERE id=?", [&user], |r| {
             r.get(0)
         })?;
@@ -1430,3 +1435,5 @@ impl Profiles {
 pub fn host_password_resets(config: &Config, decision: Option<(&str,&str)>) -> Result<Value> {
     match decision {Some((id,action))=>password_reset::host_decide(config,id,action),None=>password_reset::host_list(config)}
 }
+
+pub fn host_owner(config: &Config, confirm: Option<(&str,&str)>) -> Result<Value> {account_management::host_owner(config,confirm)}
