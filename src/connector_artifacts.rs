@@ -936,6 +936,12 @@ mod tests {
     async fn structured_and_non_email_drafts_use_revision_review_and_exact_dispatch() {
         let cases = [
             (
+                "Gmail",
+                "GMAIL_SEND_EMAIL",
+                json!({"recipient_email":"first@example.invalid","extra_recipients":["second@example.invalid"],"subject":"Draft","body":"Original","cc":null,"bcc":null,"attachment":{"name":"keep.pdf"},"thread_id":"keep-thread"}),
+                json!({"to":"second@example.invalid, third@example.invalid","cc":"first@example.invalid","bcc":"hidden@example.invalid"}),
+            ),
+            (
                 "Outlook",
                 "sendMail",
                 json!({"message":{"subject":"Draft","body":{"contentType":"HTML","content":"<p>Old</p>"},"toRecipients":[{"emailAddress":{"address":"review@example.invalid"}}],"attachments":[{"id":"keep"}]},"saveToSentItems":false}),
@@ -994,6 +1000,14 @@ mod tests {
             .unwrap();
             assert_eq!(next["status"], "pending");
             assert_eq!(next["original_input"], original);
+            if service == "Gmail" {
+                assert_eq!(next["input"]["recipient_email"], "second@example.invalid");
+                assert_eq!(next["input"]["extra_recipients"], json!(["third@example.invalid"]));
+                assert_eq!(next["input"]["cc"], json!(["first@example.invalid"]));
+                assert_eq!(next["input"]["bcc"], json!(["hidden@example.invalid"]));
+                assert_eq!(next["input"]["attachment"], original["attachment"]);
+                assert_eq!(next["input"]["thread_id"], original["thread_id"]);
+            }
             assert!(
                 update(
                     &app,

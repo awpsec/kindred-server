@@ -70,12 +70,36 @@ pub fn extend_email_fields(value: &Value, mut fields: Value) -> Value {
             fields["from"] = json!({"key":format!("{prefix}/from/emailAddress/address"),"text":address,"editable":false});
         }
     }
+    // Composio Gmail uses one primary address plus an array of additional To
+    // recipients. Present them as one field and write both keys together.
+    if fields["to"]["key"] == "recipient_email" {
+        let extras = value.get("extra_recipients");
+        if extras.is_none_or(|v| {
+            v.is_null() || v.as_array().is_some_and(|a| a.iter().all(Value::is_string))
+        }) {
+            let mut addresses = vec![fields["to"]["text"].as_str().unwrap_or("").to_owned()];
+            if let Some(rows) = extras.and_then(Value::as_array) {
+                addresses.extend(rows.iter().filter_map(Value::as_str).map(str::to_owned));
+            }
+            fields["to"]["text"] = json!(
+                addresses
+                    .into_iter()
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            fields["to"]["encoding"] = json!("primary_and_extra_recipients");
+        } else {
+            // Preserve unfamiliar recipient objects instead of losing them on save.
+            fields["to"]["editable"] = json!(false);
+        }
+    }
     // Only add absent optional fields for recognized envelopes. Do not guess
     // field names for arbitrary provider tools or MIME/draft-ID inputs.
     if fields["to"]["editable"] == true {
-        let to = fields["to"]["key"].as_str().unwrap_or("");
-        let optional = match to {
-            "to" => Some([("cc", "cc"), ("bcc", "bcc")]),
+        let to = fields["to"]["key"].as_str().unwrap_or("").to_owned();
+        let optional = match to.as_str() {
+            "to" | "recipient_email" => Some([("cc", "cc"), ("bcc", "bcc")]),
             "to_addresses" => Some([("cc", "cc_addresses"), ("bcc", "bcc_addresses")]),
             "/message/toRecipients" => Some([
                 ("cc", "/message/ccRecipients"),
@@ -87,14 +111,21 @@ pub fn extend_email_fields(value: &Value, mut fields: Value) -> Value {
         if let Some(optional) = optional {
             for (label, key) in optional {
                 let exists = if key.starts_with('/') {
-                    value.pointer(key).is_some()
+                    value.pointer(key).is_some_and(|v| !v.is_null())
                 } else {
-                    value.get(key).is_some()
+                    value.get(key).is_some_and(|v| !v.is_null())
                 };
                 if !exists && fields.get(label).is_none() {
                     let graph = key.ends_with("Recipients");
-                    fields[label] = json!({"key":key,"text":"","array":graph||fields["to"]["array"]==true,"encoding":if graph{"graph_recipients"}else{""},"editable":true,"optional":true});
+                    fields[label] = json!({"key":key,"text":"","array":graph||to=="recipient_email"||fields["to"]["array"]==true,"encoding":if graph{"graph_recipients"}else{""},"editable":true,"optional":true});
                 }
+            }
+        }
+    }
+    if fields["to"]["key"] == "recipient_email" {
+        for label in ["cc", "bcc"] {
+            if fields[label]["key"] == label && fields[label]["array"] == true {
+                fields[label]["encoding"] = json!("email_addresses");
             }
         }
     }
@@ -221,7 +252,23 @@ pub fn apply(card: &Value, edits: &Value) -> Result<Value> {
         } else {
             None
         };
-        let replacement = if meta["encoding"] == "graph_recipients" {
+        if meta["encoding"] == "primary_and_extra_recipients" {
+            let rows = recipients.as_ref().context("Missing recipients")?;
+            next["recipient_email"] = rows
+                .first()
+                .map(|r| r["email"].clone())
+                .unwrap_or(json!(""));
+            next["extra_recipients"] = json!(
+                rows.iter()
+                    .skip(1)
+                    .map(|r| r["email"].clone())
+                    .collect::<Vec<_>>()
+            );
+            continue;
+        }
+        let replacement = if meta["encoding"] == "email_addresses" {
+            json!(recipients.as_ref().context("Missing recipients")?.iter().map(|r| r["email"].clone()).collect::<Vec<_>>())
+        } else if meta["encoding"] == "graph_recipients" {
             let rows = old.as_array().cloned().unwrap_or_default();
             let mut result = Vec::new();
             for recipient in recipients.as_ref().context("Missing recipients")? {
@@ -310,6 +357,36 @@ mod tests {
             next["message"]["bccRecipients"][0]["emailAddress"]["address"],
             "hidden@example.com"
         );
+    }
+    #[test]
+    fn split_gmail_recipients_expose_copy_fields_and_round_trip_moves() {
+        let input = json!({"recipient_email":"first@example.com","extra_recipients":["second@example.com"],"body":"Keep","subject":"Keep","attachment":{"name":"keep.pdf"},"thread_id":"keep-thread"});
+        let fields = crate::connector_artifacts::email_fields(&input);
+        assert_eq!(
+            fields["to"]["text"],
+            "first@example.com, second@example.com"
+        );
+        assert_eq!(fields["cc"]["optional"], true);
+        assert_eq!(fields["bcc"]["array"], true);
+        let next = apply(&json!({"kind":"email","input":input}), &json!({"to":"second@example.com, third@example.com","cc":"first@example.com","bcc":"hidden@example.com"})).unwrap();
+        assert_eq!(next["recipient_email"], "second@example.com");
+        assert_eq!(next["extra_recipients"], json!(["third@example.com"]));
+        assert_eq!(next["cc"], json!(["first@example.com"]));
+        assert_eq!(next["bcc"], json!(["hidden@example.com"]));
+        assert_eq!(next["attachment"], input["attachment"]);
+        assert_eq!(next["thread_id"], input["thread_id"]);
+        let without_extras = apply(
+            &json!({"kind":"email","input":next}),
+            &json!({"to":"only@example.com"}),
+        )
+        .unwrap();
+        assert_eq!(without_extras["extra_recipients"], json!([]));
+        let nullable = json!({"kind":"email","input":{"recipient_email":"first@example.com","cc":null,"bcc":null}});
+        let copied = apply(&nullable, &json!({"cc":"Copy Person <copy@example.com>","bcc":"Hidden Person <hidden@example.com>"})).unwrap();
+        assert_eq!(copied["cc"], json!(["copy@example.com"]));
+        assert_eq!(copied["bcc"], json!(["hidden@example.com"]));
+        let unknown = json!({"kind":"email","input":{"recipient_email":"first@example.com","extra_recipients":[{"address":"unknown@example.com"}]}});
+        assert!(apply(&unknown, &json!({"to":"replacement@example.com"})).is_err());
     }
     #[test]
     fn graph_draft_preserves_envelope_attachments_and_matching_recipient_names() {

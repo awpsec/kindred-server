@@ -50,10 +50,19 @@ pub fn start(c: &rusqlite::Connection, run: &mut crate::db::Run) -> Result<()> {
 }
 pub fn record_message(c:&rusqlite::Connection,seq:i64,run:&str,phase:&str)->Result<()> {
     if !matches!(phase,"commentary"|"final_answer") {return Ok(());}
-    let mode:String=c.query_row("SELECT progress_mode FROM runs WHERE id=?",[run],|r|r.get(0))?;
-    if mode.is_empty() {return Ok(());}
-    let completed_phases:i64=c.query_row("SELECT COUNT(*) FROM events WHERE run_id=? AND kind='assistant' AND json_extract(body,'$.phase')='final_answer'",[run],|r|r.get(0))?;
-    let group=format!("{run}:{}",completed_phases);
+    use rusqlite::OptionalExtension;
+    // Resolve the preference when this message is emitted. Existing rows are
+    // immutable, so switching a running task never reformats its history.
+    let profile:String=c.query_row("SELECT b.profile FROM bots b JOIN runs r ON r.bot_id=b.id WHERE r.id=?",[run],|r|r.get(0))?;
+    let profile:Value=serde_json::from_str(&profile)?;
+    let general:Option<String>=c.query_row("SELECT value FROM settings WHERE key='general'",[],|r|r.get(0)).optional()?;
+    let general:Value=serde_json::from_str(general.as_deref().unwrap_or("{}"))?;
+    let mode=profile["progress_updates"].as_str().filter(|v|valid(v)).or_else(||general["progress_updates"].as_str().filter(|v|valid(v))).unwrap_or("balanced");
+    let previous:Option<(String,String,String)>=c.query_row("SELECT mode,phase,group_id FROM message_progress WHERE run_id=? ORDER BY message_seq DESC LIMIT 1",[run],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+    let group=match previous {
+        Some((old_mode,old_phase,group)) if old_mode==mode && old_phase!="final_answer" => group,
+        _ => format!("{run}:segment:{seq}"),
+    };
     c.execute("INSERT INTO message_progress(message_seq,run_id,mode,phase,group_id) VALUES(?,?,?,?,?)",rusqlite::params![seq,run,mode,phase,group])?;
     Ok(())
 }
@@ -68,26 +77,34 @@ mod tests {
     use crate::{conversation_updates, tests};
 
     #[test]
-    fn run_start_snapshot_and_emission_tags_survive_setting_changes_and_reopen() {
-        let app=tests::app();let bot=tests::bot(&app.db,"codex");
+    fn live_mode_changes_only_affect_future_messages_and_separate_segments() {
+        let app=tests::app();let mut bot=tests::bot(&app.db,"codex");
         app.db.save_setting("general",&json!({"progress_updates":"summaries"})).unwrap();
         let id=app.db.queue(&bot.id,"Long task",0).unwrap();
-        assert_eq!(app.db.run(&id).unwrap().progress_mode,"");
-        let first=app.db.claim_bot(&bot.id).unwrap().unwrap();assert_eq!(first.progress_mode,"summaries");
-        app.db.event(&id,"assistant",json!({"text":"Milestone","phase":"commentary"})).unwrap();
+        let run=app.db.claim_bot(&bot.id).unwrap().unwrap();
+        let emit=|text:&str,phase:&str|app.db.event(&id,"assistant",json!({"text":text,"phase":phase})).unwrap();
+        emit("First summary update","commentary");emit("Second summary update","commentary");
+        let original=app.db.chat_messages(&run.chat_id).unwrap();
         app.db.save_setting("general",&json!({"progress_updates":"calm"})).unwrap();
-        app.db.event(&id,"assistant",json!({"text":"Second milestone","phase":"commentary"})).unwrap();
-        app.db.event(&id,"assistant",json!({"text":"Final answer","phase":"final_answer"})).unwrap();
-        let rows=app.db.chat_messages(&first.chat_id).unwrap();
-        let tagged:Vec<_>=rows.iter().filter(|m|m["progress"]["phase"]=="commentary").collect();
-        assert_eq!(tagged.len(),2);assert_eq!(tagged[0]["progress"]["group_id"],tagged[1]["progress"]["group_id"]);
-        assert_eq!(tagged[1]["progress"]["mode"],"summaries");
-        app.db.finish(&id,"completed","Final answer","").unwrap();
-        app.db.queue(&bot.id,"New task",0).unwrap();let next=app.db.claim_bot(&bot.id).unwrap().unwrap();assert_eq!(next.progress_mode,"calm");
-        app.db.event(&next.id,"assistant",json!({"text":"Untagged phase"})).unwrap();
-        let rows=app.db.chat_messages(&first.chat_id).unwrap();
-        assert_eq!(rows.iter().find(|m|m["text"]=="Untagged phase").unwrap()["progress"],Value::Null);
-        assert_eq!(rows.iter().find(|m|m["text"]=="Second milestone").unwrap()["progress"]["mode"],"summaries");
+        emit("Normal update in the same task","commentary");
+        app.db.save_setting("general",&json!({"progress_updates":"summaries"})).unwrap();
+        emit("New summary segment","commentary");emit("End of phase","final_answer");emit("Next phase","commentary");
+        bot.profile.progress_updates="frequent".into();app.db.save_bot(&bot).unwrap();
+        emit("Bot preference wins immediately","commentary");
+        emit("Legacy untagged reply","");
+        let rows=app.db.chat_messages(&run.chat_id).unwrap();
+        let tag=|text:&str|rows.iter().find(|m|m["text"]==text).unwrap()["progress"].clone();
+        for old in original.iter().filter(|m|m["progress"].is_object()) {
+            assert_eq!(rows.iter().find(|m|m["seq"]==old["seq"]).unwrap()["progress"],old["progress"]);
+        }
+        assert_eq!(tag("First summary update")["mode"],"summaries");
+        assert_eq!(tag("First summary update")["group_id"],tag("Second summary update")["group_id"]);
+        assert_eq!(tag("Normal update in the same task")["mode"],"calm");
+        assert_ne!(tag("First summary update")["group_id"],tag("New summary segment")["group_id"]);
+        assert_eq!(tag("New summary segment")["group_id"],tag("End of phase")["group_id"]);
+        assert_ne!(tag("Next phase")["group_id"],tag("End of phase")["group_id"]);
+        assert_eq!(tag("Bot preference wins immediately")["mode"],"frequent");
+        assert_eq!(tag("Legacy untagged reply"),Value::Null);
         assert_eq!(crate::db::general_settings(None)["message_delivery"],"steer");
     }
 
