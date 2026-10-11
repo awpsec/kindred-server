@@ -23,13 +23,25 @@ class RuntimeTests(unittest.TestCase):
         for name in ('desktop-launch','start-desktop.sh'):
             old=subprocess.check_output(['git','show',BASELINE+':deploy/'+name],cwd=ROOT);(self.root/name).write_bytes(old);(self.root/name).chmod(0o755)
             self.payload[name]={'source':(ROOT/'deploy'/name).read_text(),'previous_sha256':hashlib.sha256(old).hexdigest()}
-        self.payload['browser-launch.py']={'source':(ROOT/'deploy/browser-launch.py').read_text(),'previous_sha256':None}
+        self.payload['browser-launch.py']={'source':(ROOT/'deploy/browser-launch.py').read_text(),'previous_sha256':[None,hashlib.sha256(subprocess.check_output(['git','show','HEAD:deploy/browser-launch.py'],cwd=ROOT)).hexdigest()]}
+        for name in ('ensure-screen','screen-ownership.py'):
+            if name=='ensure-screen':
+                old=subprocess.check_output(['git','show','HEAD:deploy/'+name],cwd=ROOT)
+                (self.root/name).write_bytes(old);(self.root/name).chmod(0o755)
+                previous=hashlib.sha256(old).hexdigest()
+            else:previous=None
+            self.payload[name]={'source':(ROOT/'deploy'/name).read_text(),'previous_sha256':previous}
+
         self.profile=self.root/'browser-fixture';self.profile.mkdir(mode=0o700);(self.profile/'synthetic-state').write_text('preserved');self.inode=self.profile.stat().st_ino
     def install(self,payload=None,data=None,digest=None):
         data=self.new if data is None else data
         return m.install(io.BytesIO(data),self.target,digest or hashlib.sha256(data).hexdigest(),'candidate',payload)
     def preserved(self):
         self.assertEqual(self.profile.stat().st_ino,self.inode);self.assertEqual((self.profile/'synthetic-state').read_text(),'preserved')
+    def test_partial_fence_install_is_refused_before_runtime_switch(self):
+        incomplete=dict(self.payload);del incomplete['screen-ownership.py']
+        with self.assertRaisesRegex(RuntimeError,'Incomplete'):self.install(incomplete)
+        self.assertEqual(self.target.read_bytes(),self.old);self.preserved()
     def test_binary_only_baseline_does_not_install_launchers(self):
         before=(self.root/'desktop-launch').read_bytes();result=self.install();self.assertTrue(result['updated']);self.assertFalse(result['launchers_updated']);self.assertEqual((self.root/'desktop-launch').read_bytes(),before);self.assertFalse((self.root/'browser-launch.py').exists());self.preserved()
     def test_full_verified_install_and_idempotence(self):

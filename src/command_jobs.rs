@@ -73,7 +73,7 @@ pub async fn start(app: &App, bot: &Bot, run: &Run, tool: &str, mut args: Value)
         "Command duration must be 1 second to 7 days"
     );
     args["process_id"] = json!(id);
-    let screen = app.db.screen(&bot.id)?;
+    let screen = if device.is_empty() && args["use_desktop"]==true {crate::screen_capacity::reserve(app,&bot.id).await?} else {0};
     {
         let mut c = app.db.0.lock().unwrap();
         let tx = c.transaction()?;
@@ -98,7 +98,7 @@ pub async fn start(app: &App, bot: &Bot, run: &Run, tool: &str, mut args: Value)
     // Persist the ID before sending. A lost start response is reconciled by ID,
     // never by sending the command again.
     let response = if device.is_empty() {
-        vm::guest_screen(&app.config.vm, screen, "command_start", args).await
+        if screen==0 {vm::guest(&app.config.vm,"command_start",args).await} else {vm::guest_owned(app, &bot.id, screen, "command_start", args).await}
     } else {
         crate::local_access::call(app, bot, run, tool, args).await
     };

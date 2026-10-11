@@ -460,7 +460,8 @@ impl Guard for RuntimeGuard<'_> {
             !self.app.db.turn_deferred(&self.run.id)?,
             "Task is waiting for user input"
         );
-        let slot = self.app.db.screen(&self.bot.id)?;
+        let slot = self.app.db.existing_screen(&self.bot.id)?.ok_or_else(||anyhow::anyhow!("Browser computer reservation is unavailable"))?;
+        self.app.db.screen_identity(&self.bot.id,slot)?;
         ensure!(
             !self.app.db.screen_takeover(slot)?,
             "The user controls this desktop"
@@ -555,7 +556,7 @@ pub async fn call(app: &App, bot: &Bot, run: &Run, args: Value) -> Result<Value>
     // Keep the same lease, profile and pending-RPC interruption safeguards used
     // by the existing VM computer tools. Never launch or restart a browser here.
     let mut session = crate::desktop_sessions::enter(app, run, "computer_browser_task").await?;
-    let mut browser = match driver::GuestBrowser::connect(&app.config.vm, app.db.screen(&bot.id)?)
+    let mut browser = match driver::GuestBrowser::connect(app, &bot.id, crate::screen_capacity::reserve(app,&bot.id).await?)
         .await
     {
         Ok(browser) => browser,

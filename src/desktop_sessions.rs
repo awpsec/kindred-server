@@ -87,7 +87,10 @@ impl Drop for Cleanup<'_> {
         if !self.clean && self.app.desktop_sessions.pending_rpc(self.run) {
             // An interrupted guest RPC may outlive its SSH connection. Mark the
             // display unavailable before dropping ownership, including task abort.
-            let _ = self.app.db.screen_set_quiet(self.slot, db::now() + 65);
+            let current_slot=self.app.db.run(self.run).ok()
+                .and_then(|run|self.app.db.existing_screen(&run.bot_id).ok().flatten())
+                .unwrap_or(self.slot);
+            let _ = self.app.db.screen_set_quiet(current_slot,db::now()+65);
         }
         self.app.desktop_sessions.remove(self.run);
     }
@@ -107,7 +110,7 @@ pub fn uses_desktop(tool: &str, args: &serde_json::Value) -> bool {
 }
 pub async fn enter(app: &App, run: &Run, tool: &str) -> Result<OwnedMutexGuard<Session>> {
     let mut session = app.desktop_sessions.session(&run.id).lock_owned().await;
-    let slot = app.db.screen(&run.bot_id)?;
+    let slot = crate::screen_capacity::reserve(app,&run.bot_id).await?;
     ensure!(!app.db.cancelled(&run.id), "Run cancelled");
     if session.lease.is_none() {
         ensure!(

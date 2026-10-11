@@ -130,10 +130,19 @@ fn guest_receipt_error(tool: &str, error: anyhow::Error) -> anyhow::Error {
 pub async fn guest(config: &Vm, tool: &str, args: Value) -> Result<Value> {
     guest_screen(config, 1, tool, args).await
 }
-pub async fn guest_screen(config: &Vm, screen: i64, tool: &str, mut args: Value) -> Result<Value> {
+pub async fn guest_owned(app: &crate::runtime::App, bot: &str, screen: i64, tool: &str, args: Value) -> Result<Value> {
+    let _ownership = app.screen_ownership_lock(screen).read_owned().await;
+    let identity=app.db.screen_identity(bot,screen)?;
+    guest_screen_identity(&app.config.vm,screen,tool,args,Some(&identity)).await
+}
+pub async fn guest_screen(config: &Vm, screen: i64, tool: &str, args: Value) -> Result<Value> {
+    guest_screen_identity(config,screen,tool,args,None).await
+}
+pub(crate) async fn guest_screen_identity(config:&Vm,screen:i64,tool:&str,mut args:Value,identity:Option<&crate::screen_capacity::Identity>)->Result<Value> {
     ensure!((1..=32).contains(&screen), "Invalid screen");
     let mut cmd = ssh(config);
-    cmd.arg(format!("{} guest-rpc", config.guest_binary));
+    let tail=format!("{} guest-rpc",config.guest_binary);
+    cmd.arg(identity.map_or_else(||tail.clone(),|identity|crate::screen_capacity::command(identity,"dispatch",None,&tail)));
     // Older guest binaries set DISPLAY for every shell command. Unset it inside
     // the command as well, so headless semantics do not depend on a guest upgrade.
     if matches!(tool, "guest_exec" | "command_start") && args["use_desktop"] != true {

@@ -25,7 +25,7 @@ use tokio::{
 };
 
 pub struct VncState {
-    tickets: Mutex<HashMap<String, (i64, bool, i64)>>,
+    tickets: Mutex<HashMap<String, (i64, bool, crate::screen_capacity::Identity)>>,
     pub stop: broadcast::Sender<i64>,
     sessions: AtomicUsize,
 }
@@ -39,9 +39,15 @@ impl Default for VncState {
     }
 }
 impl VncState {
+    pub fn has_pending(&self,slot:i64)->bool {
+        self.tickets.lock().unwrap().values().any(|(expiry,_,actual)|*expiry>db::now() && actual.slot==slot)
+    }
     pub fn close_all(&self) {
         self.tickets.lock().unwrap().clear();
         let _ = self.stop.send(-1);
+    }
+    fn ticket_slot(&self,ticket:&str)->Option<i64> {
+        self.tickets.lock().unwrap().get(ticket).filter(|(expiry,_,_)|*expiry>db::now()).map(|(_,_,identity)|identity.slot)
     }
     pub fn has_ticket(&self, ticket: &str) -> bool {
         ticket.len() == 64
@@ -52,7 +58,7 @@ impl VncState {
                 .get(ticket)
                 .is_some_and(|(expiry, _, _)| *expiry > db::now())
     }
-    fn issue(&self, control: bool, slot: i64) -> anyhow::Result<String> {
+    fn issue(&self, control: bool, identity: crate::screen_capacity::Identity) -> anyhow::Result<String> {
         let mut tickets = self.tickets.lock().unwrap();
         tickets.retain(|_, (expiry, _, _)| *expiry > db::now());
         anyhow::ensure!(tickets.len() < 16, "Too many pending desktop connections");
@@ -61,10 +67,10 @@ impl VncState {
             uuid::Uuid::new_v4().simple(),
             uuid::Uuid::new_v4().simple()
         );
-        tickets.insert(ticket.clone(), (db::now() + 30, control, slot));
+        tickets.insert(ticket.clone(), (db::now() + 30, control, identity));
         Ok(ticket)
     }
-    fn consume(&self, ticket: &str) -> Option<(bool, i64)> {
+    fn consume(&self, ticket: &str) -> Option<(bool, crate::screen_capacity::Identity)> {
         self.tickets
             .lock()
             .unwrap()
@@ -84,7 +90,7 @@ pub struct DesktopRequest {
     bot_id: String,
 }
 pub async fn ticket(State(app): State<Shared>, Json(request): Json<DesktopRequest>) -> Response {
-    let slot = match crate::web::screen_slot(&app, &request.bot_id) {
+    let identity = match crate::web::screen_selection(&app, &request.bot_id).await {
         Ok(s) => s,
         Err(e) => {
             return (
@@ -94,6 +100,7 @@ pub async fn ticket(State(app): State<Shared>, Json(request): Json<DesktopReques
                 .into_response();
         }
     };
+    let slot=identity.slot;
     if request.control && !app.db.screen_takeover(slot).unwrap_or(false) {
         return (
             StatusCode::CONFLICT,
@@ -101,7 +108,9 @@ pub async fn ticket(State(app): State<Shared>, Json(request): Json<DesktopReques
         )
             .into_response();
     }
-    match app.vnc.issue(request.control, slot) {
+    let _ownership=app.screen_ownership_lock(slot).read_owned().await;
+    if app.db.screen_identity(&identity.owner,slot).ok().as_ref()!=Some(&identity) {return StatusCode::CONFLICT.into_response()};
+    match app.vnc.issue(request.control, identity) {
         Ok(ticket) => {
             Json(json!({"ticket":ticket,"control":request.control,"expires_in":30})).into_response()
         }
@@ -129,9 +138,14 @@ pub async fn upgrade(
     {
         return StatusCode::FORBIDDEN.into_response();
     }
-    let Some((control, slot)) = app.vnc.consume(&query.ticket) else {
+    let Some(selected_slot)=app.vnc.ticket_slot(&query.ticket) else {return StatusCode::UNAUTHORIZED.into_response()};
+    let ownership=app.screen_ownership_lock(selected_slot).read_owned().await;
+    let Some((control, identity)) = app.vnc.consume(&query.ticket) else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
+    let slot=identity.slot;
+    if app.db.screen_identity(&identity.owner,slot).ok().as_ref()!=Some(&identity) {return StatusCode::CONFLICT.into_response()};
+    if slot!=selected_slot {return StatusCode::UNAUTHORIZED.into_response()};
     if app.vnc.sessions.fetch_add(1, Ordering::SeqCst) >= 16 {
         app.vnc.sessions.fetch_sub(1, Ordering::SeqCst);
         return StatusCode::TOO_MANY_REQUESTS.into_response();
@@ -154,15 +168,15 @@ pub async fn upgrade(
     } else {
         None
     };
-    let guard = SessionGuard(app.clone());
+    let guard = SessionGuard(app.clone(),ownership);
     if control && !app.db.screen_takeover(slot).unwrap_or(false) {
         return StatusCode::CONFLICT.into_response();
     }
     ws.max_message_size(1024 * 1024)
         .max_frame_size(1024 * 1024)
-        .on_upgrade(move |socket| bridge(socket, app, control, slot, lease, guard, receiver))
+        .on_upgrade(move |socket| bridge(socket, app, control, identity, lease, guard, receiver))
 }
-struct SessionGuard(Shared);
+struct SessionGuard(Shared, tokio::sync::OwnedRwLockReadGuard<()>);
 impl Drop for SessionGuard {
     fn drop(&mut self) {
         self.0.vnc.sessions.fetch_sub(1, Ordering::SeqCst);
@@ -172,12 +186,14 @@ async fn bridge(
     mut socket: WebSocket,
     app: Shared,
     control: bool,
-    slot: i64,
+    identity: crate::screen_capacity::Identity,
     _lease: Option<OwnedMutexGuard<()>>,
     _guard: SessionGuard,
     mut stop: broadcast::Receiver<i64>,
 ) {
-    if crate::vm::guest_screen(&app.config.vm, slot, "screen_ensure", json!({}))
+    let slot=identity.slot;
+    if app.db.screen_identity(&identity.owner,slot).ok().as_ref()!=Some(&identity) {return}
+    if crate::vm::guest_screen_identity(&app.config.vm, slot, "screen_ensure", json!({}),Some(&identity))
         .await
         .is_err()
     {
@@ -236,15 +252,16 @@ mod tests {
     #[test]
     fn desktop_tickets_are_single_use_bounded_and_expire() {
         let state = VncState::default();
-        let ticket = state.issue(true, 1).unwrap();
-        assert_eq!(state.consume(&ticket), Some((true, 1)));
+        let identity=crate::screen_capacity::Identity{slot:1,owner:db::id(),generation:db::id(),legacy:true};
+        let ticket = state.issue(true, identity.clone()).unwrap();
+        assert_eq!(state.consume(&ticket), Some((true, identity.clone())));
         assert_eq!(state.consume(&ticket), None);
-        let expired = state.issue(false, 1).unwrap();
+        let expired = state.issue(false, identity.clone()).unwrap();
         state.tickets.lock().unwrap().get_mut(&expired).unwrap().0 = db::now() - 1;
         assert_eq!(state.consume(&expired), None);
         for _ in 0..16 {
-            state.issue(false, 1).unwrap();
+            state.issue(false, identity.clone()).unwrap();
         }
-        assert!(state.issue(false, 1).is_err());
+        assert!(state.issue(false, identity.clone()).is_err());
     }
 }

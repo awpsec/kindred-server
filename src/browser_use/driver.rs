@@ -1,5 +1,5 @@
 use super::{ActionReceipt, Browser, Candidate, Observation, Task, Work};
-use crate::{config::Vm, vm};
+use crate::vm;
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::{process::Stdio, time::Duration};
@@ -9,13 +9,17 @@ use tokio::{
 };
 
 pub struct GuestBrowser {
+    _ownership: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
     _child: Child,
     input: ChildStdin,
     output: BufReader<ChildStdout>,
 }
 impl GuestBrowser {
-    pub async fn connect(config: &Vm, screen: i64) -> Result<Self> {
+    pub async fn connect(app: &crate::runtime::App, bot:&str, screen: i64) -> Result<Self> {
         ensure!((1..=32).contains(&screen), "Invalid browser screen");
+        let ownership=app.screen_ownership_lock(screen).read_owned().await;
+        let identity=app.db.screen_identity(bot,screen)?;
+        let config=&app.config.vm;
         let source = include_str!("../../deploy/browser-driver.py");
         let observer = include_str!("../../deploy/browser-observer.js");
         let profile = if screen == 1 {
@@ -24,12 +28,13 @@ impl GuestBrowser {
             format!("/home/bot/.local/share/kindred/browser-{screen}")
         };
         let mut command = vm::ssh(config);
-        command.arg(format!(
+        let tail=format!(
             "python3 -u -c '{}' '{}' ':{}'",
             source.replace('\'', "'\"'\"'"),
             profile,
             screen
-        ));
+        );
+        command.arg(crate::screen_capacity::command(&identity,"dispatch",None,&tail));
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -39,6 +44,7 @@ impl GuestBrowser {
             .spawn()
             .context("Start browser observer in the bot VM")?;
         let mut driver = Self {
+            _ownership:Some(ownership),
             input: child.stdin.take().unwrap(),
             output: BufReader::new(child.stdout.take().unwrap()),
             _child: child,
@@ -70,6 +76,7 @@ impl GuestBrowser {
             .kill_on_drop(true);
         let mut child = command.spawn()?;
         let mut driver = Self {
+            _ownership:None,
             input: child.stdin.take().unwrap(),
             output: BufReader::new(child.stdout.take().unwrap()),
             _child: child,

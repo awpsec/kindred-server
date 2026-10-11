@@ -13,6 +13,8 @@ pub struct App {
     // Test selector override. Production credentials are account-scoped and read live.
     pub decisions: Option<Arc<dyn crate::browser_use::Decisions>>,
     pub decisions_account: std::sync::OnceLock<(std::sync::Weak<crate::profiles::Profiles>, String)>,
+    pub screen_ownerships: std::sync::Mutex<std::collections::HashMap<i64, Arc<tokio::sync::RwLock<()>>>>,
+    pub screen_allocations: Arc<tokio::sync::RwLock<()>>,
     pub desktop_sessions: crate::desktop_sessions::Sessions,
     pub profile_portal: std::sync::OnceLock<(std::sync::Weak<crate::profiles::Profiles>, String)>,
     pub mail_lock: Mutex<()>,
@@ -45,6 +47,8 @@ impl App {
         let app = Arc::new(Self {
             decisions: None,
             decisions_account: Default::default(),
+            screen_ownerships: Default::default(),
+            screen_allocations: Arc::new(tokio::sync::RwLock::new(())),
             desktop_sessions: Default::default(),
             profile_portal: Default::default(),
             mail_lock: Mutex::new(()),
@@ -64,6 +68,9 @@ impl App {
             *app.maintenance_leases.lock().unwrap() = Some(crate::vm_maintenance::leases(&app)?);
         }
         Ok(app)
+    }
+    pub fn screen_ownership_lock(&self,slot:i64)->Arc<tokio::sync::RwLock<()>> {
+        self.screen_ownerships.lock().unwrap().entry(slot).or_insert_with(||Arc::new(tokio::sync::RwLock::new(()))).clone()
     }
     pub fn screen_lock(&self, slot: i64) -> Arc<Mutex<()>> {
         if slot == 1 {
@@ -877,7 +884,7 @@ async fn call_tool_inner(
         }
         "computer_release" => json!({"text":"Desktop released. Continue other work; take a fresh screenshot before further desktop actions."}),
         "computer_screenshot" => {
-            let work = vm::guest_screen(&app.config.vm, app.db.screen(&bot.id)?, name, json!({"_page_session":run.id}));
+            let work = vm::guest_owned(app, &bot.id, crate::screen_capacity::reserve(app,&bot.id).await?, name, json!({"_page_session":run.id}));
             let mut result = desktop.as_mut().expect("desktop session").rpc(work).await?;
             if let Some(session) = &mut desktop { session.observed(&result); }
             if args["share_in_chat"] == true {
@@ -1205,7 +1212,13 @@ async fn call_tool_inner(
             }
             let input_action = matches!(name, "computer_click" | "computer_type" | "computer_key" | "computer_scroll");
             if input_action { args["observe"] = json!(true); }
-            let work = vm::guest_screen(&app.config.vm, app.db.screen(&bot.id)?, name, args);
+            let work = async {
+                if name=="guest_exec" && args["use_desktop"]!=true {
+                    vm::guest(&app.config.vm,name,args).await
+                } else {
+                    vm::guest_owned(app,&bot.id,crate::screen_capacity::reserve(app,&bot.id).await?,name,args).await
+                }
+            };
             if let Some(session) = &mut desktop {
                 // Invalidate the preceding image before dispatch. Failed capture
                 // or transport must not leave the old observation usable.
@@ -1409,7 +1422,7 @@ pub async fn scheduler(app: Shared) {
                 if bot.profile.archived {
                     continue;
                 }
-                let slot = app.db.screen(&bot.id)?;
+                let slot = app.db.existing_screen(&bot.id)?.unwrap_or(0);
                 let Ok(permit) = capacity.clone().try_acquire_owned() else {
                     break;
                 };
@@ -1457,7 +1470,7 @@ pub async fn scheduler(app: Shared) {
                             eprintln!("Could not save command wait: {e}");
                         }
                         if abrupt {
-                            app.db.screen_set_quiet(slot, db::now() + 65)?;
+                            app.db.screen_set_quiet(app.db.existing_screen(&run.bot_id)?.unwrap_or(slot), db::now() + 65)?;
                         }
                         match result {
                             Ok(output) => app.db.finish(&run.id, "completed", &output, "")?,
@@ -1548,6 +1561,7 @@ pub(crate) async fn drive_run<F: std::future::Future<Output = Result<String>>>(
                 let waiting = app.db.pending_user_task(&run.id)?;
                 let now = tokio::time::Instant::now();
                 if let Some(task) = waiting {
+                    let slot=app.db.existing_screen(&run.bot_id)?.unwrap_or(slot);
                     // The provider is blocked inside request_user_action. No guest tool is running.
                     lease.take();
                     app.desktop_sessions.release(&run.id);

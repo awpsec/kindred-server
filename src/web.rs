@@ -314,8 +314,13 @@ async fn status(
     State(app): State<Shared>,
     Query(screen): Query<ScreenQuery>,
 ) -> Result<Json<Value>> {
+    let slot = if !screen.bot_id.is_empty() {app.db.existing_screen(&screen.bot_id)?}
+        else if let Some(bot)=app.db.bots()?.into_iter().find(|b|!b.profile.archived) {app.db.existing_screen(&bot.id)?} else {None};
+    let takeover=slot.map(|slot|app.db.screen_takeover(slot)).transpose()?.unwrap_or(false);
+    let quiet=slot.map(|slot|app.db.screen_quiet(slot)).transpose()?.unwrap_or(0);
+    let busy=slot.is_some_and(|slot|app.screen_lock(slot).try_lock().is_err()) || quiet>db::now();
     Ok(Json(
-        json!({"primary_bot_id":crate::primary_bot::get(&app.db)?,"version":env!("CARGO_PKG_VERSION"),"vm":app.config.vm.domain,"maintenance":crate::vm_maintenance::state(&app.db)?,"control_pauses":crate::screen_control::paused(&app.db)?,"public_url":app.config.public_url,"takeover":app.db.screen_takeover(screen_slot(&app,&screen.bot_id)?)?,"openrouter_configured":crate::connections::openrouter_key(&app).is_some(),"openrouter_zdr":app.config.openrouter.require_zdr,"max_steps":app.config.task_action_limit(),"screen_bot_id":screen.bot_id,"computer_pointer":app.db.setting(&format!("computer-pointer:{}",screen.bot_id))?,"computer_busy":app.screen_lock(screen_slot(&app,&screen.bot_id)?).try_lock().is_err() || app.db.screen_quiet(screen_slot(&app,&screen.bot_id)?)?>db::now(),"computer_recovering_seconds":(app.db.screen_quiet(screen_slot(&app,&screen.bot_id)?)?-db::now()).max(0)}),
+        json!({"primary_bot_id":crate::primary_bot::get(&app.db)?,"version":env!("CARGO_PKG_VERSION"),"vm":app.config.vm.domain,"maintenance":crate::vm_maintenance::state(&app.db)?,"control_pauses":crate::screen_control::paused(&app.db)?,"public_url":app.config.public_url,"takeover":takeover,"openrouter_configured":crate::connections::openrouter_key(&app).is_some(),"openrouter_zdr":app.config.openrouter.require_zdr,"max_steps":app.config.task_action_limit(),"screen_bot_id":screen.bot_id,"computer_pointer":app.db.setting(&format!("computer-pointer:{}",screen.bot_id))?,"computer_busy":busy,"computer_recovering_seconds":(quiet-db::now()).max(0)}),
     ))
 }
 async fn bots(State(app): State<Shared>) -> Result<Json<Vec<Bot>>> {
@@ -937,24 +942,26 @@ pub struct ScreenQuery {
     #[serde(default)]
     pub bot_id: String,
 }
-pub fn screen_slot(app: &Shared, bot_id: &str) -> anyhow::Result<i64> {
-    if !bot_id.is_empty() {
-        return app.db.screen(bot_id);
-    }
-    if let Some(bot) = app.db.bots()?.into_iter().find(|b| !b.profile.archived) {
-        app.db.screen(&bot.id)
-    } else {
-        Ok(1)
-    }
+pub async fn screen_selection(app:&Shared,bot_id:&str)->anyhow::Result<crate::screen_capacity::Identity> {
+    let owner=if !bot_id.is_empty() {bot_id.to_owned()} else {
+        app.db.bots()?.into_iter().find(|bot|!bot.profile.archived).ok_or_else(||anyhow::anyhow!("Choose a bot before opening a computer"))?.id
+    };
+    let slot=crate::screen_capacity::reserve(app,&owner).await?;
+    app.db.screen_identity(&owner,slot)
 }
+pub async fn screen_slot(app:&Shared,bot_id:&str)->anyhow::Result<i64> {Ok(screen_selection(app,bot_id).await?.slot)}
+
 async fn screenshot(
     State(app): State<Shared>,
     Query(q): Query<ScreenQuery>,
 ) -> Result<Json<Value>> {
+    let identity=screen_selection(&app,&q.bot_id).await?;
+    let slot=identity.slot;
+    let owner=identity.owner;
     Ok(Json(
-        vm::guest_screen(
-            &app.config.vm,
-            screen_slot(&app, &q.bot_id)?,
+        vm::guest_owned(
+            &app, &owner,
+            slot,
             "computer_screenshot",
             json!({}),
         )
@@ -972,7 +979,10 @@ struct Takeover {
     control_id: Option<String>,
 }
 async fn takeover(State(app): State<Shared>, Json(v): Json<Takeover>) -> Result<Json<Value>> {
-    let slot = screen_slot(&app, &v.bot_id)?;
+    let identity=screen_selection(&app,&v.bot_id).await?;
+    let slot=identity.slot;
+    let _ownership=app.screen_ownership_lock(slot).read_owned().await;
+    require!(app.db.screen_identity(&identity.owner,slot)?==identity,"This computer ownership changed");
     screen_ready(&app, slot)?;
     let check_current = || -> anyhow::Result<()> {
         if !v.enabled
@@ -1011,7 +1021,8 @@ async fn takeover(State(app): State<Shared>, Json(v): Json<Takeover>) -> Result<
     Ok(Json(json!({"enabled":v.enabled,"screen":slot})))
 }
 async fn computer(State(app): State<Shared>, Json(v): Json<Value>) -> Result<Json<Value>> {
-    let slot = screen_slot(&app, v["bot_id"].as_str().unwrap_or(""))?;
+    let identity=screen_selection(&app,v["bot_id"].as_str().unwrap_or("")).await?;
+    let slot=identity.slot;
     screen_ready(&app, slot)?;
     require!(
         app.db.screen_takeover(slot)?,
@@ -1041,7 +1052,7 @@ async fn computer(State(app): State<Shared>, Json(v): Json<Value>) -> Result<Jso
         "Take control before sending input"
     );
     Ok(Json(
-        vm::guest_screen(&app.config.vm, slot, tool, v["args"].clone()).await?,
+        vm::guest_owned(&app, &identity.owner, slot, tool, v["args"].clone()).await?,
     ))
 }
 fn screen_ready(app: &Shared, slot: i64) -> Result<()> {
@@ -1453,7 +1464,7 @@ async fn enter_user_task_code(State(app): State<Shared>, Path(id): Path<String>,
     if let Some(length) = task.authentication.as_ref().and_then(|a| a["code_length"].as_u64()) {
         require!(code.len() == length as usize, "Enter the complete verification code with the expected character count");
     }
-    let slot = app.db.screen(&task.bot_id)?;
+    let slot = crate::screen_capacity::reserve(&app,&task.bot_id).await?;
     screen_ready(&app, slot)?;
     let lock = app.screen_lock(slot);
     let _lease = tokio::time::timeout(std::time::Duration::from_secs(15), lock.lock()).await
@@ -1462,11 +1473,11 @@ async fn enter_user_task_code(State(app): State<Shared>, Path(id): Path<String>,
     require!(current.status == "pending" && app.db.run(&current.run_id)?.status == "awaiting_user" && !app.db.screen_takeover(slot)?, "This verification step is no longer waiting, or the computer is under manual control");
     app.db.reserve_code_entry(&current)?;
     // Do not return guest output/errors: they may contain the supplied text.
-    if vm::guest_screen(&app.config.vm, slot, "computer_type", json!({"text":code})).await.is_err() {
+    if vm::guest_owned(&app, &task.bot_id, slot, "computer_type", json!({"text":code})).await.is_err() {
         return Err(anyhow::anyhow!("Could not confirm code entry. Check the computer before trying again.").into());
     }
     if current.authentication.as_ref().and_then(|a| a["submission"].as_str()) != Some("automatic") {
-        if vm::guest_screen(&app.config.vm, slot, "computer_key", json!({"key":"Return"})).await.is_err() {
+        if vm::guest_owned(&app, &task.bot_id, slot, "computer_key", json!({"key":"Return"})).await.is_err() {
             return Err(anyhow::anyhow!("Code entry may have succeeded, but submission could not be confirmed. Check the computer.").into());
         }
     }
@@ -1499,7 +1510,7 @@ async fn complete_user_task(
         task.status == "pending" && app.db.run(&task.run_id)?.status == "awaiting_user",
         "This subtask is no longer waiting"
     );
-    let slot = app.db.screen(&task.bot_id)?;
+    let slot = crate::screen_capacity::reserve(&app,&task.bot_id).await?;
     app.vnc.close_controls_for(slot);
     let lock = app.screen_lock(slot);
     let _lease = tokio::time::timeout(std::time::Duration::from_secs(15), lock.lock())

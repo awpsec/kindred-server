@@ -257,7 +257,7 @@ pub async fn execute_screen(tool: &str, args: &Value, screen: i64) -> Result<Val
         std::env::var("KINDRED_GUEST").as_deref() == Ok("1"),
         "guest tools require KINDRED_GUEST=1 inside the dedicated VM"
     );
-    if tool.starts_with("computer_") && tool != "computer_resources" {
+    if (tool.starts_with("computer_") && tool != "computer_resources") || (tool=="guest_exec" && args["use_desktop"]==true) {
         let mut cmd = Command::new("/usr/local/lib/kindred/ensure-screen");
         cmd.arg(screen.to_string());
         capture(cmd, None, 30, 4096).await?;
@@ -278,6 +278,25 @@ async fn execute_display(tool: &str, args: &Value, screen: i64) -> Result<Value>
     let browser = std::env::var("KINDRED_TEST_CUA_PROFILE").unwrap_or(browser);
     let session = args["_page_session"].as_str().unwrap_or("guest-local");
     match tool {
+        "screen_ownership_support" => {
+            #[cfg(not(unix))]
+            anyhow::bail!("Screen ownership requires the managed Linux guest");
+            #[cfg(unix)]
+            {
+            use std::os::unix::fs::MetadataExt;
+            let expected=crate::vm_maintenance::managed_launcher_hashes();
+            for (name,hash) in expected.as_object().unwrap() {
+                let path=std::path::Path::new("/usr/local/lib/kindred").join(name);
+                let info=std::fs::symlink_metadata(&path)?;
+                ensure!(info.is_file() && info.uid()==0 && info.mode()&0o777==0o755,"Managed screen launcher is missing or customized");
+                let bytes=std::fs::read(path)?;
+                let digest=ring::digest::digest(&ring::digest::SHA256,&bytes);
+                let actual=digest.as_ref().iter().map(|b|format!("{b:02x}")).collect::<String>();
+                ensure!(hash.as_str()==Some(&actual),"Update matching screen launchers before reusing reservations");
+            }
+            Ok(json!({"protocol":2,"launcher_hashes":expected}))
+            }
+        },
         "screen_ensure" => {
             let mut cmd = Command::new("/usr/local/lib/kindred/ensure-screen");
             cmd.arg(screen.to_string());

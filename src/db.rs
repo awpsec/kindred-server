@@ -273,6 +273,7 @@ impl Db {
         crate::workspace_artifacts::migrate(&c)?;
         crate::command_jobs::migrate(&c)?;
         crate::mobile_push::migrate(&c)?;
+        crate::screen_capacity::migrate(&c)?;
         crate::command_jobs::recover_waits(&c)?;
         // A saved wait ended its provider turn; it is safe to recover the wait,
         // not to replay the preceding command or provider session.
@@ -346,6 +347,7 @@ impl Db {
         validate_bot(b)?;
         let mut c = self.0.lock().unwrap();
         let tx = c.transaction()?;
+        ensure!(!tx.query_row("SELECT EXISTS(SELECT 1 FROM screen_reassignments WHERE old_owner=? OR new_owner=?)",params![b.id,b.id],|r|r.get::<_,bool>(0))?,"This bot computer ownership is being verified. Try again shortly.");
         let previous: Option<(String, String)> = tx.query_row(
             "SELECT provider,model FROM bots WHERE id=?", [&b.id],
             |r| Ok((r.get(0)?, r.get(1)?)),
@@ -466,9 +468,13 @@ impl Db {
             .unwrap()
             .query_row("SELECT * FROM runs WHERE id=?", [id], run_row)?)
     }
+    // Fixture allocation only. Production requires asynchronous guest ownership proof.
+    #[cfg(test)]
     pub fn screen(&self, bot: &str) -> Result<i64> {
         self.bot(bot)?;
-        let c = self.0.lock().unwrap();
+        let mut c = self.0.lock().unwrap();
+        let c = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        ensure!(!c.query_row("SELECT EXISTS(SELECT 1 FROM screen_reassignments WHERE new_owner=? OR old_owner=?)", params![bot,bot], |r|r.get::<_,bool>(0))?, "This computer reservation is being verified. Try again shortly.");
         if let Some(slot) = c
             .query_row("SELECT slot FROM screens WHERE bot_id=?", [bot], |r| {
                 r.get(0)
@@ -477,7 +483,7 @@ impl Db {
         {
             return Ok(slot);
         }
-        let slot: i64 = c.query_row("SELECT COALESCE(MAX(slot),0)+1 FROM screens", [], |r| {
+        let slot: i64 = c.query_row("SELECT COALESCE(MAX(slot),0)+1 FROM screen_ownership", [], |r| {
             r.get(0)
         })?;
         ensure!(
@@ -495,6 +501,8 @@ impl Db {
             "INSERT INTO screens(bot_id,slot,takeover) VALUES(?,?,?)",
             params![bot, slot, legacy],
         )?;
+        c.execute("INSERT INTO screen_ownership(slot,owner_id,generation,legacy) VALUES(?,?,?,1)",params![slot,bot,id()])?;
+        c.commit()?;
         Ok(slot)
     }
     pub fn screen_ids(&self) -> Result<Vec<i64>> {
