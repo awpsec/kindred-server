@@ -81,6 +81,11 @@ def bus_context(env, uid):
         if len(value) > 128 or not re.fullmatch(r'[A-Za-z0-9_:.+-]*', value):
             raise BrowserContextError('Desktop environment marker is invalid; preserve the browser.')
         context[key] = value
+    for key in ('KINDRED_SCREEN_OWNER','KINDRED_SCREEN_GENERATION'):
+        value=env.get(key,'')
+        if value and not re.fullmatch(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}',value):
+            raise BrowserContextError('Desktop ownership marker is invalid.')
+        context[key]=value
     return context
 
 
@@ -154,7 +159,16 @@ def prepare(screen, mode='restore', url=None, root=ROOT, environ=None, proc=Path
             # configured desktop markers; it never invents a replacement bus.
             time.sleep(0.05)
     private_directory(root, os.getuid())
-    profile = private_directory(root / ('browser' if screen == 1 else 'browser-' + str(screen)), os.getuid())
+    helper=Path('/usr/local/lib/kindred/screen-ownership.py')
+    if root==ROOT and helper.exists():
+        import importlib.util
+        spec=importlib.util.spec_from_file_location('ownership',helper)
+        ownership=importlib.util.module_from_spec(spec); spec.loader.exec_module(ownership)
+        with ownership.launch_guard(screen,root,context):
+            profile = private_directory(root / ('browser' if screen == 1 else 'browser-' + str(screen)), os.getuid())
+    else:
+        # Old runtimes retain legacy profiles; reclaim refuses missing helpers.
+        profile = private_directory(root / ('browser' if screen == 1 else 'browser-' + str(screen)), os.getuid())
     return {'args': browser_arguments(profile, mode, url), 'env': dict(context, DISPLAY=display)}
 
 

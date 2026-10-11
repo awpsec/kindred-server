@@ -18,7 +18,7 @@ LAUNCHERS = None
 def stage_launchers(root, payload):
     if payload is None:
         return []
-    names = ('browser-launch.py', 'desktop-launch', 'start-desktop.sh')
+    names = ('browser-launch.py', 'desktop-launch', 'start-desktop.sh', 'ensure-screen', 'screen-ownership.py')
     if set(payload) != set(names):
         raise RuntimeError('Incomplete managed browser launcher set.')
     staged = []
@@ -40,9 +40,11 @@ def stage_launchers(root, payload):
                 candidate = hashlib.sha256(source).hexdigest()
                 if digest == candidate and target.stat().st_mode & 0o777 == 0o755:
                     continue
-                if digest not in (candidate, value['previous_sha256']):
+                previous=value['previous_sha256']
+                accepted=previous if isinstance(previous,list) else [previous]
+                if digest not in [candidate,*accepted]:
                     raise RuntimeError('Customized browser launcher was retained.')
-            elif value['previous_sha256'] is not None:
+            elif value['previous_sha256'] is not None and not (isinstance(value['previous_sha256'],list) and None in value['previous_sha256']):
                 raise RuntimeError('Managed browser launcher is missing.')
             with tempfile.NamedTemporaryFile(dir=root, prefix='.kindred-launcher-', delete=False) as out:
                 temporary = Path(out.name)

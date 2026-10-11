@@ -10,6 +10,7 @@ impl Db {
     pub fn delete_archived_bot(&self, id: &str, expected_name: &str) -> Result<()> {
         let mut c = self.0.lock().unwrap();
         let tx = c.transaction()?;
+        ensure!(!tx.query_row("SELECT EXISTS(SELECT 1 FROM screen_reassignments WHERE old_owner=? OR new_owner=?)",params![id,id],|r|r.get::<_,bool>(0))?,"This bot computer ownership is being verified. Try again shortly.");
         ensure!(
             !crate::workspace_transfer::frozen(&tx)?,
             "This workspace is paused"

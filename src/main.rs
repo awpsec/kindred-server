@@ -250,3 +250,8 @@ async fn main() -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod screen_capacity_tests;
+
+mod screen_capacity;

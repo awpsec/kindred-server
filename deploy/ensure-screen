@@ -3,6 +3,12 @@ set -eu
 screen=${1:-1}
 case "$screen" in ''|*[!0-9]*) exit 2;; esac
 [ "$screen" -ge 1 ] && [ "$screen" -le 32 ] || exit 2
+python3 - "$screen" <<'PYGUARD'
+import importlib.util, sys
+spec=importlib.util.spec_from_file_location('ownership','/usr/local/lib/kindred/screen-ownership.py')
+m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+with m.launch_guard(int(sys.argv[1])): pass
+PYGUARD
 if [ "$screen" -gt 1 ]; then
     export XDG_RUNTIME_DIR=/run/user/$(id -u)
     export DBUS_SESSION_BUS_ADDRESS=unix:path=$XDG_RUNTIME_DIR/bus
