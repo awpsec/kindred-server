@@ -23,6 +23,28 @@ def software_fixture(root):
     return software
 
 class PowerIntentRecovery(unittest.TestCase):
+    def test_reboot_stopped_refuses_without_changing_power_intent_or_disk(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary);profile='00000000-0000-4000-8000-000000000001'
+            computer=root/profile/'computer';computer.mkdir(parents=True)
+            (computer/'disk.qcow2').write_bytes(b'preserved disk')
+            intent=computer/'power-intent.json';intent.write_text('{"running":false}')
+            with patch.object(manager,'ROOT',root),patch.object(manager.sys,'argv',['manager','reboot',profile]),patch.object(manager,'running',return_value=False),patch.object(manager,'qmp') as control:
+                with self.assertRaisesRegex(ValueError,'off.*Start the computer'):
+                    manager.main()
+                control.assert_not_called()
+            self.assertEqual(intent.read_text(),'{"running":false}')
+            self.assertEqual((computer/'disk.qcow2').read_bytes(),b'preserved disk')
+
+    def test_reboot_running_dispatches_once_and_returns_receipt(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary);profile='00000000-0000-4000-8000-000000000001';output=__import__('io').StringIO()
+            with patch.object(manager,'ROOT',root),patch.object(manager.sys,'argv',['manager','reboot',profile]),patch.object(manager,'running',return_value=True),patch.object(manager,'qmp') as control,contextlib.redirect_stdout(output):
+                manager.main()
+                control.assert_called_once_with(root/profile/'computer','system_reset')
+            self.assertEqual(json.loads(output.getvalue()),{'state':'restarting'})
+            self.assertTrue(json.loads((root/profile/'computer/power-intent.json').read_text())['running'])
+
     def test_restore_isolated_preserves_stopped_and_retired(self):
         with tempfile.TemporaryDirectory() as temporary:
             root=Path(temporary)

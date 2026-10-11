@@ -479,8 +479,11 @@ def main():
                 else: raise ValueError('The computer is still setting up. Wait a few minutes and retry; its disk and setup progress are preserved.')
             print(json.dumps({'state':'running','id':profile,'resources':{k:settings[k] for k in ('cpus','memory_mb','disk_gb')}}))
         else:
+            is_running=running(root)
+            if action=='reboot' and not is_running:
+                raise ValueError('The bot computer is off. Start the computer before restarting it.')
             atomic(root/'power-intent.json',{'running':action!='shutdown'})
-            if running(root): qmp(root,'system_powerdown' if action=='shutdown' else 'system_reset')
+            if is_running: qmp(root,'system_powerdown' if action=='shutdown' else 'system_reset')
             if action=='shutdown':
                 # Keep the operation lock until QEMU exits. A message sent during
                 # shutdown then starts the same disk after shutdown has finished.
