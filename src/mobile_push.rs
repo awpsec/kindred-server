@@ -449,7 +449,23 @@ pub async fn deliver(db: &Db, transport: Arc<dyn Transport>) -> Result<usize> {
     let mut failure = None;
     for chunk in pushes.chunks(PARALLEL_SENDS) {
         let mut set = tokio::task::JoinSet::new();
+        // A previous chunk may have waited on the network while this event was
+        // dismissed or muted. Only already-started sends remain in flight.
+        let mut eligible = std::collections::HashMap::new();
         for push in chunk.iter().cloned() {
+            let allowed = match eligible.get(&push.event_id) {
+                Some(value) => *value,
+                None => match still_eligible(db, push.event_id) {
+                    Ok(value) => { eligible.insert(push.event_id, value); value }
+                    Err(error) => { failure.get_or_insert(error); continue; }
+                }
+            };
+            if !allowed {
+                if let Err(error) = db.0.lock().unwrap().execute("DELETE FROM mobile_push_outbox WHERE installation=? AND event_id=?", params![push.installation, push.event_id]) {
+                    failure.get_or_insert(error.into());
+                }
+                continue;
+            }
             let transport = transport.clone();
             set.spawn(async move {
                 let outcome = tokio::time::timeout(Duration::from_secs(30), transport.send(&push))

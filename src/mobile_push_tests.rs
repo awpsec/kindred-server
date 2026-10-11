@@ -515,3 +515,46 @@ fn reminders_push_text_and_schedule_once_and_dismissal_cancels_unsent_pushes() {
     assert!(due(&db,BOTH).unwrap().is_empty());
     assert!(outbox(&db).is_empty());
 }
+
+
+
+#[tokio::test]
+async fn dismissal_between_chunks_suppresses_not_started_devices() {
+    struct DismissOnEighth { db: Arc<Db>, chat: String, reminder: String, calls: std::sync::atomic::AtomicUsize }
+    impl Transport for DismissOnEighth {
+        fn platforms(&self) -> Platforms { BOTH }
+        fn send<'a>(&'a self, _: &'a Push) -> SendFuture<'a> {
+            let n=self.calls.fetch_add(1,std::sync::atomic::Ordering::SeqCst)+1;
+            if n==PARALLEL_SENDS {
+                self.db.reminder_update(&self.chat,None,&self.reminder,json!({"expected_revision":2,"dismiss":true})).unwrap();
+            }
+            Box::pin(async { Outcome::Delivered })
+        }
+    }
+    let db=Arc::new(Db::open(":memory:").unwrap()); let b=bot(&db,"codex");
+    for i in 0..PARALLEL_SENDS+1 { device(&db,&db::id(),"android",&format!("synthetic-device-token-{i}"),b"session"); }
+    collect(&db,&live,BOTH).unwrap();
+    let id=db.queue(&b.id,"Set reminder",0).unwrap();let run=db.run(&id).unwrap();
+    let a=db.reminder_set(&run,json!({"key":"chunk-review","message":"Synthetic reminder","local_time":"2099-09-10T12:00","timezone":"UTC"})).unwrap();
+    db.tick_reminders(a["run_at"].as_i64().unwrap()).unwrap();
+    assert_eq!(collect(&db,&live,BOTH).unwrap(),PARALLEL_SENDS+1);
+    let transport=Arc::new(DismissOnEighth { db:db.clone(),chat:run.chat_id,reminder:a["id"].as_str().unwrap().into(),calls:Default::default() });
+    deliver(&db,transport.clone()).await.unwrap();
+    assert_eq!(transport.calls.load(std::sync::atomic::Ordering::SeqCst),PARALLEL_SENDS,"Ninth device had not started when dismissal committed; it must not be sent");
+}
+
+#[test]
+fn retry_dismissal_and_first_attempt_mute_remove_unsent_alerts() {
+    for dismiss in [false,true] {
+        let db=Db::open(":memory:").unwrap();let b=bot(&db,"codex");
+        device(&db,&db::id(),"ios",IOS_TOKEN,b"session");collect(&db,&live,BOTH).unwrap();
+        let id=db.queue(&b.id,"Set reminder",0).unwrap();let run=db.run(&id).unwrap();
+        let a=db.reminder_set(&run,json!({"key":"review","message":"**Synthetic** text","local_time":"2099-01-10T12:00","timezone":"America/New_York"})).unwrap();
+        db.tick_reminders(a["run_at"].as_i64().unwrap()).unwrap();assert_eq!(collect(&db,&live,BOTH).unwrap(),1);
+        let p=due(&db,BOTH).unwrap().remove(0);
+        assert_eq!(apns_payload(&p)["aps"]["alert"]["body"],"Reminder · Jan 10, 12:00 PM EST\nSynthetic text");
+        if dismiss {record(&db,&p,Outcome::Retry{after:None}).unwrap();db.0.lock().unwrap().execute("UPDATE mobile_push_outbox SET next_attempt=0",[]).unwrap();db.reminder_update(&run.chat_id,None,a["id"].as_str().unwrap(),json!({"expected_revision":2,"dismiss":true})).unwrap();}
+        else {db.mute_notifications("chat",&run.chat_id,-1).unwrap();}
+        assert!(due(&db,BOTH).unwrap().is_empty());assert!(outbox(&db).is_empty());
+    }
+}
