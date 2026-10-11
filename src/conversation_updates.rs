@@ -810,7 +810,7 @@ pub fn record_runtime_context(db: &Db, run: &Run) -> Result<Option<Value>> {
 }
 
 pub fn with_live_context(db: &Db, run: &Run, mut result: Value) -> Result<Value> {
-    if result["deferred_question"] == true || result["finish_quietly"] == true {
+    if result["deferred_question"] == true || result["finish_quietly"] == true || result["routine_complete"] == true {
         return Ok(result);
     }
     let runtime_context = record_runtime_context(db, run).ok().flatten();

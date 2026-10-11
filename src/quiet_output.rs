@@ -25,7 +25,7 @@ pub fn is_marker(text: &str) -> bool {
 // None means an ordinary reply. Some("") means no message; a nonempty replacement
 // preserves failed checks or file delivery instead of showing a blank bubble.
 pub fn routine_replacement(c: &Connection, run: &str, text: &str) -> Result<Option<&'static str>> {
-    if !is_marker(text) {
+    if crate::routine_completion::root(c, run)?.is_some() || !is_marker(text) {
         return Ok(None);
     }
     let routine: bool = c.query_row(

@@ -255,6 +255,7 @@ impl Db {
         crate::commands::migrate(&c)?;
         crate::schedules::migrate(&c)?;
         crate::provider_inbox::migrate(&c)?;
+        crate::routine_completion::migrate(&c)?;
         crate::chats::migrate(&c)?;
         crate::workspace_transfer::migrate(&c)?;
         crate::workspace_import::migrate(&c)?;
@@ -291,7 +292,7 @@ impl Db {
             "UPDATE approvals SET status='expired' WHERE status='pending'",
             [],
         )?;
-        c.execute_batch("INSERT INTO chat_messages(chat_id,sender,body,kind,run_id,created) SELECT chat_id,bot_id,CASE WHEN error='' THEN output ELSE error END,'result',id,max(created,COALESCE((SELECT max(m.created) FROM chat_messages m WHERE m.run_id=runs.id),created)) FROM runs WHERE chat_id!='' AND status IN ('completed','failed','interrupted','cancelled') AND NOT EXISTS(SELECT 1 FROM chat_messages WHERE run_id=runs.id AND kind='result') AND NOT (status='completed' AND error='' AND (trim(output)='' OR EXISTS(SELECT 1 FROM routine_runs WHERE run_id=runs.id AND quiet=1) OR EXISTS(SELECT 1 FROM events WHERE run_id=runs.id AND kind IN ('question_wait','process_wait'))));")?;
+        c.execute_batch("INSERT INTO chat_messages(chat_id,sender,body,kind,run_id,created) SELECT chat_id,bot_id,CASE WHEN error='' THEN output ELSE error END,'result',id,max(created,COALESCE((SELECT max(m.created) FROM chat_messages m WHERE m.run_id=runs.id),created)) FROM runs WHERE chat_id!='' AND status IN ('completed','failed','interrupted','cancelled') AND NOT EXISTS(SELECT 1 FROM routine_execution WHERE run_id=runs.id) AND NOT EXISTS(SELECT 1 FROM chat_messages WHERE run_id=runs.id AND kind='result') AND NOT (status='completed' AND error='' AND (trim(output)='' OR EXISTS(SELECT 1 FROM routine_runs WHERE run_id=runs.id AND quiet=1) OR EXISTS(SELECT 1 FROM events WHERE run_id=runs.id AND kind IN ('question_wait','process_wait'))));")?;
         crate::chats::repair_projection(&c)?;
         crate::routine_controls::remove_archived_bot_schedules(&c)?;
         crate::chats::archive_inactive_bot_chats(&c)?;
@@ -587,6 +588,10 @@ impl Db {
     pub fn finish(&self, id: &str, status: &str, output: &str, error: &str) -> Result<()> {
         let mut c = self.0.lock().unwrap();
         let c = c.transaction()?;
+        if !crate::routine_completion::current(&c,id)? {c.commit()?;return Ok(());}
+        if crate::routine_completion::root(&c,id)?.is_some() && c.query_row("SELECT status IN ('completed','failed','interrupted','cancelled') FROM runs WHERE id=?",[id],|r|r.get::<_,bool>(0))? {c.commit()?;return Ok(());}
+        let finalized=crate::routine_completion::finalize(&c,id,status,output,error)?;
+        let (status,output,error)=finalized.as_ref().map(|v|(v.0.as_str(),v.1.as_str(),v.2.as_str())).unwrap_or((status,output,error));
         c.execute("UPDATE user_tasks SET status='expired' WHERE run_id=? AND status IN ('pending','ready')", [id])?;
         // Stop may be recorded after the provider returns but before completion
         // is saved. Keep it authoritative in the same transaction as cleanup.
@@ -599,6 +604,8 @@ impl Db {
             [id],
         )?;
         c.execute("UPDATE connector_artifacts SET status='interrupted',revision=revision+1 WHERE run_id=? AND status IN ('preparing','pending','approved','ready','executing')",[id])?;
+        let completed:bool=c.query_row("SELECT status='completed' AND error='' FROM runs WHERE id=?",[id],|r|r.get(0))?;
+        crate::routine_completion::publish(&c,id,completed)?;
         c.execute("INSERT OR IGNORE INTO chat_completion_pending SELECT id FROM runs WHERE id=? AND chat_id!='' AND status IN ('completed','failed','interrupted','cancelled')", [id])?;
         c.commit()?;
         Ok(())
@@ -722,13 +729,14 @@ impl Db {
         let mut c = self.0.lock().unwrap();
         let tx = c.transaction()?;
         let created = now();
+        if kind=="run_finished" && crate::routine_completion::root(&tx,run)?.is_some() && (!crate::routine_completion::current(&tx,run)? || tx.query_row("SELECT EXISTS(SELECT 1 FROM events WHERE run_id=? AND kind='run_finished')",[run],|r|r.get::<_,bool>(0))?) {tx.commit()?;return Ok(());}
         tx.execute(
             "INSERT INTO events(run_id,kind,body,created) VALUES(?,?,?,?)",
             params![run, kind, body.to_string(), created],
         )?;
         if kind == "assistant"
             && !tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM routine_runs WHERE run_id=?)",
+                "SELECT EXISTS(SELECT 1 FROM routine_runs WHERE run_id=?1) OR EXISTS(SELECT 1 FROM routine_execution WHERE run_id=?1)",
                 [run],
                 |r| r.get::<_, bool>(0),
             )?
@@ -947,6 +955,7 @@ impl Db {
                     "INSERT INTO routine_runs(run_id,routine_id) VALUES(?,?)",
                     params![run_id, routine],
                 )?;
+                crate::routine_completion::register(&tx,&run_id,&run_id)?;
                 crate::commands::snapshot_routine(&tx, &run_id, &prompt)?;
                 crate::provider_inbox::snapshot(&tx, &run_id, &routine)?;
                 if run_at.is_some() {

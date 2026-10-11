@@ -138,7 +138,7 @@ async fn run_worker(
         .spawn().context("Start the Pi harness. Install the pinned Node runtime and harness dependencies; no alternate provider was used")?;
     let mut input = child.stdin.take().unwrap();
     let mut output = BufReader::new(child.stdout.take().unwrap());
-    let tools = runtime::tool_specs_for(app, bot);
+    let tools = runtime::tool_specs_for_run(app, bot, run);
     let allowed: HashSet<String> = tools
         .iter()
         .filter_map(|t| t["name"].as_str().map(str::to_owned))
@@ -234,7 +234,7 @@ async fn run_worker(
                     .await
                     .unwrap_or_else(|e| json!({"text":e.to_string(),"failed":true}));
                 let end_turn = tool_result["deferred_question"] == true
-                    || tool_result["finish_quietly"] == true
+                    || tool_result["finish_quietly"] == true || tool_result["routine_complete"] == true
                     || tool_result["deferred_process"] == true;
                 if end_turn {
                     // The question card or quiet-completion receipt is the outcome.
@@ -629,18 +629,19 @@ mod workflow_delivery_tests {
                 "No game today. Finishing quietly.",
                 Some(("finish_quietly", json!({}))),
             ),
-            ("result", 0) => (
+            ("result" | "omission", 0) => (
                 "Let me check today's date and schedule.",
                 Some(("skills_list", json!({}))),
             ),
-            ("result", 1) => (
+            ("result" | "omission", 1) => (
                 "Checking the second source.",
                 Some(("commands_list", json!({}))),
             ),
             ("result", 2) => (
                 "Yankees play today. First pitch: 7:08 PM ET. Lineups are not posted.",
-                None,
+                Some(("routine_complete",json!({"outcome":"report","report":"Yankees play today. First pitch: 7:08 PM ET. Lineups are not posted."}))),
             ),
+            ("omission",2)=>("Unclassified no-change prose",None),
             ("create", 0) => (
                 "I will save this reusable review.",
                 Some((
@@ -671,7 +672,7 @@ mod workflow_delivery_tests {
     }
     #[tokio::test]
     async fn real_sdk_routines_deliver_only_one_final_result_or_nothing() {
-        for mode in ["quiet", "result"] {
+        for mode in ["quiet", "result", "omission"] {
             let app = crate::tests::app();
             let bot = crate::tests::bot(&app.db, "openrouter");
             let routine = crate::db::Routine {
@@ -713,11 +714,18 @@ mod workflow_delivery_tests {
                 assert!(output.is_empty());
                 assert!(messages.is_empty());
                 assert_eq!(calls.load(Ordering::SeqCst), 2);
-            } else {
-                assert!(output.starts_with("Yankees play today."));
+            } else if mode=="result" {
+                assert!(output.is_empty());
+                let done=app.db.run(&run.id).unwrap();
+                assert!(done.output.starts_with("Yankees play today."));
                 assert_eq!(messages.len(), 1);
-                assert_eq!(messages[0]["text"], output);
+                assert_eq!(messages[0]["text"], done.output);
                 assert_eq!(calls.load(Ordering::SeqCst), 3);
+            } else {
+                let done=app.db.run(&run.id).unwrap();
+                assert_eq!(done.status,"failed");assert!(done.error.contains("did not classify"));
+                assert_eq!(messages.len(),1);assert!(!messages[0]["text"].as_str().unwrap().contains("Unclassified no-change prose"));
+                assert_eq!(calls.load(Ordering::SeqCst),3);
             }
             assert!(
                 app.db

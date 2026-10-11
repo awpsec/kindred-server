@@ -85,8 +85,12 @@ impl App {
     }
 }
 
-pub fn tool_specs_for(app: &App, bot: &Bot) -> Vec<Value> {
+pub fn tool_specs_for(app: &App, bot: &Bot) -> Vec<Value> { tool_specs_scoped(app,bot,None) }
+pub fn tool_specs_for_run(app: &App, bot: &Bot, run: &Run) -> Vec<Value> { tool_specs_scoped(app,bot,Some(&run.id)) }
+fn tool_specs_scoped(app: &App, bot: &Bot, run_id: Option<&str>) -> Vec<Value> {
     let mut specs = tool_specs();
+    let scheduled=app.db.0.lock().unwrap().query_row("SELECT EXISTS(SELECT 1 FROM runs r WHERE r.bot_id=?1 AND (?2 IS NULL OR r.id=?2) AND r.status IN ('queued','running','awaiting_user','awaiting_approval') AND (EXISTS(SELECT 1 FROM routine_runs WHERE run_id=r.id) OR EXISTS(SELECT 1 FROM routine_execution WHERE run_id=r.id)))",rusqlite::params![bot.id,run_id],|r|r.get::<_,bool>(0)).unwrap_or(false);
+    if !scheduled { specs.retain(|s|s["name"]!="routine_complete"); }
     if crate::browser_use::preferred(app, bot) {
         specs.push(crate::browser_use::spec());
     }
@@ -129,6 +133,12 @@ pub fn tool_specs() -> Vec<Value> {
             "Read your saved decisions and unanswered questions in this conversation. Supply a topic_key to find an older exact topic; omission returns the latest 50. is_current_continuation=true means THIS task owns the newly chosen action and should carry it out. Answered means the user chose, not that the action succeeded. If another task owns the continuation, do not execute it again from a later routine check. Reuse pending cards and respect recorded answers.",
             json!({"topic_key":{"type":"string","maxLength":160}}),
             vec![],
+        ),
+        (
+            "routine_complete",
+            "Finish this scheduled check: quiet has no report; report/error need nonempty report text. Ends the turn. Server owns occurrence identity; no run IDs. Direct tasks cannot use this.",
+            json!({"outcome":{"type":"string","enum":["quiet","report","error"]},"report":{"type":"string","maxLength":16000}}),
+            vec!["outcome"],
         ),
         (
             "finish_quietly",
@@ -790,17 +800,27 @@ async fn call_tool_inner(
         "inbox_monitor_save" => {
             json!({"text":serde_json::to_string(&crate::mail_watch::save_for_bot(app,bot,&args).await?)?})
         }
+        "routine_complete" => {
+            if args["outcome"]=="quiet" {crate::provider_inbox::verify_success(&app.db,run)?;}
+            let mut c=app.db.0.lock().unwrap();let tx=c.transaction()?;
+            let value=crate::routine_completion::complete(&tx,&run.id,&args)?;tx.commit()?;value
+        }
         "finish_quietly" => {
             crate::provider_inbox::verify_success(&app.db, run)?;
-            let c = app.db.0.lock().unwrap();
-            let routine =
-                c.execute("UPDATE routine_runs SET quiet=1 WHERE run_id=?", [&run.id])? == 1;
+            let mut connection = app.db.0.lock().unwrap();
+            let c=connection.transaction()?;
+            let routine:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM routine_runs WHERE run_id=?)",[&run.id],|r|r.get(0))?;
+            if routine && crate::routine_completion::root(&c,&run.id)?.is_some() {
+                crate::routine_completion::complete(&c,&run.id,&json!({"outcome":"quiet"}))?;
+            } else if routine {c.execute("UPDATE routine_runs SET quiet=1 WHERE run_id=?",[&run.id])?;}
+
             let decision:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM questions WHERE continuation_run_id=?1 AND bot_id=?2 AND (chat_id=?3 OR delivery_chat_id=?3) AND status='answered')",rusqlite::params![run.id,bot.id,run.chat_id],|r|r.get(0))?;
             let shared:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM chats WHERE id=?1 AND id NOT LIKE 'dm-%' AND EXISTS(SELECT 1 FROM json_each(members) WHERE value=?2))",rusqlite::params![run.chat_id,bot.id],|r|r.get(0))?;
             ensure!(
                 routine || decision || shared,
                 "Only a routine, shared conversation or assigned question continuation can finish quietly"
             );
+            c.commit()?;
             json!({"finish_quietly":true,"text":"Finished quietly. No additional reply or completion notification is needed."})
         }
         "read_attachment" => crate::uploads::read(app, run, string(&args, "id")?).await?,
@@ -1380,7 +1400,7 @@ fn tool_activity(b: &Value) -> (&'static str, &'static str) {
 }
 #[cfg(test)]
 pub fn instructions(app: &App, bot: &Bot, run: &Run) -> Result<String> {
-    instructions_for(app, bot, run, &tool_specs_for(app, bot), None)
+    instructions_for(app, bot, run, &tool_specs_for_run(app, bot, run), None)
 }
 pub fn instructions_for(
     app: &App,

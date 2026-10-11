@@ -202,6 +202,7 @@ impl crate::db::Db {
             "INSERT INTO routine_runs(run_id,routine_id) VALUES(?,?)",
             rusqlite::params![run, id],
         )?;
+        crate::routine_completion::register(&tx,&run,&run)?;
         crate::commands::snapshot_routine(&tx, &run, &prompt)?;
         crate::provider_inbox::snapshot(&tx, &run, id)?;
         // Running a one-time reminder early consumes that single occurrence.

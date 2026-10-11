@@ -558,3 +558,16 @@ fn retry_dismissal_and_first_attempt_mute_remove_unsent_alerts() {
         assert!(due(&db,BOTH).unwrap().is_empty());assert!(outbox(&db).is_empty());
     }
 }
+#[test]
+fn structured_quiet_occurrence_does_not_queue_native_completion_push() {
+    let db=Db::open(":memory:").unwrap();let bot=bot(&db,"codex");
+    device(&db,"0f8fad5b-d9cb-469f-a165-70867728950e","ios",IOS_TOKEN,b"synthetic-session");
+    collect(&db,&live,BOTH).unwrap();
+    let run=db.queue(&bot.id,"Synthetic scheduled check",0).unwrap();
+    {let mut c=db.0.lock().unwrap();let tx=c.transaction().unwrap();
+    tx.execute("INSERT INTO routine_runs VALUES(?,'synthetic',0)",[&run]).unwrap();
+    crate::routine_completion::register(&tx,&run,&run).unwrap();
+    crate::routine_completion::complete(&tx,&run,&json!({"outcome":"quiet"})).unwrap();tx.commit().unwrap();}
+    db.finish(&run,"completed","No-change provisional","").unwrap();db.event(&run,"run_finished",json!({})).unwrap();
+    assert_eq!(collect(&db,&live,BOTH).unwrap(),0);assert!(outbox(&db).is_empty());
+}

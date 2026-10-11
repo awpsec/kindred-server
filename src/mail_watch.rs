@@ -857,6 +857,7 @@ pub fn queue_pending(db: &Db) -> Result<()> {
             "INSERT INTO routine_runs VALUES(?,?,0)",
             params![run, format!("mail:{id}")],
         )?;
+        crate::routine_completion::register(&tx,&run,&run)?;
         tx.execute("INSERT INTO mail_runs VALUES(?,?,'mail')", params![run, id])?;
         for (message, _) in rows {
             tx.execute("UPDATE mail_receipts SET run_id=? WHERE watch_id=? AND message_id=? AND run_id IS NULL",params![run,id,message])?;

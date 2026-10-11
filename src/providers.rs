@@ -214,7 +214,7 @@ async fn codex_rpc(app: &App, bot: &Bot, run: &Run, rpc: &mut Rpc) -> Result<Str
     );
     let models = codex_models(rpc).await?;
     let (model, effort) = codex_selection(&models, &bot.model, &bot.reasoning_effort)?;
-    let tools = runtime::tool_specs_for(app, bot);
+    let tools = runtime::tool_specs_for_run(app, bot, run);
     let effective = rpc
         .request(
             "config/read",
@@ -269,7 +269,7 @@ async fn codex_rpc(app: &App, bot: &Bot, run: &Run, rpc: &mut Rpc) -> Result<Str
                         .unwrap_or_else(|e| json!({"text":e.to_string(),"failed":true}))
                     };
                     end_turn = result["deferred_question"] == true
-                        || result["finish_quietly"] == true
+                        || result["finish_quietly"] == true || result["routine_complete"] == true
                         || result["deferred_process"] == true;
                     codex_tool_result(&result)
                 }
