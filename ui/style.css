@@ -4956,3 +4956,13 @@ html[data-motion=off] #notice.continuation-confirmation{animation:none}
 .conversation-header:has(>.chat-window-drag)>.bot-heading{flex:0 1 auto;max-width:none;margin-right:0;}
 .chat-window-drag{align-self:stretch;flex:1 0 48px;user-select:none;}
 .conversation-header:has(>.chat-window-drag)>.header-actions{flex:none;}
+
+/* iOS conversation text shares one reading size across chat and decisions.
+   Keep Dynamic Type's multiplier; desktop density and document typography stay separate. */
+html[data-system-text-size]{--conversation-reading-size:calc(16px * var(--text-scale,1));--conversation-secondary-size:calc(14px * var(--text-scale,1))}
+html[data-system-text-size] .message-row:not(.summary-progress-update)>.message-bubble,
+html[data-system-text-size] .request-tray :is(.request-tray-heading,.request-tray-preview,.question-title,.question-option,.question-receipt),
+html[data-system-text-size] #composer #prompt{font-size:var(--conversation-reading-size)}
+html[data-system-text-size] .request-tray :is(.question-context,.question-details,.question-custom,.question-dismiss){font-size:var(--conversation-secondary-size)}
+html[data-system-text-size] .request-tray .question-response textarea{font-size:var(--conversation-reading-size)}
+html[data-system-text-size] .summary-progress-body .message-bubble{font-size:inherit}
