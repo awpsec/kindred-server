@@ -338,7 +338,9 @@ pub fn resume(db: &Db) -> Result<()> {
                 )?;
                 crate::collaboration::reattach(&tx, &id, &next)?;
                 tx.execute("UPDATE collaboration_requests SET parent_run_id=? WHERE parent_run_id=? AND continuation_run_id=''",params![next,id])?;
-                tx.execute("INSERT INTO routine_runs(run_id,routine_id,quiet) SELECT ?1,routine_id,0 FROM routine_runs WHERE run_id=?2",params![next,id])?;
+                let recovery=crate::task_recovery::metadata(&tx,&id,"task_recovery")?;
+                let root=crate::routine_completion::root(&tx,&id)?.unwrap_or_else(||recovery.as_ref().and_then(|v|v["root_run_id"].as_str()).unwrap_or(&id).to_owned());
+                crate::routine_completion::inherit(&tx,&id,&next,&root)?;
                 tx.execute("INSERT INTO provider_inbox_runs(run_id,body) SELECT ?1,body FROM provider_inbox_runs WHERE run_id=?2",params![next,id])?;
                 tx.execute("INSERT INTO run_commands(run_id,receipt) SELECT ?1,receipt FROM run_commands WHERE run_id=?2",params![next,id])?;
             }

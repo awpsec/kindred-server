@@ -119,7 +119,7 @@ pub async fn run(app: &App, bot: &Bot, run: &Run) -> Result<String> {
         .spawn()?;
     let mut input = child.stdin.take().unwrap();
     let mut output = BufReader::new(child.stdout.take().unwrap());
-    let tools = runtime::tool_specs_for(app, bot);
+    let tools = runtime::tool_specs_for_run(app, bot, run);
     let allowed: HashSet<_> = tools
         .iter()
         .filter_map(|t| t["name"].as_str().map(str::to_owned))
@@ -377,7 +377,7 @@ pub async fn run(app: &App, bot: &Bot, run: &Run) -> Result<String> {
                     .await
                     .unwrap_or_else(|e| json!({"text":e.to_string(),"failed":true}));
                 if result["deferred_question"] == true
-                    || result["finish_quietly"] == true
+                    || result["finish_quietly"] == true || result["routine_complete"] == true
                     || result["deferred_process"] == true
                 {
                     return Ok(String::new());

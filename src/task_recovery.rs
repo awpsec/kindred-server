@@ -100,7 +100,8 @@ impl Db {
         // A fresh user follow-up after Stop may already be handling the handoff.
         // Reuse only the immediate next turn for this bot, in the same chat;
         // never absorb a routine, command, teammate message or completed work.
-        let followup: Option<String> = if status == "cancelled" {
+        let scheduled:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM routine_runs WHERE run_id=?)",[root],|r|r.get(0))?;
+        let followup: Option<String> = if status == "cancelled" && !scheduled {
             tx.query_row("SELECT r.id FROM runs r JOIN run_message_sources s ON s.run_id=r.id JOIN chat_messages m ON m.seq=s.message_seq WHERE r.bot_id=?1 AND r.chat_id=?2 AND r.status IN ('queued','running','awaiting_user','awaiting_approval') AND r.created>=?3 AND EXISTS(SELECT 1 FROM events WHERE run_id=?4 AND kind='run_stop_requested' AND created>=?5) AND r.rowid=(SELECT MIN(rowid) FROM runs WHERE bot_id=?1 AND rowid>(SELECT rowid FROM runs WHERE id=?4)) AND r.depth=0 AND r.reply_to='' AND m.sender='user' AND m.kind='message' AND m.suppressed=0 AND NOT EXISTS(SELECT 1 FROM run_commands WHERE run_id=r.id) AND NOT EXISTS(SELECT 1 FROM routine_runs WHERE run_id=r.id) AND NOT EXISTS(SELECT 1 FROM events WHERE run_id=r.id AND kind='task_recovery')",params![run.bot_id,run.chat_id,db::now()-120,source,db::now()-900],|r|r.get(0)).optional()?
         } else { None };
         let merged = followup.is_some();
@@ -108,6 +109,8 @@ impl Db {
             Some(id) => id,
             None => crate::chats::insert_run(&tx, &chat, &run.bot_id, &original, &db::id(), "", 0)?,
         };
+        crate::routine_completion::inherit(&tx,source,&next,root)?;
+        tx.execute("INSERT INTO provider_inbox_runs(run_id,body) SELECT ?,body FROM provider_inbox_runs WHERE run_id=?",params![next,root])?;
         tx.execute("INSERT INTO run_commands(run_id,receipt) SELECT ?,receipt FROM run_commands WHERE run_id=?", params![next,root])?;
         if !merged {
             tx.execute("INSERT INTO chat_messages(chat_id,sender,body,kind,run_id,created) VALUES(?,'user','Continuing task','continuation',?,?)", params![chat.id,next,db::now()])?;

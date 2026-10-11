@@ -79,6 +79,11 @@ mod recovery_fairness_tests;
 mod recovery_isolation_tests;
 mod resources;
 mod routine_controls;
+mod routine_completion;
+#[cfg(test)]
+mod routine_completion_tests;
+#[cfg(test)]
+mod quiet_recovery_parent_tests;
 #[cfg(test)]
 mod routine_duplicate_tests;
 mod routine_updates;

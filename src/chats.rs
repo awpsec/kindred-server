@@ -780,6 +780,7 @@ impl Db {
             [&run.id],
             |r| r.get(0),
         )?;
+        let publish=crate::routine_completion::publish(&tx,&run.id,done.status=="completed" && done.error.is_empty())?;
         let quiet: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM routine_runs WHERE run_id=? AND quiet=1)",
             [&run.id],
@@ -792,15 +793,15 @@ impl Db {
             None
         };
         let output = replacement.unwrap_or(&done.output);
-        let silent = done.status == "completed"
+        let silent = !publish || (done.status == "completed"
             && done.error.is_empty()
-            && (deferred || quiet || (output.trim().is_empty() && !has_attachments));
+            && (deferred || quiet || (output.trim().is_empty() && !has_attachments)));
         if silent {
             tx.execute(
                 "UPDATE chat_messages SET suppressed=1 WHERE run_id=? AND kind='result'",
                 [&run.id],
             )?;
-            if deferred
+            if !publish || deferred
                 || (quiet && !crate::collaboration::is_child(&tx, &run.id)?)
                 || (run.reply_to.is_empty() && !crate::collaboration::has_requests(&tx, &run.id)?)
             {
