@@ -4956,3 +4956,7 @@ html[data-motion=off] #notice.continuation-confirmation{animation:none}
 .conversation-header:has(>.chat-window-drag)>.bot-heading{flex:0 1 auto;max-width:none;margin-right:0;}
 .chat-window-drag{align-self:stretch;flex:1 0 48px;user-select:none;}
 .conversation-header:has(>.chat-window-drag)>.header-actions{flex:none;}
+
+/* Sending replaces the arrow, rather than adding a second glyph to its circle. */
+#composer #send.is-busy>svg{visibility:hidden}
+#composer #send.is-busy::after{position:absolute;inset:0;margin:auto;width:14px;height:14px;box-sizing:border-box;pointer-events:none}
