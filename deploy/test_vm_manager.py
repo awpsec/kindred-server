@@ -39,9 +39,13 @@ class PowerIntentRecovery(unittest.TestCase):
     def test_reboot_running_dispatches_once_and_returns_receipt(self):
         with tempfile.TemporaryDirectory() as temporary:
             root=Path(temporary);profile='00000000-0000-4000-8000-000000000001';output=__import__('io').StringIO()
-            with patch.object(manager,'ROOT',root),patch.object(manager.sys,'argv',['manager','reboot',profile]),patch.object(manager,'running',return_value=True),patch.object(manager,'qmp') as control,contextlib.redirect_stdout(output):
+            computer=root/profile/'computer';computer.mkdir(parents=True)
+            (computer/'disk.qcow2').write_bytes(b'preserved disk');(computer/'computer.json').write_text('{}')
+            disk=(computer/'disk.qcow2').stat()
+            with patch.object(manager,'ROOT',root),patch.object(manager.sys,'argv',['manager','reboot',profile]),patch.object(manager,'running',return_value=True),patch.object(manager,'qmp') as control,patch.object(manager,'reboot_process_identity',return_value=(12345,900,(disk.st_dev,disk.st_ino))),patch.object(manager,'reboot_process_exited',return_value=True),patch.object(manager,'start') as start,contextlib.redirect_stdout(output):
                 manager.main()
-                control.assert_called_once_with(root/profile/'computer','system_reset')
+                control.assert_called_once_with(root/profile/'computer','system_powerdown')
+                start.assert_called_once_with(root/profile/'computer',profile)
             self.assertEqual(json.loads(output.getvalue()),{'state':'restarting'})
             self.assertTrue(json.loads((root/profile/'computer/power-intent.json').read_text())['running'])
 

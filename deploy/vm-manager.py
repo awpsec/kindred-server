@@ -110,6 +110,66 @@ def running(root):
         raise ValueError('Kindred cannot access the bot computer control socket. Restore its ownership and permissions for the Kindred service account.') from error
     except (OSError,ValueError): return False
 
+def reboot_process_start(process, pid):
+    text = (process / 'stat').read_text()
+    # comm may contain spaces or parentheses; starttime is field 22 after comm.
+    fields = text[text.rindex(')') + 2:].split()
+    if int(text.split(' ', 1)[0]) != pid: raise ValueError('PID changed')
+    started = int(fields[19])
+    if started <= 0: raise ValueError('Invalid process start time')
+    return started
+
+def reboot_process_identity(root, profile):
+    """Bind the recorded QEMU PID to this disk before asking it to shut down."""
+    try:
+        pidfile = root / 'qemu.pid'
+        if pidfile.is_symlink(): raise ValueError('redirected PID record')
+        pid = int(pidfile.read_text().strip())
+        if pid <= 1: raise ValueError('invalid PID')
+        disk = root / 'disk.qcow2'
+        metadata = root / 'computer.json'
+        if disk.is_symlink() or not disk.is_file() or metadata.is_symlink() or not metadata.is_file():
+            raise ValueError('existing computer files missing or redirected')
+        disk_stat = disk.stat()
+        process = Path(f'/proc/{pid}')
+        started = reboot_process_start(process, pid)
+        command = (process / 'cmdline').read_bytes().split(b'\0')
+        expected_name = ('kindred-' + profile).encode()
+        expected_disk = f'file={root}/disk.qcow2,if=virtio,format=qcow2'.encode()
+        if ((process / 'exe').readlink().name != 'qemu-system-x86_64'
+            or not command or command[0].rsplit(b'/', 1)[-1] != b'qemu-system-x86_64'
+            or not any(command[i:i+2] == [b'-name', expected_name] for i in range(len(command)-1))
+            or not any(command[i:i+2] == [b'-drive', expected_disk] for i in range(len(command)-1))
+            or process.stat().st_uid != os.geteuid()
+            or reboot_process_start(process, pid) != started
+            or pidfile.is_symlink() or int(pidfile.read_text().strip()) != pid):
+            raise ValueError('process does not match this computer')
+        return pid, started, (disk_stat.st_dev, disk_stat.st_ino)
+    except (OSError, ValueError, IndexError) as error:
+        raise ValueError('Cannot verify the bot computer process identity. No replacement process was started.') from error
+
+def reboot_process_exited(root, identity):
+    """QMP loss is not exit. Unknown or reused process identity refuses restart."""
+    try:
+        pid, started, disk_identity = identity
+        pidfile = root / 'qemu.pid'
+        if pidfile.is_symlink(): raise ValueError('PID record redirected')
+        try: recorded = int(pidfile.read_text().strip())
+        except FileNotFoundError: recorded = None
+        if recorded is not None and recorded != pid: raise ValueError('PID record changed')
+        process = Path(f'/proc/{pid}')
+        try:
+            current = reboot_process_start(process, pid)
+        except FileNotFoundError:
+            # Missing stat is only exit if the process directory is also absent.
+            try: process.stat()
+            except FileNotFoundError: return True
+            raise ValueError('process metadata missing')
+        if current != started or recorded is None: raise ValueError('Process identity changed')
+        return False
+    except (OSError, ValueError, IndexError) as error:
+        raise ValueError('Cannot verify the bot computer process identity. No replacement process was started.') from error
+
 def prepare(root, profile):
     metadata=root/'computer.json'
     if metadata.exists(): return json.loads(metadata.read_text())
@@ -482,14 +542,31 @@ def main():
             is_running=running(root)
             if action=='reboot' and not is_running:
                 raise ValueError('The bot computer is off. Start the computer before restarting it.')
+            identity = reboot_process_identity(root, profile) if action=='reboot' else None
             atomic(root/'power-intent.json',{'running':action!='shutdown'})
-            if is_running: qmp(root,'system_powerdown' if action=='shutdown' else 'system_reset')
-            if action=='shutdown':
+            if is_running: qmp(root,'system_powerdown')
+            if is_running:
                 # Keep the operation lock until QEMU exits. A message sent during
                 # shutdown then starts the same disk after shutdown has finished.
                 deadline=time.monotonic()+60
-                while running(root) and time.monotonic()<deadline: time.sleep(.5)
-                if running(root): raise ValueError('The computer is still shutting down. Wait a moment and retry.')
+                if action=='reboot':
+                    while not reboot_process_exited(root, identity) and time.monotonic()<deadline: time.sleep(.5)
+                    if not reboot_process_exited(root, identity):
+                        raise ValueError('The computer is still shutting down. No hardware reset was sent; wait a moment and retry.')
+                else:
+                    while running(root) and time.monotonic()<deadline: time.sleep(.5)
+                    if running(root): raise ValueError('The computer is still shutting down. No hardware reset was sent; wait a moment and retry.')
+            if action=='reboot':
+                # A hardware reset bypasses Chromium and filesystem shutdown.
+                # Boot the same existing disk only after ACPI shutdown completed.
+                disk = root / 'disk.qcow2'
+                metadata = root / 'computer.json'
+                if disk.is_symlink() or not disk.is_file() or metadata.is_symlink() or not metadata.is_file():
+                    raise ValueError('The existing computer files are unavailable. No replacement process was started.')
+                disk_stat = disk.stat()
+                if (disk_stat.st_dev, disk_stat.st_ino) != identity[2]:
+                    raise ValueError('The existing computer disk changed. No replacement process was started.')
+                start(root,profile)
             print(json.dumps({'state':'shut off' if action=='shutdown' else 'restarting'}))
 
 if __name__=='__main__':
