@@ -33,7 +33,7 @@ class RuntimeUpdate(unittest.TestCase):
                 with self.assertRaises(Exception):
                     update.install(io.BytesIO(data),target,digest or hashlib.sha256(data).hexdigest(),'test')
                 self.assertEqual(target.read_bytes(),b'original runtime')
-                self.assertEqual(list(Path(root).iterdir()),[target])
+                self.assertEqual(set(Path(root).iterdir()),{target,Path(root)/'.kindred-runtime.lock'})
 
 
 if __name__=='__main__':unittest.main()

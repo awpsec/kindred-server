@@ -4,6 +4,7 @@ import hashlib
 import fcntl
 import json
 import os
+import pwd
 from pathlib import Path
 import shutil
 import subprocess
@@ -15,10 +16,32 @@ LIMIT = 256 * 1024 * 1024
 LAUNCHERS = None
 
 
-def stage_launchers(root, payload):
+def launcher_target(root, name, systemd_root):
+    if name == 'browser-session.json':
+        return Path(systemd_root).parent / 'chromium' / 'policies' / 'managed' / name
+    if name == 'kindred-guest-desktop.service':
+        return Path(systemd_root) / 'system' / name
+    if name == 'kindred-screen@.service':
+        return Path(systemd_root) / 'user' / name
+    return Path(root) / name
+
+
+def reload_units():
+    subprocess.run(['systemctl', 'daemon-reload'], check=True, capture_output=True, timeout=15)
+    uid = pwd.getpwnam('bot').pw_uid
+    runtime = Path('/run/user') / str(uid)
+    if (runtime / 'bus').exists():
+        subprocess.run(['runuser', '-u', 'bot', '--', 'env', 'XDG_RUNTIME_DIR=' + str(runtime),
+                        'DBUS_SESSION_BUS_ADDRESS=unix:path=' + str(runtime / 'bus'),
+                        'systemctl', '--user', 'daemon-reload'], check=True, capture_output=True, timeout=15)
+
+
+def stage_launchers(root, payload, systemd_root=Path('/etc/systemd')):
     if payload is None:
         return []
-    names = ('browser-launch.py', 'desktop-launch', 'start-desktop.sh', 'ensure-screen', 'screen-ownership.py')
+    names = ('browser-launch.py', 'stop-browser.py', 'desktop-launch', 'start-desktop.sh',
+             'ensure-screen', 'screen-ownership.py', 'kindred-guest-desktop.service', 'kindred-screen@.service',
+             'browser-session.json')
     if set(payload) != set(names):
         raise RuntimeError('Incomplete managed browser launcher set.')
     staged = []
@@ -28,7 +51,15 @@ def stage_launchers(root, payload):
             source = value['source'].encode('utf-8')
             if not source or len(source) > 64 * 1024:
                 raise RuntimeError('Invalid managed browser launcher source.')
-            target = root / name
+            target = launcher_target(root, name, systemd_root)
+            desired_mode = 0o644 if name.endswith(('.service', '.json')) else 0o755
+            if name == 'browser-session.json':
+                if json.loads(source) != {'RestoreOnStartup': 1}:
+                    raise RuntimeError('Invalid managed browser session policy.')
+                for parent in target.parents:
+                    if parent.is_symlink():
+                        raise RuntimeError('Redirected browser policy was retained.')
+                target.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
             old = None
             if target.is_symlink():
                 raise RuntimeError('Customized browser launcher was retained.')
@@ -38,7 +69,7 @@ def stage_launchers(root, payload):
                 old = target.read_bytes()
                 digest = hashlib.sha256(old).hexdigest()
                 candidate = hashlib.sha256(source).hexdigest()
-                if digest == candidate and target.stat().st_mode & 0o777 == 0o755:
+                if digest == candidate and target.stat().st_mode & 0o777 == desired_mode:
                     continue
                 previous=value['previous_sha256']
                 accepted=previous if isinstance(previous,list) else [previous]
@@ -46,11 +77,11 @@ def stage_launchers(root, payload):
                     raise RuntimeError('Customized browser launcher was retained.')
             elif value['previous_sha256'] is not None and not (isinstance(value['previous_sha256'],list) and None in value['previous_sha256']):
                 raise RuntimeError('Managed browser launcher is missing.')
-            with tempfile.NamedTemporaryFile(dir=root, prefix='.kindred-launcher-', delete=False) as out:
+            with tempfile.NamedTemporaryFile(dir=target.parent, prefix='.kindred-launcher-', delete=False) as out:
                 temporary = Path(out.name)
                 staged.append((target, temporary, old, target.stat().st_mode & 0o777 if old is not None else None))
                 out.write(source); out.flush(); os.fsync(out.fileno())
-            temporary.chmod(0o755)
+            temporary.chmod(desired_mode)
         return staged
     except Exception:
         for _, temporary, _, _ in staged:
@@ -73,7 +104,7 @@ def restore_launcher(target, old, mode):
 
 
 
-def install(stream, target, expected_hash, version, launchers=None):
+def install(stream, target, expected_hash, version, launchers=None, systemd_root=Path('/etc/systemd')):
     # Distinct server/profile callers may target the same VM runtime.
     lock_path = Path(target).parent / '.kindred-runtime.lock'
     descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
@@ -85,10 +116,10 @@ def install(stream, target, expected_hash, version, launchers=None):
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             raise RuntimeError('Another guest runtime installation is in progress.') from None
-        return _install(stream, target, expected_hash, version, launchers)
+        return _install(stream, target, expected_hash, version, launchers, systemd_root)
 
 
-def _install(stream, target, expected_hash, version, launchers=None):
+def _install(stream, target, expected_hash, version, launchers=None, systemd_root=Path('/etc/systemd')):
     target = Path(target)
     if not target.is_file() or target.is_symlink():
         raise RuntimeError('Managed Kindred guest executable is missing or customized.')
@@ -117,7 +148,7 @@ def _install(stream, target, expected_hash, version, launchers=None):
         result = subprocess.run([str(temporary), 'guest-rpc'], env={**os.environ, 'KINDRED_GUEST': '1'}, input=json.dumps({'tool':'command_poll','args':{'commands':[]},'screen':1}), capture_output=True, text=True, timeout=15, check=True)
         if json.loads(result.stdout) != {'commands': []}:
             raise RuntimeError('Guest executable does not support managed commands.')
-        staged = stage_launchers(target.parent, launchers)
+        staged = stage_launchers(target.parent, launchers, systemd_root)
         updated = hashlib.sha256(target.read_bytes()).hexdigest() != expected_hash
         # Prepare rollback copies before the first switch. No browser process,
         # profile, cookie or credential path is part of this installation.
@@ -138,16 +169,21 @@ def _install(stream, target, expected_hash, version, launchers=None):
                 switched.append((path, old, mode))
             if launchers is not None:
                 for name, value in launchers.items():
-                    digest = hashlib.sha256((target.parent / name).read_bytes()).hexdigest()
+                    digest = hashlib.sha256(launcher_target(target.parent, name, systemd_root).read_bytes()).hexdigest()
                     if digest != hashlib.sha256(value['source'].encode('utf-8')).hexdigest():
                         raise RuntimeError('Browser launcher installation did not verify.')
                     launcher_hashes[name] = digest
+            if staged:
+                # Reload definitions only; browsers and displays keep running.
+                reload_units()
             if updated:
                 os.replace(temporary, target)
                 temporary = None
         except Exception:
             for path, old, mode in reversed(switched):
                 restore_launcher(path, old, mode)
+            if staged:
+                reload_units()
             raise
         return {'updated': updated, 'version': version, 'launchers_updated': bool(staged), 'launcher_hashes': launcher_hashes}
     finally:

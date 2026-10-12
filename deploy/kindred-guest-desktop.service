@@ -9,6 +9,8 @@ Environment=DISPLAY=:1
 Environment=HOME=/home/bot
 Environment=KINDRED_GUEST=1
 ExecStart=/usr/local/lib/kindred/start-desktop.sh
+ExecStop=/usr/local/lib/kindred/stop-browser.py --screen 1
+TimeoutStopSec=35
 Restart=on-failure
 RestartSec=3
 KillMode=control-group

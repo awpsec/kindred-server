@@ -22,6 +22,9 @@ class RuntimeTests(unittest.TestCase):
         self.temp=tempfile.TemporaryDirectory(prefix='kindred-runtime-test-');self.addCleanup(self.temp.cleanup);self.root=Path(self.temp.name)
         self.target=self.root/'kindred-bin';self.old=executable('old');self.new=executable('candidate');self.target.write_bytes(self.old);self.target.chmod(0o755)
         self.payload={}
+        self.systemd=self.root/'systemd'
+        for kind in ('system','user'):(self.systemd/kind).mkdir(parents=True)
+        self.reload=self.enterContext(patch.object(m,'reload_units'))
         for name in ('desktop-launch','start-desktop.sh'):
             old=subprocess.check_output(['git','show',BASELINE+':deploy/'+name],cwd=ROOT);(self.root/name).write_bytes(old);(self.root/name).chmod(0o755)
             self.payload[name]={'source':(ROOT/'deploy'/name).read_text(),'previous_sha256':hashlib.sha256(old).hexdigest()}
@@ -34,10 +37,16 @@ class RuntimeTests(unittest.TestCase):
             else:previous=None
             self.payload[name]={'source':(ROOT/'deploy'/name).read_text(),'previous_sha256':previous}
 
+        for name in ('kindred-guest-desktop.service','kindred-screen@.service'):
+            old=subprocess.check_output(['git','show','HEAD:deploy/'+name],cwd=ROOT)
+            target=m.launcher_target(self.root,name,self.systemd);target.write_bytes(old);target.chmod(0o644)
+            self.payload[name]={'source':(ROOT/'deploy'/name).read_text(),'previous_sha256':hashlib.sha256(old).hexdigest()}
+        self.payload['stop-browser.py']={'source':(ROOT/'deploy/stop-browser.py').read_text(),'previous_sha256':None}
+        self.payload['browser-session.json']={'source':(ROOT/'deploy/browser-session.json').read_text(),'previous_sha256':None}
         self.profile=self.root/'browser-fixture';self.profile.mkdir(mode=0o700);(self.profile/'synthetic-state').write_text('preserved');self.inode=self.profile.stat().st_ino
     def install(self,payload=None,data=None,digest=None):
         data=self.new if data is None else data
-        return m.install(io.BytesIO(data),self.target,digest or hashlib.sha256(data).hexdigest(),'candidate',payload)
+        return m.install(io.BytesIO(data),self.target,digest or hashlib.sha256(data).hexdigest(),'candidate',payload,self.systemd)
     def preserved(self):
         self.assertEqual(self.profile.stat().st_ino,self.inode);self.assertEqual((self.profile/'synthetic-state').read_text(),'preserved')
     def test_partial_fence_install_is_refused_before_runtime_switch(self):
@@ -50,8 +59,10 @@ class RuntimeTests(unittest.TestCase):
         production=(ROOT/'src/vm_maintenance.rs').read_text()
         payload={}
         for name in self.payload:
-            old=subprocess.check_output(['git','show','0874619f13bf708679df3cc2dbfb34a3f5c8b39d:deploy/'+name],cwd=ROOT)
-            (self.root/name).write_bytes(old);(self.root/name).chmod(0o755)
+            if name in ('stop-browser.py','browser-session.json'):old=None
+            else:
+                old=subprocess.check_output(['git','show','0874619f13bf708679df3cc2dbfb34a3f5c8b39d:deploy/'+name],cwd=ROOT)
+                target=m.launcher_target(self.root,name,self.systemd);target.write_bytes(old);target.chmod(0o644 if name.endswith(('.service','.json')) else 0o755)
             declaration=re.search(r'"'+re.escape(name)+r'":\{"source":include_str!\([^\n]+?\),"previous_sha256":([^}]+)\}',production)
             self.assertIsNotNone(declaration,name)
             payload[name]={'source':(ROOT/'deploy'/name).read_text(),'previous_sha256':json.loads(declaration[1])}
@@ -63,8 +74,10 @@ class RuntimeTests(unittest.TestCase):
     def test_production_payload_upgrades_exact_corrected_0862_helpers(self):
         production=(ROOT/'src/vm_maintenance.rs').read_text(); payload={}
         for name in self.payload:
-            old=subprocess.check_output(['git','show','bd9765cc9efbf9b65c503d4b4ca9a6378af71a24:deploy/'+name],cwd=ROOT)
-            (self.root/name).write_bytes(old);(self.root/name).chmod(0o755)
+            if name in ('stop-browser.py','browser-session.json'):old=None
+            else:
+                old=subprocess.check_output(['git','show','bd9765cc9efbf9b65c503d4b4ca9a6378af71a24:deploy/'+name],cwd=ROOT)
+                target=m.launcher_target(self.root,name,self.systemd);target.write_bytes(old);target.chmod(0o644 if name.endswith(('.service','.json')) else 0o755)
             declaration=re.search(r'"'+re.escape(name)+r'":\{"source":include_str!\([^\n]+?\),"previous_sha256":([^}]+)\}',production)
             self.assertIsNotNone(declaration,name)
             payload[name]={'source':(ROOT/'deploy'/name).read_text(),'previous_sha256':json.loads(declaration[1])}
@@ -77,7 +90,8 @@ class RuntimeTests(unittest.TestCase):
     def test_full_verified_install_and_idempotence(self):
         result=self.install(self.payload);self.assertTrue(result['updated']);self.assertTrue(result['launchers_updated'])
         for name,value in self.payload.items():
-            self.assertEqual((self.root/name).read_text(),value['source']);self.assertEqual((self.root/name).stat().st_mode&0o777,0o755);self.assertEqual((self.root/name).stat().st_uid,self.target.stat().st_uid)
+            target=m.launcher_target(self.root,name,self.systemd)
+            self.assertEqual(target.read_text(),value['source']);self.assertEqual(target.stat().st_mode&0o777,0o644 if name.endswith(('.service','.json')) else 0o755);self.assertEqual(target.stat().st_uid,self.target.stat().st_uid)
         self.assertEqual((self.root/'kindred-bin.previous').read_bytes(),self.old)
         result=self.install(self.payload);self.assertFalse(result['updated']);self.assertFalse(result['launchers_updated']);self.preserved()
     def test_unchanged_runtime_still_installs_and_verifies_launchers(self):
@@ -121,6 +135,24 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(self.target.read_bytes(),self.old);self.assertFalse((self.root/'browser-launch.py').exists())
         for name,value in before.items():self.assertEqual((self.root/name).read_bytes(),value);self.assertEqual((self.root/name).stat().st_mode&0o777,0o755)
         self.preserved()
+    def test_service_reload_failure_restores_units_and_runtime(self):
+        before={name:m.launcher_target(self.root,name,self.systemd).read_bytes() for name in ('kindred-guest-desktop.service','kindred-screen@.service')}
+        self.reload.side_effect=[subprocess.CalledProcessError(1,'systemctl'),None]
+        with self.assertRaises(subprocess.CalledProcessError):self.install(self.payload)
+        self.assertEqual(self.target.read_bytes(),self.old)
+        self.assertFalse((self.root/'stop-browser.py').exists())
+        for name,data in before.items():self.assertEqual(m.launcher_target(self.root,name,self.systemd).read_bytes(),data)
+        self.assertEqual(self.reload.call_count,2);self.preserved()
+
+    def test_custom_session_policy_is_retained_before_any_switch(self):
+        policy=m.launcher_target(self.root,'browser-session.json',self.systemd)
+        policy.parent.mkdir(parents=True);policy.write_text('{"RestoreOnStartup":4}')
+        before=(self.root/'desktop-launch').read_bytes()
+        with self.assertRaisesRegex(RuntimeError,'Customized'):self.install(self.payload)
+        self.assertEqual(policy.read_text(),'{"RestoreOnStartup":4}')
+        self.assertEqual((self.root/'desktop-launch').read_bytes(),before)
+        self.assertEqual(self.target.read_bytes(),self.old);self.preserved()
+
     def test_concurrent_install_refused_without_effect(self):
         with open(self.root/'.kindred-runtime.lock','a+b') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
