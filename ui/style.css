@@ -4956,3 +4956,13 @@ html[data-motion=off] #notice.continuation-confirmation{animation:none}
 .conversation-header:has(>.chat-window-drag)>.bot-heading{flex:0 1 auto;max-width:none;margin-right:0;}
 .chat-window-drag{align-self:stretch;flex:1 0 48px;user-select:none;}
 .conversation-header:has(>.chat-window-drag)>.header-actions{flex:none;}
+
+/* Image attachments sit directly above their message, with compact overflow. */
+.message-files.message-images{padding:0;margin:0 0 6px;gap:6px;flex-wrap:nowrap;}
+.message-images .message-file-image,.message-images>.message-images-more{width:clamp(52px,17vw,96px);flex:0 1 96px;min-width:0;}
+.message-images .uploaded-image-open{width:100%;height:auto;aspect-ratio:1;}
+.message-images>.message-images-more{height:auto;aspect-ratio:1;display:grid;place-items:center;align-self:flex-start;color:var(--muted);background:var(--surface);}
+.attachment-only .message-files{padding:0;gap:6px;}
+.attachment-gallery .message-files{justify-content:flex-start;gap:10px;}
+
+.message-images + .message-row{margin-top:0;}
