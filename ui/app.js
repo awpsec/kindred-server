@@ -3686,7 +3686,9 @@ $("composer").onsubmit = (e) => {
   }, $("send"));
 };
 function resizeComposer() {
-  const editor=$('prompt'),form=$('composer');editor.style.height='auto';dictationUI?.render();
+  const editor=$('prompt'),form=$('composer');
+  editor.dataset.empty=String(!composerText(editor).replace(/\u200b/g,'').trim());
+  editor.style.height='auto';dictationUI?.render();
   if(!form.getClientRects().length||form.matches('.is-replying,.has-files,.is-dictating')){
     form.classList.remove('is-multiline');return;
   }
@@ -6196,6 +6198,8 @@ function refitComputer(){if(state.rfb)state.rfb.scaleViewport=true;}
 function finishComputerTransition(){computerTransition?.();refitComputer();}
 window.addEventListener('resize',finishComputerTransition);
 function setComputerExpanded(expanded) {
+  // iOS already uses its native full-size computer layout, including Open links.
+  if(window.__KINDRED_MOBILE_PLATFORM==='ios')expanded=false;
   const panel=$('computer-panel'),screen=$('desktop'),before=panel.getBoundingClientRect(),screenBefore=screen.getBoundingClientRect(),changed=panel.classList.contains('expanded')!==expanded;
   finishComputerTransition();
   if(changed)panel.getAnimations().forEach(a=>a.cancel());

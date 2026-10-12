@@ -2328,7 +2328,8 @@ input[type="checkbox"]:checked::after {
   font-size: calc(15px * var(--text-scale, 1));
   line-height: calc(22px * var(--text-scale, 1));
 }
-#prompt:empty:before {
+#prompt:empty:before,
+#prompt[data-empty="true"]:before {
   content: attr(data-placeholder);
   color: var(--muted);
   pointer-events: none;
@@ -4956,3 +4957,6 @@ html[data-motion=off] #notice.continuation-confirmation{animation:none}
 .conversation-header:has(>.chat-window-drag)>.bot-heading{flex:0 1 auto;max-width:none;margin-right:0;}
 .chat-window-drag{align-self:stretch;flex:1 0 48px;user-select:none;}
 .conversation-header:has(>.chat-window-drag)>.header-actions{flex:none;}
+
+/* Native iOS already presents the supported full-size computer surface. */
+html[data-system-text-size] :is(#computer-expand,.desktop-preview-open){display:none}
