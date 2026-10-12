@@ -249,7 +249,9 @@ pub async fn run(app: &App, bot: &Bot, run: &Run) -> Result<String> {
                 }
                 text.push_str(part);
                 final_reply = part.to_owned();
-                app.db.event(&run.id, "assistant", json!({"text":part}))?;
+                // The CLI bridge has no native phase field. Its verified complete
+                // frame identifies the final reply; until then these are updates.
+                app.db.event(&run.id, "assistant", json!({"text":part,"phase":"commentary"}))?;
             }
             "usage" if ready => crate::provider_accounts::record(app, bot, run, &frame)?,
             "connector_approval" if ready && bot.provider == "claude-code" => {
@@ -402,6 +404,7 @@ pub async fn run(app: &App, bot: &Bot, run: &Run) -> Result<String> {
                     !text.trim().is_empty() || !calls.is_empty(),
                     "Provider completed without a result"
                 );
+                crate::progress_updates::finish_message(&app.db, &run.id, &final_reply)?;
                 return Ok(final_reply);
             }
             "error" if frame["code"] == "tool_bridge_unavailable" => bail!(

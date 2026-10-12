@@ -32,7 +32,7 @@ pub fn valid_approval(mode: &str) -> bool {
 pub fn general_settings(saved: Option<Value>) -> Value {
     let mut settings = json!({"name":"You","identity":"","theme":"dark",
         "reduced_motion":false,"approval_mode":"ask","show_activity":false,"separate_bot_chats":true,
-        "default_provider":"codex","model_defaults":{},"local_access":false,"notifications":"all","timezone":"","timezone_mode":"auto","progress_updates":"balanced","message_delivery":"steer"});
+        "default_provider":"codex","model_defaults":{},"local_access":false,"notifications":"all","timezone":"","timezone_mode":"auto","progress_updates":"summaries","message_delivery":"steer"});
     if let Some(Value::Object(saved)) = saved {
         settings.as_object_mut().unwrap().extend(saved);
     }

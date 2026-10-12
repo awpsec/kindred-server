@@ -786,7 +786,7 @@ async fn save_settings(State(app): State<Shared>, Json(v): Json<Value>) -> Resul
         "Invalid time zone mode"
     );
     require!(v.get("progress_updates").is_none_or(Value::is_string), "Invalid progress updates setting");
-    let progress_updates = v["progress_updates"].as_str().or_else(||prior["progress_updates"].as_str()).unwrap_or("balanced");
+    let progress_updates = v["progress_updates"].as_str().or_else(||prior["progress_updates"].as_str()).unwrap_or("summaries");
     require!(crate::progress_updates::valid(progress_updates), "Invalid progress updates setting");
     require!(v.get("message_delivery").is_none_or(Value::is_string), "Invalid message delivery setting");
     let message_delivery=v["message_delivery"].as_str().or_else(||prior["message_delivery"].as_str()).unwrap_or("steer");

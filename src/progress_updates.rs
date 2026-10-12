@@ -14,7 +14,7 @@ pub fn resolved(bot: &Bot, general: &Value) -> String {
         general["progress_updates"]
             .as_str()
             .filter(|s| valid(s))
-            .unwrap_or("balanced")
+            .unwrap_or("summaries")
             .into()
     }
 }
@@ -43,7 +43,7 @@ pub fn start(c: &rusqlite::Connection, run: &mut crate::db::Run) -> Result<()> {
     let profile:Value=serde_json::from_str(&profile)?;
     let general:Option<String>=c.query_row("SELECT value FROM settings WHERE key='general'",[],|r|r.get(0)).optional()?;
     let general:Value=serde_json::from_str(general.as_deref().unwrap_or("{}"))?;
-    run.progress_mode=profile["progress_updates"].as_str().filter(|v|valid(v)).or_else(||general["progress_updates"].as_str().filter(|v|valid(v))).unwrap_or("balanced").into();
+    run.progress_mode=profile["progress_updates"].as_str().filter(|v|valid(v)).or_else(||general["progress_updates"].as_str().filter(|v|valid(v))).unwrap_or("summaries").into();
     run.progress_started=crate::db::now();
     c.execute("UPDATE runs SET progress_mode=?,progress_started=? WHERE id=?",rusqlite::params![run.progress_mode,run.progress_started,run.id])?;
     Ok(())
@@ -57,7 +57,7 @@ pub fn record_message(c:&rusqlite::Connection,seq:i64,run:&str,phase:&str)->Resu
     let profile:Value=serde_json::from_str(&profile)?;
     let general:Option<String>=c.query_row("SELECT value FROM settings WHERE key='general'",[],|r|r.get(0)).optional()?;
     let general:Value=serde_json::from_str(general.as_deref().unwrap_or("{}"))?;
-    let mode=profile["progress_updates"].as_str().filter(|v|valid(v)).or_else(||general["progress_updates"].as_str().filter(|v|valid(v))).unwrap_or("balanced");
+    let mode=profile["progress_updates"].as_str().filter(|v|valid(v)).or_else(||general["progress_updates"].as_str().filter(|v|valid(v))).unwrap_or("summaries");
     let previous:Option<(String,String,String)>=c.query_row("SELECT mode,phase,group_id FROM message_progress WHERE run_id=? ORDER BY message_seq DESC LIMIT 1",[run],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
     let group=match previous {
         Some((old_mode,old_phase,group)) if old_mode==mode && old_phase!="final_answer" => group,
@@ -66,6 +66,14 @@ pub fn record_message(c:&rusqlite::Connection,seq:i64,run:&str,phase:&str)->Resu
     c.execute("INSERT INTO message_progress(message_seq,run_id,mode,phase,group_id) VALUES(?,?,?,?,?)",rusqlite::params![seq,run,mode,phase,group])?;
     Ok(())
 }
+// CLI providers stream interim messages without native phase metadata. Once
+// completion is verified, retain the final reply outside the progress group.
+pub fn finish_message(db: &Db, run: &str, text: &str) -> Result<()> {
+    let c = db.0.lock().unwrap();
+    c.execute("UPDATE message_progress SET phase='final_answer' WHERE run_id=?1 AND message_seq=(SELECT seq FROM chat_messages WHERE run_id=?1 AND kind='assistant' AND body=?2 ORDER BY seq DESC LIMIT 1)", rusqlite::params![run,text])?;
+    Ok(())
+}
+
 pub fn set_task_title(db: &Db, run: &crate::db::Run, title: &str) -> Result<Value> {
     let title = title.trim();
     anyhow::ensure!(!title.is_empty() && title.chars().count() <= 80 && !title.chars().any(char::is_control), "Task title must be a single line of 1-80 characters");
@@ -86,6 +94,26 @@ pub fn message(c:&rusqlite::Connection,seq:i64)->Result<Value> {
 mod tests {
     use super::*;
     use crate::{conversation_updates, tests};
+
+    #[test]
+    fn cli_updates_group_by_default_and_completion_stays_visible() {
+        let app=tests::app();let bot=tests::bot(&app.db,"claude-code");
+        let id=app.db.queue(&bot.id,"Long workflow",0).unwrap();
+        let run=app.db.claim_bot(&bot.id).unwrap().unwrap();
+        assert_eq!(run.progress_mode,"summaries");
+        for text in ["Inspecting settings", "Updating commands", "Commands are ready"] {
+            app.db.event(&id,"assistant",json!({"text":text,"phase":"commentary"})).unwrap();
+        }
+        finish_message(&app.db,&id,"Commands are ready").unwrap();
+        let messages=app.db.chat_messages(&run.chat_id).unwrap();
+        let updates:Vec<_>=messages.iter().filter(|m|m["kind"]=="assistant").collect();
+        assert_eq!(updates.len(),3);
+        assert_eq!(updates[0]["progress"]["mode"],"summaries");
+        assert_eq!(updates[0]["progress"]["group_id"],updates[1]["progress"]["group_id"]);
+        assert_eq!(updates[0]["progress"]["phase"],"commentary");
+        assert_eq!(updates[2]["progress"]["phase"],"final_answer");
+        assert_eq!(resolved(&bot,&json!({"progress_updates":"calm"})),"calm");
+    }
 
     #[tokio::test]
     async fn model_task_title_is_scoped_persistent_and_available_in_history() {
@@ -155,7 +183,7 @@ mod tests {
         let app = tests::app();
         let mut bot = tests::bot(&app.db, "codex");
         assert_eq!(bot.profile.progress_updates, "inherit");
-        assert_eq!(resolved(&bot, &json!({})), "balanced");
+        assert_eq!(resolved(&bot, &json!({})), "summaries");
         assert_eq!(resolved(&bot, &json!({"progress_updates":"calm"})), "calm");
         bot.profile.progress_updates = "frequent".into();
         app.db.save_bot(&bot).unwrap();
