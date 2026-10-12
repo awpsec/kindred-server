@@ -6,6 +6,7 @@ import shutil
 import socket
 import tempfile
 import unittest
+from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location('launch', ROOT/'deploy/browser-launch.py')
 launch = importlib.util.module_from_spec(spec); spec.loader.exec_module(launch)
@@ -35,6 +36,26 @@ class LaunchTests(unittest.TestCase):
         self.assertIn('--user-data-dir='+str(self.root/'profiles/browser-2'), result['args'])
         self.assertNotIn('--password-store=basic',result['args'])
         self.assertEqual((self.root/'profiles/browser-2').stat().st_mode & 0o777,0o700)
+    def test_legacy_state_root_preserves_mode_and_private_browser_profile(self):
+        self.desktop();root=self.root/'profiles';root.mkdir(mode=0o755);inode=root.stat().st_ino
+        with patch.object(launch,'ROOT',root):result=self.prepare()
+        self.assertIn('--user-data-dir='+str(root/'browser-2'),result['args'])
+        self.assertEqual(root.stat().st_ino,inode)
+        self.assertEqual(root.stat().st_mode & 0o777,0o755)
+        self.assertEqual((root/'browser-2').stat().st_mode & 0o777,0o700)
+    def test_legacy_root_exception_never_allows_foreign_or_writable_profiles(self):
+        root=self.root/'profiles';root.mkdir(mode=0o755)
+        with patch.object(launch,'ROOT',root):
+            for mode in [0o775,0o777,0o750,0o1755]:
+                root.chmod(mode)
+                with self.assertRaises(launch.BrowserContextError):launch.private_directory(root,os.getuid())
+            root.chmod(0o755)
+            with self.assertRaises(launch.BrowserContextError):launch.private_directory(root,os.getuid()+1)
+            profile=root/'browser-2';profile.mkdir(mode=0o755)
+            with self.assertRaises(launch.BrowserContextError):launch.private_directory(profile,os.getuid())
+            link=self.root/'redirect';link.symlink_to(root)
+            with patch.object(launch,'ROOT',link):
+                with self.assertRaises(launch.BrowserContextError):launch.private_directory(link,os.getuid())
     def test_desktop_markers_replace_unrelated_caller_detection(self):
         env=dict(self.env,XDG_CURRENT_DESKTOP='OPENBOX',DESKTOP_SESSION='openbox')
         self.desktop(env=env)

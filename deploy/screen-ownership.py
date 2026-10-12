@@ -16,7 +16,10 @@ def private(path, create=False):
     if create and not path.exists():
         path.mkdir(mode=0o700)
     info = path.lstat()
-    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+    # Older guests retain this non-writable shared state root at 0755.
+    # Only its metadata may be public; ownership records and profiles stay private.
+    legacy_root = path == ROOT and stat.S_IMODE(info.st_mode) == 0o755
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or (info.st_mode & 0o077 and not legacy_root):
         raise RuntimeError('Screen ownership directory is not private')
 
 def read_record(path):

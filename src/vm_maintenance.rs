@@ -141,11 +141,11 @@ async fn update_guest_runtime(app: &App) -> Result<()> {
     // Only known managed launcher bytes are replaced. Custom launchers fail
     // before the runtime switches; existing browsers/profiles are untouched.
     let launchers=serde_json::json!({
-        "browser-launch.py":{"source":include_str!("../deploy/browser-launch.py"),"previous_sha256":["1166f7ad32848fa71b4084960825bc40c9bbe03300d8c23c0d6710533efd8ee2",null]},
+        "browser-launch.py":{"source":include_str!("../deploy/browser-launch.py"),"previous_sha256":["f0d21bee517c16ce234a4ac233dfbf8b1009ddcc70ec0063bbaadd3bd4ded9a8","1166f7ad32848fa71b4084960825bc40c9bbe03300d8c23c0d6710533efd8ee2",null]},
         "desktop-launch":{"source":include_str!("../deploy/desktop-launch"),"previous_sha256":["ee430558ef4fd501d1dd55a453e4de9c9d9fc58018464a1091dee7adfccaa1df", "8cae9194cb3d1dc53606cb52aa254a531364bce3c006c0444d93088def9c2ba3"]},
         "start-desktop.sh":{"source":include_str!("../deploy/start-desktop.sh"),"previous_sha256":["45eb0cdb9e2ea03b86f8c6d21d96f769ebaa07d86d04e2f442da6732b6aaf3c6", "3d10321fd71359ceac432daa657b299d346aeb6142d07fe33a42d372733803d4"]},
         "ensure-screen":{"source":include_str!("../deploy/ensure-screen"),"previous_sha256":["de417ce99b63a1effd3f4c37efab7fb2e285ed7a7bfb8888ded84cbfc4fc27d9"]},
-        "screen-ownership.py":{"source":include_str!("../deploy/screen-ownership.py"),"previous_sha256":null}
+        "screen-ownership.py":{"source":include_str!("../deploy/screen-ownership.py"),"previous_sha256":["e3e81b892467ae509ecd873ce786407ef5bc9d0a5781ea37edd119019e26f004",null]}
     });
     let declaration=format!("LAUNCHERS = json.loads({})",serde_json::to_string(&serde_json::to_string(&launchers)?)?);
     let helper=include_str!("../deploy/update-guest-runtime.py").replace("LAUNCHERS = None", &declaration).replace('\'', "'\"'\"'");

@@ -3,6 +3,8 @@ import fcntl
 import hashlib
 import importlib.util
 import io
+import json
+import re
 from pathlib import Path
 import subprocess
 import tempfile
@@ -44,6 +46,20 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(self.target.read_bytes(),self.old);self.preserved()
     def test_binary_only_baseline_does_not_install_launchers(self):
         before=(self.root/'desktop-launch').read_bytes();result=self.install();self.assertTrue(result['updated']);self.assertFalse(result['launchers_updated']);self.assertEqual((self.root/'desktop-launch').read_bytes(),before);self.assertFalse((self.root/'browser-launch.py').exists());self.preserved()
+    def test_production_payload_upgrades_exact_0861_helpers_and_replays(self):
+        production=(ROOT/'src/vm_maintenance.rs').read_text()
+        payload={}
+        for name in self.payload:
+            old=subprocess.check_output(['git','show','0874619f13bf708679df3cc2dbfb34a3f5c8b39d:deploy/'+name],cwd=ROOT)
+            (self.root/name).write_bytes(old);(self.root/name).chmod(0o755)
+            declaration=re.search(r'"'+re.escape(name)+r'":\{"source":include_str!\([^\n]+?\),"previous_sha256":([^}]+)\}',production)
+            self.assertIsNotNone(declaration,name)
+            payload[name]={'source':(ROOT/'deploy'/name).read_text(),'previous_sha256':json.loads(declaration[1])}
+        result=self.install(payload)
+        self.assertTrue(result['updated']);self.assertTrue(result['launchers_updated'])
+        self.assertEqual(result['launcher_hashes'],{name:hashlib.sha256(v['source'].encode()).hexdigest() for name,v in payload.items()})
+        result=self.install(payload)
+        self.assertFalse(result['updated']);self.assertFalse(result['launchers_updated']);self.preserved()
     def test_full_verified_install_and_idempotence(self):
         result=self.install(self.payload);self.assertTrue(result['updated']);self.assertTrue(result['launchers_updated'])
         for name,value in self.payload.items():

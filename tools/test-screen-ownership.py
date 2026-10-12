@@ -153,6 +153,14 @@ class ClaimDispatch(unittest.TestCase):
         old=self.invoke('dispatch',owner=str(uuid.uuid4()),generation=str(uuid.uuid4()),legacy=True,command=command)
         self.assertNotEqual(old.returncode,0);self.assertFalse(marker.exists())
         fresh=self.invoke('dispatch',command=command);self.assertEqual(fresh.returncode,0,fresh.stderr.decode());self.assertTrue(marker.exists())
+    def test_legacy_public_state_root_keeps_mode_and_private_claim_record(self):
+        self.root.chmod(0o755); before=self.root.stat().st_ino
+        result=self.invoke('claim-empty')
+        self.assertEqual(result.returncode,0,result.stderr.decode())
+        self.assertEqual(self.root.stat().st_ino,before)
+        self.assertEqual(self.root.stat().st_mode & 0o777,0o755)
+        self.assertEqual((self.root/'screen-owners').stat().st_mode & 0o777,0o700)
+        self.assertEqual((self.root/'screen-owners/2.json').stat().st_mode & 0o777,0o600)
     def test_interrupted_database_commit_can_repeat_exact_claim(self):
         self.assertEqual(self.invoke('claim-empty').returncode,0)
         # Startup may pin the new owner's profile while the backend CAS is pending.
@@ -172,6 +180,36 @@ class ClaimDispatch(unittest.TestCase):
         self.assertEqual(self.invoke('claim-empty').returncode,0)
         self.assertEqual(m.read_record(records/'2.json')['generation'],self.generation)
 
+
+class LegacyRootBoundary(unittest.TestCase):
+    def test_only_exact_owned_legacy_root_can_be_public(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d)/'state';root.mkdir(mode=0o755)
+            with patch.object(m,'ROOT',root):
+                m.private(root)
+                for name in ['screen-owners','browser-2','other']:
+                    child=root/name;child.mkdir(mode=0o755)
+                    with self.assertRaises(RuntimeError):m.private(child)
+                for mode in [0o775,0o777,0o750,0o1755]:
+                    root.chmod(mode)
+                    with self.assertRaises(RuntimeError):m.private(root)
+                root.chmod(0o755)
+                with patch.object(m.os,'getuid',return_value=os.getuid()+1):
+                    with self.assertRaises(RuntimeError):m.private(root)
+                link=Path(d)/'link';link.symlink_to(root)
+                with patch.object(m,'ROOT',link):
+                    with self.assertRaises(RuntimeError):m.private(link)
+    def test_private_records_remain_required_under_legacy_root(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d)/'state';root.mkdir(mode=0o755)
+            with patch.object(m,'ROOT',root):
+                with m.launch_guard(2,root,startup=True):pass
+                self.assertEqual((root/'screen-owners').stat().st_mode & 0o777,0o700)
+                self.assertEqual((root/'browser-2').stat().st_mode & 0o777,0o700)
+                (root/'screen-owners').chmod(0o755)
+                with self.assertRaises(RuntimeError):
+                    with m.launch_guard(3,root,startup=True):pass
+                self.assertFalse((root/'browser-3').exists())
 
 class RootInspectorContract(unittest.TestCase):
     @unittest.skipUnless(os.geteuid()==0,'root-only refusal check')

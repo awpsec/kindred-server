@@ -33,7 +33,10 @@ def private_directory(path, uid):
     if not path.exists():
         path.mkdir(mode=0o700, parents=True)
     info = path.stat()
-    if not stat.S_ISDIR(info.st_mode) or info.st_uid != uid or info.st_mode & 0o077:
+    # Match the ownership fence's exact legacy root exception without chmod.
+    # Browser directories below this root still require private permissions.
+    legacy_root = path == ROOT and stat.S_IMODE(info.st_mode) == 0o755
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != uid or (info.st_mode & 0o077 and not legacy_root):
         raise BrowserContextError('Browser profile is unavailable or not private; do not reset it.')
     return path
 
