@@ -60,6 +60,20 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(result['launcher_hashes'],{name:hashlib.sha256(v['source'].encode()).hexdigest() for name,v in payload.items()})
         result=self.install(payload)
         self.assertFalse(result['updated']);self.assertFalse(result['launchers_updated']);self.preserved()
+    def test_production_payload_upgrades_exact_corrected_0862_helpers(self):
+        production=(ROOT/'src/vm_maintenance.rs').read_text(); payload={}
+        for name in self.payload:
+            old=subprocess.check_output(['git','show','bd9765cc9efbf9b65c503d4b4ca9a6378af71a24:deploy/'+name],cwd=ROOT)
+            (self.root/name).write_bytes(old);(self.root/name).chmod(0o755)
+            declaration=re.search(r'"'+re.escape(name)+r'":\{"source":include_str!\([^\n]+?\),"previous_sha256":([^}]+)\}',production)
+            self.assertIsNotNone(declaration,name)
+            payload[name]={'source':(ROOT/'deploy'/name).read_text(),'previous_sha256':json.loads(declaration[1])}
+        result=self.install(payload)
+        self.assertTrue(result['updated']);self.assertTrue(result['launchers_updated'])
+        self.assertEqual(result['launcher_hashes'],{name:hashlib.sha256(v['source'].encode()).hexdigest() for name,v in payload.items()})
+        self.assertEqual((self.root/'screen-ownership.py').read_text(),(ROOT/'deploy/screen-ownership.py').read_text())
+        result=self.install(payload)
+        self.assertFalse(result['updated']);self.assertFalse(result['launchers_updated']);self.preserved()
     def test_full_verified_install_and_idempotence(self):
         result=self.install(self.payload);self.assertTrue(result['updated']);self.assertTrue(result['launchers_updated'])
         for name,value in self.payload.items():

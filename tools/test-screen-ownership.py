@@ -253,4 +253,69 @@ class RootInspectorContract(unittest.TestCase):
             self.assertEqual(run.call_args.args[0],['/usr/bin/sudo','-n','/usr/bin/python3','-I','-B','/usr/local/lib/kindred/screen-ownership.py','--inspect-proc','--slot','2'])
             self.assertEqual(run.call_args.kwargs['timeout'],5)
 
+class ParentLockMetadata(unittest.TestCase):
+    def setUp(self):
+        self.temp=tempfile.TemporaryDirectory()
+        self.base=Path(self.temp.name)
+        self.root=self.base/'root'; self.root.mkdir(mode=0o700)
+        self.records=self.root/'screen-owners'; self.records.mkdir(mode=0o700)
+        self.lock=self.records/'2.lock'; self.lock.touch(mode=0o600)
+        self.fd=os.open(self.lock,os.O_RDWR)
+        fcntl.flock(self.fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+    def tearDown(self):
+        os.close(self.fd); self.temp.cleanup()
+    def check_child(self, root=None, uid=None):
+        # Fresh child must find the real kernel flock held by this test parent.
+        script="import importlib.util,sys;from pathlib import Path;s=importlib.util.spec_from_file_location('ownership',sys.argv[1]);m=importlib.util.module_from_spec(s);s.loader.exec_module(m);m.ROOT=Path(sys.argv[2]);m.verify_parent_lock(2,int(sys.argv[3]))"
+        return subprocess.run([sys.executable,'-c',script,str(Path(m.__file__).resolve()),str(root or self.root),str(os.getuid() if uid is None else uid)],capture_output=True,timeout=5)
+    def test_owned_legacy_root_accepts_actual_ancestor_flock_without_mutation(self):
+        self.root.chmod(0o755)
+        paths=(self.root,self.records,self.lock)
+        before=[(p.stat().st_ino,p.stat().st_mode) for p in paths]
+        result=self.check_child()
+        self.assertEqual(result.returncode,0,result.stderr.decode())
+        self.assertEqual(before,[(p.stat().st_ino,p.stat().st_mode) for p in paths])
+    def test_private_root_still_accepts_actual_ancestor_flock(self):
+        result=self.check_child(); self.assertEqual(result.returncode,0,result.stderr.decode())
+    def test_writable_or_other_public_root_refuses(self):
+        for mode in (0o775,0o777,0o750,0o705):
+            with self.subTest(mode=mode):
+                self.root.chmod(mode);self.assertNotEqual(self.check_child().returncode,0)
+    def test_private_children_and_lock_remain_required(self):
+        self.root.chmod(0o755)
+        for path in (self.records,self.lock):
+            path.chmod(0o755)
+            self.assertNotEqual(self.check_child().returncode,0)
+            path.chmod(0o700 if path==self.records else 0o600)
+    def test_redirected_private_records_or_lock_refuse(self):
+        self.root.chmod(0o755)
+        self.lock.unlink(); target=self.base/'other-lock';target.touch(mode=0o600)
+        self.lock.symlink_to(target)
+        self.assertNotEqual(self.check_child().returncode,0)
+        self.lock.unlink();self.lock.touch(mode=0o600)
+        moved=self.base/'other-records';self.records.rename(moved)
+        self.records.symlink_to(moved,target_is_directory=True)
+        self.assertNotEqual(self.check_child().returncode,0)
+    def test_foreign_uid_refuses(self):
+        self.root.chmod(0o755);self.assertNotEqual(self.check_child(uid=os.getuid()+1).returncode,0)
+    def test_root_and_ancestor_redirects_refuse(self):
+        alias=self.base/'alias';alias.symlink_to(self.root,target_is_directory=True)
+        self.assertNotEqual(self.check_child(root=alias).returncode,0)
+        parent_alias=self.base/'parent-alias';parent_alias.symlink_to(self.base,target_is_directory=True)
+        self.assertNotEqual(self.check_child(root=parent_alias/'root').returncode,0)
+    def test_missing_ancestor_flock_refuses(self):
+        self.root.chmod(0o755);fcntl.flock(self.fd,fcntl.LOCK_UN)
+        result=self.check_child();self.assertNotEqual(result.returncode,0)
+        self.assertIn(b'requires its ancestor slot lock',result.stderr)
+    def test_foreign_process_flock_is_not_an_ancestor(self):
+        self.root.chmod(0o755);fcntl.flock(self.fd,fcntl.LOCK_UN)
+        script="import fcntl,sys;f=open(sys.argv[1],'r+');fcntl.flock(f,fcntl.LOCK_EX);print('held',flush=True);sys.stdin.read()"
+        with subprocess.Popen([sys.executable,'-c',script,str(self.lock)],stdin=subprocess.PIPE,stdout=subprocess.PIPE,text=True) as holder:
+            try:
+                self.assertEqual(holder.stdout.readline().strip(),'held')
+                result=self.check_child();self.assertNotEqual(result.returncode,0)
+                self.assertIn(b'requires its ancestor slot lock',result.stderr)
+            finally:
+                holder.stdin.close();holder.wait(timeout=5)
+
 if __name__=='__main__':unittest.main()

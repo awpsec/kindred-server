@@ -126,9 +126,14 @@ def privileged_process_receipt(slot):
 
 def verify_parent_lock(slot,uid):
     records=ROOT/'screen-owners'; lockpath=records/f'{slot}.lock'
+    for ancestor in ROOT.parents:
+        if ancestor.is_symlink():
+            raise RuntimeError('Process inspector lock is unavailable')
     for path in (ROOT,records,lockpath):
         info=path.lstat()
-        if stat.S_ISLNK(info.st_mode) or info.st_uid!=uid or info.st_mode&0o077:
+        # Match private(ROOT): the legacy state root alone may remain 0755.
+        legacy_root = path == ROOT and stat.S_ISDIR(info.st_mode) and stat.S_IMODE(info.st_mode) == 0o755
+        if stat.S_ISLNK(info.st_mode) or info.st_uid!=uid or (info.st_mode&0o077 and not legacy_root):
             raise RuntimeError('Process inspector lock is unavailable')
     info=lockpath.lstat()
     if not stat.S_ISREG(info.st_mode): raise RuntimeError('Process inspector lock is unavailable')
