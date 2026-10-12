@@ -6,10 +6,11 @@ Environment=HOME=/home/bot
 Environment=KINDRED_GUEST=1
 ExecStart=/usr/local/lib/kindred/start-desktop.sh %i
 ExecStartPost=/usr/local/lib/kindred/wait-screen-ready %i
+ExecStop=/usr/local/lib/kindred/stop-browser.py --screen %i
 Restart=on-failure
 RestartSec=3
 KillMode=control-group
-TimeoutStopSec=15
+TimeoutStopSec=35
 
 [Install]
 WantedBy=default.target

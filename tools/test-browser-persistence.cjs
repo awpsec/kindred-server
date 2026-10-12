@@ -23,10 +23,11 @@ if(!process.env.KINDRED_PERSISTENCE_CHILD){
  async function stop(x,crash=false){
   if(crash){process.kill(-x.child.pid,'SIGKILL');}else{
    // Send normal WM_DELETE_WINDOW only to windows of this owned process/display.
-   execFileSync('python3',[path.join(root,'tools/close-fixture-browser.py'),String(x.child.pid)],{env:{...process.env,DISPLAY:x.policy.env.DISPLAY},timeout:5000});
+   const close="import importlib.util,sys;from pathlib import Path;s=importlib.util.spec_from_file_location('stop',sys.argv[1]);m=importlib.util.module_from_spec(s);s.loader.exec_module(m);m.close_browser(int(sys.argv[2]),root=Path(sys.argv[3]))";
+   execFileSync('python3',['-c',close,path.join(root,'deploy/stop-browser.py'),x.policy.env.DISPLAY.slice(1),path.join(dir,'profiles')],{env:{...process.env,DISPLAY:x.policy.env.DISPLAY},timeout:25000});
   }
   for(let i=0;i<100&&x.child.exitCode===null&&x.child.signalCode===null;i++)await sleep(50);
-  if(!crash)assert.equal(x.child.exitCode,0,'Normal close must not be a forced kill');
+  if(!crash){assert.equal(x.child.exitCode,0,'Normal close must not be a forced kill');const prefs=JSON.parse(fs.readFileSync(path.join(x.profile,'Default/Preferences'),'utf8'));assert.equal(prefs.profile.exit_type,'Normal','Shutdown must finish Chromium save before X11/bus stops');}
   await x.browser.close().catch(()=>{});browsers.delete(x.child);
  }
  async function seed(x){const context=x.browser.contexts()[0],page=context.pages()[0]||await context.newPage();await page.goto(origin+'/seed');await page.evaluate(async()=>{localStorage.setItem('auth-fixture','synthetic');await new Promise((resolve,reject)=>{const q=indexedDB.open('auth-fixture',1);q.onupgradeneeded=()=>q.result.createObjectStore('state');q.onerror=()=>reject(q.error);q.onsuccess=()=>{const db=q.result,tx=db.transaction('state','readwrite');tx.objectStore('state').put('synthetic','auth');tx.oncomplete=()=>{db.close();resolve();};tx.onerror=()=>reject(tx.error);};});});}
@@ -34,8 +35,13 @@ if(!process.env.KINDRED_PERSISTENCE_CHILD){
  try{
   let screen;for(let n=20;n<=32;n++){if(fs.existsSync('/tmp/.X11-unix/X'+n))continue;const child=spawn('Xvfb',[':'+n,'-screen','0','1440x900x24','-nolisten','tcp'],{stdio:'ignore'});await sleep(150);if(child.exitCode===null){xvfb=child;screen=n;break;}}assert(screen,'No disposable display available');
   openbox=spawn('openbox',['--sm-disable'],{env:{...process.env,DISPLAY:':'+screen},stdio:'ignore'});await sleep(300);
-  const results=[];let x=await launch(screen);await seed(x);const inode=fs.statSync(x.profile).ino;await stop(x);
-  x=await launch(screen,'new');let state=await inspect(x);assert(state.cookies.persistent&&state.cookies.session&&state.localStorage&&state.indexedDB);assert(state.tabs>=1);assert.equal(fs.statSync(x.profile).ino,inode);results.push({boundary:'normal-close/cross-action-new',...state,profileInodePreserved:true,busSelected:!!x.policy.env.DBUS_SESSION_BUS_ADDRESS});
+  const results=[];let x=await launch(screen);await seed(x);const inode=fs.statSync(x.profile).ino;
+  // An actual verified installer runs while this headed browser stays alive.
+  const update=path.join(dir,'update');fs.mkdirSync(update);
+  const receipt=JSON.parse(execFileSync('python3',[path.join(root,'tools/update-browser-fixture.py'),update],{encoding:'utf8',timeout:15000}));
+  assert(receipt.launchers_updated);assert.equal(x.child.exitCode,null);let beforeStop=await inspect(x);assert(beforeStop.cookies.persistent&&beforeStop.cookies.session&&beforeStop.localStorage&&beforeStop.indexedDB);results.push({boundary:'verified-runtime-and-desktop-update',...beforeStop,browserProcessPreserved:true,profileInodePreserved:fs.statSync(x.profile).ino===inode});
+  await stop(x);
+  x=await launch(screen,'new');let state=await inspect(x);assert(state.cookies.persistent&&state.cookies.session&&state.localStorage&&state.indexedDB);assert(state.tabs>=1);assert.equal(fs.statSync(x.profile).ino,inode);results.push({boundary:'normal-close/cross-action-new',...state,profileInodePreserved:true,busSelected:!!x.policy.env.DBUS_SESSION_BUS_ADDRESS,cleanExit:true});
   await stop(x,true);x=await launch(screen);state=await inspect(x);assert(state.cookies.persistent&&state.localStorage&&state.indexedDB);assert(state.tabs>=1);results.push({boundary:'crash/restore',...state});await stop(x);
   // Recreate the disposable desktop/bus without changing profile/XDG data.
   // This is a desktop-session restart, not a VM reboot or keyring proof.
@@ -44,7 +50,7 @@ if(!process.env.KINDRED_PERSISTENCE_CHILD){
   busHost=spawn('dbus-run-session',['--','sh','-c','openbox --sm-disable & wait'],{env:{...process.env,DISPLAY:':'+screen},stdio:'ignore',detached:true});await sleep(350);
   x=await launch(screen);assert.notEqual(x.policy.env.DBUS_SESSION_BUS_ADDRESS,firstBus);state=await inspect(x);
   assert(state.cookies.persistent&&state.cookies.session&&state.localStorage&&state.indexedDB);assert(state.tabs>=1);
-  results.push({boundary:'desktop-session-bus-restart',...state,distinctBus:true});await stop(x);
+  results.push({boundary:'desktop-session-bus-restart',...state,distinctBus:true,cleanExit:true});await stop(x);
   // A second desktop has the same UID and bus, but a distinct assigned profile.
   const other=screen===32?19:screen+1;assert(!fs.existsSync('/tmp/.X11-unix/X'+other));const secondX=spawn('Xvfb',[':'+other,'-screen','0','1440x900x24','-nolisten','tcp'],{stdio:'ignore'});let secondBox;
   try{await sleep(200);secondBox=spawn('openbox',['--sm-disable'],{env:{...process.env,DISPLAY:':'+other},stdio:'ignore'});await sleep(300);x=await launch(other);state=await inspect(x);assert(!state.cookies.persistent&&!state.cookies.session&&!state.localStorage&&!state.indexedDB);results.push({boundary:'separate-screen',...state});await stop(x);}finally{secondBox?.kill('SIGTERM');secondX.kill('SIGTERM');}

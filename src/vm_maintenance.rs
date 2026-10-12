@@ -145,7 +145,11 @@ async fn update_guest_runtime(app: &App) -> Result<()> {
         "desktop-launch":{"source":include_str!("../deploy/desktop-launch"),"previous_sha256":["ee430558ef4fd501d1dd55a453e4de9c9d9fc58018464a1091dee7adfccaa1df", "8cae9194cb3d1dc53606cb52aa254a531364bce3c006c0444d93088def9c2ba3"]},
         "start-desktop.sh":{"source":include_str!("../deploy/start-desktop.sh"),"previous_sha256":["45eb0cdb9e2ea03b86f8c6d21d96f769ebaa07d86d04e2f442da6732b6aaf3c6", "3d10321fd71359ceac432daa657b299d346aeb6142d07fe33a42d372733803d4"]},
         "ensure-screen":{"source":include_str!("../deploy/ensure-screen"),"previous_sha256":["de417ce99b63a1effd3f4c37efab7fb2e285ed7a7bfb8888ded84cbfc4fc27d9"]},
-        "screen-ownership.py":{"source":include_str!("../deploy/screen-ownership.py"),"previous_sha256":["1c309e1bbbb04b7d597328e09c060060a6499daeaa4c266ddedf1e59049d2fca","e3e81b892467ae509ecd873ce786407ef5bc9d0a5781ea37edd119019e26f004",null]}
+        "screen-ownership.py":{"source":include_str!("../deploy/screen-ownership.py"),"previous_sha256":["1c309e1bbbb04b7d597328e09c060060a6499daeaa4c266ddedf1e59049d2fca","e3e81b892467ae509ecd873ce786407ef5bc9d0a5781ea37edd119019e26f004",null]},
+        "stop-browser.py":{"source":include_str!("../deploy/stop-browser.py"),"previous_sha256":null},
+        "kindred-guest-desktop.service":{"source":include_str!("../deploy/kindred-guest-desktop.service"),"previous_sha256":["8027a12da5fed5a475215474667794d96bec562786f8287c5aa8707fcede4197","0c38908d416d1af1c535452abf6fd0eaa4c72541462cac785ff5666fde7765b3"]},
+        "kindred-screen@.service":{"source":include_str!("../deploy/kindred-screen@.service"),"previous_sha256":["0c1160391b4945ce6849dfe502a7c24285379018e60d9b8b9ab55e177ef007e6"]},
+        "browser-session.json":{"source":include_str!("../deploy/browser-session.json"),"previous_sha256":null}
     });
     let declaration=format!("LAUNCHERS = json.loads({})",serde_json::to_string(&serde_json::to_string(&launchers)?)?);
     let helper=include_str!("../deploy/update-guest-runtime.py").replace("LAUNCHERS = None", &declaration).replace('\'', "'\"'\"'");
@@ -163,7 +167,11 @@ pub(crate) fn managed_launcher_hashes() -> Value {
         ("desktop-launch",include_str!("../deploy/desktop-launch")),
         ("start-desktop.sh",include_str!("../deploy/start-desktop.sh")),
         ("ensure-screen",include_str!("../deploy/ensure-screen")),
-        ("screen-ownership.py",include_str!("../deploy/screen-ownership.py"))
+        ("screen-ownership.py",include_str!("../deploy/screen-ownership.py")),
+        ("stop-browser.py",include_str!("../deploy/stop-browser.py")),
+        ("kindred-guest-desktop.service",include_str!("../deploy/kindred-guest-desktop.service")),
+        ("kindred-screen@.service",include_str!("../deploy/kindred-screen@.service")),
+        ("browser-session.json",include_str!("../deploy/browser-session.json"))
     ] {
         let digest=ring::digest::digest(&ring::digest::SHA256,source.as_bytes());
         values.insert(name.into(),Value::String(digest.as_ref().iter().map(|b|format!("{b:02x}")).collect()));

@@ -483,13 +483,17 @@ def main():
             if action=='reboot' and not is_running:
                 raise ValueError('The bot computer is off. Start the computer before restarting it.')
             atomic(root/'power-intent.json',{'running':action!='shutdown'})
-            if is_running: qmp(root,'system_powerdown' if action=='shutdown' else 'system_reset')
-            if action=='shutdown':
+            if is_running: qmp(root,'system_powerdown')
+            if is_running:
                 # Keep the operation lock until QEMU exits. A message sent during
                 # shutdown then starts the same disk after shutdown has finished.
                 deadline=time.monotonic()+60
                 while running(root) and time.monotonic()<deadline: time.sleep(.5)
-                if running(root): raise ValueError('The computer is still shutting down. Wait a moment and retry.')
+                if running(root): raise ValueError('The computer is still shutting down. No hardware reset was sent; wait a moment and retry.')
+            if action=='reboot':
+                # A hardware reset bypasses Chromium and filesystem shutdown.
+                # Boot the same existing disk only after ACPI shutdown completed.
+                start(root,profile)
             print(json.dumps({'state':'shut off' if action=='shutdown' else 'restarting'}))
 
 if __name__=='__main__':

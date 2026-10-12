@@ -39,11 +39,21 @@ class PowerIntentRecovery(unittest.TestCase):
     def test_reboot_running_dispatches_once_and_returns_receipt(self):
         with tempfile.TemporaryDirectory() as temporary:
             root=Path(temporary);profile='00000000-0000-4000-8000-000000000001';output=__import__('io').StringIO()
-            with patch.object(manager,'ROOT',root),patch.object(manager.sys,'argv',['manager','reboot',profile]),patch.object(manager,'running',return_value=True),patch.object(manager,'qmp') as control,contextlib.redirect_stdout(output):
+            with patch.object(manager,'ROOT',root),patch.object(manager.sys,'argv',['manager','reboot',profile]),patch.object(manager,'running',side_effect=[True,True,False,False]),patch.object(manager.time,'sleep'),patch.object(manager,'start') as start,patch.object(manager,'qmp') as control,contextlib.redirect_stdout(output):
                 manager.main()
-                control.assert_called_once_with(root/profile/'computer','system_reset')
+                control.assert_called_once_with(root/profile/'computer','system_powerdown')
+                start.assert_called_once_with(root/profile/'computer',profile)
             self.assertEqual(json.loads(output.getvalue()),{'state':'restarting'})
             self.assertTrue(json.loads((root/profile/'computer/power-intent.json').read_text())['running'])
+
+    def test_reboot_timeout_never_resets_or_starts_a_running_disk(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary);profile='00000000-0000-4000-8000-000000000001'
+            with patch.object(manager,'ROOT',root),patch.object(manager.sys,'argv',['manager','reboot',profile]),patch.object(manager,'running',return_value=True),patch.object(manager.time,'monotonic',side_effect=[0,61]),patch.object(manager,'start') as start,patch.object(manager,'qmp') as control:
+                with self.assertRaisesRegex(ValueError,'No hardware reset'):
+                    manager.main()
+                control.assert_called_once_with(root/profile/'computer','system_powerdown')
+                start.assert_not_called()
 
     def test_restore_isolated_preserves_stopped_and_retired(self):
         with tempfile.TemporaryDirectory() as temporary:

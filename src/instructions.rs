@@ -7,7 +7,7 @@ use anyhow::{Result, bail};
 use rusqlite::OptionalExtension;
 use serde_json::{Value, json};
 
-pub const VERSION: &str = "38";
+pub const VERSION: &str = "39";
 pub const CORE: &str = include_str!("prompts/00-core.md");
 pub const BOUNDED_CORE: &str = include_str!("prompts/00-bounded-core.md");
 pub const CHAPTERS: &[(&str, &str)] = &[
@@ -415,7 +415,8 @@ mod tests {
         // Saved-login guidance must survive compact context assembly, rather
         // than live only in a reference chapter the bot may never request.
         for text in [&full, &compact, &large] {
-            assert!(text.contains("Bitwarden"));
+            assert!(text.contains("password manager or browser"));
+            assert!(!text.contains("Bitwarden"));
             assert!(text.contains("masked autofill"));
             assert!(text.contains("locked vault"));
             assert!(text.contains("try autofill yourself"));
