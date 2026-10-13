@@ -416,6 +416,11 @@ mod tests {
         // than live only in a reference chapter the bot may never request.
         for text in [&full, &compact, &large] {
             assert!(text.contains("Bitwarden"));
+            assert!(text.contains("Copy username / Copy password"));
+            assert!(text.to_lowercase().contains("search or scroll"));
+            assert!(text.contains("read the clipboard back"));
+            assert!(!text.contains("Never reveal or copy passwords"));
+            assert!(!text.contains("without revealing, copying or reading the password"));
             assert!(text.contains("masked autofill"));
             assert!(text.contains("locked vault"));
             assert!(text.contains("try autofill yourself"));
