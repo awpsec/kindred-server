@@ -260,3 +260,6 @@ async fn main() -> Result<()> {
 mod screen_capacity_tests;
 
 mod screen_capacity;
+
+#[cfg(test)]
+mod skill_maintenance_tests;

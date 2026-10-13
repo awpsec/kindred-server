@@ -161,17 +161,68 @@ pub fn migrate(c: &Connection) -> Result<()> {
       CREATE TABLE IF NOT EXISTS run_commands(run_id TEXT PRIMARY KEY REFERENCES runs(id),receipt TEXT NOT NULL);")?;
     Ok(())
 }
+pub(crate) fn skill_state(c: &Connection, name: &str) -> Result<Value> {
+    c.query_row("SELECT rowid,name,body,command,description,parameters,import_data FROM skills WHERE name=?", [name], |r| {
+        Ok(json!({"row_id":r.get::<_,i64>(0)?,"name":r.get::<_,String>(1)?,"body":r.get::<_,String>(2)?,"command":r.get::<_,String>(3)?,"description":r.get::<_,String>(4)?,"parameters":r.get::<_,String>(5)?,"import_data":r.get::<_,String>(6)?}))
+    }).optional()?.context("Skill not found; use skills_list for its exact installed name")
+}
+pub(crate) fn skill_hash(state: &Value) -> String {
+    ring::digest::digest(&ring::digest::SHA256, state.to_string().as_bytes())
+        .as_ref().iter().map(|b| format!("{b:02x}")).collect()
+}
 fn skills(c: &Connection) -> Result<Vec<Value>> {
-    Ok(c.prepare("SELECT name,body,command,description,parameters,import_data FROM skills ORDER BY name")?.query_map([],|r|{
+    Ok(c.prepare("SELECT name,body,command,description,parameters,import_data,rowid FROM skills ORDER BY name")?.query_map([],|r|{
         let parameters:String=r.get(4)?;
         let imported:Value=serde_json::from_str(&r.get::<_,String>(5)?).unwrap_or(Value::Null);
         let parameters=crate::skill_import::arguments::parameters(&imported,serde_json::from_str(&parameters).unwrap_or_default());
-        Ok(json!({"name":r.get::<_,String>(0)?,"body":r.get::<_,String>(1)?,"command":r.get::<_,String>(2)?,"description":r.get::<_,String>(3)?,"parameters":parameters,"import":crate::skill_import::summary(&imported)}))
+        let name=r.get::<_,String>(0)?;
+        let current_hash=skill_hash(&json!({"row_id":r.get::<_,i64>(6)?,"name":name,"body":r.get::<_,String>(1)?,"command":r.get::<_,String>(2)?,"description":r.get::<_,String>(3)?,"parameters":r.get::<_,String>(4)?,"import_data":r.get::<_,String>(5)?}));
+        Ok(json!({"name":name,"body":r.get::<_,String>(1)?,"command":r.get::<_,String>(2)?,"description":r.get::<_,String>(3)?,"parameters":parameters,"import":crate::skill_import::summary(&imported),"current_hash":current_hash}))
     })?.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 impl Db {
     pub fn skills(&self) -> Result<Vec<Value>> {
         skills(&self.0.lock().unwrap())
+    }
+    /// Change the installed row in place, including its source-sync references.
+    /// The supplied fingerprint covers every persisted field, not only the body.
+    pub fn rename_skill(&self, v: &Value) -> Result<Value> {
+        let name=v["name"].as_str().context("Skill name is required")?;
+        let new_name=v["new_name"].as_str().context("New skill name is required")?.trim();
+        ensure!(!new_name.is_empty() && new_name.len()<=100 && !new_name.chars().any(char::is_control),"Invalid skill name");
+        let mut c=self.0.lock().unwrap();let tx=c.transaction()?;
+        let old=skill_state(&tx,name)?;
+        ensure!(v["expected_current_hash"].as_str()==Some(skill_hash(&old).as_str()),"Skill changed since reading it; read skills_list again");
+        let command=match v.get("command") {
+            Some(value)=>value.as_str().context("Command must be text")?.trim().trim_start_matches('/'),
+            None=>old["command"].as_str().unwrap(),
+        };
+        ensure!(command.is_empty() || (slug(command) && !reserved(command)),"Choose a non-reserved lowercase command name, up to 48 characters");
+        ensure!(!tx.query_row("SELECT EXISTS(SELECT 1 FROM skills WHERE name=? AND name!=?)",params![new_name,name],|r|r.get::<_,bool>(0))?,"Another skill already has that name");
+        ensure!(command.is_empty() || !tx.query_row("SELECT EXISTS(SELECT 1 FROM skills WHERE command=? AND name!=?)",params![command,name],|r|r.get::<_,bool>(0))?,"Another skill already uses this command");
+        let mut imported:Value=serde_json::from_str(old["import_data"].as_str().unwrap()).context("Saved skill provenance is invalid")?;
+        let mut import_data=old["import_data"].as_str().unwrap().to_owned();
+        if imported.is_object() {
+            imported["name"]=json!(new_name);imported["command"]=json!(command);
+            import_data=imported.to_string();
+        }
+        tx.execute("UPDATE skills SET name=?,command=?,import_data=? WHERE name=?",params![new_name,command,import_data,name])?;
+        crate::workspace_import::maintain_skill_links(&tx,name,Some((new_name,command)))?;
+        let current_hash=skill_hash(&skill_state(&tx,new_name)?);
+        tx.commit()?;
+        Ok(json!({"old_name":name,"name":new_name,"old_command":old["command"],"command":command,"current_hash":current_hash,"status":"renamed"}))
+    }
+    pub fn remove_skill(&self, v: &Value) -> Result<Value> {
+        self.delete_skill_checked(v["name"].as_str().context("Skill name is required")?,Some(v["expected_current_hash"].as_str().context("Current skill fingerprint is required")?))
+    }
+    pub(crate) fn delete_skill_checked(&self, name: &str, expected: Option<&str>) -> Result<Value> {
+        let mut c=self.0.lock().unwrap();let tx=c.transaction()?;
+        let old=skill_state(&tx,name)?;
+        if let Some(expected)=expected {ensure!(expected==skill_hash(&old),"Skill changed since reading it; read skills_list again");}
+        crate::workspace_import::maintain_skill_links(&tx,name,None)?;
+        ensure!(tx.execute("DELETE FROM skills WHERE name=?",[name])?==1,"Skill not found");
+        tx.commit()?;
+        Ok(json!({"name":name,"command":old["command"],"status":"deleted","source_files_deleted":false}))
     }
     pub fn save_skill(&self, v: &Value) -> Result<Value> {
         let name = v["name"].as_str().context("Skill name is required")?.trim();

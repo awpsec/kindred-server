@@ -433,10 +433,7 @@ impl Db {
         Ok(())
     }
     pub fn delete_skill(&self, name: &str) -> Result<()> {
-        self.0
-            .lock()
-            .unwrap()
-            .execute("DELETE FROM skills WHERE name=?", [name])?;
+        self.delete_skill_checked(name, None)?;
         Ok(())
     }
     pub fn queue(&self, bot_id: &str, prompt: &str, depth: i64) -> Result<String> {

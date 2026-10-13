@@ -726,3 +726,38 @@ fn workspace_converter_receives_large_source_skills_before_condensing() {
             > 72000
     );
 }
+
+#[test]
+fn skill_maintenance_workspace_rename_updates_links_and_fences_prepared_sync() {
+    let app=crate::tests::app();let actor=crate::tests::bot(&app.db,"codex");let bot=created(&app.db,&actor);
+    let (pending,run,v)=ready(&app.db,&bot,&bot.id,"two");
+    let before=app.db.skills().unwrap()[0].clone();
+    app.db.rename_skill(&json!({"name":"Harold review","new_name":"Maintained review","command":"maintained-review","expected_current_hash":before["current_hash"]})).unwrap();
+    let origin=origin(&app.db,&bot.id).unwrap();let key=".agents/skills/review/SKILL.md";
+    assert_eq!(origin["workflows"][key]["name"],"Maintained review");assert_eq!(origin["workflows"][key]["command"],"maintained-review");
+    assert!(apply(&app.db,&pending,&json!({"revision":v["revision"]})).is_err());
+    app.db.finish(&run.id,"completed","Stale review","").unwrap();
+    let (id,_,v)=ready(&app.db,&bot,&bot.id,"two");let mut draft=v["draft"].clone();draft["workflows"][0]["name"]=json!("Maintained review");draft["workflows"][0]["command"]=json!("maintained-review");
+    apply(&app.db,&id,&json!({"revision":v["revision"],"draft":draft})).unwrap();
+    let skills=app.db.skills().unwrap();assert_eq!(skills.len(),1);assert_eq!(skills[0]["name"],"Maintained review");assert!(skills[0]["body"].as_str().unwrap().contains("two"));
+}
+#[test]
+fn skill_maintenance_workspace_delete_does_not_resurrect_on_repeated_sync() {
+    let app=crate::tests::app();let actor=crate::tests::bot(&app.db,"codex");let bot=created(&app.db,&actor);let key=".agents/skills/review/SKILL.md";
+    let original=origin_c(&app.db.0.lock().unwrap(),&bot.id).unwrap()["snapshot"].clone();
+    let before=app.db.skills().unwrap()[0].clone();app.db.remove_skill(&json!({"name":"Harold review","expected_current_hash":before["current_hash"]})).unwrap();
+    assert_eq!(origin_c(&app.db.0.lock().unwrap(),&bot.id).unwrap()["snapshot"],original);
+    for version in ["two","three"] {
+        let (id,run)=started(&app.db,&bot,&bot.id,snapshot(version));
+        assert!(draft(&app.db,&bot,&run,&proposal(&id,version)).is_err());
+        let mut skipped=proposal(&id,version);skipped["workflows"]=json!([{"key":key,"include":false}]);draft(&app.db,&bot,&run,&skipped).unwrap();let v=get(&app.db,&id).unwrap();apply(&app.db,&id,&json!({"revision":v["revision"]})).unwrap();app.db.finish(&run.id,"completed","Synced other guidance","").unwrap();
+        assert!(app.db.skills().unwrap().is_empty());assert_eq!(origin(&app.db,&bot.id).unwrap()["removed_workflows"][key]["name"],"Harold review");
+    }
+}
+#[test]
+fn skill_maintenance_workspace_link_failure_rolls_back_row_change() {
+    let app=crate::tests::app();let actor=crate::tests::bot(&app.db,"codex");let bot=created(&app.db,&actor);let before=app.db.skills().unwrap();
+    app.db.0.lock().unwrap().execute("UPDATE workspace_origins SET data='invalid' WHERE bot_id=?",[&bot.id]).unwrap();
+    assert!(app.db.rename_skill(&json!({"name":"Harold review","new_name":"new","expected_current_hash":before[0]["current_hash"]})).is_err());assert_eq!(app.db.skills().unwrap(),before);
+    assert!(app.db.remove_skill(&json!({"name":"Harold review","expected_current_hash":before[0]["current_hash"]})).is_err());assert_eq!(app.db.skills().unwrap(),before);
+}
