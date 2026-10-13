@@ -29,11 +29,23 @@ fn folders(c:&Connection)->Result<Value>{
 }
 fn validate(v:&Value)->Result<()> {
  ensure!(v["title"].as_str().is_some_and(|s|!s.trim().is_empty()&&s.len()<=200),"Title must contain 1–200 bytes");
- ensure!(matches!(v["language"].as_str(),Some("markdown"|"html"|"jsx")),"Use markdown, html or jsx");
+ ensure!(matches!(v["language"].as_str(),Some("markdown"|"html"|"jsx"|"file")),"Use markdown, html or jsx");
  ensure!(v["source"].as_str().is_some_and(|s|s.len()<=SOURCE_MAX_BYTES),"This artifact is too large to save (limit about 4 MB of text). Split it into smaller artifacts.");
  ensure!(v.get("kind").is_none()||matches!(v["kind"].as_str(),Some("document"|"slides"|"sheet"|"app")),"Use document, slides, sheet or app");
  ensure!(v.get("folder").is_none()||v["folder"].as_str().is_some_and(|s|s.len()<=120&&!s.chars().any(char::is_control)),"Folder must be text up to 120 bytes");
+ ensure!(v["language"]!="file"||v["file"].is_object(),"File artifacts require an authorized original attachment");
  ensure!(v["state"].to_string().len()<=STATE_MAX_BYTES,"This artifact's saved data is too large (limit about 2 MB). Clear old entries and try again.");Ok(())
+}
+// Only immutable files already shared in this conversation may back an artifact.
+// The caller supplies an attachment ID; all identity and provenance comes from SQL.
+fn file_reference(c:&Connection,chat:&str,id:&str)->Result<Value>{
+ let (name,size,hash,created,run,bot,source):(String,i64,String,i64,String,String,String)=c.query_row("SELECT d.name,length(d.bytes),d.sha256,d.created,r.id,r.bot_id,d.source_url FROM deliverables d JOIN runs r ON r.id=d.run_id WHERE d.id=? AND r.chat_id=?",params![id,chat],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?))).context("Original file not found in this conversation")?;
+ let extension=name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+ let content_type=match extension.as_str(){"docx"=>"application/vnd.openxmlformats-officedocument.wordprocessingml.document","xlsx"=>"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet","pdf"=>"application/pdf",_=>anyhow::bail!("Publish a DOCX, XLSX or PDF attachment")};
+ Ok(json!({"id":id,"name":name,"extension":extension,"content_type":content_type,"size":size,"sha256":hash,"created":created,"run_id":run,"bot_id":bot,"source_url":source}))
+}
+fn artifact_body_file(c:&Connection,chat:&str,args:&Value)->Result<Option<Value>>{
+ if let Some(id)=args.get("file_id") {let id=id.as_str().context("File ID must be text")?;ensure!(args.get("source").is_none()&&args.get("state").is_none(),"Publish the original file separately from an editable review copy");return Ok(Some(file_reference(c,chat,id)?));}Ok(None)
 }
 fn record(c:&Connection,id:&str)->Result<Value> {
  let (body,chat,bot,revision,updated,archived):(String,String,String,i64,i64,bool)=c.query_row("SELECT body,chat_id,bot_id,revision,updated,archived FROM workspace_artifacts WHERE id=?",[id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).context("Artifact not found in this workspace")?;
@@ -102,19 +114,20 @@ impl Db {
  pub fn workspace_artifact_read(&self,id:&str)->Result<Value>{record(&self.0.lock().unwrap(),id)}
  pub fn workspace_artifact_list(&self)->Result<Value>{
   let c=self.0.lock().unwrap();let cutoff=db::now()-IDLE;
-  let mut query=c.prepare("SELECT id,chat_id,bot_id,revision,updated,archived,json_extract(body,'$.title'),json_extract(body,'$.language'),json_extract(body,'$.kind'),json_extract(body,'$.folder') FROM workspace_artifacts ORDER BY updated DESC,id")?;
+  let mut query=c.prepare("SELECT id,chat_id,bot_id,revision,updated,archived,json_extract(body,'$.title'),json_extract(body,'$.language'),json_extract(body,'$.kind'),json_extract(body,'$.folder'),json_extract(body,'$.file') FROM workspace_artifacts ORDER BY updated DESC,id")?;
   let values=query.query_map([],|r|{
    let id:String=r.get(0)?;let language:String=r.get(7)?;let updated:i64=r.get(4)?;let archived:bool=r.get(5)?;let kind:Option<String>=r.get(8)?;
-   Ok(json!({"id":id,"chat_id":r.get::<_,String>(1)?,"bot_id":r.get::<_,String>(2)?,"revision":r.get::<_,i64>(3)?,"updated":updated,"archived":archived||updated<=cutoff,"title":r.get::<_,String>(6)?,"kind":kind.unwrap_or_else(||if language=="markdown"{"document"}else{"app"}.into()),"language":language,"folder":r.get::<_,Option<String>>(9)?.unwrap_or_default(),"path":format!("/artifacts/{id}")}))
+   let mut value=json!({"id":id,"chat_id":r.get::<_,String>(1)?,"bot_id":r.get::<_,String>(2)?,"revision":r.get::<_,i64>(3)?,"updated":updated,"archived":archived||updated<=cutoff,"title":r.get::<_,String>(6)?,"kind":kind.unwrap_or_else(||if language=="markdown"{"document"}else{"app"}.into()),"language":language,"folder":r.get::<_,Option<String>>(9)?.unwrap_or_default(),"path":format!("/artifacts/{id}")});if language=="file"{let file:String=r.get(10)?;value["file"]=serde_json::from_str(&file).map_err(|e|rusqlite::Error::FromSqlConversionFailure(10,rusqlite::types::Type::Text,Box::new(e)))?;}Ok(value)
   })?.collect::<rusqlite::Result<Vec<_>>>()?;Ok(json!(values))
  }
- pub fn workspace_artifact_create(&self,run:&Run,args:&Value)->Result<Value>{self.workspace_artifact_create_in_chat(&run.chat_id,&run.bot_id,args)}
+ pub fn workspace_artifact_create(&self,run:&Run,args:&Value)->Result<Value>{let actual=self.run(&run.id)?;ensure!(actual.chat_id==run.chat_id&&actual.bot_id==run.bot_id,"Task ownership changed");self.workspace_artifact_create_in_chat(&run.chat_id,&run.bot_id,args)}
  pub fn workspace_artifact_create_in_chat(&self,chat:&str,bot:&str,args:&Value)->Result<Value>{self.workspace_artifact_create_with_actor(chat,bot,args,"bot")}
  pub fn workspace_artifact_create_with_actor(&self,chat:&str,bot:&str,args:&Value,actor:&str)->Result<Value>{
   let key=args["key"].as_str().context("A stable artifact key is required")?;ensure!(!key.is_empty()&&key.len()<=100,"Invalid artifact key");
   let mut c=self.0.lock().unwrap();let tx=c.transaction()?;writable(&tx,chat)?;
-  if let Some(id)=tx.query_row("SELECT id FROM workspace_artifacts WHERE chat_id=? AND artifact_key=?",params![chat,key],|r|r.get::<_,String>(0)).optional()?{return record(&tx,&id);}
-  let body=json!({"created_by":actor,"folder":args.get("folder").cloned().unwrap_or(json!("")),"title":args["title"],"language":args["language"],"source":args["source"],"state":args.get("state").cloned().unwrap_or(json!({})),"kind":args.get("kind").cloned().unwrap_or(json!(if args["language"]=="markdown" {"document"}else{"app"}))});validate(&body)?;register_folder(&tx,body["folder"].as_str().unwrap_or(""))?;let id=db::id();let now=db::now();
+  let file=artifact_body_file(&tx,chat,args)?;
+  if let Some(id)=tx.query_row("SELECT id FROM workspace_artifacts WHERE chat_id=? AND artifact_key=?",params![chat,key],|r|r.get::<_,String>(0)).optional()?{let prior=record(&tx,&id)?;if let Some(file)=&file{ensure!(prior["language"]=="file"&&prior["file"]["id"]==file["id"],"This key already names a different artifact. Update its file with expected_revision or use a separate key");}return Ok(prior);}
+  let mut body=json!({"created_by":actor,"folder":args.get("folder").cloned().unwrap_or(json!("")),"title":args["title"],"language":args["language"],"source":args["source"],"state":args.get("state").cloned().unwrap_or(json!({})),"kind":args.get("kind").cloned().unwrap_or(json!(if args["language"]=="markdown" {"document"}else{"app"}))});if let Some(file)=file{body["language"]=json!("file");body["kind"]=json!(if file["extension"]=="xlsx"{"sheet"}else{"document"});body["source"]=json!("");body["state"]=json!({});body["file"]=file;}validate(&body)?;register_folder(&tx,body["folder"].as_str().unwrap_or(""))?;let id=db::id();let now=db::now();
   tx.execute("INSERT INTO workspace_artifacts VALUES(?,?,?,?,?,1,?,0)",params![id,chat,bot,key,body.to_string(),now])?;
   tx.execute("INSERT INTO workspace_artifact_versions VALUES(?,1,?,?)",params![id,body.to_string(),now])?;
   let v=record(&tx,&id)?;publish(&tx,&v)?;tx.commit()?;Ok(v)
@@ -123,12 +136,33 @@ impl Db {
   let mut c=self.0.lock().unwrap();let tx=c.transaction()?;let mut v=record(&tx,id)?;writable(&tx,v["chat_id"].as_str().unwrap())?;
   let revision=v["revision"].as_i64().unwrap();ensure!(patch["expected_revision"].as_i64()==Some(revision),"Artifact changed. Reload and merge your edits before saving");
   ensure!(v["archived"]!=true||patch["reopen"]==true,"Artifact is archived. Reopen it before editing");
+  if v["language"]=="file"{ensure!(["language","source","state","kind"].iter().all(|k|patch.get(k).is_none()),"Original files are read-only. Publish a replacement attachment or create a separate editable document");if let Some(file)=artifact_body_file(&tx,v["chat_id"].as_str().unwrap(),patch)?{v["file"]=file;v["kind"]=json!(if v["file"]["extension"]=="xlsx"{"sheet"}else{"document"});}}else{ensure!(patch.get("file_id").is_none(),"Keep the editable review copy; publish the original as a separate artifact");}
   for k in ["title","language","source","state","kind","folder"]{if let Some(x)=patch.get(k){v[k]=x.clone();}}validate(&v)?;register_folder(&tx,v["folder"].as_str().unwrap_or(""))?;
-  let body=json!({"created_by":v.get("created_by").cloned().unwrap_or(Value::Null),"folder":v.get("folder").cloned().unwrap_or(json!("")),"title":v["title"],"language":v["language"],"source":v["source"],"state":v["state"],"kind":v.get("kind").cloned().unwrap_or(json!(if v["language"]=="markdown" {"document"}else{"app"}))});let now=db::now();
+  let mut body=json!({"created_by":v.get("created_by").cloned().unwrap_or(Value::Null),"folder":v.get("folder").cloned().unwrap_or(json!("")),"title":v["title"],"language":v["language"],"source":v["source"],"state":v["state"],"kind":v.get("kind").cloned().unwrap_or(json!(if v["language"]=="markdown" {"document"}else{"app"}))});if v["language"]=="file"{body["file"]=v["file"].clone();}let now=db::now();
   tx.execute("UPDATE workspace_artifacts SET body=?,revision=revision+1,updated=?,archived=? WHERE id=?",params![body.to_string(),now,patch["archive"]==true,id])?;
   tx.execute("INSERT INTO workspace_artifact_versions VALUES(?,?,?,?)",params![id,revision+1,body.to_string(),now])?;
   let v=record(&tx,id)?;publish(&tx,&v)?;tx.commit()?;Ok(v)
  }
+ pub fn workspace_artifact_file(&self,id:&str,revision:i64)->Result<(Value,Vec<u8>)>{
+  let c=self.0.lock().unwrap();let current=record(&c,id)?;ensure!(revision>0&&revision<=current["revision"].as_i64().unwrap(),"Artifact revision not found");
+  let body:String=c.query_row("SELECT body FROM workspace_artifact_versions WHERE artifact_id=? AND revision=?",params![id,revision],|r|r.get(0))?;let value:Value=serde_json::from_str(&body)?;ensure!(value["language"]=="file","This is an editable Kindred artifact, not an original file");
+  let file=file_reference(&c,current["chat_id"].as_str().unwrap(),value["file"]["id"].as_str().context("Missing original file")?)?;ensure!(["id","name","extension","content_type","size","sha256","created","run_id","bot_id"].iter().all(|key|file[key]==value["file"][key]),"Original file identity changed");
+  let bytes=c.query_row("SELECT bytes FROM deliverables WHERE id=?",[file["id"].as_str().unwrap()],|r|r.get::<_,Vec<u8>>(0))?;let hash:String=ring::digest::digest(&ring::digest::SHA256,&bytes).as_ref().iter().map(|b|format!("{b:02x}")).collect();ensure!(file["sha256"]==hash,"Original file bytes changed");Ok((value["file"].clone(),bytes))
+ }
+ pub fn workspace_artifact_export(&self,id:&str)->Result<Value>{
+  use base64::Engine;let value=self.workspace_artifact_read(id)?;
+  if value["language"]!="file"{return crate::artifact_export::export(&value);}
+  let (file,bytes)=self.workspace_artifact_file(id,value["revision"].as_i64().unwrap())?;
+  Ok(json!({"filename":file["name"],"content_type":file["content_type"],"data_base64":base64::engine::general_purpose::STANDARD.encode(bytes),"revision":value["revision"],"sha256":file["sha256"],"original":true}))
+ }
+}
+pub async fn original(State(app):State<Shared>,Path((id,revision)):Path<(String,i64)>)->Result<axum::response::Response,crate::web::Error>{
+ let (file,bytes)=app.db.workspace_artifact_file(&id,revision)?;
+ Ok(crate::web::download_file_response(file["name"].as_str().unwrap().to_owned(),bytes))
+}
+pub async fn page_preview(State(app):State<Shared>,Path((id,revision)):Path<(String,i64)>)->Result<axum::response::Response,crate::web::Error>{
+ use axum::{response::IntoResponse,http::header};let (file,bytes)=app.db.workspace_artifact_file(&id,revision)?;let pdf=crate::document_preview::render(file["name"].as_str().unwrap().to_owned(),bytes).await?;
+ Ok(([(header::CONTENT_TYPE,"application/pdf"),(header::CACHE_CONTROL,"no-store")],pdf).into_response())
 }
 pub async fn folder_list(State(app):State<Shared>)->Result<Json<Value>,crate::web::Error>{Ok(Json(app.db.workspace_artifact_folders()?))}
 pub async fn folder_create(State(app):State<Shared>,Json(args):Json<Value>)->Result<Json<Value>,crate::web::Error>{Ok(Json(app.db.workspace_artifact_folder_create(args["name"].as_str().context("Folder name is required")?)?))}
@@ -359,7 +393,7 @@ pub async fn update(State(app):State<Shared>,Path(id):Path<String>,Json(patch):J
 
 }
 
-pub async fn export(State(app):State<Shared>,Path(id):Path<String>)->Result<Json<Value>,crate::web::Error>{Ok(Json(crate::artifact_export::export(&app.db.workspace_artifact_read(&id)?)?))}
+pub async fn export(State(app):State<Shared>,Path(id):Path<String>)->Result<Json<Value>,crate::web::Error>{Ok(Json(app.db.workspace_artifact_export(&id)?))}
 
 #[cfg(test)]
 mod office_folder_tests {
@@ -378,5 +412,42 @@ mod office_folder_tests {
  async fn office_folder_mutations_require_authentication(){
   use tower::ServiceExt;use axum::{body::Body,http::Request};let app=crate::tests::app();
   for method in ["PATCH","DELETE"]{let response=crate::web::router(app.clone()).oneshot(Request::builder().method(method).uri("/api/workspace-artifact-folders").header("content-type","application/json").body(Body::from(r#"{"name":"Reports","new_name":"Renamed"}"#)).unwrap()).await.unwrap();assert_eq!(response.status(),401);}
+ }
+}
+
+#[cfg(test)] mod file_tests {
+ use super::*;use base64::Engine;
+ fn fixture()->(Shared,crate::db::Bot,Run){let app=crate::tests::app();let bot=crate::tests::bot(&app.db,"codex");let run=app.db.run(&app.db.queue(&bot.id,"Publish original",0).unwrap()).unwrap();(app,bot,run)}
+ #[test] fn original_file_revisions_preserve_bytes_and_native_copy(){
+  let (app,_,run)=fixture();let db=&app.db;let first=db.attach_file(&run,"/workspace/report.docx",b"original Word bytes").unwrap();
+  let args=json!({"key":"original","title":"Client report","file_id":first["id"]});let a=db.workspace_artifact_create(&run,&args).unwrap();let id=a["id"].as_str().unwrap();assert_eq!(a["language"],"file");assert_eq!(a["file"]["name"],"report.docx");assert_eq!(db.workspace_artifact_create(&run,&args).unwrap()["id"],id);
+  let original=db.workspace_artifact_export(id).unwrap();assert_eq!(base64::engine::general_purpose::STANDARD.decode(original["data_base64"].as_str().unwrap()).unwrap(),b"original Word bytes");assert_eq!(original["filename"],"report.docx");assert_eq!(original["original"],true);
+  let second=db.attach_file(&run,"/workspace/report.docx",b"replacement Word bytes").unwrap();let b=db.workspace_artifact_update(id,&json!({"expected_revision":1,"file_id":second["id"]})).unwrap();assert_eq!(b["revision"],2);assert_eq!(db.workspace_artifact_file(id,1).unwrap().1,b"original Word bytes");assert_eq!(db.workspace_artifact_file(id,2).unwrap().1,b"replacement Word bytes");assert!(db.workspace_artifact_update(id,&json!({"expected_revision":1,"file_id":first["id"]})).is_err());
+  for field in ["source","language","state","kind"]{assert!(db.workspace_artifact_update(id,&json!({"expected_revision":2,field:"overwrite"})).is_err());}assert_eq!(db.workspace_artifact_read(id).unwrap(),b);
+  let native=db.workspace_artifact_create(&run,&json!({"key":"review","title":"Review copy","language":"markdown","source":"# Review copy"})).unwrap();let nid=native["id"].as_str().unwrap();assert!(db.workspace_artifact_update(nid,&json!({"expected_revision":1,"file_id":first["id"]})).is_err());assert_eq!(db.workspace_artifact_read(nid).unwrap()["source"],"# Review copy");assert!(db.workspace_artifact_export(nid).unwrap()["original"].is_null());
+ }
+ #[test] fn file_identity_is_chat_bound_and_server_derived(){
+  let (app,_,run)=fixture();let other=crate::tests::bot(&app.db,"codex");let foreign=app.db.run(&app.db.queue(&other.id,"Foreign",0).unwrap()).unwrap();let file=app.db.attach_file(&foreign,"/workspace/foreign.xlsx",b"Workbook").unwrap();
+  let args=json!({"key":"file","title":"Original","file_id":file["id"],"file":{"name":"fake.docx","sha256":"fake"}});assert!(app.db.workspace_artifact_create(&run,&args).is_err());let v=app.db.workspace_artifact_create(&foreign,&args).unwrap();assert_eq!(v["file"]["name"],"foreign.xlsx");assert_eq!(v["file"]["sha256"],file["sha256"]);assert_eq!(v["file"]["run_id"],foreign.id);assert_eq!(v["file"]["bot_id"],other.id);assert_eq!(v["kind"],"sheet");
+  for bad in [json!({"key":"bad","title":"Bad","language":"file","source":"text"}),json!({"key":"bad","title":"Bad","file_id":"/etc/passwd"}),json!({"key":"bad","title":"Bad","file_id":file["id"],"source":"Pretend DOCX"})]{assert!(app.db.workspace_artifact_create(&foreign,&bad).is_err());}
+  let unsupported=app.db.attach_file(&foreign,"/workspace/report.txt",b"text").unwrap();assert!(app.db.workspace_artifact_create(&foreign,&json!({"key":"text","title":"Text","file_id":unsupported["id"]})).is_err());
+ }
+ #[test] fn original_identity_and_provenance_are_revision_bound(){
+  let (app,_,run)=fixture();let file=app.db.attach_file(&run,"/workspace/source.docx",b"Original").unwrap();let a=app.db.workspace_artifact_create(&run,&json!({"key":"original","title":"Original","file_id":file["id"]})).unwrap();let id=a["id"].as_str().unwrap();
+  app.db.attach_file_with_source(&run,"/workspace/source.docx",b"Original","https://docs.google.com/document/d/synthetic/edit").unwrap();assert_eq!(app.db.workspace_artifact_file(id,1).unwrap().0["source_url"],"");
+  {let c=app.db.0.lock().unwrap();c.execute("UPDATE deliverables SET bytes=? WHERE id=?",params![b"Changed!".as_slice(),file["id"].as_str().unwrap()]).unwrap();}assert!(app.db.workspace_artifact_file(id,1).unwrap_err().to_string().contains("bytes changed"));
+ }
+ #[tokio::test] async fn tools_refuse_cross_chat_original_export_and_replace(){
+  let (app,bot,run)=fixture();let foreign_bot=crate::tests::bot(&app.db,"claude-code");let foreign=app.db.run(&app.db.queue(&foreign_bot.id,"Foreign",0).unwrap()).unwrap();let file=app.db.attach_file(&foreign,"/workspace/private.pdf",b"%PDF-original").unwrap();
+  let args=json!({"key":"pdf","title":"PDF","file_id":file["id"]});let result=crate::runtime::call_tool(&app,&foreign_bot,&foreign,"artifact_publish_file",args).await.unwrap();let value:Value=serde_json::from_str(result["text"].as_str().unwrap()).unwrap();let id=value["id"].as_str().unwrap();
+  let export=crate::runtime::call_tool(&app,&bot,&run,"artifact_export",json!({"id":id})).await.unwrap();assert_eq!(export["failed"],true);assert!(export["text"].as_str().unwrap().contains("another conversation"));assert!(export["file"].is_null());let update=crate::runtime::call_tool(&app,&bot,&run,"artifact_update",json!({"id":id,"expected_revision":1,"title":"Stolen"})).await.unwrap();assert_eq!(update["failed"],true);assert_eq!(app.db.workspace_artifact_read(id).unwrap()["revision"],1);
+  assert!(crate::runtime::tool_specs_for(&app,&bot).iter().any(|v|v["name"]=="artifact_publish_file"));
+ }
+ #[tokio::test] async fn original_routes_authenticate_account_and_revision(){
+  use tower::ServiceExt;use axum::{body::{Body,to_bytes},http::{Request,StatusCode}};
+  let (app,_,run)=fixture();let foreign=crate::tests::app();let f=app.db.attach_file(&run,"/workspace/report.docx",b"exact original").unwrap();let a=app.db.workspace_artifact_create(&run,&json!({"key":"doc","title":"Word","file_id":f["id"]})).unwrap();let uri=format!("/api/workspace-artifacts/{}/file/1",a["id"].as_str().unwrap());
+  let request=|token:&str|Request::builder().uri(&uri).header("authorization",format!("Bearer {token}")).body(Body::empty()).unwrap();
+  let response=crate::web::router(app.clone()).oneshot(request(&app.token)).await.unwrap();assert_eq!(response.status(),StatusCode::OK);assert_eq!(to_bytes(response.into_body(),1024).await.unwrap().as_ref(),b"exact original");
+  assert_ne!(crate::web::router(app.clone()).oneshot(request("wrong")).await.unwrap().status(),StatusCode::OK);assert_ne!(crate::web::router(foreign.clone()).oneshot(request(&foreign.token)).await.unwrap().status(),StatusCode::OK);assert!(app.db.workspace_artifact_file(a["id"].as_str().unwrap(),2).is_err());
  }
 }
