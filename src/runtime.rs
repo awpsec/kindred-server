@@ -291,33 +291,45 @@ pub fn tool_specs() -> Vec<Value> {
         ),
         (
             "skills_list",
-            "Read this profile's shared reusable skills, including slash command names and parameter definitions.",
+            "List this profile's installed skills, commands, parameters and current_hash for guarded maintenance; explicit-only imports are listed without instructions.",
             json!({}),
             vec![],
         ),
         (
             "skill_load",
-            "Load a saved workflow, including a lesson from Teach a task. Ordinary skills return their instructions without accessing the VM. Imported skills also materialize their scripts/templates in the bot VM and return compatibility notes and the directory. A slash invocation uses the exact workflow snapshotted when queued. Never executes the workflow itself.",
+            "Load saved workflow instructions. Imported packages materialize scripts/templates in the bot VM and return compatibility notes/directory; ordinary skills do not access the VM. Slash invocations use the queued snapshot. Loading never executes.",
             json!({"name":{"type":"string"}}),
             vec!["name"],
         ),
         (
             "skill_import_local",
-            "Review/import an existing command/prompt .md file or SKILL.md and its supporting folder from the paired desktop. First call local_skill_scan to discover paths. action=preview returns instructions, compatibility notes and a fingerprint for review. Then action=import with expected_hash from that review imports the exact package. Do this when the user asks to find/review/import their workflows, without running them. Imports retain their exact desktop and path for future updates. Use skill_refresh_local to pull a newer version of an existing linked workflow; do not create duplicate names to update it. Local permissions still apply. Do not paste file contents or credentials into arguments.",
+            "Import .md commands or SKILL.md folders from the exact paired desktop with local permission. Discover via local_skill_scan; preview then import with expected_hash, preserving reviewed bytes/source/compatibility. Never execute or put file contents/credentials in arguments. Refresh existing links instead of duplicating.",
             json!({"device_id":{"type":"string","description":"Exact paired desktop ID; required when All paired desktops is selected."},"path":{"type":"string"},"action":{"type":"string","enum":["preview","import"]},"expected_hash":{"type":"string"},"name":{"type":"string"},"command":{"type":"string"}}),
             vec!["path", "action"],
         ),
         (
             "skill_refresh_local",
-            "Pull updates for already imported local workflows from their saved desktop and path. action=list includes all imported workflows, including explicit-only commands. For each selected linked workflow call preview, then update with the returned expected_source_hash and expected_current_hash. A user request to pull latest versions authorizes safe updates; do not ask again per unchanged or nonconflicting item. Preserve names, slash commands and settings. Missing/offline sources leave installed copies intact. If both source and Kindred changed, ask the user; use_source requires their explicit choice to replace Kindred edits. Never execute a workflow during refresh or substitute a different source.",
+            "Refresh imports from saved desktop/path. List includes explicit-only; preview/update require both hashes. Preserve names/commands/settings and installed copies if offline/missing. Requested nonconflicting refresh needs no extra approval; ask on conflict before use_source. Never execute or substitute sources.",
             json!({"action":{"type":"string","enum":["list","preview","update"]},"name":{"type":"string"},"expected_source_hash":{"type":"string"},"expected_current_hash":{"type":"string"},"conflict_policy":{"type":"string","enum":["preserve","use_source"]}}),
             vec!["action"],
         ),
         (
             "skill_save",
-            "Save or update a reusable skill and slash command from the user's requested workflow. Read skills_list first to avoid replacing an unrelated skill. command is a unique lowercase name without /; omission preserves an existing name or creates one automatically. Describe named inputs with parameters and refer to them as {{name}} in the instructions. Required inputs come before optional ones; only the final input may use rest=true for a sentence. Do not execute the workflow merely because you saved it. Return its command and an example after saving succeeds.",
+            "Save/update after skills_list. command: unique lowercase, no /; omission preserves/generates. Define {{name}} parameters, required before optional, rest last. Report command/example; never execute. For rename/delete use maintenance tools, not duplicates/RETIRED.",
             json!({"name":{"type":"string"},"body":{"type":"string"},"command":{"type":"string"},"description":{"type":"string"},"parameters":{"type":"array","maxItems":8,"items":{"type":"object","properties":{"name":{"type":"string"},"description":{"type":"string"},"required":{"type":"boolean"},"rest":{"type":"boolean"}},"required":["name"],"additionalProperties":false}}}),
             vec!["name", "body"],
+        ),
+        (
+            "skill_rename",
+            "Rename this profile’s installed skill with current_hash from skills_list. Preserve content/source links; command changes only if supplied. No extra confirmation for authorized requests; originals untouched.",
+            json!({"name":{"type":"string"},"new_name":{"type":"string"},"expected_current_hash":{"type":"string"},"command":{"type":"string"}}),
+            vec!["name","new_name","expected_current_hash"],
+        ),
+        (
+            "skill_delete",
+            "Delete this profile’s exact skill with current_hash from skills_list; missing/stale fails. Originals/queued snapshots remain; workspace sync cannot restore it. No extra confirmation for authorized requests.",
+            json!({"name":{"type":"string"},"expected_current_hash":{"type":"string"}}),
+            vec!["name","expected_current_hash"],
         ),
         (
             "commands_list",
@@ -1005,7 +1017,11 @@ async fn call_tool_inner(
             json!({"text":"Memory saved locally."})
         }
         "skills_list" => {
-            json!({"text":serde_json::to_string(&crate::skill_import::model_catalog(&app.db)?)?})
+            let mut skills=app.db.skills()?;
+            for skill in &mut skills {
+                if skill["import"].is_object() {skill.as_object_mut().unwrap().remove("body");}
+            }
+            json!({"text":serde_json::to_string(&skills)?})
         }
         "skill_load" => crate::skill_import::materialize(app, run, string(&args, "name")?).await?,
         "skill_import_local" => crate::skill_import::local(app, bot, run, &args).await?,
@@ -1017,6 +1033,13 @@ async fn call_tool_inner(
         "skill_save" => {
             let skill = app.db.save_skill(&args)?;
             json!({"text":format!("Skill saved: {}",serde_json::to_string(&skill)?),"skill":skill})
+        }
+        "skill_rename" | "skill_delete" => {
+            let current=app.db.run(&run.id)?;
+            ensure!(current.bot_id==bot.id && run.bot_id==bot.id && !app.account_disabled() && !app.db.bot(&bot.id)?.profile.archived,"Skill maintenance requires this profile's active teammate and task");
+            ensure!(matches!(current.status.as_str(),"queued"|"running"),"This task is no longer active");
+            let skill=if name=="skill_rename" {app.db.rename_skill(&args)?} else {app.db.remove_skill(&args)?};
+            json!({"text":serde_json::to_string(&skill)?,"skill":skill})
         }
         "bots_list" => {
             let primary=crate::primary_bot::get(&app.db)?;
@@ -1379,7 +1402,7 @@ fn tool_activity(b: &Value) -> (&'static str, &'static str) {
         | "skill_import_local"
         | "skill_refresh_local" => ("read", "Reading files"),
         "local_list" => ("investigate", "Browsing files"),
-        "computer_type" | "skill_save" | "remember" | "local_write" => {
+        "computer_type" | "skill_save" | "skill_rename" | "skill_delete" | "remember" | "local_write" => {
             ("write", "Putting it into words")
         }
         "local_mkdir" => ("hammer", "Creating a folder"),
