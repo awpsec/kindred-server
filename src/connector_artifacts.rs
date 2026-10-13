@@ -8,7 +8,7 @@ use axum::{
     Json,
     extract::{Path, State},
 };
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 
 pub fn migrate(c: &Connection) -> Result<()> {
@@ -16,6 +16,8 @@ pub fn migrate(c: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS connector_artifacts_run ON connector_artifacts(run_id);
         CREATE TABLE IF NOT EXISTS connector_action_grants(bot_id TEXT NOT NULL,origin TEXT NOT NULL,account_key TEXT NOT NULL,connector_key TEXT NOT NULL,action TEXT NOT NULL,permission TEXT NOT NULL,PRIMARY KEY(bot_id,origin,account_key,connector_key,action));
         UPDATE connector_artifacts SET status='interrupted' WHERE status IN ('preparing','pending','approved','ready','executing');")?;
+    let columns=c.prepare("PRAGMA table_info(connector_artifacts)")?.query_map([],|r|r.get::<_,String>(1))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    if !columns.iter().any(|v|v=="progress_message_seq") { c.execute_batch("ALTER TABLE connector_artifacts ADD COLUMN progress_message_seq INTEGER NOT NULL DEFAULT 0;")?; }
     Ok(())
 }
 fn str_at<'a>(v: &'a Value, keys: &[&str]) -> &'a str {
@@ -202,6 +204,8 @@ pub fn record(c: &Connection, id: &str) -> Result<Value> {
     ] {
         value[k] = v;
     }
+    // Authoritative persisted anchor; never trust connector inputs for ownership.
+    value["progress_message_seq"]=json!(c.query_row("SELECT progress_message_seq FROM connector_artifacts WHERE id=?",[id],|r|r.get::<_,i64>(0))?);
     // Correct historical receipts made before reply/forward were recognized as
     // sends, without executing or changing the recorded action.
     value["email_send"] = json!(email_send(&json!({"toolkit":value["connector"],"tool_name":value["tool"]})));
@@ -231,7 +235,8 @@ pub fn create(db: &Db, run: &Run, args: &Value) -> Result<String> {
     let body = json!({"connector":service(args),"connection":str_at(args,&["connection","toolkit"]),"source":match args["origin"].as_str(){Some("claude-account")=>"Claude",Some("codex-account")=>"Codex",_=>"Kindred"},"tool":tool_name(args),"kind":kind(args),"title":title(args),"email_send":email_send(args),"retry_unknown":run.prompt.starts_with("Prepare a NEW email revision for my review.") && run.prompt.contains("This may already have been sent"),"account":str_at(args,&["account_name","account_id"]),"original_input":input(args),"input":input(args),"records":[],"forced":args["forced"]==true,"read_only":args["read_only"]==true,"display_read_only":args["read_only"]==true || (args["origin"]=="claude-account" && read_only_hint(args))});
     let mut c = db.0.lock().unwrap();
     let tx = c.transaction()?;
-    tx.execute("INSERT INTO connector_artifacts(id,run_id,chat_id,bot_id,body,status,created) VALUES(?,?,?,?,?,'preparing',?)",params![id,run.id,run.chat_id,run.bot_id,body.to_string(),db::now()])?;
+    let progress_message_seq:i64=tx.query_row("SELECT CASE WHEN mode='summaries' AND phase='commentary' THEN message_seq ELSE 0 END FROM message_progress WHERE run_id=? ORDER BY message_seq DESC LIMIT 1",[&run.id],|r|r.get(0)).optional()?.unwrap_or(0);
+    tx.execute("INSERT INTO connector_artifacts(id,run_id,chat_id,bot_id,body,status,created,progress_message_seq) VALUES(?,?,?,?,?,'preparing',?,?)",params![id,run.id,run.chat_id,run.bot_id,body.to_string(),db::now(),progress_message_seq])?;
     {
         tx.execute("INSERT INTO chat_messages(chat_id,sender,body,kind,run_id,created) VALUES(?,?,?,'connector_artifact',?,?)",params![run.chat_id,run.bot_id,id,run.id,db::now()])?;
     }
@@ -1346,5 +1351,21 @@ mod tests {
         assert!(!email_send(&a));
         a["tool_name"] = json!("mcp__claude_ai_Gmail__send_email_and_delete_everything");
         assert!(!email_send(&a));
+    }
+}
+
+#[cfg(test)]
+mod task_anchor_tests {
+    use super::*;
+    #[test]
+    fn completed_call_anchor_is_server_snapshot_not_model_input_and_survives_reload() {
+        let root=std::env::temp_dir().join(format!("kindred-call-anchor-{}",db::id()));std::fs::create_dir_all(&root).unwrap();let path=root.join("kindred.db");let database=Db::open(path.to_str().unwrap()).unwrap();let bot=crate::tests::bot(&database,"codex");database.queue(&bot.id,"Read tracker",0).unwrap();let run=database.claim_bot(&bot.id).unwrap().unwrap();database.event(&run.id,"assistant",json!({"text":"Reading tracker","phase":"commentary"})).unwrap();
+        let seq=database.chat_messages(&run.chat_id).unwrap().iter().find(|m|m["progress"].is_object()).unwrap()["seq"].as_i64().unwrap();
+        let id=create(&database,&run,&json!({"toolkit":"googledrive","tool_slug":"read_record","input":{"id":"synthetic"},"progress_message_seq":9999})).unwrap();complete(&database,&id,&json!({"text":"Synthetic read complete"}),false).unwrap();let saved=record(&database.0.lock().unwrap(),&id).unwrap();assert_eq!(saved["progress_message_seq"],seq);drop(database);
+        let database=Db::open(path.to_str().unwrap()).unwrap();assert_eq!(record(&database.0.lock().unwrap(),&id).unwrap()["progress_message_seq"],seq);drop(database);std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn no_summary_anchor_is_not_backfilled_from_run_mode_or_input() {
+        let app=crate::tests::app();let bot=crate::tests::bot(&app.db,"codex");app.db.queue(&bot.id,"No summary",0).unwrap();let run=app.db.claim_bot(&bot.id).unwrap().unwrap();let id=create(&app.db,&run,&json!({"toolkit":"googledrive","tool_slug":"read_record","input":{"progress_message_seq":12}})).unwrap();assert_eq!(record(&app.db.0.lock().unwrap(),&id).unwrap()["progress_message_seq"],0);
     }
 }

@@ -29,6 +29,10 @@ pub struct Question {
     pub selected: Option<usize>,
     pub continuation_run_id: String,
     pub created: i64,
+    #[serde(default)]
+    pub task_group_id: String,
+    #[serde(default)]
+    pub answered_at: i64,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -65,6 +69,8 @@ fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Question> {
         selected: r.get::<_, Option<i64>>(10)?.map(|v| v as usize),
         continuation_run_id: r.get(11)?,
         created: r.get(12)?,
+        task_group_id: r.get("task_group_id")?,
+        answered_at: r.get("answered_at")?,
     })
 }
 pub fn migrate(c: &Connection) -> Result<()> {
@@ -72,6 +78,9 @@ pub fn migrate(c: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS questions_chat ON questions(chat_id,status,created);")?;
     let columns=c.prepare("PRAGMA table_info(questions)")?.query_map([],|r|r.get::<_,String>(1))?.collect::<rusqlite::Result<Vec<_>>>()?;
     if !columns.iter().any(|v|v=="delivery_chat_id"){c.execute_batch("ALTER TABLE questions ADD COLUMN delivery_chat_id TEXT NOT NULL DEFAULT '';")?;}
+    for (name, spec) in [("task_group_id", "TEXT NOT NULL DEFAULT ''"), ("answered_at", "INTEGER NOT NULL DEFAULT 0")] {
+        if !columns.iter().any(|v|v==name) { c.execute_batch(&format!("ALTER TABLE questions ADD COLUMN {name} {spec};"))?; }
+    }
     Ok(())
 }
 impl Db {
@@ -184,7 +193,7 @@ impl Db {
                 id: db::id(),
                 run_id: run.id.clone(),
                 chat_id: run.chat_id.clone(),
-                delivery_chat_id: destination,
+                delivery_chat_id: destination.clone(),
                 bot_id: run.bot_id.clone(),
                 topic_key: input.topic_key,
                 question: input.question.trim().into(),
@@ -195,8 +204,14 @@ impl Db {
                 selected: None,
                 continuation_run_id: String::new(),
                 created: db::now(),
+                // Snapshot an explicit emission group only in the delivery chat.
+                // Old questions remain unlinked; no historical inference/backfill.
+                task_group_id: if run.chat_id==destination {
+                    tx.query_row("SELECT CASE WHEN mode='summaries' AND phase='commentary' THEN group_id ELSE '' END FROM message_progress WHERE run_id=? ORDER BY message_seq DESC LIMIT 1", [&run.id], |r|r.get(0)).optional()?.unwrap_or_default()
+                } else { String::new() },
+                answered_at: 0,
             };
-            tx.execute("INSERT INTO questions(id,run_id,chat_id,bot_id,topic_key,question,context,options,created,delivery_chat_id) VALUES(?,?,?,?,?,?,?,?,?,?)",params![q.id,q.run_id,q.chat_id,q.bot_id,q.topic_key,q.question,q.context,serde_json::to_string(&q.options)?,q.created,q.delivery_chat_id])?;
+            tx.execute("INSERT INTO questions(id,run_id,chat_id,bot_id,topic_key,question,context,options,created,delivery_chat_id,task_group_id) VALUES(?,?,?,?,?,?,?,?,?,?,?)",params![q.id,q.run_id,q.chat_id,q.bot_id,q.topic_key,q.question,q.context,serde_json::to_string(&q.options)?,q.created,q.delivery_chat_id,q.task_group_id])?;
             tx.execute("INSERT INTO chat_messages(chat_id,sender,body,kind,run_id,created) VALUES(?,?,?,'question',?,?)",params![q.delivery_chat_id,q.bot_id,q.id,q.run_id,q.created])?;
             tx.execute(
                 "INSERT INTO events(run_id,kind,body,created) VALUES(?,'question',?,?)",
@@ -310,10 +325,12 @@ impl Db {
             },
             if collaboration { original_run.depth } else { 0 },
         )?;
+        // Keep the existing task label on the explicitly assigned continuation.
+        tx.execute("UPDATE runs SET task_title=? WHERE id=?",params![original_run.task_title,run])?;
         if collaboration {
             crate::collaboration::reattach(&tx, &q.run_id, &run)?;
         }
-        ensure!(tx.execute("UPDATE questions SET status='answered',answer=?,selected=?,continuation_run_id=? WHERE id=? AND status='pending'",params![text,answer.selected.map(|v|v as i64),run,id])?==1,"This question was already answered");
+        ensure!(tx.execute("UPDATE questions SET status='answered',answer=?,selected=?,continuation_run_id=?,answered_at=? WHERE id=? AND status='pending'",params![text,answer.selected.map(|v|v as i64),run,db::now(),id])?==1,"This question was already answered");
         tx.execute(
             "INSERT INTO events(run_id,kind,body,created) VALUES(?,'question_answered',?,?)",
             params![
@@ -349,5 +366,38 @@ mod context_tests {
         assert_eq!(visible_context(body, "group-123"), body);
         let ordinary = "From group Team: an update.\n\nKeep this context.";
         assert_eq!(visible_context(ordinary, "group-123"), ordinary);
+    }
+}
+
+#[cfg(test)]
+mod task_receipt_tests {
+    use super::*;
+    use crate::{tests,progress_updates};
+    fn input(topic:&str)->QuestionInput { QuestionInput{topic_key:topic.into(),question:"Which trackers?".into(),context:"October is ready. August remains a draft.".into(),options:vec!["Upload all three".into(),"Keep drafts".into()]} }
+    fn group(db:&Db,run:&str)->String { db.chat_messages(&db.run(run).unwrap().chat_id).unwrap().iter().rev().find(|m|m["run_id"]==run&&m["progress"].is_object()).unwrap()["progress"]["group_id"].as_str().unwrap().into() }
+    #[test]
+    fn explicit_answer_continuation_keeps_task_across_restart_and_unrelated_runs_do_not() {
+        let root=std::env::temp_dir().join(format!("kindred-task-receipt-{}",db::id()));std::fs::create_dir_all(&root).unwrap();let path=root.join("kindred.db");
+        let database=Db::open(path.to_str().unwrap()).unwrap();let bot=tests::bot(&database,"codex");database.queue(&bot.id,"Prepare trackers",0).unwrap();let run=database.claim_bot(&bot.id).unwrap().unwrap();
+        progress_updates::set_task_title(&database,&run,"Prepare monthly trackers").unwrap();database.event(&run.id,"assistant",json!({"text":"Preparing trackers","phase":"commentary"})).unwrap();let key=group(&database,&run.id);
+        database.ask_question(&run,input("trackers")).unwrap();let q=database.pending_questions().unwrap().remove(0);assert_eq!(q.task_group_id,key);
+        database.finish(&run.id,"completed","","").unwrap();let saved=database.answer_question(&q.id,Answer{selected:Some(0),custom:None}).unwrap();assert!(saved.answered_at>0);
+        let again=database.answer_question(&q.id,Answer{selected:Some(0),custom:None}).unwrap();assert_eq!(again.continuation_run_id,saved.continuation_run_id);assert!(database.answer_question(&q.id,Answer{selected:None,custom:Some("Different answer".into())}).is_err());drop(database);
+        let database=Db::open(path.to_str().unwrap()).unwrap();assert_eq!(database.question(&q.id).unwrap().task_group_id,key);let follow=database.claim_bot(&bot.id).unwrap().unwrap();assert_eq!(follow.id,saved.continuation_run_id);assert_eq!(follow.task_title,"Prepare monthly trackers");
+        database.event(&follow.id,"assistant",json!({"text":"Uploading selected trackers","phase":"commentary"})).unwrap();assert_eq!(group(&database,&follow.id),key);
+        database.ask_question(&follow,input("second-choice")).unwrap();assert_eq!(database.pending_questions().unwrap()[0].task_group_id,key);
+        database.finish(&follow.id,"completed","Done","").unwrap();database.queue(&bot.id,"Unrelated task",0).unwrap();let other=database.claim_bot(&bot.id).unwrap().unwrap();database.event(&other.id,"assistant",json!({"text":"Unrelated opening","phase":"commentary"})).unwrap();assert_ne!(group(&database,&other.id),key);
+        drop(database);std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn legacy_unlinked_and_non_summary_questions_do_not_invent_task_membership() {
+        let app=tests::app();let bot=tests::bot(&app.db,"codex");app.db.queue(&bot.id,"No updates yet",0).unwrap();let run=app.db.claim_bot(&bot.id).unwrap().unwrap();app.db.ask_question(&run,input("unlinked")).unwrap();assert_eq!(app.db.pending_questions().unwrap()[0].task_group_id,"");
+        app.db.event(&run.id,"assistant",json!({"text":"Summary opening","phase":"commentary"})).unwrap();let mut general=app.db.setting("general").unwrap().unwrap_or_default();general["progress_updates"]=json!("frequent");app.db.save_setting("general",&general).unwrap();app.db.event(&run.id,"assistant",json!({"text":"Ordinary interim update","phase":"commentary"})).unwrap();app.db.ask_question(&run,input("ordinary")).unwrap();assert!(app.db.pending_questions().unwrap().iter().all(|q|q.task_group_id.is_empty()));
+        let c=app.db.0.lock().unwrap();progress_updates::message(&c,1).unwrap();migrate(&c).unwrap();
+    }
+    #[test]
+    fn cross_chat_and_wrong_bot_continuation_never_reuse_saved_group() {
+        let app=tests::app();let bot=tests::bot(&app.db,"codex");app.db.queue(&bot.id,"Original",0).unwrap();let run=app.db.claim_bot(&bot.id).unwrap().unwrap();app.db.event(&run.id,"assistant",json!({"text":"Opening","phase":"commentary"})).unwrap();let key=group(&app.db,&run.id);app.db.ask_question(&run,input("wrong-scope")).unwrap();let q=app.db.pending_questions().unwrap().remove(0);app.db.finish(&run.id,"completed","","").unwrap();let saved=app.db.answer_question(&q.id,Answer{selected:Some(1),custom:None}).unwrap();
+        app.db.0.lock().unwrap().execute("UPDATE questions SET delivery_chat_id='different-chat' WHERE id=?",[q.id]).unwrap();let follow=app.db.claim_bot(&bot.id).unwrap().unwrap();app.db.event(&follow.id,"assistant",json!({"text":"Different route","phase":"commentary"})).unwrap();assert_ne!(group(&app.db,&saved.continuation_run_id),key);
     }
 }

@@ -59,9 +59,14 @@ pub fn record_message(c:&rusqlite::Connection,seq:i64,run:&str,phase:&str)->Resu
     let general:Value=serde_json::from_str(general.as_deref().unwrap_or("{}"))?;
     let mode=profile["progress_updates"].as_str().filter(|v|valid(v)).or_else(||general["progress_updates"].as_str().filter(|v|valid(v))).unwrap_or("summaries");
     let previous:Option<(String,String,String)>=c.query_row("SELECT mode,phase,group_id FROM message_progress WHERE run_id=? ORDER BY message_seq DESC LIMIT 1",[run],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+    // A question answer is a persisted continuation, not a new unrelated task.
+    // Bind bot and chat again at emission; never merge cross-chat delivery.
+    let continuation:Option<String>=if mode=="summaries" && previous.is_none() {
+        c.query_row("SELECT q.task_group_id FROM questions q JOIN runs origin ON origin.id=q.run_id JOIN runs child ON child.id=q.continuation_run_id WHERE child.id=?1 AND q.status='answered' AND q.task_group_id!='' AND q.bot_id=child.bot_id AND origin.bot_id=child.bot_id AND origin.chat_id=child.chat_id AND q.delivery_chat_id=child.chat_id ORDER BY q.created DESC LIMIT 1",[run],|r|r.get(0)).optional()?
+    } else {None};
     let group=match previous {
         Some((old_mode,old_phase,group)) if old_mode==mode && old_phase!="final_answer" => group,
-        _ => format!("{run}:segment:{seq}"),
+        _ => continuation.unwrap_or_else(||format!("{run}:segment:{seq}")),
     };
     c.execute("INSERT INTO message_progress(message_seq,run_id,mode,phase,group_id) VALUES(?,?,?,?,?)",rusqlite::params![seq,run,mode,phase,group])?;
     Ok(())
