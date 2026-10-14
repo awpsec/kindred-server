@@ -737,6 +737,7 @@ impl Db {
             "INSERT INTO events(run_id,kind,body,created) VALUES(?,?,?,?)",
             params![run, kind, body.to_string(), created],
         )?;
+        if kind=="tool_started" {crate::progress_updates::observe_tool(&tx,run,body["tool"].as_str().unwrap_or(""))?;}
         if kind == "assistant"
             && !tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM routine_runs WHERE run_id=?1) OR EXISTS(SELECT 1 FROM routine_execution WHERE run_id=?1)",

@@ -391,6 +391,7 @@ async fn codex_rpc(app: &App, bot: &Bot, run: &Run, rpc: &mut Rpc) -> Result<Str
                     ensure!(p.pointer("/turn/id").and_then(Value::as_str)==Some(turn.as_str()),"Unmatched Codex follow-up completion");
                     app.db.complete_followup_turn(run,&offer)?;
                 }
+                crate::progress_updates::finish_message(&app.db,&run.id,&output)?;
                 ensure!(!app.account_disabled(),"This account is disabled");
                 if let Some(offer)=app.db.offer_followups(run)? {
                     app.db.dispatch_followup(run,runtime::string(&offer,"id")?)?;
