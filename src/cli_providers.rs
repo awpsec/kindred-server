@@ -112,11 +112,14 @@ pub async fn run(app: &App, bot: &Bot, run: &Run) -> Result<String> {
     );
     let mut cmd = vm::ssh(&app.config.vm);
     cmd.arg(format!("python3 {HELPER} worker {}", bot.provider));
-    let mut child = cmd
+    let child = cmd
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()?;
+    run_child(app,bot,run,child).await
+}
+async fn run_child(app:&App,bot:&Bot,run:&Run,mut child:tokio::process::Child)->Result<String> {
     let mut input = child.stdin.take().unwrap();
     let mut output = BufReader::new(child.stdout.take().unwrap());
     let tools = runtime::tool_specs_for_run(app, bot, run);
@@ -397,6 +400,7 @@ pub async fn run(app: &App, bot: &Bot, run: &Run) -> Result<String> {
                 let input_id=runtime::string(&frame,"input_id")?;
                 ensure!(!(input_id=="initial"&&initial_boundary),"Repeated subscription initial completion");initial_boundary=true;
                 ensure!(input_id==followup_offer.as_deref().unwrap_or("initial"),"Unmatched subscription follow-up completion");
+                crate::progress_updates::finish_message(&app.db,&run.id,&final_reply)?;
                 if let Some(offer)=followup_offer.take(){app.db.complete_followup_turn(run,&offer)?;}
                 ensure!(!app.account_disabled(),"This account is disabled");
                 let offer=app.db.offer_followups(run)?;
@@ -440,6 +444,40 @@ pub async fn run(app: &App, bot: &Bot, run: &Run) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn classification_subscription_turn_boundary_preserves_each_phase() {
+        for provider in ["claude-code","kimi-code"] {for first_work in [false,true] {
+            let app=crate::tests::app();let bot=crate::tests::bot(&app.db,provider);app.db.queue(&bot.id,"Synthetic original",0).unwrap();let run=app.db.claim_bot(&bot.id).unwrap().unwrap();
+            let source=app.db.chat_send(&run.chat_id,"Exact synthetic next request",&[]).unwrap()[0].clone();app.db.request_steering(&source,&run.id).unwrap();
+            let script=r#"import sys,json
+first_work=sys.argv[1]=='true'
+def read():return json.loads(sys.stdin.readline())
+def send(v):print(json.dumps(v),flush=True)
+def tool(i):
+ send({'type':'tool_call','id':i,'name':'set_task_title','args':{'title':'Review actual website'}})
+ assert read()['type']=='tool_result'
+start=read();send({'type':'ready','protocol':1,'provider':start['provider'],'model':start['model'],'reasoning_effort':start['reasoning_effort']})
+if first_work:tool('name-first')
+send({'type':'assistant','text':'First opening'})
+send({'type':'assistant','text':'First final'})
+send({'type':'turn_complete','input_id':'initial'})
+decision=read();assert 'Exact synthetic next request' in decision['prompt'] and decision['offer_id']
+if not first_work:tool('name-second')
+send({'type':'assistant','text':'Second opening'})
+send({'type':'assistant','text':'Second final'})
+send({'type':'turn_complete','input_id':decision['offer_id']})
+assert read()['finish']
+send({'type':'complete','output':'First opening\nFirst final\nSecond opening\nSecond final'})
+"#;
+            let child=tokio::process::Command::new("python3").args(["-u","-c",script,if first_work {"true"}else{"false"}]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit()).kill_on_drop(true).spawn().unwrap();
+            assert_eq!(run_child(&app,&bot,&run,child).await.unwrap(),"Second final");
+            let rows=app.db.chat_messages(&run.chat_id).unwrap();let find=|text:&str|rows.iter().find(|m|m["text"]==text).unwrap();
+            assert_eq!(find("First opening")["progress"]["work_qualified"],first_work);
+            assert_eq!(find("Second opening")["progress"]["work_qualified"],!first_work);
+            assert_eq!(find("First final")["progress"]["phase"],"final_answer");assert_eq!(find("Second final")["progress"]["phase"],"final_answer");
+            assert_eq!(app.db.run(&source).unwrap().status,"steered");
+        }}
+    }
     #[test]
     fn long_native_calls_have_a_separate_nonrenewing_deadline() {
         assert_eq!(frame_timeout(false, 600, None), Duration::from_secs(60));

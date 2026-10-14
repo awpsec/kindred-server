@@ -48,6 +48,52 @@ pub fn start(c: &rusqlite::Connection, run: &mut crate::db::Run) -> Result<()> {
     c.execute("UPDATE runs SET progress_mode=?,progress_started=? WHERE id=?",rusqlite::params![run.progress_mode,run.progress_started,run.id])?;
     Ok(())
 }
+// Only explicit task intent or actual work tools qualify new commentary.
+// Tool names are protocol metadata; request/output text and elapsed time are not classifiers.
+pub fn work_title(tool:&str)->Option<&'static str> {
+    match tool {
+        "computer_open_url"|"computer_browser_task"=>Some("Review website"),
+        "computer_screenshot"|"computer_click"|"computer_type"|"computer_key"|"computer_scroll"=>Some("Work on bot computer"),
+        "guest_exec"|"command_start"=>Some("Work on bot computer"),
+        "local_list"|"local_read"|"local_write"|"local_mkdir"|"local_skill_scan"|"local_exec"|"local_screenshot"|"local_click"|"local_type"|"local_key"|"local_scroll"=>Some("Work on local computer"),
+        "connector_execute"|"codex_connector"|"claude_connector"=>Some("Use connected service"),
+        "artifact_read"|"artifact_create"|"artifact_update"|"artifact_publish_file"|"artifact_export"|"share_file"|"read_attachment"=>Some("Work with documents"),
+        "skill_save"|"skill_import_local"|"skill_refresh_local"|"skill_rename"|"skill_delete"=>Some("Maintain bot skills"),
+        "workspace_import_start"|"workspace_import_draft"|"workspace_sync_prepare"|"workspace_sync_apply"=>Some("Update workspace"),
+        "send_to_bot"=>Some("Coordinate teammate work"),
+        "checklist_create"|"checklist_update"|"reminder_set"|"reminder_update"|"routine_create"|"routine_update"|"routine_control"|"inbox_monitor_setup"|"inbox_monitor_save"=>Some("Manage plans and schedules"),
+        "visual_panel"=>Some("Prepare interactive panel"),
+        _=>None,
+    }
+}
+fn phase_boundary(c:&rusqlite::Connection,run:&str)->Result<(i64,i64)> {
+    Ok(c.query_row("SELECT COALESCE(MAX(p.message_seq),0),COALESCE(MAX(m.source_event_seq),0) FROM message_progress p JOIN chat_messages m ON m.seq=p.message_seq WHERE p.run_id=? AND p.phase='final_answer'",[run],|r|Ok((r.get(0)?,r.get(1)?)))?)
+}
+fn phase_title(c:&rusqlite::Connection,run:&str)->Result<Option<String>> {
+    use rusqlite::OptionalExtension;
+    let (boundary,event)=phase_boundary(c,run)?;
+    let title:Option<String>=c.query_row("SELECT json_extract(body,'$.title') FROM events WHERE run_id=? AND kind='task_work' AND seq>? ORDER BY seq DESC LIMIT 1",rusqlite::params![run,event],|r|r.get(0)).optional()?;
+    if title.is_some(){return Ok(title);}
+    // Only the first phase of an explicit, same-chat answered-question continuation inherits task intent.
+    if boundary==0 {return Ok(c.query_row("SELECT r.task_title FROM questions q JOIN runs origin ON origin.id=q.run_id JOIN runs r ON r.id=q.continuation_run_id WHERE r.id=? AND q.status='answered' AND q.task_group_id!='' AND q.bot_id=r.bot_id AND origin.bot_id=r.bot_id AND origin.chat_id=r.chat_id AND q.delivery_chat_id=r.chat_id ORDER BY q.created DESC LIMIT 1",[run],|r|r.get(0)).optional()?);}
+    Ok(None)
+}
+pub fn qualify(c:&rusqlite::Connection,run:&str,title:&str)->Result<()> {qualify_as(c,run,title,false)}
+fn qualify_as(c:&rusqlite::Connection,run:&str,title:&str,replace:bool)->Result<()> {
+    let active:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM runs WHERE id=? AND status='running')",[run],|r|r.get(0))?;
+    if !active{return Ok(());}
+    let previous=phase_title(c,run)?;
+    let selected=if replace {title.to_owned()}else{previous.clone().unwrap_or_else(||title.to_owned())};
+    if previous.as_deref()==Some(selected.as_str()){return Ok(());}
+    c.execute("UPDATE runs SET task_title=? WHERE id=?",rusqlite::params![selected,run])?;
+    let (boundary,_)=phase_boundary(c,run)?;
+    c.execute("INSERT INTO events(run_id,kind,body,created) VALUES(?,'task_work',?,?)",rusqlite::params![run,json!({"title":selected}).to_string(),crate::db::now()])?;
+    c.execute("UPDATE message_progress SET work_qualified=1,task_title=? WHERE run_id=? AND message_seq>? AND work_qualified IS NOT NULL",rusqlite::params![selected,run,boundary])?;
+    Ok(())
+}
+pub fn observe_tool(c:&rusqlite::Connection,run:&str,tool:&str)->Result<()> {
+    if let Some(title)=work_title(tool){qualify(c,run,title)?;}Ok(())
+}
 pub fn record_message(c:&rusqlite::Connection,seq:i64,run:&str,phase:&str)->Result<()> {
     if !matches!(phase,"commentary"|"final_answer") {return Ok(());}
     use rusqlite::OptionalExtension;
@@ -68,31 +114,40 @@ pub fn record_message(c:&rusqlite::Connection,seq:i64,run:&str,phase:&str)->Resu
         Some((old_mode,old_phase,group)) if old_mode==mode && old_phase!="final_answer" => group,
         _ => continuation.unwrap_or_else(||format!("{run}:segment:{seq}")),
     };
-    c.execute("INSERT INTO message_progress(message_seq,run_id,mode,phase,group_id) VALUES(?,?,?,?,?)",rusqlite::params![seq,run,mode,phase,group])?;
+    let title=phase_title(c,run)?;let qualified=title.is_some();
+    c.execute("INSERT INTO message_progress(message_seq,run_id,mode,phase,group_id,work_qualified,task_title) VALUES(?,?,?,?,?,?,?)",rusqlite::params![seq,run,mode,phase,group,qualified,title.unwrap_or_default()])?;
     Ok(())
 }
 // CLI providers stream interim messages without native phase metadata. Once
 // completion is verified, retain the final reply outside the progress group.
 pub fn finish_message(db: &Db, run: &str, text: &str) -> Result<()> {
-    let c = db.0.lock().unwrap();
-    c.execute("UPDATE message_progress SET phase='final_answer' WHERE run_id=?1 AND message_seq=(SELECT seq FROM chat_messages WHERE run_id=?1 AND kind='assistant' AND body=?2 ORDER BY seq DESC LIMIT 1)", rusqlite::params![run,text])?;
-    Ok(())
+    use rusqlite::OptionalExtension;
+    if text.trim().is_empty(){return Ok(());}
+    let mut c=db.0.lock().unwrap();let tx=c.transaction()?;
+    let seq:Option<i64>=tx.query_row("SELECT seq FROM chat_messages WHERE run_id=? AND kind='assistant' AND body=? ORDER BY seq DESC LIMIT 1",rusqlite::params![run,text],|r|r.get(0)).optional()?;
+    if let Some(seq)=seq {
+        let changed=tx.execute("UPDATE message_progress SET phase='final_answer' WHERE message_seq=? AND run_id=?",rusqlite::params![seq,run])?;
+        if changed==0 {record_message(&tx,seq,run,"final_answer")?;}
+    }
+    tx.commit()?;Ok(())
 }
 
 pub fn set_task_title(db: &Db, run: &crate::db::Run, title: &str) -> Result<Value> {
     let title = title.trim();
     anyhow::ensure!(!title.is_empty() && title.chars().count() <= 80 && !title.chars().any(char::is_control), "Task title must be a single line of 1-80 characters");
-    let changed = db.0.lock().unwrap().execute(
+    let mut c=db.0.lock().unwrap();let tx=c.transaction()?;
+    let changed = tx.execute(
         "UPDATE runs SET task_title=? WHERE id=? AND bot_id=? AND status='running'",
         rusqlite::params![title, run.id, run.bot_id],
     )?;
     anyhow::ensure!(changed == 1, "Only the current running task can be named");
+    qualify_as(&tx,&run.id,title,true)?;tx.commit()?;
     Ok(json!({"title":title,"text":"Task title saved."}))
 }
 
 pub fn message(c:&rusqlite::Connection,seq:i64)->Result<Value> {
     use rusqlite::OptionalExtension;
-    Ok(c.query_row("SELECT p.run_id,p.mode,p.phase,p.group_id,r.task_title FROM message_progress p JOIN runs r ON r.id=p.run_id WHERE p.message_seq=?",[seq],|r|Ok(json!({"run_id":r.get::<_,String>(0)?,"mode":r.get::<_,String>(1)?,"phase":r.get::<_,String>(2)?,"group_id":r.get::<_,String>(3)?,"task_title":r.get::<_,String>(4)?}))).optional()?.unwrap_or(Value::Null))
+    Ok(c.query_row("SELECT p.run_id,p.mode,p.phase,p.group_id,COALESCE(p.task_title,r.task_title),p.work_qualified FROM message_progress p JOIN runs r ON r.id=p.run_id WHERE p.message_seq=?",[seq],|r|Ok(json!({"run_id":r.get::<_,String>(0)?,"mode":r.get::<_,String>(1)?,"phase":r.get::<_,String>(2)?,"group_id":r.get::<_,String>(3)?,"task_title":r.get::<_,String>(4)?,"work_qualified":r.get::<_,Option<bool>>(5)?}))).optional()?.unwrap_or(Value::Null))
 }
 
 #[cfg(test)]
@@ -101,11 +156,70 @@ mod tests {
     use crate::{conversation_updates, tests};
 
     #[test]
+    fn classification_qualification_metadata_is_not_repeated_and_untagged_finals_fence_next_phase() {
+        let app=tests::app();let bot=tests::bot(&app.db,"codex");let id=app.db.queue(&bot.id,"Read a file",0).unwrap();let run=app.db.claim_bot(&bot.id).unwrap().unwrap();
+        app.db.event(&id,"tool_started",json!({"tool":"local_read","args":{}})).unwrap();
+        for _ in 0..8 {app.db.event(&id,"tool_started",json!({"tool":"artifact_read","args":{}})).unwrap();}
+        let count=||app.db.events(&id).unwrap().iter().filter(|e|e["kind"]=="task_work").count();assert_eq!(count(),1);
+        set_task_title(&app.db,&run,"Review local document").unwrap();assert_eq!(count(),2);set_task_title(&app.db,&run,"Review local document").unwrap();assert_eq!(count(),2);
+        app.db.event(&id,"assistant",json!({"text":"First final without phase"})).unwrap();finish_message(&app.db,&id,"First final without phase").unwrap();
+        app.db.event(&id,"assistant",json!({"phase":"commentary","text":"An ordinary followup"})).unwrap();
+        let rows=app.db.chat_messages(&run.chat_id).unwrap();assert_eq!(rows.iter().find(|m|m["text"]=="An ordinary followup").unwrap()["progress"]["work_qualified"],false);
+        assert_eq!(rows.iter().find(|m|m["text"]=="First final without phase").unwrap()["progress"]["phase"],"final_answer");
+    }
+    #[test]
+    fn classification_segment_boundaries_preserve_conversation_in_both_directions() {
+        for first_work in [false,true] {
+            let app=tests::app();let bot=tests::bot(&app.db,"claude-code");let id=app.db.queue(&bot.id,"Two different conversational turns",0).unwrap();let run=app.db.claim_bot(&bot.id).unwrap().unwrap();
+            if first_work {set_task_title(&app.db,&run,"Review first website").unwrap();}
+            app.db.event(&id,"assistant",json!({"phase":"commentary","text":"First opening"})).unwrap();
+            app.db.event(&id,"assistant",json!({"phase":"final_answer","text":"First final"})).unwrap();
+            app.db.event(&id,"assistant",json!({"phase":"commentary","text":"Second opening"})).unwrap();
+            if !first_work {app.db.event(&id,"tool_started",json!({"tool":"computer_open_url","args":{"url":"https://example.test"}})).unwrap();}
+            let rows=app.db.chat_messages(&run.chat_id).unwrap();
+            let a=rows.iter().find(|m|m["text"]=="First opening").unwrap();let b=rows.iter().find(|m|m["text"]=="Second opening").unwrap();
+            assert_eq!(a["progress"]["work_qualified"],first_work,"{a}");assert_eq!(b["progress"]["work_qualified"],!first_work,"{b}");
+            if first_work {assert_eq!(a["progress"]["task_title"],"Review first website");}else{assert_eq!(a["progress"]["task_title"],"");assert_eq!(b["progress"]["task_title"],"Review website");}
+        }
+    }
+    #[test]
+    fn classification_ordinary_conversation_and_memory_never_become_work() {
+        for seconds in [14,20] {
+            let app=tests::app();let bot=tests::bot(&app.db,"codex");
+            let id=app.db.queue(&bot.id,"Thanks, please remember my preference",0).unwrap();
+            let run=app.db.claim_bot(&bot.id).unwrap().unwrap();
+            app.db.0.lock().unwrap().execute("UPDATE runs SET progress_started=? WHERE id=?",rusqlite::params![crate::db::now()-seconds,id]).unwrap();
+            app.db.event(&id,"assistant",json!({"phase":"commentary","text":"I understand your preference."})).unwrap();
+            app.db.event(&id,"tool_started",json!({"tool":"remember","args":{"text":"My preference"}})).unwrap();
+            let messages=app.db.chat_messages(&run.chat_id).unwrap();
+            let m=messages.iter().find(|m|m["kind"]=="assistant").unwrap();
+            assert_eq!(m["progress"]["work_qualified"],false,"{seconds}: {m}");
+            assert_eq!(app.db.run(&id).unwrap().task_title,"");
+        }
+    }
+    #[test]
+    fn classification_first_real_work_promotes_opening_and_retains_model_title() {
+        let app=tests::app();let bot=tests::bot(&app.db,"codex");
+        let id=app.db.queue(&bot.id,"Review this website",0).unwrap();let run=app.db.claim_bot(&bot.id).unwrap().unwrap();
+        app.db.event(&id,"assistant",json!({"phase":"commentary","text":"Checking the website."})).unwrap();
+        app.db.event(&id,"tool_started",json!({"tool":"computer_open_url","args":{"url":"https://example.test"}})).unwrap();
+        let m=app.db.chat_messages(&run.chat_id).unwrap().into_iter().find(|m|m["kind"]=="assistant").unwrap();
+        assert_eq!(m["progress"]["work_qualified"],true);
+        assert_eq!(app.db.run(&id).unwrap().task_title,"Review website");
+        set_task_title(&app.db,&run,"Review website accessibility").unwrap();
+        app.db.event(&id,"tool_started",json!({"tool":"guest_exec","args":{}})).unwrap();
+        assert_eq!(app.db.run(&id).unwrap().task_title,"Review website accessibility");
+        app.db.event(&id,"assistant",json!({"phase":"final_answer","text":"The review is complete."})).unwrap();
+        let rows=app.db.chat_messages(&run.chat_id).unwrap();
+        assert_eq!(rows.iter().find(|m|m["text"]=="The review is complete.").unwrap()["progress"]["phase"],"final_answer");
+    }
+    #[test]
     fn cli_updates_group_by_default_and_completion_stays_visible() {
         let app=tests::app();let bot=tests::bot(&app.db,"claude-code");
         let id=app.db.queue(&bot.id,"Long workflow",0).unwrap();
         let run=app.db.claim_bot(&bot.id).unwrap().unwrap();
         assert_eq!(run.progress_mode,"summaries");
+        set_task_title(&app.db,&run,"Update workspace commands").unwrap();
         for text in ["Inspecting settings", "Updating commands", "Commands are ready"] {
             app.db.event(&id,"assistant",json!({"text":text,"phase":"commentary"})).unwrap();
         }
@@ -157,6 +271,7 @@ mod tests {
         app.db.save_setting("general",&json!({"progress_updates":"summaries"})).unwrap();
         let id=app.db.queue(&bot.id,"Long task",0).unwrap();
         let run=app.db.claim_bot(&bot.id).unwrap().unwrap();
+        set_task_title(&app.db,&run,"Review task settings").unwrap();
         let emit=|text:&str,phase:&str|app.db.event(&id,"assistant",json!({"text":text,"phase":phase})).unwrap();
         emit("First summary update","commentary");emit("Second summary update","commentary");
         let original=app.db.chat_messages(&run.chat_id).unwrap();

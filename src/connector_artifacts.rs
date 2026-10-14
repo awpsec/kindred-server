@@ -235,7 +235,8 @@ pub fn create(db: &Db, run: &Run, args: &Value) -> Result<String> {
     let body = json!({"connector":service(args),"connection":str_at(args,&["connection","toolkit"]),"source":match args["origin"].as_str(){Some("claude-account")=>"Claude",Some("codex-account")=>"Codex",_=>"Kindred"},"tool":tool_name(args),"kind":kind(args),"title":title(args),"email_send":email_send(args),"retry_unknown":run.prompt.starts_with("Prepare a NEW email revision for my review.") && run.prompt.contains("This may already have been sent"),"account":str_at(args,&["account_name","account_id"]),"original_input":input(args),"input":input(args),"records":[],"forced":args["forced"]==true,"read_only":args["read_only"]==true,"display_read_only":args["read_only"]==true || (args["origin"]=="claude-account" && read_only_hint(args))});
     let mut c = db.0.lock().unwrap();
     let tx = c.transaction()?;
-    let progress_message_seq:i64=tx.query_row("SELECT CASE WHEN mode='summaries' AND phase='commentary' THEN message_seq ELSE 0 END FROM message_progress WHERE run_id=? ORDER BY message_seq DESC LIMIT 1",[&run.id],|r|r.get(0)).optional()?.unwrap_or(0);
+    crate::progress_updates::qualify(&tx,&run.id,"Use connected service")?;
+    let progress_message_seq:i64=tx.query_row("SELECT CASE WHEN mode='summaries' AND phase='commentary' AND COALESCE(work_qualified,1)=1 THEN message_seq ELSE 0 END FROM message_progress WHERE run_id=? ORDER BY message_seq DESC LIMIT 1",[&run.id],|r|r.get(0)).optional()?.unwrap_or(0);
     tx.execute("INSERT INTO connector_artifacts(id,run_id,chat_id,bot_id,body,status,created,progress_message_seq) VALUES(?,?,?,?,?,'preparing',?,?)",params![id,run.id,run.chat_id,run.bot_id,body.to_string(),db::now(),progress_message_seq])?;
     {
         tx.execute("INSERT INTO chat_messages(chat_id,sender,body,kind,run_id,created) VALUES(?,?,?,'connector_artifact',?,?)",params![run.chat_id,run.bot_id,id,run.id,db::now()])?;

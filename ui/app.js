@@ -4764,7 +4764,7 @@ function reminderWhen(reminder){
   return {label:dateLabel+', '+time,zone:zone===Intl.DateTimeFormat().resolvedOptions().timeZone?'':zoneLabel,full:date.toLocaleString([],{timeZone:zone,dateStyle:'full',timeStyle:'short'})+' · '+zone};
 }
 function progressGroups(messages){
-  const groups=new Map();for(const m of messages)if(m.kind==='assistant'&&m.progress?.mode==='summaries'&&m.progress.phase==='commentary'&&m.progress.run_id===m.run_id&&m.progress.group_id&&!m.status_notice){const items=groups.get(m.progress.group_id)||[];items.push(m);groups.set(m.progress.group_id,items);}
+  const groups=new Map();for(const m of messages)if(m.kind==='assistant'&&m.progress?.mode==='summaries'&&m.progress.phase==='commentary'&&m.progress.work_qualified!==false&&m.progress.run_id===m.run_id&&m.progress.group_id&&!m.status_notice){const items=groups.get(m.progress.group_id)||[];items.push(m);groups.set(m.progress.group_id,items);}
   // Summaries is a presentation preference, not a duration or message-count heuristic.
   return groups;
 }
@@ -4844,11 +4844,16 @@ function summaryProgress(items,entry,runs){
   entry.progressTimePins??=new Set();
   const taskEnded=phaseFinal?.created||(finished?(entry.messages.find(m=>m.kind==='result'&&m.run_id===run?.id)?.created||items.at(-1).created):Math.floor(Date.now()/1000));
   const elapsed=taskStarted&&taskStarted<=taskEnded?taskEnded-taskStarted:null;
-  const taskName=(rootRun?.task_title||first.progress?.task_title||'Task progress').trim()||'Task progress',taskLabel=node('span','summary-progress-task'),taskText=node('span','summary-progress-name',taskName);taskLabel.title=taskName;taskLabel.append(taskText);
+  const taskName=((first.progress?.work_qualified==null?rootRun?.task_title||first.progress?.task_title:first.progress?.task_title||rootRun?.task_title)||'Task progress').trim()||'Task progress',taskLabel=node('span','summary-progress-task'),taskText=node('span','summary-progress-name',taskName);taskLabel.title=taskName;taskLabel.append(taskText);
   if(!finished&&run?.status==='running'){taskText.classList.add('is-working');taskText.style.animationDelay=`-${((Date.now()/1000-(run.progress_started||run.created||0))%6+6)%6}s`;}
   const taskChevron=node('span','summary-progress-chevron','⌄');taskChevron.setAttribute('aria-hidden','true');title.prepend(taskChevron);
   title.append(node('strong','',name),taskLabel);
-  if(elapsed!==null)title.append(node('span','muted small summary-progress-time',elapsedTime(elapsed)));
+  if(elapsed!==null){
+    const timer=node('span','muted small summary-progress-time',elapsedTime(elapsed));
+    // Tick locally with the existing one-second clock, independent of chat redraws.
+    if(!finished)timer.dataset.groupStarted=String(taskStarted);
+    title.append(timer);
+  }
   title.append(node('span','muted small summary-progress-count',`Show progress · ${items.length} updates${questions.some(m=>m.question.status==='pending')?' · Waiting for your answer':questions.some(m=>m.question.status==='answered')?' · '+questions.filter(m=>m.question.status==='answered').length+' answer'+(questions.filter(m=>m.question.status==='answered').length===1?'':'s'):''}${finished?' · '+({completed:'Task finished',failed:'Task failed',cancelled:'Task stopped',interrupted:'Task interrupted'}[run?.status]||(phaseFinal?'Phase complete':'Task ended')):''}`));
   const body=node('div','summary-progress-body');for(const m of [...items,...questions].sort((a,b)=>(a.question?.created??a.created)-(b.question?.created??b.created)||a.seq-b.seq)){if(m.question){body.append(taskQuestionReceipt(m,entry,key,taskStarted));continue;}const update=node('div','summary-progress-update');update.dataset.message=String(m.seq);const content=markdown(m.text),ownedCalls=calls.filter(call=>call.connector_artifact.progress_message_seq===m.seq);
     if(Number.isFinite(m.created)&&m.created>0){

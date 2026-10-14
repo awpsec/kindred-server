@@ -13,6 +13,9 @@ pub fn migrate(c: &Connection) -> Result<()> {
     c.execute_batch("CREATE TABLE IF NOT EXISTS steering_requests(source_run_id TEXT PRIMARY KEY REFERENCES runs(id),run_id TEXT NOT NULL REFERENCES runs(id),created INTEGER NOT NULL);")?;
     c.execute_batch("CREATE TABLE IF NOT EXISTS message_send_modes(message_seq INTEGER PRIMARY KEY REFERENCES chat_messages(seq),mode TEXT NOT NULL);CREATE TABLE IF NOT EXISTS queued_message_claims(request_id TEXT PRIMARY KEY,chat_id TEXT NOT NULL,message_seq INTEGER NOT NULL,payload TEXT NOT NULL);")?;
     c.execute_batch("CREATE TABLE IF NOT EXISTS message_progress(message_seq INTEGER PRIMARY KEY REFERENCES chat_messages(seq),run_id TEXT NOT NULL REFERENCES runs(id),mode TEXT NOT NULL,phase TEXT NOT NULL,group_id TEXT NOT NULL);")?;
+    let columns:Vec<String>=c.prepare("PRAGMA table_info(message_progress)")?.query_map([],|r|r.get(1))?.collect::<rusqlite::Result<_>>()?;
+    if !columns.iter().any(|v|v=="work_qualified") {c.execute_batch("ALTER TABLE message_progress ADD COLUMN work_qualified INTEGER CHECK(work_qualified IS NULL OR work_qualified IN (0,1));")?;}
+    if !columns.iter().any(|v|v=="task_title") {c.execute_batch("ALTER TABLE message_progress ADD COLUMN task_title TEXT;")?;}
     c.execute_batch("CREATE TABLE IF NOT EXISTS followup_offers(id TEXT PRIMARY KEY,run_id TEXT NOT NULL REFERENCES runs(id),state TEXT NOT NULL,body TEXT NOT NULL,created INTEGER NOT NULL);CREATE TABLE IF NOT EXISTS followup_offer_sources(source_run_id TEXT PRIMARY KEY REFERENCES runs(id),offer_id TEXT NOT NULL REFERENCES followup_offers(id));")?;
     Ok(())
 }

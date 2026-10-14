@@ -207,7 +207,7 @@ impl Db {
                 // Snapshot an explicit emission group only in the delivery chat.
                 // Old questions remain unlinked; no historical inference/backfill.
                 task_group_id: if run.chat_id==destination {
-                    tx.query_row("SELECT CASE WHEN mode='summaries' AND phase='commentary' THEN group_id ELSE '' END FROM message_progress WHERE run_id=? ORDER BY message_seq DESC LIMIT 1", [&run.id], |r|r.get(0)).optional()?.unwrap_or_default()
+                    tx.query_row("SELECT CASE WHEN mode='summaries' AND phase='commentary' AND COALESCE(work_qualified,1)=1 THEN group_id ELSE '' END FROM message_progress WHERE run_id=? ORDER BY message_seq DESC LIMIT 1", [&run.id], |r|r.get(0)).optional()?.unwrap_or_default()
                 } else { String::new() },
                 answered_at: 0,
             };
@@ -397,7 +397,7 @@ mod task_receipt_tests {
     }
     #[test]
     fn cross_chat_and_wrong_bot_continuation_never_reuse_saved_group() {
-        let app=tests::app();let bot=tests::bot(&app.db,"codex");app.db.queue(&bot.id,"Original",0).unwrap();let run=app.db.claim_bot(&bot.id).unwrap().unwrap();app.db.event(&run.id,"assistant",json!({"text":"Opening","phase":"commentary"})).unwrap();let key=group(&app.db,&run.id);app.db.ask_question(&run,input("wrong-scope")).unwrap();let q=app.db.pending_questions().unwrap().remove(0);app.db.finish(&run.id,"completed","","").unwrap();let saved=app.db.answer_question(&q.id,Answer{selected:Some(1),custom:None}).unwrap();
+        let app=tests::app();let bot=tests::bot(&app.db,"codex");app.db.queue(&bot.id,"Original",0).unwrap();let run=app.db.claim_bot(&bot.id).unwrap().unwrap();progress_updates::set_task_title(&app.db,&run,"Prepare original task").unwrap();app.db.event(&run.id,"assistant",json!({"text":"Opening","phase":"commentary"})).unwrap();let key=group(&app.db,&run.id);app.db.ask_question(&run,input("wrong-scope")).unwrap();let q=app.db.pending_questions().unwrap().remove(0);app.db.finish(&run.id,"completed","","").unwrap();let saved=app.db.answer_question(&q.id,Answer{selected:Some(1),custom:None}).unwrap();
         app.db.0.lock().unwrap().execute("UPDATE questions SET delivery_chat_id='different-chat' WHERE id=?",[q.id]).unwrap();let follow=app.db.claim_bot(&bot.id).unwrap().unwrap();app.db.event(&follow.id,"assistant",json!({"text":"Different route","phase":"commentary"})).unwrap();assert_ne!(group(&app.db,&saved.continuation_run_id),key);
     }
 }
