@@ -33,7 +33,10 @@ class RuntimeUpdate(unittest.TestCase):
                 with self.assertRaises(Exception):
                     update.install(io.BytesIO(data),target,digest or hashlib.sha256(data).hexdigest(),'test')
                 self.assertEqual(target.read_bytes(),b'original runtime')
-                self.assertEqual(list(Path(root).iterdir()),[target])
+                # The persistent lock must survive failures so concurrent callers
+                # cannot lock a different inode. No staged payload may remain.
+                self.assertEqual(set(Path(root).iterdir()),{target,Path(root)/'.kindred-runtime.lock'})
+                self.assertEqual((Path(root)/'.kindred-runtime.lock').stat().st_mode & 0o777,0o600)
 
 
 if __name__=='__main__':unittest.main()

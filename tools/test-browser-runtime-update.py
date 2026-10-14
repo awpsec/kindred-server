@@ -11,7 +11,6 @@ import tempfile
 import unittest
 from unittest.mock import patch
 ROOT=Path(__file__).resolve().parents[1]
-BASELINE='d724df072e47b828cc355ed77c55762968c6739f'
 spec=importlib.util.spec_from_file_location('update',ROOT/'deploy/update-guest-runtime.py');m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
 
 def executable(version,broken=False):
@@ -23,12 +22,12 @@ class RuntimeTests(unittest.TestCase):
         self.target=self.root/'kindred-bin';self.old=executable('old');self.new=executable('candidate');self.target.write_bytes(self.old);self.target.chmod(0o755)
         self.payload={}
         for name in ('desktop-launch','start-desktop.sh'):
-            old=subprocess.check_output(['git','show',BASELINE+':deploy/'+name],cwd=ROOT);(self.root/name).write_bytes(old);(self.root/name).chmod(0o755)
+            old=(ROOT/'tools/fixtures/original-managed-launchers'/name).read_bytes();(self.root/name).write_bytes(old);(self.root/name).chmod(0o755)
             self.payload[name]={'source':(ROOT/'deploy'/name).read_text(),'previous_sha256':hashlib.sha256(old).hexdigest()}
-        self.payload['browser-launch.py']={'source':(ROOT/'deploy/browser-launch.py').read_text(),'previous_sha256':[None,hashlib.sha256(subprocess.check_output(['git','show','HEAD:deploy/browser-launch.py'],cwd=ROOT)).hexdigest()]}
+        self.payload['browser-launch.py']={'source':(ROOT/'deploy/browser-launch.py').read_text(),'previous_sha256':[None,hashlib.sha256((ROOT/'deploy/browser-launch.py').read_bytes()).hexdigest()]}
         for name in ('ensure-screen','screen-ownership.py'):
             if name=='ensure-screen':
-                old=subprocess.check_output(['git','show','HEAD:deploy/'+name],cwd=ROOT)
+                old=(ROOT/'deploy'/name).read_bytes()
                 (self.root/name).write_bytes(old);(self.root/name).chmod(0o755)
                 previous=hashlib.sha256(old).hexdigest()
             else:previous=None
@@ -74,6 +73,26 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual((self.root/'screen-ownership.py').read_text(),(ROOT/'deploy/screen-ownership.py').read_text())
         result=self.install(payload)
         self.assertFalse(result['updated']);self.assertFalse(result['launchers_updated']);self.preserved()
+    def test_production_payload_upgrades_original_managed_helpers(self):
+        # Existing installations can retain the first shipped launcher even
+        # after multiple binary-only guest updates. This is not customization.
+        production=(ROOT/'src/vm_maintenance.rs').read_text(); payload={}
+        for name in self.payload:
+            path=self.root/name
+            old=ROOT/'tools/fixtures/original-managed-launchers'/name
+            if old.is_file():
+                path.write_bytes(old.read_bytes());path.chmod(0o755)
+            else:
+                path.unlink(missing_ok=True)
+            declaration=re.search(r'"'+re.escape(name)+r'":\{"source":include_str!\([^\n]+?\),"previous_sha256":([^}]+)\}',production)
+            self.assertIsNotNone(declaration,name)
+            payload[name]={'source':(ROOT/'deploy'/name).read_text(),'previous_sha256':json.loads(declaration[1])}
+        result=self.install(payload)
+        self.assertTrue(result['updated']);self.assertTrue(result['launchers_updated'])
+        self.assertEqual(result['launcher_hashes'],{name:hashlib.sha256(v['source'].encode()).hexdigest() for name,v in payload.items()})
+        self.assertEqual((self.root/'start-desktop.sh.previous').read_bytes(),(ROOT/'tools/fixtures/original-managed-launchers/start-desktop.sh').read_bytes())
+        self.preserved()
+
     def test_full_verified_install_and_idempotence(self):
         result=self.install(self.payload);self.assertTrue(result['updated']);self.assertTrue(result['launchers_updated'])
         for name,value in self.payload.items():
