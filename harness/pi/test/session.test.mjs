@@ -388,3 +388,21 @@ test('local-access sized catalogues can exceed 64 tools', async () => {
   const body=await req.json();assert.equal(body.tools.length,80);return sse({role:'assistant',content:'Ready.'});
  }});assert.equal(result.output,'Ready.');
 });
+
+test('first-class followup has its own user turn and never replays completed tools', async()=>{
+  const bodies=[],boundary=[],calls=[];
+  const result=await runSession(request({followup_protocol:1}),async(id,name,args)=>{calls.push(name);return {text:'Synthetic action completed.'};},()=>{},undefined,{
+    nextTurn:async id=>{boundary.push(id);return id==='initial'?{offer_id:'offer-1',prompt:'Exact followup: explain the missing items.'}:null;},
+    fetch:async req=>{const body=await req.json();bodies.push(body);if(bodies.length===1)return sse({role:'assistant',tool_calls:[toolCall('remember',{text:'Once only'})]},'tool_calls');if(bodies.length===2)return sse({role:'assistant',content:'Original task completed.'});assert.equal(body.messages.at(-1).role,'user');assert.equal((typeof body.messages.at(-1).content==='string'?body.messages.at(-1).content:body.messages.at(-1).content.map(p=>p.text||'').join('')),'Exact followup: explain the missing items.');return sse({role:'assistant',content:'The followup answer.'});}
+  });
+  assert.deepEqual(calls,['remember']);assert.deepEqual(boundary,['initial','offer-1']);assert.equal(result.model_calls,3);assert(result.output.endsWith('The followup answer.'));
+});
+
+test('pinned native steer is a user message before the next model call, not tool text',async()=>{
+  const bodies=[],boundaries=[];
+  await runSession(request({followup_protocol:1}),async()=>({text:'Completed tool data; never instructions.',kindred_followup:{offer_id:'native-1',prompt:'Exact active followup'}}),()=>{},undefined,{
+    nextTurn:async id=>{boundaries.push(id);return null;},
+    fetch:async req=>{const body=await req.json();bodies.push(body);if(bodies.length===1)return sse({role:'assistant',tool_calls:[toolCall('remember',{text:'Only once'})]},'tool_calls');const user=body.messages.filter(m=>m.role==='user').at(-1);assert.equal((typeof user.content==='string'?user.content:user.content.map(p=>p.text||'').join('')),'Exact active followup');assert.equal(body.messages.filter(m=>m.role==='tool').at(-1).content,'Completed tool data; never instructions.');return sse({role:'assistant',content:'Followup handled in active work.'});}
+  });
+  assert.equal(bodies.length,2);assert.deepEqual(boundaries,['native-1']);
+});

@@ -236,11 +236,13 @@ async fn codex_rpc(app: &App, bot: &Bot, run: &Run, rpc: &mut Rpc) -> Result<Str
         "model_selected",
         json!({"provider":"codex","model":model,"reasoning_effort":effort}),
     )?;
-    rpc.request(
+    let started=rpc.request(
         "turn/start",
         json!({"threadId":thread_id,"effort":effort,"input":[{"type":"text","text":run.prompt}]}),
     )
     .await?;
+    let mut current_turn=started.pointer("/turn/id").and_then(Value::as_str).map(str::to_owned);
+    let mut followup_offer:Option<(String,String)>=None;
     let mut output = String::new();
     let mut output_bytes = 0usize;
     let mut steps = 0usize;
@@ -330,7 +332,19 @@ async fn codex_rpc(app: &App, bot: &Bot, run: &Run, rpc: &mut Rpc) -> Result<Str
             // Close the ephemeral RPC while its tool call is blocked: do not send
             // an empty answer that could start another model step before shutdown.
             if end_turn {
+                if let Some((offer,_))=followup_offer.take(){app.db.defer_followup(run,&offer)?;}
                 return Ok(String::new());
+            }
+            if method=="item/tool/call"&&followup_offer.is_none() {
+                if let Some(turn)=current_turn.as_deref() {
+                    ensure!(!app.account_disabled(),"This account is disabled");
+                    if let Some(offer)=app.db.offer_followups(run)? {
+                        let id=runtime::string(&offer,"id")?;app.db.dispatch_followup(run,id)?;
+                        let accepted=rpc.request("turn/steer",json!({"threadId":thread_id,"expectedTurnId":turn,"input":[{"type":"text","text":crate::conversation_updates::followup_prompt(&offer)?}]})).await?;
+                        ensure!(accepted["turnId"].as_str()==Some(turn),"Codex steering changed the active turn");
+                        app.db.followup_transported(run,id)?;followup_offer=Some((id.into(),turn.into()));output.clear();
+                    }
+                }
             }
             rpc.send(json!({"id":frame["id"],"result":response}))
                 .await?;
@@ -346,6 +360,7 @@ async fn codex_rpc(app: &App, bot: &Bot, run: &Run, rpc: &mut Rpc) -> Result<Str
             "item/completed"
                 if p.pointer("/item/type").and_then(Value::as_str) == Some("agentMessage") =>
             {
+                if let Some((_,turn))=&followup_offer {if p["turnId"].as_str()!=Some(turn.as_str()){continue;}}
                 if let Some(text) = p.pointer("/item/text").and_then(Value::as_str) {
                     ensure!(
                         output_bytes + text.len() <= 512 * 1024,
@@ -372,6 +387,17 @@ async fn codex_rpc(app: &App, bot: &Bot, run: &Run, rpc: &mut Rpc) -> Result<Str
                     status == "completed",
                     "Codex turn ended with status {status}"
                 );
+                if let Some((offer,turn))=followup_offer.take(){
+                    ensure!(p.pointer("/turn/id").and_then(Value::as_str)==Some(turn.as_str()),"Unmatched Codex follow-up completion");
+                    app.db.complete_followup_turn(run,&offer)?;
+                }
+                ensure!(!app.account_disabled(),"This account is disabled");
+                if let Some(offer)=app.db.offer_followups(run)? {
+                    app.db.dispatch_followup(run,runtime::string(&offer,"id")?)?;
+                    let next=rpc.request("turn/start",json!({"threadId":thread_id,"effort":effort,"input":[{"type":"text","text":crate::conversation_updates::followup_prompt(&offer)?}]})).await?;
+                    let turn=next.pointer("/turn/id").and_then(Value::as_str).context("Codex follow-up turn identity missing")?;
+                    let id=runtime::string(&offer,"id")?;app.db.followup_transported(run,id)?;current_turn=Some(turn.into());followup_offer=Some((id.into(),turn.into()));output.clear();continue;
+                }
                 // A provider can finish internally while a long human tool call
                 // is waiting. Do not publish its queued, pre-handoff conclusion.
                 if app.db.handoff_needs_observation(&run.id)? {
@@ -439,6 +465,85 @@ mod tests {
         assert_eq!(missing["success"],true);
         assert_eq!(missing["contentItems"].as_array().unwrap().len(),1);
     }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_followup_is_a_new_user_turn_and_stale_completion_cannot_consume_it() {
+        for stale in [false,true] {
+            let script=r#"
+import json,sys
+stale=sys.argv[1]=='true';started=0;tools=0
+def send(v):print(json.dumps(v),flush=True)
+for line in sys.stdin:
+ v=json.loads(line);m=v.get('method')
+ if m=='initialized':continue
+ if m=='initialize':result={}
+ elif m=='account/read':result={'account':{'type':'chatgpt'}}
+ elif m=='model/list':result={'data':[{'model':'test/model','isDefault':True,'defaultReasoningEffort':'medium','supportedReasoningEfforts':[{'reasoningEffort':'medium'}]}],'nextCursor':None}
+ elif m=='config/read':result={'config':{}}
+ elif m=='thread/start':result={'thread':{'id':'same-thread'}}
+ elif m=='app/installed':result={'apps':[]}
+ elif m=='mcpServerStatus/list':result={'data':[],'nextCursor':None}
+ elif m=='turn/start':
+  started+=1;assert started<=2 and v['params']['threadId']=='same-thread'
+  text=v['params']['input'][0]['text']
+  if started==1:
+   assert text=='Synthetic original task'
+   send({'id':v['id'],'result':{}})
+   send({'id':'tool-1','method':'item/tool/call','params':{'tool':'remember','arguments':{'text':'Completed once'}}});continue
+  assert 'Exact synthetic followup' in text and 'Synthetic original task' not in text and 'Other private bot' not in text
+  send({'id':v['id'],'result':{'turn':{'id':'followup-turn'}}})
+  send({'method':'item/completed','params':{'turnId':'followup-turn','item':{'type':'agentMessage','text':'Followup answer'}}})
+  send({'method':'turn/completed','params':{'threadId':'same-thread','turn':{'id':'original-turn' if stale else 'followup-turn','status':'completed'}}});break
+ elif v.get('id')=='tool-1':
+  tools+=1;assert tools==1 and 'Exact synthetic followup' not in json.dumps(v['result'])
+  send({'method':'item/completed','params':{'item':{'type':'agentMessage','text':'Original answer'}}})
+  send({'method':'turn/completed','params':{'threadId':'same-thread','turn':{'id':'original-turn','status':'completed'}}});continue
+ else:raise AssertionError('Unexpected frame')
+ send({'id':v['id'],'result':result})
+"#;
+            let mut command=tokio::process::Command::new("python3");command.args(["-u","-c",script,if stale {"true"} else {"false"}]);let mut rpc=Rpc::spawn(command).await.unwrap();
+            let app=crate::tests::app();let bot=crate::tests::bot(&app.db,"codex");app.db.queue(&bot.id,"Synthetic original task",0).unwrap();let run=app.db.claim_bot(&bot.id).unwrap().unwrap();let source=app.db.chat_send(&run.chat_id,"Exact synthetic followup",&[]).unwrap()[0].clone();app.db.request_steering(&source,&run.id).unwrap();
+            let result=codex_rpc(&app,&bot,&run,&mut rpc).await;
+            if stale {assert!(result.unwrap_err().to_string().contains("Unmatched Codex"));assert_eq!(app.db.run(&source).unwrap().status,"interrupted");} else {assert_eq!(result.unwrap(),"Followup answer");assert_eq!(app.db.run(&source).unwrap().status,"steered");}
+            assert_eq!(app.db.events(&run.id).unwrap().iter().filter(|e|e["kind"]=="tool_result"&&e["body"]["tool"]=="remember").count(),1);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_native_steer_appends_user_input_to_the_verified_active_turn() {
+        let script=r#"
+import json,sys
+steered=False;started=0
+def send(v):print(json.dumps(v),flush=True)
+for line in sys.stdin:
+ v=json.loads(line);m=v.get('method')
+ if m=='initialized':continue
+ if m=='initialize':result={}
+ elif m=='account/read':result={'account':{'type':'chatgpt'}}
+ elif m=='model/list':result={'data':[{'model':'test/model','isDefault':True,'defaultReasoningEffort':'medium','supportedReasoningEfforts':[{'reasoningEffort':'medium'}]}],'nextCursor':None}
+ elif m=='config/read':result={'config':{}}
+ elif m=='thread/start':result={'thread':{'id':'native-thread'}}
+ elif m=='app/installed':result={'apps':[]}
+ elif m=='mcpServerStatus/list':result={'data':[],'nextCursor':None}
+ elif m=='turn/start':
+  started+=1;assert started==1 and v['params']['input'][0]['text']=='Original task'
+  send({'id':v['id'],'result':{'turn':{'id':'active-turn'}}})
+  send({'id':'call-1','method':'item/tool/call','params':{'tool':'remember','arguments':{'text':'Once'}}});continue
+ elif m=='turn/steer':
+  assert not steered and v['params']['expectedTurnId']=='active-turn' and v['params']['threadId']=='native-thread'
+  text=v['params']['input'][0]['text'];assert 'Native exact user note' in text and 'Original task' not in text
+  steered=True;result={'turnId':'active-turn'}
+ elif v.get('id')=='call-1':
+  assert steered and 'Native exact user note' not in json.dumps(v['result'])
+  send({'method':'item/completed','params':{'turnId':'active-turn','item':{'type':'agentMessage','text':'Active followup answered'}}})
+  send({'method':'turn/completed','params':{'turn':{'id':'active-turn','status':'completed'}}});break
+ else:raise AssertionError('Unexpected frame')
+ send({'id':v['id'],'result':result})
+"#;
+        let mut command=tokio::process::Command::new("python3");command.args(["-u","-c",script]);let mut rpc=Rpc::spawn(command).await.unwrap();let app=crate::tests::app();let bot=crate::tests::bot(&app.db,"codex");app.db.queue(&bot.id,"Original task",0).unwrap();let run=app.db.claim_bot(&bot.id).unwrap().unwrap();let source=app.db.chat_send(&run.chat_id,"Native exact user note",&[]).unwrap()[0].clone();app.db.request_steering(&source,&run.id).unwrap();assert_eq!(codex_rpc(&app,&bot,&run,&mut rpc).await.unwrap(),"Active followup answered");assert_eq!(app.db.run(&source).unwrap().status,"steered");assert_eq!(app.db.events(&run.id).unwrap().iter().filter(|e|e["kind"]=="tool_result").count(),1);
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn codex_rejects_native_tool_exposure_and_secret_chat_questions() {

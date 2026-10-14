@@ -144,7 +144,7 @@ async fn run_worker(
         .filter_map(|t| t["name"].as_str().map(str::to_owned))
         .collect();
     send(&mut input, json!({
-        "type":"start", "protocol":1, "provider":bot.provider, "model":bot.model,
+        "type":"start", "protocol":1, "followup_protocol":1, "provider":bot.provider, "model":bot.model,
         "session_id":format!("{}:{}",bot.id,run.chat_id),
         "model_info":model_info, "api_key":key, "endpoint":endpoint, "fixture":fixture,
         "request_timeout_ms":app.config.request_timeout_seconds * 1000,
@@ -152,6 +152,9 @@ async fn run_worker(
         "reasoning_effort":bot.reasoning_effort, "require_zdr":app.config.openrouter.require_zdr,
         "max_steps":app.config.max_steps
     })).await?;
+    let mut followup_offer:Option<String>=None;
+    let mut native_followup=false;
+    let mut initial_boundary=false;
     let mut ready = false;
     let mut result = String::new();
     let mut call_ids = HashSet::new();
@@ -185,7 +188,7 @@ async fn run_worker(
                         && frame["model"] == bot.model,
                     "Unexpected Pi harness version or model selection"
                 );
-                ready = true;
+                ready = true;native_followup=frame["native_followup"]==true;
                 app.db.event(&run.id, "model_selected", json!({"provider":bot.provider,"model":bot.model,"reasoning_effort":bot.reasoning_effort,"harness":"pi","harness_version":frame["sdk_version"]}))?;
             }
             "progress" if ready => {
@@ -230,7 +233,7 @@ async fn run_worker(
                     "Pi requested a tool outside Kindred's tool set"
                 );
                 crate::provider_retry::check_tool_budget(app, run)?;
-                let tool_result = runtime::call_tool(app, bot, run, name, frame["args"].clone())
+                let mut tool_result = runtime::call_tool(app, bot, run, name, frame["args"].clone())
                     .await
                     .unwrap_or_else(|e| json!({"text":e.to_string(),"failed":true}));
                 let end_turn = tool_result["deferred_question"] == true
@@ -239,13 +242,21 @@ async fn run_worker(
                 if end_turn {
                     // The question card or quiet-completion receipt is the outcome.
                     // Progress already lives in events; it is never a final reply.
+                    if let Some(offer)=followup_offer.take(){app.db.defer_followup(run,&offer)?;}
                     return Ok(String::new());
+                }
+                if native_followup&&followup_offer.is_none()&&!initial_boundary {
+                    if !app.account_disabled(){if let Some(offer)=app.db.offer_followups(run)? {
+                        let id=runtime::string(&offer,"id")?;app.db.dispatch_followup(run,id)?;
+                        tool_result["kindred_followup"]=json!({"offer_id":id,"prompt":crate::conversation_updates::followup_prompt(&offer)?});followup_offer=Some(id.into());
+                    }}
                 }
                 send(
                     &mut input,
                     json!({"type":"tool_result","id":id,"result":tool_result}),
                 )
                 .await?;
+                if native_followup {if let Some(offer)=tool_result["kindred_followup"]["offer_id"].as_str(){app.db.followup_transported(run,offer)?;}}
             }
             "usage" if ready => {
                 crate::provider_accounts::record(app, bot, run, &frame)?;
@@ -259,7 +270,20 @@ async fn run_worker(
                         .event(&run.id, "context", json!({"state":frame["state"],"summary":frame["summary"].as_str().map(|s|crate::runtime::bounded(s,32000))}))?;
                 }
             }
+            "turn_complete" if ready => {
+                let input_id=runtime::string(&frame,"input_id")?;
+                ensure!(!(input_id=="initial"&&initial_boundary),"Repeated Pi initial completion");initial_boundary=true;
+                ensure!(input_id==followup_offer.as_deref().unwrap_or("initial"),"Unmatched Pi follow-up completion");
+                if let Some(offer)=followup_offer.take(){app.db.complete_followup_turn(run,&offer)?;}
+                ensure!(!app.account_disabled(),"This account is disabled");
+                let offer=app.db.offer_followups(run)?;
+                let decision=if let Some(offer)=&offer {json!({"type":"turn_decision","id":input_id,"offer_id":offer["id"],"prompt":crate::conversation_updates::followup_prompt(offer)?})} else {json!({"type":"turn_decision","id":input_id,"finish":true})};
+                if let Some(offer)=&offer {app.db.dispatch_followup(run,runtime::string(offer,"id")?)?;}
+                send(&mut input,decision).await?;
+                if let Some(offer)=offer {let id=runtime::string(&offer,"id")?;app.db.followup_transported(run,id)?;followup_offer=Some(id.into());}
+            }
             "complete" if ready => {
+                ensure!(followup_offer.is_none(),"Follow-up turn did not complete");
                 ensure!(
                     frame["output"].as_str().unwrap_or("").trim_end() == result.trim_end(),
                     "Pi completion did not match its emitted result"
@@ -327,6 +351,19 @@ pub fn sse_response(value: Value) -> axum::response::Response {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn actual_pi_sdk_delivers_active_followup_as_user_and_commits_matching_turn() {
+        use axum::{Router,Json,extract::State,routing::post};use std::{sync::{Arc,atomic::{AtomicUsize,Ordering}},future::IntoFuture};
+        async fn reply(State(count):State<Arc<AtomicUsize>>,Json(body):Json<Value>)->axum::response::Response {
+            if count.fetch_add(1,Ordering::SeqCst)==0 {return sse_response(json!({"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"one-effect","type":"function","function":{"name":"remember","arguments":"{\"text\":\"Completed once\"}"}}]},"finish_reason":"tool_calls"}]}));}
+            let user=body["messages"].as_array().unwrap().iter().rev().find(|m|m["role"]=="user").unwrap();let text=user["content"].as_str().map(str::to_owned).unwrap_or_else(||user["content"].as_array().unwrap().iter().filter_map(|p|p["text"].as_str()).collect::<Vec<_>>().join(""));
+            assert!(text.contains("Exact synthetic active followup"));assert!(!text.contains("Synthetic original assignment"));let tool=body["messages"].as_array().unwrap().iter().find(|m|m["role"]=="tool").unwrap();assert!(!tool.to_string().contains("Exact synthetic active followup"));
+            sse_response(json!({"choices":[{"message":{"role":"assistant","content":"Followup user turn answered."},"finish_reason":"stop"}]}))
+        }
+        let count=Arc::new(AtomicUsize::new(0));let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let endpoint=format!("http://{}/chat/completions",listener.local_addr().unwrap());let server=tokio::spawn(axum::serve(listener,Router::new().route("/chat/completions",post(reply)).with_state(count.clone())).into_future());
+        let app=crate::tests::app();let bot=crate::tests::bot(&app.db,"openrouter");app.db.queue(&bot.id,"Synthetic original assignment",0).unwrap();let run=app.db.claim_bot(&bot.id).unwrap().unwrap();let source=app.db.chat_send(&run.chat_id,"Exact synthetic active followup",&[]).unwrap()[0].clone();app.db.request_steering(&source,&run.id).unwrap();
+        let output=fixture(&app,&bot,&run,"fixture-key",&endpoint).await.unwrap();assert_eq!(output,"Followup user turn answered.");assert_eq!(count.load(Ordering::SeqCst),2);assert_eq!(app.db.run(&source).unwrap().status,"steered");assert_eq!(app.db.events(&run.id).unwrap().iter().filter(|e|e["kind"]=="tool_result"&&e["body"]["tool"]=="remember").count(),1);server.abort();
+    }
     #[tokio::test]
     async fn model_request_timeout_is_independent_of_task_cap() {
         let mut app = crate::tests::app();

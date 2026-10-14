@@ -191,7 +191,7 @@ export async function runSession(request, callTool, emit, signal, options = {}) 
   const adapter = providerAdapter(request);
   if (request.reasoning_effort && !adapter.model.reasoning) throw new HarnessError('reasoning');
   const temporary = await mkdtemp(join(tmpdir(), 'kindred-pi-'));
-  let session;
+  let session, currentInputId='initial';
   const timeoutMs = request.request_timeout_ms ?? 1_800_000;
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 30000 || timeoutMs > 7_200_000) throw new HarnessError('budget');
   const failure = { value: null };
@@ -272,6 +272,11 @@ export async function runSession(request, callTool, emit, signal, options = {}) 
         if (++toolCalls > request.max_steps && request.max_steps > 0) { failure.value = new HarnessError('budget'); throw failure.value; }
         if (signal?.aborted || toolSignal?.aborted) throw new HarnessError('aborted');
         const result = await callTool(id, tool.name, args, toolSignal);
+        if(result.kindred_followup){
+          const next=result.kindred_followup;
+          if(request.followup_protocol!==1||currentInputId!=='initial'||typeof next.offer_id!=='string'||typeof next.prompt!=='string'||!next.prompt.trim()) throw new HarnessError('protocol');
+          await session.steer(next.prompt);currentInputId=next.offer_id;
+        }
         const content = [{ type: 'text', text: result.text || '' }];
         if (result.image) {
           const match = /^data:(image\/(?:png|jpeg|gif|webp));base64,([A-Za-z0-9+/=]+)$/.exec(result.image);
@@ -331,10 +336,22 @@ export async function runSession(request, callTool, emit, signal, options = {}) 
       if (event.type === 'compaction_start') emit({ type: 'context', state: 'compacting' });
       if (event.type === 'compaction_end') emit({ type: 'context', state: event.errorMessage || event.aborted ? 'failed' : 'compacted', ...(!event.errorMessage && !event.aborted && typeof event.result?.summary === 'string' ? { summary: event.result.summary.slice(0, 24000) } : {}) });
     });
-    emit({ type: 'ready', protocol: 1, sdk_version: SDK_VERSION, provider: request.provider, model: request.model });
+    emit({ type: 'ready', protocol: 1, sdk_version: SDK_VERSION, provider: request.provider, model: request.model, native_followup:request.followup_protocol===1 });
     if (signal?.aborted) throw new HarnessError('aborted');
-    try { await session.prompt(request.prompt, { expandPromptTemplates: false }); }
-    catch { throw failure.value || new HarnessError(signal?.aborted ? 'aborted' : 'harness'); }
+    try {
+      let prompt=request.prompt;
+      while (true) {
+        await session.prompt(prompt, { expandPromptTemplates: false });
+        if(signal?.aborted) throw new HarnessError('aborted');
+        if (failure.value) throw failure.value;
+        if (!options.nextTurn) break;
+        const next=await options.nextTurn(currentInputId);
+        if (!next) break;
+        if (typeof next.offer_id!=='string'||typeof next.prompt!=='string'||!next.prompt.trim()) throw new HarnessError('protocol');
+        currentInputId=next.offer_id;prompt=next.prompt;
+      }
+    }
+    catch { throw signal?.aborted ? new HarnessError('aborted') : failure.value || new HarnessError('harness'); }
     finally { signal?.removeEventListener('abort', abort); }
     if (signal?.aborted) throw new HarnessError('aborted');
     if (failure.value) throw failure.value;

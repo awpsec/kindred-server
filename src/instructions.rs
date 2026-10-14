@@ -331,6 +331,7 @@ pub fn build(
         "available_conversations":memberships,"recent_shared_conversations":shared,
         "context_limits":"Context is destination-scoped. Private memory and other conversations are withheld in shared destinations. Other bots' memories and private DMs are excluded. chats_list and chat_read retrieve membership-scoped history, including the bot's own prior posts. Empty groups are real conversations. Excerpts may be shortened; omitted history is not proof of absence. Preserve attribution and audience privacy."
     });
+    if let Some(recovery)=app.db.followup_recovery(run)? {packet["followup_delivery_recovery"]=recovery;}
     let mut output = String::with_capacity(110_000);
     output.push_str(if context_window.is_some_and(|n|n<64000) {BOUNDED_CORE} else {CORE});
     if full_guide {

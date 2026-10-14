@@ -69,6 +69,7 @@ impl Db {
             !crate::workspace_transfer::frozen(&tx)?,
             "This workspace is being moved"
         );
+        ensure!(!tx.query_row("SELECT EXISTS(SELECT 1 FROM followup_offer_sources s JOIN followup_offers o ON o.id=s.offer_id JOIN runs parent ON parent.id=o.run_id WHERE s.source_run_id=? AND parent.status IN ('running','awaiting_user','awaiting_approval','cancelling'))",[source],|r|r.get::<_,bool>(0))?,"This follow-up still belongs to an active task. Wait for its handoff outcome before continuing.");
         let status: String =
             tx.query_row("SELECT status FROM runs WHERE id=?", [source], |r| r.get(0))?;
         ensure!(

@@ -281,6 +281,7 @@ impl Db {
         c.execute("UPDATE runs SET status='completed',error='',output='' WHERE status='running' AND EXISTS(SELECT 1 FROM events WHERE run_id=runs.id AND kind='process_wait')", [])?;
         // An interrupted external action must never be replayed automatically.
         let interrupted=c.execute("UPDATE runs SET status='interrupted',error='Service restarted during this run. Review tool activity before retrying.' WHERE status IN ('running','awaiting_user','awaiting_approval','cancelling')", [])?;
+        c.execute("UPDATE followup_offers SET state='uncertain' WHERE state IN ('dispatching','transported') AND EXISTS(SELECT 1 FROM runs parent WHERE parent.id=followup_offers.run_id AND parent.status IN ('interrupted','failed','completed','cancelled'))",[])?;
         c.execute(
             "UPDATE local_requests SET status='expired' WHERE status IN ('queued','claimed')",
             [],
@@ -603,6 +604,10 @@ impl Db {
         c.execute("UPDATE connector_artifacts SET status='interrupted',revision=revision+1 WHERE run_id=? AND status IN ('preparing','pending','approved','ready','executing')",[id])?;
         let completed:bool=c.query_row("SELECT status='completed' AND error='' FROM runs WHERE id=?",[id],|r|r.get(0))?;
         crate::routine_completion::publish(&c,id,completed)?;
+        // Provisional handoffs do not produce an error bubble during healthy
+        // work. A terminal owner releases an unresolved source recovery receipt.
+        c.execute("UPDATE followup_offers SET state='uncertain' WHERE run_id=? AND state IN ('dispatching','transported') AND EXISTS(SELECT 1 FROM runs WHERE id=? AND status IN ('completed','failed','interrupted','cancelled'))",params![id,id])?;
+        c.execute("INSERT OR IGNORE INTO chat_completion_pending SELECT source_run_id FROM followup_offer_sources s JOIN followup_offers o ON o.id=s.offer_id JOIN runs source ON source.id=s.source_run_id WHERE o.run_id=? AND o.state='uncertain' AND source.status='interrupted'",[id])?;
         c.execute("INSERT OR IGNORE INTO chat_completion_pending SELECT id FROM runs WHERE id=? AND chat_id!='' AND status IN ('completed','failed','interrupted','cancelled')", [id])?;
         c.commit()?;
         Ok(())
@@ -652,6 +657,7 @@ impl Db {
         self.run(id)?;
         let mut c = self.0.lock().unwrap();
         let tx = c.transaction()?;
+        ensure!(!tx.query_row("SELECT EXISTS(SELECT 1 FROM followup_offer_sources s JOIN followup_offers o ON o.id=s.offer_id JOIN runs parent ON parent.id=o.run_id WHERE s.source_run_id=? AND parent.status IN ('running','awaiting_user','awaiting_approval') AND o.state IN ('dispatching','transported'))",[id],|r|r.get::<_,bool>(0))?,"This message has been handed to the active task. Stop that task instead; its external effects cannot be withdrawn.");
         // Stop this task and its descendants, never its parallel group siblings
         // or the user's independent queued messages.
         let mut affected = vec![id.to_string()];

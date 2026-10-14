@@ -124,8 +124,10 @@ pub async fn run(app: &App, bot: &Bot, run: &Run) -> Result<String> {
         .iter()
         .filter_map(|t| t["name"].as_str().map(str::to_owned))
         .collect();
-    crate::pi::send(&mut input,json!({"type":"start","protocol":1,"provider":bot.provider,"model":bot.model,"reasoning_effort":bot.reasoning_effort,
+    crate::pi::send(&mut input,json!({"type":"start","protocol":1,"followup_protocol":1,"provider":bot.provider,"model":bot.model,"reasoning_effort":bot.reasoning_effort,
         "instructions":runtime::instructions_for(app,bot,run,&tools,None)?,"prompt":run.prompt,"tools":tools,"max_steps":app.config.max_steps})).await?;
+    let mut followup_offer:Option<String>=None;
+    let mut initial_boundary=false;
     let mut ready = false;
     let mut text = String::new();
     let mut final_reply = String::new();
@@ -382,6 +384,7 @@ pub async fn run(app: &App, bot: &Bot, run: &Run) -> Result<String> {
                     || result["finish_quietly"] == true || result["routine_complete"] == true
                     || result["deferred_process"] == true
                 {
+                    if let Some(offer)=followup_offer.take(){app.db.defer_followup(run,&offer)?;}
                     return Ok(String::new());
                 }
                 crate::pi::send(
@@ -390,7 +393,20 @@ pub async fn run(app: &App, bot: &Bot, run: &Run) -> Result<String> {
                 )
                 .await?;
             }
+            "turn_complete" if ready => {
+                let input_id=runtime::string(&frame,"input_id")?;
+                ensure!(!(input_id=="initial"&&initial_boundary),"Repeated subscription initial completion");initial_boundary=true;
+                ensure!(input_id==followup_offer.as_deref().unwrap_or("initial"),"Unmatched subscription follow-up completion");
+                if let Some(offer)=followup_offer.take(){app.db.complete_followup_turn(run,&offer)?;}
+                ensure!(!app.account_disabled(),"This account is disabled");
+                let offer=app.db.offer_followups(run)?;
+                let decision=if let Some(offer)=&offer {json!({"type":"turn_decision","id":format!("turn-{input_id}"),"offer_id":offer["id"],"prompt":crate::conversation_updates::followup_prompt(offer)?})} else {json!({"type":"turn_decision","id":format!("turn-{input_id}"),"finish":true})};
+                if let Some(offer)=&offer {app.db.dispatch_followup(run,runtime::string(offer,"id")?)?;}
+                crate::pi::send(&mut input,decision).await?;
+                if let Some(offer)=offer {let id=runtime::string(&offer,"id")?;app.db.followup_transported(run,id)?;followup_offer=Some(id.into());}
+            }
             "complete" if ready => {
+                ensure!(followup_offer.is_none(),"Follow-up turn did not complete");
                 crate::provider_inbox::verify_success(&app.db, run)?;
                 ensure!(
                     connector_calls.is_empty(),

@@ -113,6 +113,8 @@ where
                 return Ok(output);
             }
             Err(error) => {
+                let uncertain:bool=app.db.0.lock().unwrap().query_row("SELECT EXISTS(SELECT 1 FROM followup_offers WHERE run_id=? AND state IN ('dispatching','transported','uncertain'))",[&run.id],|r|r.get(0))?;
+                if uncertain {return Err(error.context("Follow-up handoff did not complete. Review source activity and explicitly continue the held message; automatic replay is disabled."));}
                 if !transient(&error) || !can_resume(app, run)? || app.db.turn_deferred(&run.id)? {
                     return Err(error);
                 }
@@ -154,6 +156,13 @@ mod tests {
     use super::*;
     use crate::tests;
     use std::{cell::Cell, future::ready};
+    #[tokio::test]
+    async fn uncertain_followup_disables_automatic_provider_replay() {
+        use std::sync::atomic::{AtomicUsize,Ordering};
+        let app=crate::tests::app();let bot=crate::tests::bot(&app.db,"codex");app.db.queue(&bot.id,"Root action",0).unwrap();let run=app.db.claim_bot(&bot.id).unwrap().unwrap();let source=app.db.chat_send(&run.chat_id,"Followup",&[]).unwrap()[0].clone();app.db.request_steering(&source,&run.id).unwrap();let offer=app.db.offer_followups(&run).unwrap().unwrap();app.db.dispatch_followup(&run,offer["id"].as_str().unwrap()).unwrap();let calls=AtomicUsize::new(0);
+        let result=retry(&app,&run,||async {calls.fetch_add(1,Ordering::SeqCst);bail!("Subscription provider timed out")},&[Duration::ZERO;5]).await;
+        assert!(result.unwrap_err().to_string().contains("automatic replay is disabled"));assert_eq!(calls.load(Ordering::SeqCst),1);assert_eq!(app.db.run(&source).unwrap().status,"interrupted");assert!(!app.db.events(&run.id).unwrap().iter().any(|e|e["kind"]=="provider_retry"));
+    }
     #[tokio::test]
     async fn lost_computer_receipt_blocks_provider_replay_and_more_input_but_not_readback() {
         let app = tests::app();

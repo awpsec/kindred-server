@@ -347,6 +347,10 @@ async def worker(provider):
     fragments = []
     bridge_ready = False
     completed = False
+    native_results=set()
+    can_followup=provider!='claude-code'
+    input_id = 'initial'
+    prompt_id = 'prompt'
     bridge_event = asyncio.Event()
     def flush_fragments():
         text=''.join(fragments).strip(); fragments.clear()
@@ -370,12 +374,28 @@ async def worker(provider):
         try:
             while True:
                 packet = await read(source)
-                assert packet['type'] == 'tool_result' and packet['id'] in pending
-                pending.pop(packet['id']).set_result(packet['result'])
+                assert packet['type'] in ('tool_result', 'turn_decision') and packet['id'] in pending
+                pending.pop(packet['id']).set_result(packet.get('result',packet))
         finally:
             await stop_child(1 if completed else 0)
             for future in pending.values():
                 if not future.done(): future.set_exception(EOFError())
+    async def next_turn():
+        nonlocal input_id, prompt_id
+        if request.get('followup_protocol') != 1 or not can_followup: return False
+        key='turn-'+input_id
+        future=asyncio.get_running_loop().create_future();pending[key]=future
+        emit({'type':'turn_complete','input_id':input_id})
+        decision=await future
+        assert decision['type']=='turn_decision' and decision['id']==key
+        if decision.get('finish') is True: return False
+        assert isinstance(decision.get('offer_id'),str) and isinstance(decision.get('prompt'),str) and decision['prompt'].strip()
+        input_id=decision['offer_id'];prompt_id='followup-'+input_id
+        if provider=='claude-code':
+            await send(child.stdin, {'type':'user','message':{'role':'user','content':decision['prompt']}})
+        else:
+            await send(child.stdin, {'jsonrpc':'2.0','id':prompt_id,'method':'prompt','params':{'user_input':decision['prompt']}})
+        return True
     async def tool(identifier, name, args):
         nonlocal count
         if provider == 'claude-code':
@@ -509,11 +529,17 @@ async def worker(provider):
                             if not is_error: output.append(text)
                             emit({'type': 'assistant', 'text': text, 'is_error': is_error})
                     if p.get('type') == 'result':
+                        native_id=p.get('uuid')
+                        if input_id!='initial' and (not isinstance(native_id,str) or not native_id or native_id in native_results):
+                            raise RuntimeError('Unmatched Claude follow-up completion')
+                        if isinstance(native_id,str) and native_id:
+                            native_results.add(native_id);can_followup=True
                         if callbacks: await asyncio.gather(*callbacks)
                         if any(not c['finished'] for c in connector_bridge.calls.values()):
                             raise RuntimeError('Claude connector completed without an execution receipt')
                         if not bridge_ready and not p.get('is_error'): raise ToolBridgeError('Claude completed without its Kindred tools connected')
                         if p.get('is_error') or p.get('subtype') != 'success': raise RuntimeError('The provider could not finish this task. Check its connection and subscription limits.')
+                        if await next_turn(): continue
                         break
                 else:
                     if p.get('id') == 'init':
@@ -521,9 +547,10 @@ async def worker(provider):
                         assert result.get('protocol_version') == '1.10' and set(result.get('external_tools',{}).get('accepted',[])) == set(tools)
                         emit({'type': 'ready', 'protocol': 1, 'provider': provider, 'model': request['model']})
                         await send(child.stdin, {'jsonrpc': '2.0', 'id': 'prompt', 'method': 'prompt', 'params': {'user_input': request['prompt']}})
-                    elif p.get('id') == 'prompt':
+                    elif p.get('id') == prompt_id:
                         flush_fragments()
                         if 'error' in p: raise RuntimeError('Kimi Code could not finish this task. Check its connection and quota.')
+                        if await next_turn(): continue
                         break
                     else:
                         params = p.get('params', {})

@@ -5,6 +5,7 @@ import { runSession, HarnessError, SDK_VERSION } from './session.mjs';
 const MAX_FRAME = 8 * 1024 * 1024;
 const pending = new Map();
 const controller = new AbortController();
+let turnDecision=null;
 let initialized = false, completed = false, buffer = Buffer.alloc(0);
 function send(frame) {
   const encoded = JSON.stringify(frame) + '\n';
@@ -15,6 +16,7 @@ function stop() {
   controller.abort();
   for (const entry of pending.values()) entry.reject(new HarnessError('aborted'));
   pending.clear();
+  if(turnDecision){turnDecision.reject(new HarnessError("aborted"));turnDecision=null;}
 }
 async function start(request) {
   try {
@@ -24,7 +26,10 @@ async function start(request) {
       signal?.addEventListener('abort', abort, { once: true });
       pending.set(id, { resolve: result => { signal?.removeEventListener('abort', abort); resolve(result); }, reject });
       send({ type: 'tool_call', id, name, args });
-    }), send, controller.signal);
+    }), send, controller.signal, request.followup_protocol===1 ? {nextTurn:inputId=>new Promise((resolve,reject)=>{
+      if(turnDecision) {reject(new HarnessError('protocol'));return;}
+      turnDecision={id:inputId,resolve,reject};send({type:'turn_complete',input_id:inputId});
+    })} : {});
     send({ type: 'complete', ...result });
   } catch (error) {
     send({ type: 'error', code: error instanceof HarnessError ? error.code : 'harness',
@@ -40,6 +45,10 @@ function receive(frame) {
     initialized = true; void start(frame); return;
   }
   if (frame.type === 'abort') { stop(); return; }
+  if (frame.type === 'turn_decision') {
+    if(!turnDecision||frame.id!==turnDecision.id) throw new HarnessError('protocol');
+    const entry=turnDecision;turnDecision=null;entry.resolve(frame.finish===true?null:frame);return;
+  }
   if (frame.type !== 'tool_result' || !pending.has(frame.id)) throw new HarnessError('protocol');
   const entry = pending.get(frame.id); pending.delete(frame.id); entry.resolve(frame.result);
 }

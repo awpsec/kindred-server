@@ -116,16 +116,20 @@ class Bridge(unittest.TestCase):
         for packet in [{},dict(good,tools=[]),dict(good,mcp_servers=[{'name':'kindred','status':'failed'}])]:
             with self.assertRaises(module.ToolBridgeError):module.validate_claude_tools(packet,{'remember':{}})
 
-    def exercise(self,provider,model=None,effort='',error_packet=None,bad_bridge=False,cleanup=False,tool_count=1,max_steps=4,image=None):
+    def exercise(self,provider,model=None,effort='',error_packet=None,bad_bridge=False,cleanup=False,tool_count=1,max_steps=4,image=None,followup=False):
         with tempfile.TemporaryDirectory() as d:
             binary=Path(d)/'fixture';fixture=FAKE.replace("'name':'kindred','status':'connected'","'name':'kindred','status':'failed'") if bad_bridge else FAKE;fixture=fixture.replace('    child.terminate();child.wait()',"    child.terminate();child.wait()\n    import time;time.sleep(.15)\n    from pathlib import Path\n    Path(__file__).with_name('worker-cleaned').write_text('done')") if cleanup else fixture
             if image:
                 fixture=fixture.replace("    result=read(); assert result['result']['return_value']['is_error'] is True", "    result=read(); assert result['result']['return_value']['is_error'] is True\n    import base64,struct\n    part=result['result']['return_value']['output'][1]\n    assert part['type']=='image_url'\n    png=base64.b64decode(part['image_url']['url'].split(',',1)[1]);assert struct.unpack('>II',png[16:24])==(1440,900)")
                 fixture=fixture.replace("    assert result['result']['isError'] is True", "    import base64,struct\n    part=result['result']['content'][1]\n    assert part['type']=='image' and part['mimeType']=='image/png'\n    png=base64.b64decode(part['data']);assert struct.unpack('>II',png[16:24])==(1440,900)\n    assert result['result']['isError'] is True")
+            if followup:
+                fixture=fixture.replace("    emit({'jsonrpc':'2.0','id':'prompt','result':{'status':'finished'}})", "    emit({'jsonrpc':'2.0','id':'prompt','result':{'status':'finished'}})\n    next=read();assert next['method']=='prompt' and next['id']=='followup-offer-1' and next['params']['user_input']=='Exact followup user bytes'\n    emit({'method':'event','params':{'type':'TextPart','payload':{'type':'text','text':'Followup answer.'}}})\n    emit({'jsonrpc':'2.0','id':next['id'],'result':{'status':'finished'}})")
+                fixture=fixture.replace("    emit({'type':'result','subtype':'success','is_error':False})", "    emit({'type':'result','subtype':'success','is_error':False,'uuid':'original-result'})\n    next=read();assert next['type']=='user' and next['message']['role']=='user' and next['message']['content']=='Exact followup user bytes'\n    emit({'type':'assistant','message':{'id':'msg-2','content':[{'type':'text','text':'Followup answer.'}]}})\n    emit({'type':'result','subtype':'success','is_error':False,'uuid':'followup-result'})")
             binary.write_text(fixture if error_packet is None else FAKE.replace("    emit({'type':'result','subtype':'success','is_error':False})", "    emit("+repr(error_packet)+")\n    emit({'type':'result','subtype':'error_during_execution','is_error':True})"));binary.chmod(0o755)
             child=subprocess.Popen([sys.executable,'-c',LAUNCH,str(HELPER),str(binary),provider],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
             start={'protocol':1,'provider':provider,'model':model or ('sonnet' if provider=='claude-code' else 'kimi'),'reasoning_effort':effort,'instructions':'Use only supplied tools.','prompt':'Remember hello.','max_steps':max_steps,
                    'tools':[{'name':'remember','description':'Remember text','inputSchema':{'type':'object','properties':{'text':{'type':'string'}},'required':['text']}}]}
+            if followup:start['followup_protocol']=1
             start['tools'] += [dict(start['tools'][0],name='extra_'+str(i)) for i in range(tool_count-1)]
             child.stdin.write(json.dumps(start)+'\n');child.stdin.flush()
             events=[]
@@ -139,6 +143,11 @@ class Bridge(unittest.TestCase):
                 if frame['type']=='tool_call':
                     self.assertEqual(frame['args'],{'text':'hello'})
                     child.stdin.write(json.dumps({'type':'tool_result','id':frame['id'],'result':dict({'text':'Declined','failed':True},**({'image':image} if image else {}))})+'\n');child.stdin.flush()
+                if frame['type']=='turn_complete':
+                    self.assertTrue(followup);self.assertIn(frame['input_id'],('initial','offer-1'))
+                    decision={'type':'turn_decision','id':'turn-'+frame['input_id']}
+                    decision.update({'offer_id':'offer-1','prompt':'Exact followup user bytes'} if frame['input_id']=='initial' else {'finish':True})
+                    child.stdin.write(json.dumps(decision)+'\n');child.stdin.flush()
                 if frame['type']=='complete': break
             child.stdin.close();child.wait(timeout=10)
             errors=child.stderr.read();child.stdout.close();child.stderr.close()
@@ -156,8 +165,9 @@ class Bridge(unittest.TestCase):
             self.assertEqual(child.returncode,0,errors)
             self.assertEqual(sum(e['type']=='tool_call' for e in events),1)
             self.assertEqual(events[-1]['type'],'complete',events)
-            self.assertEqual(events[-1]['output'],'Declined.' if provider=='claude-code' else 'Working.\nDeclined.')
-            self.assertEqual(sum(e['type']=='assistant' for e in events),1 if provider=='claude-code' else 2)
+            self.assertEqual(events[-1]['output'],('Declined.' if provider=='claude-code' else 'Working.\nDeclined.')+('\nFollowup answer.' if followup else ''))
+            if followup:self.assertEqual([e['input_id'] for e in events if e['type']=='turn_complete'],['initial','offer-1'])
+            self.assertEqual(sum(e['type']=='assistant' for e in events),(1 if provider=='claude-code' else 2)+(1 if followup else 0))
             receipt=next(e for e in events if e['type']=='usage');self.assertEqual(receipt['cost_source'],'subscription')
             self.assertEqual(receipt['output_tokens'],4)
             self.assertEqual(next(e for e in events if e['type']=='ready').get('reasoning_effort',''),effort)
@@ -180,6 +190,11 @@ class Bridge(unittest.TestCase):
         fixture = FAKE.replace(final, "    for _ in range(10050): emit({'type':'system','subtype':'status'})\n" + final)
         with patch(__name__ + '.FAKE', fixture):
             self.exercise('claude-code')
+
+    def test_claude_followup_uses_native_user_packet_same_process(self):
+        self.exercise('claude-code',followup=True)
+    def test_kimi_followup_uses_native_prompt_same_process(self):
+        self.exercise('kimi-code',followup=True)
 
     def test_catalogue_uses_control_request_without_user_turn(self):
         with tempfile.TemporaryDirectory() as d:
