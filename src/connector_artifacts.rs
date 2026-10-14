@@ -136,22 +136,14 @@ pub fn email_fields(value: &Value) -> Value {
         ("subject", &["subject", "subject_line"][..]),
         (
             "body",
-            &[
-                "body",
-                "message_body",
-                "body_text",
-                "body_html",
-                "html_body",
-                "content",
-                "message",
-            ][..],
+            crate::connector_edits::EMAIL_BODY_KEYS,
         ),
     ] {
         if let Some((key, text)) = aliases
             .iter()
             .find_map(|k| value.get(*k).and_then(field_value).map(|s| (*k, s)))
         {
-            fields.insert(label.into(), json!({"key":key,"text":text,"array":value[key].is_array(),"editable":label!="from"}));
+            fields.insert(label.into(), json!({"key":key,"text":text,"array":value[key].is_array(),"editable":label!="from" && !crate::connector_edits::opaque_email(value),"format":if label=="body" && crate::connector_edits::html_body(value,key){"html"}else{"text"}}));
         }
     }
     crate::connector_edits::extend_email_fields(value, json!(fields))
@@ -210,6 +202,7 @@ pub fn record(c: &Connection, id: &str) -> Result<Value> {
     // sends, without executing or changing the recorded action.
     value["email_send"] = json!(email_send(&json!({"toolkit":value["connector"],"tool_name":value["tool"]})));
     value["email"] = email_fields(&value["input"]);
+    value["body_resave_required"] = json!(value["kind"] == "email" && crate::connector_edits::validate_email_delivery(&value).is_err());
     value["review_requested"]=json!(c.query_row("SELECT EXISTS(SELECT 1 FROM chat_send_receipts WHERE request_id=?)",[id],|r|r.get::<_,bool>(0))?);
     if crate::connector_edits::read_only(&value) {
         if let Some(fields) = value["email"].as_object_mut() {
@@ -287,6 +280,9 @@ pub fn dispatch(db: &Db, run: &Run, args: &Value) -> Result<()> {
         .as_str()
         .context("Connector card missing")?;
     let c = db.0.lock().unwrap();
+    let card = record(&c, id)?;
+    crate::connector_edits::validate_email_delivery(&card)?;
+    ensure!(input(args) == &card["input"], "Connector inputs changed after review");
     let explicit: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM connector_artifacts f JOIN approvals a ON a.id=f.approval_id WHERE f.id=? AND a.status='approved')",[id],|r|r.get(0))?;
     if !explicit && args["read_only"] != true {
         ensure!(
@@ -725,6 +721,56 @@ mod tests {
         .unwrap()["revision"]
             .as_i64()
             .unwrap()
+    }
+    #[tokio::test]
+    async fn email_body_saved_review_has_exact_native_payload_once() {
+        for tool in ["mcp__claude_ai_Gmail__send_email", "mcp__claude_ai_Gmail__send_message"] {
+            let (app,bot,run,mut args,_)=fixture();
+            crate::connector_policy::catalogue(&app.db,&"a".repeat(64),&json!([{"origin":"claude-account","name":"claude.ai Gmail","display_name":"Gmail","connector_key":"gmail-1","status":"connected","tools":[tool]}])).unwrap();
+            args["tool_name"]=json!(tool);
+            args["input"]=json!({"to":["review@example.invalid"],"cc":["cc@example.invalid"],"bcc":["bcc@example.invalid"],"subject":"Synthetic reviewed subject","body":"Keep this. DELETE SYNTHETIC SPAN.","htmlBody":"<p>Keep this. DELETE SYNTHETIC SPAN.</p><p>Signature retained</p>","replyThreadId":"synthetic-thread","attachments":[{"id":"synthetic-attachment"}]});
+            let id=create(&app.db,&run,&args).unwrap();args["artifact_id"]=json!(id);
+            let (a,b,r,mut request)=(app.clone(),bot.clone(),run.clone(),args.clone());
+            let task=tokio::spawn(async move{let allowed=review(&a,&b,&r,"claude_connector",&mut request,false).await.unwrap();(allowed,request)});
+            tokio::time::timeout(std::time::Duration::from_secs(3),async{while app.db.approvals().unwrap().is_empty(){tokio::time::sleep(std::time::Duration::from_millis(10)).await;}}).await.unwrap();
+            let rev=record(&app.db.0.lock().unwrap(),&id).unwrap()["revision"].as_i64().unwrap();
+            let saved=update(&app,&id,&json!({"action":"edit","revision":rev,"fields":{"body":"Keep this.\nSignature retained"}})).unwrap();
+            assert!(update(&app,&id,&json!({"action":"approve","revision":rev})).is_err());
+            assert!(update(&app,&id,&json!({"action":"edit","revision":rev,"fields":{"body":"Racing old save"}})).is_err());
+            update(&app,&id,&json!({"action":"approve","revision":saved["revision"]})).unwrap();
+            let (allowed,effective)=task.await.unwrap();assert!(allowed);
+            let mut tampered=effective.clone();tampered["input"]["htmlBody"]=json!("Stale hidden text");
+            assert!(dispatch(&app.db,&run,&tampered).is_err());
+            dispatch(&app.db,&run,&effective).unwrap();assert!(dispatch(&app.db,&run,&effective).is_err());
+            for key in ["to","cc","bcc","subject","replyThreadId","attachments"]{assert_eq!(effective["input"][key],args["input"][key]);}
+            assert_eq!(effective["input"]["htmlBody"],"<p>Keep this.<br>Signature retained</p>");
+            assert_eq!(effective["input"]["body"],"Keep this.\nSignature retained");
+            if let Ok(root)=std::env::var("KINDRED_EMAIL_PAYLOAD_DIR") {
+                std::fs::write(std::path::Path::new(&root).join(format!("{}.json",tool)),json!({"tool":tool,"original":args["input"],"approved_input":effective["input"],"html_only_fields":email_fields(&json!({"htmlBody":"<p>HTML-only</p>"}))}).to_string()).unwrap();
+            }
+            complete(&app.db,&id,&json!({"id":"synthetic-sent"}),false).unwrap();
+            let retained=record(&app.db.0.lock().unwrap(),&id).unwrap();
+            assert_eq!(retained["original_input"],args["input"]);
+            assert_eq!(retained["input"],effective["input"]);
+        }
+    }
+    #[test]
+    fn email_body_preupgrade_pending_save_repairs_but_approval_and_dispatch_never_do() {
+        let (app,_,run,mut args,_)=fixture();
+        args["input"]=json!({"body":"Original DELETE","htmlBody":"<p>Original DELETE</p>","to":"review@example.invalid","subject":"Review"});
+        let id=create(&app.db,&run,&args).unwrap();args["artifact_id"]=json!(id);
+        pending(&app,&run,&args);
+        let mut legacy=record(&app.db.0.lock().unwrap(),&id).unwrap();
+        legacy["input"]["body"]=json!("Reviewed");legacy["edited_by_user"]=json!(true);
+        app.db.0.lock().unwrap().execute("UPDATE connector_artifacts SET body=? WHERE id=?",params![legacy.to_string(),id]).unwrap();
+        let rev=legacy["revision"].as_i64().unwrap();
+        assert_eq!(record(&app.db.0.lock().unwrap(),&id).unwrap()["body_resave_required"],true);
+        assert!(update(&app,&id,&json!({"action":"approve","revision":rev})).unwrap_err().to_string().contains("older body alternative"));
+        assert!(dispatch(&app.db,&run,&args).unwrap_err().to_string().contains("older body alternative"));
+        let saved=update(&app,&id,&json!({"action":"edit","revision":rev,"fields":{"body":"Reviewed"}})).unwrap();
+        assert_eq!(saved["input"]["htmlBody"],"<p>Reviewed</p>");
+        assert_eq!(saved["body_resave_required"],false);
+        update(&app,&id,&json!({"action":"approve","revision":saved["revision"]})).unwrap();
     }
     #[tokio::test]
     async fn synthetic_email_adapter_counts_success_refusal_and_lost_receipt_without_replay() {

@@ -132,6 +132,133 @@ pub fn extend_email_fields(value: &Value, mut fields: Value) -> Value {
     fields
 }
 
+// Only these existing body alternatives are rewritten; remote drafts and MIME
+// messages cannot be changed by editing local preview fields.
+pub const EMAIL_BODY_KEYS: &[&str] = &[
+    "body",
+    "message_body",
+    "body_text",
+    "textBody",
+    "content",
+    "message",
+    "body_html",
+    "html_body",
+    "htmlBody",
+];
+pub fn opaque_email(value: &Value) -> bool {
+    [
+        "raw",
+        "mime",
+        "mime_message",
+        "raw_message",
+        "draft_id",
+        "draftId",
+        "draft",
+    ]
+    .iter()
+    .any(|key| value.get(*key).is_some_and(|v| !v.is_null()))
+}
+pub fn html_body(value: &Value, key: &str) -> bool {
+    matches!(key, "body_html" | "html_body" | "htmlBody")
+        || (!matches!(key, "body_text" | "textBody")
+            && (value["is_html"] == true || value["body_type"] == "html"))
+}
+fn escaped_html(text: &str) -> String {
+    format!(
+        "<p>{}</p>",
+        text.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('\"', "&quot;")
+            .replace('\r', "")
+            .replace('\n', "<br>")
+    )
+}
+fn synchronize_email_body(next: &mut Value, meta: &Value, text: &str) -> Result<()> {
+    let key = meta["key"].as_str().context("Missing body field")?;
+    if key.starts_with('/') {
+        // Graph exposes one typed body. A second body outside that envelope is
+        // ambiguous, so retain it and refuse the edit rather than sending it.
+        let envelope = if key.starts_with("/message/") {
+            &next["message"]
+        } else {
+            &*next
+        };
+        ensure!(
+            EMAIL_BODY_KEYS
+                .iter()
+                .filter(|k| !matches!(**k, "body" | "message"))
+                .all(|k| envelope.get(*k).is_none_or(Value::is_null)),
+            "This email has an unsupported body alternative; request a new draft"
+        );
+        if key.starts_with("/message/") {
+            ensure!(
+                EMAIL_BODY_KEYS
+                    .iter()
+                    .filter(|k| **k != "message")
+                    .all(|k| next.get(*k).is_none_or(Value::is_null)),
+                "This email has an unsupported body alternative; request a new draft"
+            );
+        }
+        return Ok(());
+    }
+    let html = meta["format"] == "html";
+    for alias in EMAIL_BODY_KEYS {
+        let Some(old) = next.get(*alias) else {
+            continue;
+        };
+        if old.is_null() {
+            continue;
+        }
+        ensure!(
+            old.is_string(),
+            "This email has an unsupported body alternative; request a new draft"
+        );
+        let alternative_html = html_body(next, alias);
+        ensure!(
+            !html || alternative_html,
+            "This HTML draft has an unsupported plain alternative; request a new draft"
+        );
+        next[*alias] = json!(if alternative_html && !html {
+            escaped_html(text)
+        } else {
+            text.to_owned()
+        });
+    }
+    Ok(())
+}
+// Pre-upgrade pending drafts may already contain edited plain text and stale
+// HTML. Refuse them until an explicit Save regenerates the alternatives. Never
+// repair a payload silently during approval or dispatch.
+pub fn validate_email_delivery(card: &Value) -> Result<()> {
+    if card["kind"] != "email" || card["edited_by_user"] != true {
+        return Ok(());
+    }
+    ensure!(
+        !opaque_email(&card["input"]),
+        "This remote draft or MIME message cannot use local edits; request a new draft"
+    );
+    let current = crate::connector_artifacts::email_fields(&card["input"]);
+    let original = crate::connector_artifacts::email_fields(&card["original_input"]);
+    let body_changed = current["body"]["text"] != original["body"]["text"]
+        || EMAIL_BODY_KEYS
+            .iter()
+            .any(|key| card["input"].get(*key) != card["original_input"].get(*key));
+    if !body_changed {
+        return Ok(());
+    }
+    let text = current["body"]["text"]
+        .as_str()
+        .context("Edited email body is no longer available")?;
+    let mut coherent = card["input"].clone();
+    synchronize_email_body(&mut coherent, &current["body"], text)?;
+    ensure!(
+        coherent == card["input"],
+        "This saved draft has an older body alternative. Open Edit draft and Save edits before sending."
+    );
+    Ok(())
+}
+
 pub fn read_only(card: &Value) -> bool {
     card["read_only"] == true
         || card["display_read_only"] == true
@@ -212,6 +339,10 @@ pub fn apply(card: &Value, edits: &Value) -> Result<Value> {
     );
     let current = &card["input"];
     let email = card["kind"] == "email";
+    ensure!(
+        !email || !opaque_email(current),
+        "Remote drafts and MIME messages cannot be edited here; request a new draft"
+    );
     let known = if email {
         crate::connector_artifacts::email_fields(current)
     } else {
@@ -267,7 +398,14 @@ pub fn apply(card: &Value, edits: &Value) -> Result<Value> {
             continue;
         }
         let replacement = if meta["encoding"] == "email_addresses" {
-            json!(recipients.as_ref().context("Missing recipients")?.iter().map(|r| r["email"].clone()).collect::<Vec<_>>())
+            json!(
+                recipients
+                    .as_ref()
+                    .context("Missing recipients")?
+                    .iter()
+                    .map(|r| r["email"].clone())
+                    .collect::<Vec<_>>()
+            )
         } else if meta["encoding"] == "graph_recipients" {
             let rows = old.as_array().cloned().unwrap_or_default();
             let mut result = Vec::new();
@@ -324,6 +462,11 @@ pub fn apply(card: &Value, edits: &Value) -> Result<Value> {
             next[key] = replacement;
         }
     }
+    if email {
+        if let Some(text) = edits.get("body").and_then(Value::as_str) {
+            synchronize_email_body(&mut next, &known["body"], text)?;
+        }
+    }
     ensure!(
         next.to_string().len() <= 200_000,
         "Connector input too large for review"
@@ -334,6 +477,122 @@ pub fn apply(card: &Value, edits: &Value) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn email_body_alternatives_follow_reviewed_plain_text_and_keep_headers() {
+        for alias in ["htmlBody", "html_body", "body_html"] {
+            let mut input = json!({"body":"Keep. DELETE.","textBody":"Keep. DELETE.","to":["a@example.invalid"],"cc":["c@example.invalid"],"bcc":["b@example.invalid"],"subject":"Review","replyThreadId":"thread","attachments":[{"id":"file"}]});
+            input[alias] = json!("<p><strong>Keep. DELETE.</strong></p>");
+            let card = json!({"kind":"email","input":input});
+            let headers = apply(&card, &json!({"subject":"New subject"})).unwrap();
+            assert_eq!(
+                headers[alias], input[alias],
+                "Header edits preserve HTML formatting"
+            );
+            let next = apply(
+                &card,
+                &json!({"body":"Keep <exact> & safe.\nSignature retained"}),
+            )
+            .unwrap();
+            assert_eq!(
+                next[alias],
+                "<p>Keep &lt;exact&gt; &amp; safe.<br>Signature retained</p>"
+            );
+            assert_eq!(next["textBody"], next["body"]);
+            for key in ["to", "cc", "bcc", "subject", "replyThreadId", "attachments"] {
+                assert_eq!(next[key], input[key]);
+            }
+        }
+    }
+    #[test]
+    fn email_body_legacy_alternative_edit_cannot_hide_behind_unchanged_primary() {
+        let original = json!({"body":"Original","htmlBody":"<p>Original</p>"});
+        let mut edited = original.clone();
+        edited["htmlBody"] = json!("<p>Different hidden content</p>");
+        let card =
+            json!({"kind":"email","edited_by_user":true,"original_input":original,"input":edited});
+        assert!(
+            validate_email_delivery(&card)
+                .unwrap_err()
+                .to_string()
+                .contains("older body alternative")
+        );
+        let repaired = apply(&card, &json!({"body":"Original"})).unwrap();
+        assert_eq!(repaired["htmlBody"], "<p>Original</p>");
+        let mut card = card;
+        card["input"] = repaired;
+        validate_email_delivery(&card).unwrap();
+    }
+    #[test]
+    fn email_body_html_only_metadata_and_aliases_remain_html() {
+        for alias in ["htmlBody", "html_body", "body_html"] {
+            let mut input = json!({"to":"a@example.invalid","subject":"Review"});
+            input[alias] = json!("<p>Original</p>");
+            let fields = crate::connector_artifacts::email_fields(&input);
+            assert_eq!(fields["body"]["format"], "html");
+            assert_eq!(fields["body"]["key"], alias);
+            let next = apply(
+                &json!({"kind":"email","input":input}),
+                &json!({"body":"<p><strong>Edited</strong></p>"}),
+            )
+            .unwrap();
+            assert_eq!(next[alias], "<p><strong>Edited</strong></p>");
+        }
+        let input = json!({"body":"<p>Original</p>","htmlBody":"<p>Original</p>","is_html":true});
+        assert_eq!(
+            crate::connector_artifacts::email_fields(&input)["body"]["format"],
+            "html"
+        );
+        let next = apply(
+            &json!({"kind":"email","input":input}),
+            &json!({"body":"<p>Edited</p>"}),
+        )
+        .unwrap();
+        assert_eq!(next["body"], next["htmlBody"]);
+    }
+    #[test]
+    fn email_body_opaque_or_ambiguous_alternatives_refuse_without_mutation() {
+        for key in ["raw", "draft_id", "draftId", "mime_message"] {
+            let mut input = json!({"body":"Old","to":"a@example.invalid"});
+            input[key] = json!("opaque");
+            assert!(
+                apply(
+                    &json!({"kind":"email","input":input}),
+                    &json!({"body":"New"})
+                )
+                .is_err()
+            );
+        }
+        for alternative in [json!({"content":"hidden"}), json!(["hidden"])] {
+            let input = json!({"body":"Old","htmlBody":alternative});
+            assert!(
+                apply(
+                    &json!({"kind":"email","input":input}),
+                    &json!({"body":"New"})
+                )
+                .is_err()
+            );
+        }
+        for input in [
+            json!({"body":{"contentType":"HTML","content":"<p>Old</p>"},"htmlBody":"hidden"}),
+            json!({"message":{"body":{"contentType":"Text","content":"Old"}},"body":"hidden"}),
+        ] {
+            assert!(
+                apply(
+                    &json!({"kind":"email","input":input}),
+                    &json!({"body":"New"})
+                )
+                .is_err()
+            );
+        }
+        let input = json!({"body":"<p>Old</p>","is_html":true,"textBody":"Old"});
+        assert!(
+            apply(
+                &json!({"kind":"email","input":input}),
+                &json!({"body":"<p>New</p>"})
+            )
+            .is_err()
+        );
+    }
     #[test]
     fn recipient_chips_preserve_names_and_add_optional_copy_fields() {
         let input = json!({"to":["old@example.com"],"subject":"Keep","body":"Keep","attachments":["keep.pdf"]});
