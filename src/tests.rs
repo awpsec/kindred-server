@@ -562,6 +562,28 @@ async fn handoffs_are_queued_with_depth_and_do_not_copy_other_history() {
     assert!(!recipient.prompt.contains("private original prompt"));
 }
 #[tokio::test]
+async fn pending_approval_feed_has_explicit_status_for_existing_clients() {
+    use std::future::IntoFuture;
+    let app = app();
+    let b = bot(&app.db, "codex");
+    let run = app.db.queue(&b.id, "Review an instruction change", 0).unwrap();
+    app.db.claim().unwrap();
+    let approval = app.db.request_approval(&run, "bot_instructions_update", &json!({"bot_name":"Test bot"})).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/api/approvals", listener.local_addr().unwrap());
+    let server = tokio::spawn(axum::serve(listener, crate::web::router(app.clone())).into_future());
+    let client = reqwest::Client::new();
+    let pending: Value = client.get(&url).bearer_auth(&app.token).send().await.unwrap().json().await.unwrap();
+    assert_eq!(pending[0]["id"], approval);
+    assert_eq!(pending[0]["status"], "pending");
+    assert_eq!(pending[0]["status"], app.db.run_approvals(&run).unwrap()[0]["status"]);
+    app.db.decide(&approval, false).unwrap();
+    let resolved: Value = client.get(&url).bearer_auth(&app.token).send().await.unwrap().json().await.unwrap();
+    assert_eq!(resolved, json!([]));
+    assert_eq!(app.db.run_approvals(&run).unwrap()[0]["status"], "denied");
+    server.abort();
+}
+#[tokio::test]
 async fn denied_guest_action_never_launches_ssh() {
     let app = app();
     let b = bot(&app.db, "codex");
