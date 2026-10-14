@@ -100,7 +100,18 @@ fn permission(
     account: &str,
     connector: &str,
 ) -> Result<bool> {
-    Ok(permission_override(c, bot, origin, account, connector)? == Some(true))
+    if let Some(allowed) = permission_override(c, bot, origin, account, connector)? {
+        return Ok(allowed);
+    }
+    // An untouched connector inherits the bot's live access mode. An explicit
+    // connector Ask remains a narrower restriction, including under Full access.
+    let mode: String = c.query_row("SELECT approval_mode FROM bots WHERE id=?", [bot], |r| r.get(0))?;
+    if mode != "inherit" {
+        return Ok(mode == "full");
+    }
+    let general: Option<String> = c.query_row("SELECT value FROM settings WHERE key='general'", [], |r| r.get(0)).optional()?;
+    let general: Value = general.map(|v| serde_json::from_str(&v)).transpose()?.unwrap_or_default();
+    Ok(general["approval_mode"] == "full")
 }
 fn permission_override(
     c: &Connection,
@@ -154,11 +165,7 @@ pub(crate) fn approval_override_locked(
         let scoped: Option<String> = c.query_row("SELECT permission FROM connector_action_grants WHERE bot_id=? AND origin=? AND account_key=? AND connector_key=? AND action='email_send'",params![bot,origin,account,connector],|r|r.get(0)).optional()?;
         return Ok(Some(scoped.as_deref() == Some("allow")));
     }
-    // A visible off switch means ask, including before any preference was saved.
-    // Do not let the general Full access policy turn an absent connector grant on.
-    Ok(Some(
-        permission_override(c, bot, origin, account, connector)?.unwrap_or(false),
-    ))
+    Ok(Some(permission(c, bot, origin, account, connector)?))
 }
 fn service(name: &str) -> String {
     let n: String = name
@@ -245,7 +252,7 @@ pub fn inventory(app: &App, bot: &Bot) -> Result<Value> {
     let mut rows = rows;
     for row in &mut rows {
         row["always_allow"] = json!(
-            row["permission_persistence_available"] != false
+            origin != "codex-account" && row["permission_persistence_available"] != false
                 && permission(
                     &c,
                     &bot.id,
@@ -319,7 +326,7 @@ pub fn inventory(app: &App, bot: &Bot) -> Result<Value> {
         }
     }
     result["routing_instruction"] = json!(
-        "Connected describes account authentication, not permission to act. Prefer provider means the current bot's provider_source: Codex connections for a Codex bot, Claude connections for a Claude bot. Kindred connections remain available alongside provider connections or alone. For duplicate services use preferred_source unless the user explicitly selects another source; ask when unconfigured or ask. A missing or unavailable preferred provider connection requires an explanation and a choice, not silent fallback. Source preference grants no permissions. When requires_approval is true or always_allow is false, actions require approval even in Full access mode. Read-only account limits, email-specific policies, and provider-forced reviews still apply. execution_available=false means the connector cannot execute. permission_persistence_available=false means each call needs review and no standing grant can be saved. Never switch sources after denial or authorization failure. Use connector_configure to propose saved preferences or permissions; only the person's approval saves them."
+        "Connected describes account authentication, not permission to act. Prefer provider means the current bot's provider_source: Codex connections for a Codex bot, Claude connections for a Claude bot. Kindred connections remain available alongside provider connections or alone. For duplicate services use preferred_source unless the user explicitly selects another source; ask when unconfigured or ask. A missing or unavailable preferred provider connection requires an explanation and a choice, not silent fallback. Source preference grants no permissions. Untouched Claude and Kindred connections inherit Full access; an explicit connector Ask overrides it. requires_approval and always_allow report this effective permission. Read-only account limits, email-specific policies, and provider-forced reviews still apply. execution_available=false means the connector cannot execute. permission_persistence_available=false means each call needs review and no standing grant can be saved. Never switch sources after denial or authorization failure. Use connector_configure to propose saved preferences or permissions; only the person's approval saves them."
     );
     Ok(result)
 }
@@ -621,9 +628,10 @@ pub async fn configure(app: &App, bot: &Bot, run: &Run, args: &Value) -> Result<
             inv["claude_account_key"].as_str().unwrap_or("").len() == 64,
             "Refresh Claude connectors first"
         );
-        if (connector == "*" && inv["claude_all_allowed"] == true)
-            || row.is_some_and(|r| r["always_allow"] == true)
-        {
+        // Full access allows execution, but does not itself save a standing grant
+        // that would outlive a later change to the bot's approval mode.
+        if permission_override(&app.db.0.lock().unwrap(), &bot.id, "claude-account",
+            inv["claude_account_key"].as_str().unwrap_or(""), connector)? == Some(true) {
             return Ok(json!({"text":"This bot already has Always allow for that scope."}));
         }
         json!({"request":"always_allow","origin":"claude-account","account_key":inv["claude_account_key"],"connector_key":connector,"connection":row.map(|r|r["display_name"].clone()),"connections":inv["claude_connections"]})
@@ -730,6 +738,7 @@ mod tests {
         assert_eq!(inv["preferred_source"], "provider");
         assert_eq!(inv["resolved_preferred_source"], "claude");
         bot.provider = "codex".into();
+        bot.approval_mode = "full".into();
         app.db.save_bot(&bot).unwrap();
         let inv = inventory(&app, &bot).unwrap();
         assert_eq!(inv["resolved_preferred_source"], "codex");
@@ -738,6 +747,8 @@ mod tests {
             "codex-gmail"
         );
         assert_eq!(inv["provider_all_allowed"], false);
+        assert_eq!(inv["provider_connections"][0]["requires_approval"], true);
+        assert_eq!(inv["provider_connections"][0]["always_allow"], false);
         assert_eq!(inv["apps"].as_array().unwrap().len(), 2);
         let mut grant = json!({"request":"permission","origin":"codex-account","account_key":"b".repeat(64),"connector_key":"codex-gmail","connection":"Gmail","always_allow":true});
         assert!(save_settings(&app, &bot.id, &grant).is_err());
@@ -972,15 +983,45 @@ mod tests {
         .unwrap()
     }
     #[tokio::test]
-    async fn an_untouched_off_switch_requires_approval_even_with_full_access() {
+    async fn untouched_connectors_follow_live_full_access_and_explicit_ask_wins() {
         let (app, mut bot, run) = fixture();
+        shared(&app);
+        let stale = bot.clone();
+        assert_eq!(approval_override(&app.db, &bot.id, &args("gmail-1")).unwrap(), Some(false));
         bot.approval_mode = "full".into();
         app.db.save_bot(&bot).unwrap();
-        let inv = inventory(&app, &bot).unwrap();
-        assert_eq!(inv["claude_connections"][0]["always_allow"], false);
-        assert_eq!(inv["claude_connections"][0]["execution_permission"], "ask");
-        assert_eq!(inv["claude_connections"][0]["requires_approval"], true);
-        let (a, b, r) = (app.clone(), bot.clone(), run.clone());
+        let inv = inventory(&app, &stale).unwrap();
+        assert_eq!(inv["claude_connections"][0]["always_allow"], true);
+        assert_eq!(inv["claude_connections"][0]["execution_permission"], "always_allow");
+        assert_eq!(inv["claude_connections"][0]["requires_approval"], false);
+        assert_eq!(inv["apps"][0]["accounts"][0]["requires_approval"], false);
+        for (tool, mut input) in [
+            ("claude_connector", args("gmail-1")),
+            ("connector_execute", json!({"origin":"kindred","account_key":"kindred-confluence-1","connector_key":"confluence","tool_name":"search"})),
+        ] {
+            input["input"] = json!({"query":"fixture"});
+            input["arguments"] = json!({"query":"fixture"});
+            input["artifact_id"] = json!(crate::connector_artifacts::create(&app.db, &run, &input).unwrap());
+            assert!(tokio::time::timeout(std::time::Duration::from_secs(1), crate::connector_artifacts::review(&app, &stale, &run, tool, &mut input, false)).await.unwrap().unwrap());
+            crate::connector_artifacts::dispatch(&app.db, &run, &input).unwrap();
+        }
+        assert!(app.db.run_approvals(&run.id).unwrap().is_empty());
+        assert_eq!(app.db.0.lock().unwrap().query_row("SELECT count(*) FROM connector_grants WHERE bot_id=?", [&bot.id], |r| r.get::<_,i64>(0)).unwrap(), 0);
+
+        // Full access is an inherited default, not a persistent connector grant.
+        bot.approval_mode = "inherit".into();
+        app.db.save_bot(&bot).unwrap();
+        app.db.save_setting("general", &json!({"approval_mode":"full"})).unwrap();
+        assert_eq!(approval_override(&app.db, &bot.id, &args("gmail-1")).unwrap(), Some(true));
+        app.db.save_setting("general", &json!({"approval_mode":"auto"})).unwrap();
+        assert_eq!(approval_override(&app.db, &bot.id, &args("gmail-1")).unwrap(), Some(false));
+        app.db.save_setting("general", &json!({"approval_mode":"ask"})).unwrap();
+        assert_eq!(approval_override(&app.db, &bot.id, &args("gmail-1")).unwrap(), Some(false));
+        bot.approval_mode = "full".into();
+        app.db.save_bot(&bot).unwrap();
+        save_settings(&app, &bot.id, &json!({"request":"permission","origin":"claude-account","account_key":"a".repeat(64),"connector_key":"gmail-1","always_allow":false})).unwrap();
+        assert_eq!(inventory(&app, &bot).unwrap()["claude_connections"][1]["requires_approval"], true);
+        let (a, b, r) = (app.clone(), stale.clone(), run.clone());
         let task = tokio::spawn(async move {
             runtime::approve_required(&a, &b, &r, "claude_connector", &args("gmail-1"), false).await
         });
@@ -988,12 +1029,38 @@ mod tests {
         assert!(!task.is_finished());
         decide(&app.db, &id, false, "").unwrap();
         assert!(!task.await.unwrap().unwrap());
+    }
+    #[test]
+    fn provider_inventory_remains_hidden_after_switching_to_openrouter() {
+        let (app, mut bot, _) = fixture();
         bot.provider = "openrouter".into();
         bot.model = "fixture/model".into();
         app.db.save_bot(&bot).unwrap();
         let hidden = inventory(&app, &bot).unwrap();
         assert!(hidden["claude_connections"].as_array().unwrap().is_empty());
         assert_eq!(hidden["claude_account_key"], "");
+    }
+    #[tokio::test]
+    async fn full_access_preserves_forced_codex_and_email_reviews() {
+        for kind in ["forced", "codex", "email"] {
+            let (app, mut bot, run) = fixture();
+            bot.approval_mode = "full".into();
+            app.db.save_bot(&bot).unwrap();
+            let mut input = args("gmail-1");
+            if kind == "codex" { input["origin"] = json!("codex-account"); }
+            if kind == "email" {
+                input["connection"] = json!("claude.ai Gmail");
+                input["tool_name"] = json!("mcp__claude_ai_Gmail__send_email");
+            }
+            let (a, b, r) = (app.clone(), bot.clone(), run.clone());
+            let task = tokio::spawn(async move {
+                runtime::approve_required(&a, &b, &r, "claude_connector", &input, kind == "forced").await
+            });
+            let id = wait_approval(&app).await;
+            assert!(!task.is_finished(), "{kind} must require review");
+            decide(&app.db, &id, false, "").unwrap();
+            assert!(!task.await.unwrap().unwrap());
+        }
     }
     #[tokio::test]
     async fn bulk_chat_confirmation_is_required_even_in_full_mode_then_covers_all_connections() {
@@ -1013,7 +1080,7 @@ mod tests {
         let id = wait_approval(&app).await;
         assert_eq!(
             approval_override(&app.db, &bot.id, &args("gmail-1")).unwrap(),
-            Some(false)
+            Some(true)
         );
         decide(&app.db, &id, true, "always_allow").unwrap();
         let result = task.await.unwrap().unwrap();
