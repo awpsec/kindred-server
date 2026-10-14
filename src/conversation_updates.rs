@@ -212,6 +212,7 @@ impl Db {
         let body:Value=serde_json::from_str(&body.ok_or_else(||anyhow::anyhow!("Invalid follow-up dispatch"))?)?;
         ensure!(body["bot_id"]==run.bot_id&&body["chat_id"]==run.chat_id&&tx.query_row("SELECT status='running' FROM runs WHERE id=?",[&run.id],|r|r.get::<_,bool>(0))?,"Follow-up owner changed");
         for message in body["messages"].as_array().unwrap(){ensure!(tx.execute("UPDATE runs SET status='interrupted',error='Follow-up handoff is in progress or uncertain. Review source activity before explicitly continuing; never repeat external effects automatically.' WHERE id=? AND bot_id=? AND chat_id=? AND status='queued'",params![message["source_run_id"].as_str().unwrap(),run.bot_id,run.chat_id])?==1,"Follow-up source changed before dispatch");}
+        tx.execute("INSERT INTO events(run_id,kind,body,created) VALUES(?,'followup_dispatch',?,?)",params![run.id,json!({"offer_id":offer}).to_string(),db::now()])?;
         tx.execute("UPDATE followup_offers SET state='dispatching' WHERE id=?",[offer])?;tx.commit()?;Ok(())
     }
     pub fn followup_transported(&self,run:&Run,offer:&str)->Result<()> {
@@ -223,11 +224,13 @@ impl Db {
     pub fn defer_followup(&self,run:&Run,offer:&str)->Result<()> {
         let handoff={
             let c=self.0.lock().unwrap();
-            let question:Option<String>=c.query_row("SELECT q.id FROM questions q JOIN events e ON e.run_id=q.run_id AND e.kind='question_wait' AND json_extract(e.body,'$.id')=q.id WHERE q.run_id=? AND q.bot_id=? AND q.chat_id=? AND q.status IN ('pending','answered','skipped','cancelled') ORDER BY e.seq DESC LIMIT 1",params![run.id,run.bot_id,run.chat_id],|r|r.get(0)).optional()?;
+            let dispatch:Option<i64>=c.query_row("SELECT e.seq FROM events e JOIN followup_offers o ON o.id=json_extract(e.body,'$.offer_id') AND o.run_id=e.run_id WHERE o.id=? AND o.run_id=? AND o.state='transported' AND e.kind='followup_dispatch' ORDER BY e.seq DESC LIMIT 1",params![offer,run.id],|r|r.get(0)).optional()?;
+            let dispatch=dispatch.ok_or_else(||anyhow::anyhow!("Follow-up has no matching dispatch receipt"))?;
+            let question:Option<String>=c.query_row("SELECT q.id FROM questions q JOIN events e ON e.run_id=q.run_id AND e.kind='question_wait' AND json_extract(e.body,'$.id')=q.id WHERE q.run_id=? AND q.bot_id=? AND q.chat_id=? AND q.status IN ('pending','answered','skipped','cancelled') AND e.seq>?4 ORDER BY e.seq DESC LIMIT 1",params![run.id,run.bot_id,run.chat_id,dispatch],|r|r.get(0)).optional()?;
             if let Some(id)=question {json!({"kind":"question","question_id":id})}
-            else if let Some(ids)=c.query_row("SELECT ids FROM command_waits WHERE run_id=?",[&run.id],|r|r.get::<_,String>(0)).optional()? {json!({"kind":"process_wait","command_ids":serde_json::from_str::<Value>(&ids)?})}
+            else if let Some(ids)=c.query_row("SELECT w.ids FROM command_waits w JOIN events e ON e.run_id=w.run_id AND e.kind='process_wait' AND json_extract(e.body,'$.ids')=w.ids WHERE w.run_id=? AND e.seq>? ORDER BY e.seq DESC LIMIT 1",params![run.id,dispatch],|r|r.get::<_,String>(0)).optional()? {json!({"kind":"process_wait","command_ids":serde_json::from_str::<Value>(&ids)?})}
             else {
-                let receipt:Option<(i64,String)>=c.query_row("SELECT seq,json_extract(body,'$.tool') FROM events WHERE run_id=? AND kind='tool_result' AND json_extract(body,'$.tool') IN ('finish_quietly','routine_complete') AND COALESCE(json_extract(body,'$.failed'),0)=0 ORDER BY seq DESC LIMIT 1",[&run.id],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+                let receipt:Option<(i64,String)>=c.query_row("SELECT seq,json_extract(body,'$.tool') FROM events WHERE run_id=? AND kind='tool_result' AND json_extract(body,'$.tool') IN ('finish_quietly','routine_complete') AND COALESCE(json_extract(body,'$.failed'),0)=0 AND seq>?2 ORDER BY seq DESC LIMIT 1",params![run.id,dispatch],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
                 let (seq,tool)=receipt.ok_or_else(||anyhow::anyhow!("Follow-up has no durable managed handoff"))?;json!({"kind":"quiet_completion","tool":tool,"receipt_seq":seq})
             }
         };
@@ -821,6 +824,14 @@ mod tests {
     fn followup_offer_survives_context_compaction_events_without_loss_or_reclaim() {
         let app=tests::app();let bot=tests::bot(&app.db,"codex");app.db.queue(&bot.id,"Root",0).unwrap();let run=app.db.claim_bot(&bot.id).unwrap().unwrap();let source=app.db.chat_send(&run.chat_id,"Exact followup outside provider context",&[]).unwrap()[0].clone();app.db.request_steering(&source,&run.id).unwrap();let offer=app.db.offer_followups(&run).unwrap().unwrap();let id=offer["id"].as_str().unwrap();app.db.dispatch_followup(&run,id).unwrap();app.db.followup_transported(&run,id).unwrap();for state in ["compacting","compacted"] {app.db.event(&run.id,"context",json!({"state":state,"summary":"Synthetic context lifecycle only"})).unwrap();}let stored:String=app.db.0.lock().unwrap().query_row("SELECT body FROM followup_offers WHERE id=?",[id],|r|r.get(0)).unwrap();assert_eq!(serde_json::from_str::<Value>(&stored).unwrap(),offer);assert!(app.db.offer_followups(&run).unwrap().is_none());assert!(app.db.claim_bot(&bot.id).unwrap().is_none());app.db.complete_followup_turn(&run,id).unwrap();assert_eq!(app.db.run(&source).unwrap().status,"steered");
     }
+    #[test]
+    fn followup_managed_receipt_must_follow_its_own_dispatch_sequence() {
+        for tool in ["finish_quietly","routine_complete"] {
+            let app=tests::app();let bot=tests::bot(&app.db,"codex");app.db.queue(&bot.id,"Root",0).unwrap();let run=app.db.claim_bot(&bot.id).unwrap().unwrap();app.db.event(&run.id,"tool_result",json!({"tool":tool,"failed":false})).unwrap();let source=app.db.chat_send(&run.chat_id,"New followup",&[]).unwrap()[0].clone();app.db.request_steering(&source,&run.id).unwrap();let offer=app.db.offer_followups(&run).unwrap().unwrap();let id=offer["id"].as_str().unwrap();app.db.dispatch_followup(&run,id).unwrap();app.db.followup_transported(&run,id).unwrap();assert!(app.db.defer_followup(&run,id).is_err(),"old receipt cannot settle this offer");assert_eq!(app.db.run(&source).unwrap().status,"interrupted");assert!(!app.db.events(&run.id).unwrap().iter().any(|e|e["kind"]=="user_followups"));
+            app.db.event(&run.id,"tool_result",json!({"tool":tool,"failed":false})).unwrap();app.db.defer_followup(&run,id).unwrap();assert_eq!(app.db.run(&source).unwrap().status,"steered");let events=app.db.events(&run.id).unwrap();let dispatch=events.iter().find(|e|e["kind"]=="followup_dispatch").unwrap()["seq"].as_i64().unwrap();let receipt=events.iter().find(|e|e["kind"]=="user_followups").unwrap()["body"]["handoff"]["receipt_seq"].as_i64().unwrap();assert!(receipt>dispatch);
+        }
+    }
+
     #[test]
     fn progress_reminder_is_factual_and_preserves_quiet_routines() {
         let app = tests::app();
