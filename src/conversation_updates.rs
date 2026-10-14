@@ -1,5 +1,5 @@
 //! Deliver selected follow-ups as distinct user turns; tool output never consumes them.
-//! The original provider session remains alive; no action is interrupted/replayed.
+//! The original provider session remains alive; executing actions are never replayed.
 use crate::db::{self, Db, Run};
 use anyhow::{Result, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -10,6 +10,7 @@ pub fn simple_approval(tool:&str,args:&Value)->bool {
 }
 pub fn migrate(c: &Connection) -> Result<()> {
     c.execute_batch("CREATE TABLE IF NOT EXISTS run_steering(source_run_id TEXT PRIMARY KEY REFERENCES runs(id),run_id TEXT NOT NULL REFERENCES runs(id),created INTEGER NOT NULL);CREATE INDEX IF NOT EXISTS steering_owner ON run_steering(run_id);")?;
+    c.execute_batch("CREATE TABLE IF NOT EXISTS queue_push_requests(source_run_id TEXT PRIMARY KEY REFERENCES runs(id),run_id TEXT NOT NULL REFERENCES runs(id),created INTEGER NOT NULL);CREATE INDEX IF NOT EXISTS queue_push_owner ON queue_push_requests(run_id);")?;
     c.execute_batch("CREATE TABLE IF NOT EXISTS steering_requests(source_run_id TEXT PRIMARY KEY REFERENCES runs(id),run_id TEXT NOT NULL REFERENCES runs(id),created INTEGER NOT NULL);")?;
     c.execute_batch("CREATE TABLE IF NOT EXISTS message_send_modes(message_seq INTEGER PRIMARY KEY REFERENCES chat_messages(seq),mode TEXT NOT NULL);CREATE TABLE IF NOT EXISTS queued_message_claims(request_id TEXT PRIMARY KEY,chat_id TEXT NOT NULL,message_seq INTEGER NOT NULL,payload TEXT NOT NULL);")?;
     c.execute_batch("CREATE TABLE IF NOT EXISTS message_progress(message_seq INTEGER PRIMARY KEY REFERENCES chat_messages(seq),run_id TEXT NOT NULL REFERENCES runs(id),mode TEXT NOT NULL,phase TEXT NOT NULL,group_id TEXT NOT NULL);")?;
@@ -19,6 +20,10 @@ pub fn migrate(c: &Connection) -> Result<()> {
     c.execute_batch("CREATE TABLE IF NOT EXISTS followup_offers(id TEXT PRIMARY KEY,run_id TEXT NOT NULL REFERENCES runs(id),state TEXT NOT NULL,body TEXT NOT NULL,created INTEGER NOT NULL);CREATE TABLE IF NOT EXISTS followup_offer_sources(source_run_id TEXT PRIMARY KEY REFERENCES runs(id),offer_id TEXT NOT NULL REFERENCES followup_offers(id));")?;
     Ok(())
 }
+fn push_targets(c: &Connection) -> Result<Vec<(String,String)>> {
+    Ok(c.prepare("SELECT s.id,t.id FROM runs s JOIN runs t ON t.bot_id=s.bot_id AND t.chat_id=s.chat_id JOIN run_message_sources m ON m.run_id=s.id JOIN chat_messages msg ON msg.seq=m.message_seq WHERE s.status='queued' AND t.status IN ('running','awaiting_approval') AND s.rowid>t.rowid AND s.depth=0 AND s.reply_to='' AND msg.sender='user' AND msg.kind='message' AND msg.suppressed=0 AND NOT EXISTS(SELECT 1 FROM queue_push_requests WHERE source_run_id=s.id) AND NOT EXISTS(SELECT 1 FROM followup_offer_sources WHERE source_run_id=s.id) AND NOT EXISTS(SELECT 1 FROM run_commands WHERE run_id=s.id) AND NOT EXISTS(SELECT 1 FROM routine_runs WHERE run_id=s.id) AND NOT EXISTS(SELECT 1 FROM questions WHERE continuation_run_id=s.id) ORDER BY s.rowid")?.query_map([],|r|Ok((r.get(0)?,r.get(1)?)))?.collect::<rusqlite::Result<_>>()?)
+}
+
 impl Db {
     pub fn edit_queued_message(&self, chat: &str, seq: i64, expected: &str, text: &str) -> Result<()> {
         ensure!(!text.trim().is_empty() && text.len() <= 64000, "Message must be 1..64000 bytes");
@@ -137,6 +142,49 @@ impl Db {
         Ok(payload)
     }
 
+    /// Candidates are actual queued user messages in the active task's conversation.
+    /// Questions and takeovers remain explicit decisions; Push never answers them.
+    pub fn push_targets(&self) -> Result<Vec<(String, String)>> {
+        push_targets(&self.0.lock().unwrap())
+    }
+    pub fn push_queued(&self, chat: &str, sources: &[String]) -> Result<Value> {
+        ensure!(!sources.is_empty() && sources.len() <= 100, "Choose 1..100 queued messages to push");
+        let mut c = self.0.lock().unwrap();
+        let tx = c.transaction()?;
+        ensure!(!crate::workspace_transfer::frozen(&tx)?, "This workspace is paused");
+        // Validate the entire snapshot before changing anything, including retries.
+        for source in sources {
+            ensure!(tx.query_row("SELECT EXISTS(SELECT 1 FROM runs WHERE id=? AND chat_id=?)", params![source,chat], |r|r.get::<_,bool>(0))?, "This message belongs to another conversation");
+        }
+        let eligible = push_targets(&tx)?;
+        let mut requested = 0;
+        let mut targets = std::collections::HashSet::new();
+        for (source,target) in eligible {
+            if !sources.contains(&source) { continue; }
+            tx.execute("INSERT INTO queue_push_requests VALUES(?,?,?)", params![source,target,db::now()])?;
+            tx.execute("INSERT INTO steering_requests VALUES(?,?,?) ON CONFLICT(source_run_id) DO UPDATE SET run_id=excluded.run_id,created=excluded.created", params![source,target,db::now()])?;
+            requested += 1;
+            targets.insert(target);
+        }
+        for target in targets {
+            // Withdraw only actions that have not been approved or started. The
+            // waiting provider receives an interruption result, never permission.
+            let approvals:Vec<String> = tx.prepare("SELECT id FROM approvals WHERE run_id=? AND status='pending'")?.query_map([&target],|r|r.get(0))?.collect::<rusqlite::Result<_>>()?;
+            for approval in approvals {
+                tx.execute("UPDATE approvals SET status='cancelled' WHERE id=? AND status='pending'",[&approval])?;
+                tx.execute("UPDATE connector_artifacts SET status='cancelled',revision=revision+1 WHERE approval_id=? AND status='pending'",[&approval])?;
+                tx.execute("INSERT INTO events(run_id,kind,body,created) VALUES(?,'approval_interrupted',?,?)",params![target,json!({"id":approval,"reason":"queued_message_pushed"}).to_string(),db::now()])?;
+            }
+            tx.execute("UPDATE runs SET status='running' WHERE id=? AND status='awaiting_approval'",[&target])?;
+        }
+        tx.commit()?;
+        Ok(json!({"requested_count":requested}))
+    }
+    /// A Push waits for a supported provider boundary. Prevent a provider from
+    /// starting further actions instead of yielding to the pushed user input.
+    pub fn pushed_followups_pending(&self, run: &str) -> Result<bool> {
+        Ok(self.0.lock().unwrap().query_row("SELECT EXISTS(SELECT 1 FROM queue_push_requests p JOIN runs s ON s.id=p.source_run_id JOIN steering_requests q ON q.source_run_id=s.id AND q.run_id=p.run_id WHERE p.run_id=? AND s.status='queued')",[run],|r|r.get(0))?)
+    }
     pub fn request_steering(&self, source: &str, target: &str) -> Result<Value> {
         let mut c = self.0.lock().unwrap();
         let tx = c.transaction()?;
@@ -278,6 +326,128 @@ impl Db {
 mod tests {
     use super::*;
     use crate::{runtime, tests};
+
+    #[tokio::test]
+    async fn push_snapshot_is_authenticated_scoped_and_idempotent() {
+        use std::future::IntoFuture;
+        let app=tests::app(); let bot=tests::bot(&app.db,"codex");
+        app.db.queue(&bot.id,"Original",0).unwrap(); let run=app.db.claim_bot(&bot.id).unwrap().unwrap();
+        let source=app.db.chat_send(&run.chat_id,"Please change direction",&[]).unwrap()[0].clone();
+        let approval=app.db.request_approval(&run.id,"computer_click",&json!({"x":10,"y":20})).unwrap();
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base=format!("http://{}/api",listener.local_addr().unwrap());
+        let server=tokio::spawn(axum::serve(listener,crate::web::router(app.clone())).into_future());
+        let client=reqwest::Client::new(); let url=format!("{base}/chats/{}/push",run.chat_id);
+        let before:Value=client.get(format!("{base}/runs")).bearer_auth(&app.token).send().await.unwrap().json().await.unwrap();
+        assert_eq!(before.as_array().unwrap().iter().find(|r|r["id"]==source).unwrap()["push_target_run_id"],run.id);
+        let input=json!({"run_ids":[source]});
+        assert_eq!(client.post(&url).json(&input).send().await.unwrap().status(),401);
+        assert_eq!(app.db.approval(&approval).unwrap(),"pending");
+        let pushed:Value=client.post(&url).bearer_auth(&app.token).json(&input).send().await.unwrap().json().await.unwrap();
+        assert_eq!(pushed["requested_count"],1);
+        assert_eq!(app.db.approval(&approval).unwrap(),"cancelled");
+        assert!(app.db.decide(&approval,true).is_err());
+        assert_eq!(app.db.run(&run.id).unwrap().status,"running");
+        assert!(app.db.push_targets().unwrap().is_empty());
+        assert_eq!(app.db.push_queued(&run.chat_id,&[source.clone()]).unwrap()["requested_count"],0);
+        assert_eq!(app.db.run(&source).unwrap().status,"queued");
+        // The source is consumed only after the existing transport receipt path.
+        let offer=app.db.offer_followups(&run).unwrap().unwrap(); let id=offer["id"].as_str().unwrap();
+        assert_eq!(offer["messages"][0]["text"],"Please change direction");
+        app.db.dispatch_followup(&run,id).unwrap(); app.db.followup_transported(&run,id).unwrap();
+        assert!(!app.db.pushed_followups_pending(&run.id).unwrap());
+        app.db.complete_followup_turn(&run,id).unwrap();
+        assert_eq!(app.db.run(&source).unwrap().status,"steered");
+        assert!(app.db.offer_followups(&run).unwrap().is_none());
+        server.abort();
+    }
+
+    #[test]
+    fn push_validates_snapshot_and_does_not_touch_other_chats_or_late_messages() {
+        let app=tests::app();let bot=tests::bot(&app.db,"codex");let other=tests::bot(&app.db,"codex");
+        app.db.queue(&bot.id,"Original",0).unwrap();let run=app.db.claim_bot(&bot.id).unwrap().unwrap();
+        let source=app.db.chat_send(&run.chat_id,"Push this",&[]).unwrap()[0].clone();
+        let cross=app.db.queue(&other.id,"Other conversation",0).unwrap();
+        assert!(app.db.push_queued(&run.chat_id,&[source.clone(),cross]).is_err());
+        assert!(!app.db.pushed_followups_pending(&run.id).unwrap());
+        let later=app.db.chat_send(&run.chat_id,"Keep this queued",&[]).unwrap()[0].clone();
+        assert_eq!(app.db.push_queued(&run.chat_id,&[source.clone(),source]).unwrap()["requested_count"],1);
+        let offer=app.db.offer_followups(&run).unwrap().unwrap();
+        assert_eq!(offer["messages"].as_array().unwrap().len(),1);
+        assert_eq!(app.db.run(&later).unwrap().status,"queued");
+        assert!(app.db.push_targets().unwrap().iter().any(|(id,_)|id==&later));
+    }
+
+    #[test]
+    fn push_multiple_batches_yield_until_all_pushed_input_is_delivered() {
+        let app=tests::app();let bot=tests::bot(&app.db,"codex");
+        app.db.queue(&bot.id,"Original",0).unwrap();let run=app.db.claim_bot(&bot.id).unwrap().unwrap();
+        let sources:Vec<String>=(0..6).map(|i|app.db.chat_send(&run.chat_id,&format!("Followup {i}"),&[]).unwrap()[0].clone()).collect();
+        assert_eq!(app.db.push_queued(&run.chat_id,&sources).unwrap()["requested_count"],6);
+        assert!(app.db.pushed_followups_pending(&run.id).unwrap());
+        let first=app.db.offer_followups(&run).unwrap().unwrap();assert_eq!(first["messages"].as_array().unwrap().len(),4);
+        let id=first["id"].as_str().unwrap();app.db.dispatch_followup(&run,id).unwrap();app.db.followup_transported(&run,id).unwrap();
+        assert!(app.db.pushed_followups_pending(&run.id).unwrap(),"yield this turn so the remainder is delivered before more work");
+        assert!(app.db.request_approval(&run.id,"computer_click",&json!({})).is_err(),"a new approval must not strand the remaining pushed batch");
+        app.db.complete_followup_turn(&run,id).unwrap();
+        assert!(app.db.pushed_followups_pending(&run.id).unwrap());
+        let second=app.db.offer_followups(&run).unwrap().unwrap();assert_eq!(second["messages"].as_array().unwrap().len(),2);
+        let id=second["id"].as_str().unwrap();app.db.dispatch_followup(&run,id).unwrap();app.db.followup_transported(&run,id).unwrap();app.db.complete_followup_turn(&run,id).unwrap();
+        assert!(!app.db.pushed_followups_pending(&run.id).unwrap());
+        assert!(sources.iter().all(|source|app.db.run(source).unwrap().status=="steered"));
+    }
+
+    #[test]
+    fn push_during_an_existing_followup_still_stops_new_actions() {
+        let app=tests::app();let bot=tests::bot(&app.db,"codex");
+        app.db.queue(&bot.id,"Original",0).unwrap();let run=app.db.claim_bot(&bot.id).unwrap().unwrap();
+        let first=app.db.chat_send(&run.chat_id,"Automatic followup",&[]).unwrap()[0].clone();
+        app.db.request_steering(&first,&run.id).unwrap();
+        let offer=app.db.offer_followups(&run).unwrap().unwrap();let id=offer["id"].as_str().unwrap();
+        app.db.dispatch_followup(&run,id).unwrap();app.db.followup_transported(&run,id).unwrap();
+        let second=app.db.chat_send(&run.chat_id,"Push now",&[]).unwrap()[0].clone();
+        app.db.push_queued(&run.chat_id,&[second.clone()]).unwrap();
+        assert!(app.db.pushed_followups_pending(&run.id).unwrap());
+        assert!(app.db.request_approval(&run.id,"computer_click",&json!({})).is_err());
+        app.db.complete_followup_turn(&run,id).unwrap();
+        let next=app.db.offer_followups(&run).unwrap().unwrap();assert_eq!(next["messages"][0]["source_run_id"],second);
+        let id=next["id"].as_str().unwrap();app.db.dispatch_followup(&run,id).unwrap();app.db.followup_transported(&run,id).unwrap();
+        assert!(!app.db.pushed_followups_pending(&run.id).unwrap());
+        app.db.complete_followup_turn(&run,id).unwrap();
+    }
+
+    #[test]
+    fn push_finish_race_preserves_queue_and_manual_questions() {
+        let app=tests::app();let bot=tests::bot(&app.db,"codex");
+        app.db.queue(&bot.id,"Original",0).unwrap();let run=app.db.claim_bot(&bot.id).unwrap().unwrap();
+        let source=app.db.chat_send(&run.chat_id,"Followup",&[]).unwrap()[0].clone();
+        app.db.0.lock().unwrap().execute("UPDATE runs SET status='awaiting_user' WHERE id=?",[&run.id]).unwrap();
+        assert!(app.db.push_targets().unwrap().is_empty());
+        assert_eq!(app.db.push_queued(&run.chat_id,&[source.clone()]).unwrap()["requested_count"],0);
+        assert_eq!(app.db.run(&run.id).unwrap().status,"awaiting_user");
+        app.db.finish(&run.id,"completed","Done","").unwrap();
+        assert_eq!(app.db.push_queued(&run.chat_id,&[source.clone()]).unwrap()["requested_count"],0);
+        assert_eq!(app.db.run(&source).unwrap().status,"queued");
+    }
+
+    #[tokio::test]
+    async fn push_releases_approval_wait_without_executing_or_auto_approving() {
+        let app=tests::app();let bot=tests::bot(&app.db,"codex");
+        app.db.queue(&bot.id,"Original",0).unwrap();let run=app.db.claim_bot(&bot.id).unwrap().unwrap();
+        let (a,b,r)=(app.clone(),bot.clone(),run.clone());
+        let waiting=tokio::spawn(async move {runtime::approve_required(&a,&b,&r,"bot_instructions_update",&json!({}),true).await});
+        tokio::time::timeout(std::time::Duration::from_secs(3),async {while app.db.approvals().unwrap().is_empty(){tokio::time::sleep(std::time::Duration::from_millis(10)).await;}}).await.unwrap();
+        let source=app.db.chat_send(&run.chat_id,"Change these instructions",&[]).unwrap()[0].clone();
+        // Automatic steering never dismisses a human review.
+        app.db.request_steering(&source,&run.id).unwrap();
+        assert_eq!(app.db.run(&run.id).unwrap().status,"awaiting_approval");
+        app.db.push_queued(&run.chat_id,&[source]).unwrap();
+        let result=tokio::time::timeout(std::time::Duration::from_secs(2),waiting).await.unwrap().unwrap();
+        assert!(result.unwrap_err().to_string().contains("action was not executed"));
+        assert!(runtime::call_tool(&app,&bot,&run,"remember",json!({"text":"must not write"})).await.unwrap_err().to_string().contains("pushed a new message"));
+        assert!(app.db.request_approval(&run.id,"computer_click",&json!({})).is_err());
+        assert!(!app.db.events(&run.id).unwrap().iter().any(|e|e["kind"]=="tool_started"));
+    }
 
     #[tokio::test]
     async fn router_settings_queue_restore_and_request_receipts_are_authenticated_and_durable() {

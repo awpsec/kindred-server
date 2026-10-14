@@ -657,6 +657,7 @@ pub async fn approve_required(
     args: &Value,
     force: bool,
 ) -> Result<bool> {
+    ensure!(!app.db.pushed_followups_pending(&run.id)?, "The user pushed a new message. Finish this response now to receive it before starting another action. This call was not executed.");
     let force = force || (crate::connector_artifacts::email_send(args)
         && (crate::connector_artifacts::email_review_requested(&run.prompt) || crate::work_rules::coordinator_round(&app.db, run)?));
     // Resolve on every action so live preference changes also affect an existing run.
@@ -682,12 +683,14 @@ pub async fn approve_required(
         match app.db.approval(&id)?.as_str() {
             "approved" => return Ok(true),
             "pending" => {}
+            "cancelled" => bail!("The user pushed a new message. This approval was cancelled and the action was not executed. Finish this response now so the queued user input can be delivered; do not retry the action."),
             _ => return Ok(false),
         }
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
 }
 pub async fn call_tool(app: &App, bot: &Bot, run: &Run, name: &str, args: Value) -> Result<Value> {
+    ensure!(!app.db.pushed_followups_pending(&run.id)?, "The user pushed a new message. Finish this response now to receive it before starting another action. This call was not executed.");
     crate::provider_retry::check_tool_budget(app, run)?;
     if !crate::desktop_sessions::uses_desktop(name, &args) && name != "request_user_action" {
         app.desktop_sessions.release(&run.id);
