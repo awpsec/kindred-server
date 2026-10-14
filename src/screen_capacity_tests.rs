@@ -406,3 +406,13 @@ fn changed_pending_previous_identity_cannot_be_committed() {
     assert_eq!(app.db.existing_screen(&old.id).unwrap(), Some(slot));
     assert_eq!(app.db.existing_screen(&next.id).unwrap(), None);
 }
+
+#[test]
+fn old_guest_capability_error_identifies_runtime_update_without_masking_transport() {
+    let error = crate::screen_capacity::guest_support_error(anyhow::anyhow!("guest: unknown guest tool"));
+    assert!(error.to_string().contains("runtime is out of date"));
+    assert!(error.to_string().contains("Settings > Bot Computer"));
+    assert!(!error.to_string().contains("unknown guest tool"));
+    let transport = crate::screen_capacity::guest_support_error(anyhow::anyhow!("SSH connection refused"));
+    assert_eq!(transport.to_string(), "SSH connection refused");
+}

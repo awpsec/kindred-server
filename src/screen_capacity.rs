@@ -223,15 +223,28 @@ async fn verify_guest_support(app: &crate::runtime::App) -> Result<()> {
         "screen_ownership_support",
         serde_json::json!({}),
     )
-    .await?;
+    .await
+    .map_err(guest_support_error)?;
     validate_guest_support(&support)
+}
+
+const RUNTIME_UPDATE_REQUIRED: &str = "The bot computer runtime is out of date. Open Settings > Bot Computer and update the computer, then reconnect. Your existing browser sessions are retained.";
+
+pub(crate) fn guest_support_error(error: anyhow::Error) -> anyhow::Error {
+    // This is the allocation capability probe, not the requested browser tool.
+    // Keep transport failures intact, but identify older managed guests clearly.
+    if error.to_string() == "guest: unknown guest tool" {
+        anyhow::anyhow!(RUNTIME_UPDATE_REQUIRED)
+    } else {
+        error
+    }
 }
 
 pub(crate) fn validate_guest_support(support: &serde_json::Value) -> Result<()> {
     ensure!(
         support["protocol"] == 2
             && support["launcher_hashes"] == crate::vm_maintenance::managed_launcher_hashes(),
-        "Update this computer runtime and launchers before verifying unused screen reservations"
+        RUNTIME_UPDATE_REQUIRED
     );
     Ok(())
 }

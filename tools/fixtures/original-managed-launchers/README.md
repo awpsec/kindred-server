@@ -1,0 +1,1 @@
+Original managed launchers from public server commit `0de1bde`. These fixtures reproduce existing VMs whose binary was updated while the original launchers remained. The browser launch and ownership helpers did not exist in that release. They are fixture data only and must never be executed against a live VM.
