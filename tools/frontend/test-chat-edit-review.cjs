@@ -23,7 +23,7 @@ fs.mkdirSync('/tmp/kindred-chat-edit',{recursive:true});
 await page.locator('.chat-edit-review').screenshot({path:'/tmp/kindred-chat-edit/review.png'});
 await card.getByRole('button',{name:'Allow changes',exact:true}).click();
 await page.waitForTimeout(100);assert.equal(decisions[0].approved,true);
-await render('pending');await card.getByRole('button',{name:'Decline',exact:true}).click();await page.waitForTimeout(100);assert.equal(decisions[1].approved,false);
+await render(undefined);await card.getByRole('button',{name:'Decline',exact:true}).click();await page.waitForTimeout(100);assert.equal(decisions[1].approved,false);
 await render('approved');assert(await card.getByText('Allowed',{exact:true}).isVisible());assert.equal(await card.getByRole('button',{name:'Allow changes',exact:true}).count(),0);
 assert.deepEqual(errors,[]);
 console.log('Chat edit review: fields, member names, allow/decline, completed receipt passed');
