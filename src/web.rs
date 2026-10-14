@@ -138,6 +138,7 @@ pub fn router(app: Shared) -> Router {
         .route("/runs/{id}/cancel", post(cancel))
         .route("/runs/{id}/continue", post(continue_task))
         .route("/runs/{id}/steer", post(steer_run))
+        .route("/chats/{id}/push", post(push_queued))
         .route("/approvals", get(approvals))
         .route("/email-contacts", get(crate::email_contacts::search))
         .route("/approvals/{id}", post(decide))
@@ -432,8 +433,10 @@ struct RunQuery {
 }
 async fn runs(State(app): State<Shared>, Query(q): Query<RunQuery>) -> Result<Json<Vec<Value>>> {
     let delegations=app.db.current_delegations()?;
+    let push_targets=app.db.push_targets()?;
     let rows = app.db.runs(q.bot_id.as_deref())?.into_iter().map(|run| {
         let mut value = serde_json::to_value(&run)?;
+        if let Some((_,target))=push_targets.iter().find(|(source,_)|source==&run.id){value["push_target_run_id"]=json!(target);}
         if let Some(delegation)=delegations.iter().find(|d|d["run_id"]==run.id){value["delegation"]=delegation.clone();}
         if !run.chat_id.is_empty() && !run.chat_id.starts_with("dm-") {
             value["activity_started"] = json!(app.db.group_activity_started(&run.id)?);
@@ -613,6 +616,11 @@ async fn edit_queued_message(
     Ok(Json(json!({"ok":true})))
 }
 
+#[derive(Deserialize)]
+struct PushQueued { run_ids: Vec<String> }
+async fn push_queued(State(app): State<Shared>, Path(chat): Path<String>, Json(input): Json<PushQueued>) -> Result<Json<Value>> {
+    Ok(Json(app.db.push_queued(&chat, &input.run_ids)?))
+}
 async fn steer_run(
     State(app): State<Shared>,
     Path(id): Path<String>,

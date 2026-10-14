@@ -37,6 +37,7 @@ const TABLES: &[&str] = &[
     "run_message_sources",
     "run_steering",
     "steering_requests",
+    "queue_push_requests",
     "followup_offers",
     "followup_offer_sources",
     "message_send_modes",
@@ -302,6 +303,7 @@ impl Db {
                         | "provider_inbox_routines"
                         | "provider_inbox_runs"
                         | "steering_requests"
+                        | "queue_push_requests"
                         | "followup_offers"
                         | "followup_offer_sources"
                         | "bot_chat_posts"
@@ -339,6 +341,7 @@ impl Db {
                     | "provider_inbox_routines"
                     | "provider_inbox_runs"
                     | "steering_requests"
+                    | "queue_push_requests"
                         | "followup_offers"
                         | "followup_offer_sources"
                     | "bot_chat_posts"

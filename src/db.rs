@@ -784,6 +784,7 @@ impl Db {
         let id = id();
         let mut c = self.0.lock().unwrap();
         let c = c.transaction()?;
+        ensure!(!c.query_row("SELECT EXISTS(SELECT 1 FROM queue_push_requests p JOIN runs s ON s.id=p.source_run_id WHERE p.run_id=? AND s.status='queued')",[run],|r|r.get::<_,bool>(0))?, "The user pushed a new message. Finish this response to receive it before requesting another approval. This action was not executed.");
         c.execute(
             "INSERT INTO approvals(id,run_id,tool,args) VALUES(?,?,?,?)",
             params![id, run, tool, args.to_string()],

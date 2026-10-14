@@ -569,7 +569,7 @@ pub fn complete(db: &Db, id: &str, result: &Value, failed: bool) -> Result<()> {
     } else {
         "The connector returned successfully."
     });
-    tx.execute("UPDATE connector_artifacts SET body=?,status=?,revision=revision+1 WHERE id=? AND status NOT IN ('denied','changes_requested')",params![value.to_string(),if failed{"failed"}else{"completed"},id])?;
+    tx.execute("UPDATE connector_artifacts SET body=?,status=?,revision=revision+1 WHERE id=? AND status NOT IN ('denied','changes_requested','cancelled')",params![value.to_string(),if failed{"failed"}else{"completed"},id])?;
     tx.commit()?;
     Ok(())
 }
@@ -721,6 +721,19 @@ mod tests {
         .unwrap()["revision"]
             .as_i64()
             .unwrap()
+    }
+    #[test]
+    fn push_cancels_email_review_without_allowing_send_or_losing_receipt() {
+        let (app,_bot,run,args,id)=fixture();
+        pending(&app,&run,&args);
+        let source=app.db.chat_send(&run.chat_id,"Revise the draft first",&[]).unwrap()[0].clone();
+        assert_eq!(app.db.push_queued(&run.chat_id,&[source]).unwrap()["requested_count"],1);
+        let value=record(&app.db.0.lock().unwrap(),&id).unwrap();
+        assert_eq!(value["status"],"cancelled");
+        assert!(dispatch(&app.db,&run,&args).is_err());
+        // Native providers can still return a denied-call receipt afterward.
+        complete(&app.db,&id,&json!({"text":"Call did not execute"}),true).unwrap();
+        assert_eq!(record(&app.db.0.lock().unwrap(),&id).unwrap()["status"],"cancelled");
     }
     #[tokio::test]
     async fn email_body_saved_review_has_exact_native_payload_once() {
