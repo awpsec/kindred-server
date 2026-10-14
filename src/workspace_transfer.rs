@@ -70,6 +70,7 @@ const TABLES: &[&str] = &[
     "continuity_obligations",
     "continuity_sessions",
     "continuity_dependencies",
+    "standing_work_rules",
     "command_jobs",
     "command_waits",
 
@@ -293,6 +294,7 @@ impl Db {
                     | "continuity_obligations"
                     | "continuity_sessions"
                     | "continuity_dependencies"
+                    | "standing_work_rules"
                     | "command_jobs"
                     | "command_waits"
 
@@ -329,6 +331,7 @@ impl Db {
                     | "continuity_obligations"
                     | "continuity_sessions"
                     | "continuity_dependencies"
+                    | "standing_work_rules"
                     | "command_jobs"
                     | "command_waits"
 

@@ -7,7 +7,7 @@ use anyhow::{Result, bail};
 use rusqlite::OptionalExtension;
 use serde_json::{Value, json};
 
-pub const VERSION: &str = "38";
+pub const VERSION: &str = "39";
 pub const CORE: &str = include_str!("prompts/00-core.md");
 pub const BOUNDED_CORE: &str = include_str!("prompts/00-bounded-core.md");
 pub const CHAPTERS: &[(&str, &str)] = &[
@@ -306,6 +306,7 @@ pub fn build(
         "provider_retry":retry_context,
         "progress_updates":crate::progress_updates::context(&app.db,bot)?,
         "primary_bot":crate::primary_bot::context(&app.db,&bot.id,private_destination)?,
+        "standing_work_rules":crate::work_rules::read(&app.db,run,false)?,
         "schema_version":1,"guide_version":VERSION,"guide_tier":if full_guide{"full"}else{"core_with_reference_tool"},
         "generated_at_unix_utc":db::now(),"timezone":crate::timezone::context(&app.db, db::now())?,
         "bot":{"id":bot.id,"name":bot.name,"role_label":bot.profile.label,"role_description":bot.profile.description,

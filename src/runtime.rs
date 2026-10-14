@@ -284,8 +284,19 @@ pub fn tool_specs() -> Vec<Value> {
             vec!["direction"],
         ),
         (
+            "work_rules_read",
+            "Read your saved work scopes and revisions, limited to this audience.",
+            json!({}), vec![],
+        ),
+        (
+            "work_rule_save",
+            "Save owner-granted scope or revoke it. Read rules first (new key: revision 0). Cite the owner's message_seq. No new tool permissions or scheduling.",
+            json!({"key":{"type":"string"},"expected_revision":{"type":"integer","minimum":0},"source_message_seq":{"type":"integer"},"enabled":{"type":"boolean"},"scope":{"type":"string","enum":["conversation","owner_workspace"]},"trigger":{"type":"string","maxLength":300},"allowed_actions":{"type":"string","maxLength":900},"stop_before":{"type":"string","maxLength":300},"report_to":{"type":"string","enum":["current_chat","owner_dm"]}}),
+            vec!["key","expected_revision","source_message_seq","enabled"],
+        ),
+        (
             "remember",
-            "Save your own durable memory from any conversation, including bot-to-bot rooms. For new lasting rules, responsibilities or preferences, use mode=append with only the new facts: Kindred preserves existing memory without exposing it, so memory_read and a separate DM are not required. Required before acknowledging a responsibility assigned to YOU, including one relayed by a teammate. mode=replace is allowed only in your owner DM: read the full current memory first and preserve unrelated facts. Omitting mode retains legacy behavior (replacement in your DM, server-side merge elsewhere). Total memory is limited to 64,000 UTF-8 bytes; rejected saves preserve prior memory. Keep detailed work in continuity notes. Preserve attribution for facts about teammates. Never store passwords or treat saved rules as permission to act.",
+            "Save your own durable memory from any conversation, including bot-to-bot rooms. For new lasting rules, responsibilities or preferences, use mode=append with only the new facts: Kindred preserves existing memory without exposing it, so memory_read and a separate DM are not required. Required before acknowledging a responsibility assigned to YOU, including one relayed by a teammate. mode=replace is allowed only in your owner DM: read the full current memory first and preserve unrelated facts. Omitting mode retains legacy behavior (replacement in your DM, server-side merge elsewhere). Total memory is limited to 64,000 UTF-8 bytes; rejected saves preserve prior memory. Keep detailed work in continuity notes. Preserve attribution for facts about teammates. Never store passwords. For owner-granted ongoing action scope, use work_rule_save instead: ordinary memory is not action authorization and is withheld in shared chats.",
             json!({"text":{"type":"string"},"mode":{"type":"string","enum":["append","replace"]}}),
             vec!["text"],
         ),
@@ -495,7 +506,7 @@ pub fn tool_specs() -> Vec<Value> {
         ),
         (
             "chat_post",
-            "Post your actual message to an existing shared chat you belong to, even if it is empty or you are currently in a DM. Discover it with chats_list and read it first. Supply stable key for this intended post and exact member IDs in mentions to efficiently request replies; ordinary direct names also work. An introduction without addressees is posted without waking everyone. Never create a replacement group merely to address an existing one. Do not disclose unrelated private DM content. Ordinary replies already appear in the current conversation. After posting there, do not repeat the post as a final answer; call finish_quietly if done. This is a conversation post, not a blocking request; use send_to_bot for delegated work whose result must return to this task.",
+            "Post to an existing shared chat you belong to, or deliver a requested private report to your own dm-<bot_id>. Other bots' DMs are inaccessible. Never include credentials. Discover it with chats_list and read it first. Supply stable key for this intended post and exact member IDs in mentions to efficiently request replies; ordinary direct names also work. Unaddressed shared updates may wake the configured coordinator; DM reports wake no bot. Never create a replacement group merely to address an existing one. Do not disclose unrelated private DM content. Ordinary replies already appear in the current conversation. After posting there, do not repeat the post as a final answer; call finish_quietly if done. This is a conversation post, not a blocking request; use send_to_bot for delegated work whose result must return to this task.",
             json!({"chat_id":{"type":"string"},"key":{"type":"string","maxLength":100},"message":{"type":"string","maxLength":64000},"mentions":{"type":"array","items":{"type":"string"},"maxItems":6}}),
             vec!["chat_id", "key", "message"],
         ),
@@ -647,7 +658,7 @@ pub async fn approve_required(
     force: bool,
 ) -> Result<bool> {
     let force = force || (crate::connector_artifacts::email_send(args)
-        && crate::connector_artifacts::email_review_requested(&run.prompt));
+        && (crate::connector_artifacts::email_review_requested(&run.prompt) || crate::work_rules::coordinator_round(&app.db, run)?));
     // Resolve on every action so live preference changes also affect an existing run.
     let connector_override = if matches!(
         tool,
@@ -872,6 +883,8 @@ async fn call_tool_inner(
         "obligations_read" => json!({"text":json!({"obligations":crate::continuity::store::obligations(&app.db,run,args["after"].as_str().unwrap_or(""),args["include_closed"].as_bool().unwrap_or(false))?,"pending":crate::continuity::store::pending(&app.db,run)?}).to_string()}),
         "pending_read" => json!({"text":crate::continuity::store::pending_page(&app.db,run,string(&args,"kind")?,args["after"].as_str().unwrap_or(""))?.to_string()}),
         "receipts_read" => json!({"text":crate::continuity::store::receipts(&app.db,run,string(&args,"run_id")?,args["before"].as_i64().unwrap_or(i64::MAX))?.to_string()}),
+        "work_rule_save" => json!({"text":crate::work_rules::save(&app.db,run,&args)?.to_string()}),
+        "work_rules_read" => json!({"text":crate::work_rules::read(&app.db,run,true)?.to_string()}),
         "memory_read" => {
             let current=app.db.bot(&bot.id)?;
             let memory=crate::continuity::store::memory(&app.db,run,&current.memory)?;

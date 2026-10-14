@@ -104,6 +104,12 @@ pub(super) fn migrate(c: &Connection) -> Result<()> {
       CREATE INDEX IF NOT EXISTS server_feed_profile ON server_feed(profile_id,id);
       CREATE TABLE IF NOT EXISTS server_feed_positions(profile_id TEXT PRIMARY KEY,private_cursor INTEGER NOT NULL,shared_cursor INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS server_reactions(seq INTEGER NOT NULL REFERENCES server_messages(seq),account TEXT NOT NULL,emoji TEXT NOT NULL,PRIMARY KEY(seq,account));")?;
+    c.execute_batch("CREATE INDEX IF NOT EXISTS server_message_round ON server_messages(round_id,seq);")?;
+    let columns = c.prepare("PRAGMA table_info(server_jobs)")?
+        .query_map([], |r| r.get::<_, String>(1))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    if !columns.iter().any(|name| name == "coordinator_update") {
+        c.execute_batch("ALTER TABLE server_jobs ADD COLUMN coordinator_update INTEGER NOT NULL DEFAULT 0;")?;
+    }
     Ok(())
 }
 fn auth(p: &Profiles, headers: &HeaderMap) -> Result<Identity> {
@@ -724,6 +730,7 @@ fn route(
     sender: &str,
     round: &str,
     depth: i64,
+    coordinator: Option<&str>,
 ) -> Result<()> {
     if from_bot && !r.bot_to_bot {
         return Ok(());
@@ -753,6 +760,16 @@ fn route(
             .query_map(params![r.id,seq], |row| row.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
         targets = crate::team_chats::default_recipient(text, &r.description, &members, &recent);
     }
+    let coordinator_fallback = targets.is_empty() && from_bot && r.all_messages && coordinator.is_some();
+    if coordinator_fallback {
+        targets.push(coordinator.unwrap().to_owned());
+    }
+    // 1 identifies the coordinator fallback; 2 carries its review boundary into
+    // explicitly addressed descendants in another profile without changing targets.
+    let coordinator_update: i64 = if coordinator_fallback { 1 } else if from_bot && c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM server_jobs j JOIN server_messages m ON m.seq=j.seq WHERE m.round_id=? AND j.coordinator_update<>0)",
+        [round], |row| row.get::<_, bool>(0),
+    )? { 2 } else { 0 };
     let mut bots = HashSet::new();
     for target in targets {
         if let Some(m) = r.participants.iter().find(|m| m.id == target) {
@@ -774,8 +791,8 @@ fn route(
             break;
         }
         c.execute(
-            "INSERT OR IGNORE INTO server_jobs(seq,participant) VALUES(?,?)",
-            params![seq, bot],
+            "INSERT OR IGNORE INTO server_jobs(seq,participant,coordinator_update) VALUES(?,?,?)",
+            params![seq, bot, coordinator_update],
         )?;
     }
     Ok(())
@@ -838,7 +855,7 @@ async fn send(
         tx.execute("INSERT INTO server_messages(room_id,sender,body,created,round_id,reply_to) VALUES(?,?,?,?,?,?)",params![key,sender,text,db::now(),round,v["reply_to"].as_i64()])?;
         let seq = tx.last_insert_rowid();
         for file in &files {ensure!(tx.execute("UPDATE server_uploads SET message_seq=? WHERE id=? AND room_id=? AND account=? AND message_seq IS NULL",params![seq,file,key,id.account])?==1,"Attachment is unavailable or belongs to another message");}
-        route(&tx, &r, seq, text, &mentions, false, &sender, &round, 0)?;
+        route(&tx, &r, seq, text, &mentions, false, &sender, &round, 0, None)?;
         tx.execute(
             "INSERT INTO server_sends VALUES(?,?,?,?)",
             params![id.account, request, body, seq],
@@ -949,6 +966,32 @@ fn refresh_room_identities(p: &Profiles) -> Result<Vec<Room>> {
     Ok(rooms)
 }
 
+// Resolve profile preferences outside the registry transaction. A guest account's
+// primary bot must never become the room owner's default coordinator by accident.
+fn room_coordinator(p: &Profiles, r: &Room, enabled_profiles: &[String]) -> Result<Option<String>> {
+    if !r.all_messages || !r.bot_to_bot { return Ok(None); }
+    let active = r.participants.iter().filter(|m| m.kind == "bot" && !m.inactive && enabled_profiles.contains(&m.profile_id)).collect::<Vec<_>>();
+    let names = active.iter().map(|m| (m.id.clone(), m.name.clone())).collect::<Vec<_>>();
+    if let Some(id) = crate::team_chats::coordinator_recipient(&r.description, &names, None) {
+        return Ok(Some(id));
+    }
+    let mut selected = Vec::new();
+    let mut checked = HashSet::new();
+    for member in active.iter().filter(|m| m.account == r.owner) {
+        if !checked.insert(member.profile_id.clone()) { continue; }
+        let app = p.app(&member.profile_id)?;
+        if !app.db.transfer_status()?.is_null() { continue; }
+        if let Some(primary) = crate::primary_bot::get(&app.db)? {
+            if let Some(candidate) = active.iter().find(|m| m.profile_id == member.profile_id && m.bot_id == primary) {
+                selected.push(candidate.id.clone());
+            }
+        }
+    }
+    // Multiple profiles can belong to one account. Ambiguity is not permission
+    // to pick a random profile's assistant.
+    Ok(if selected.len() == 1 { selected.pop() } else { None })
+}
+
 fn sync(p: &Profiles) -> Result<()> {
     let rooms = refresh_room_identities(p)?;
     if rooms.is_empty() {
@@ -963,6 +1006,8 @@ fn sync(p: &Profiles) -> Result<()> {
         )?
         .query_map([], |r| r.get(0))?
         .collect::<rusqlite::Result<_>>()?;
+    let coordinators = rooms.iter().map(|r| Ok((r.id.clone(), room_coordinator(p, r, &profiles)?)))
+        .collect::<Result<std::collections::HashMap<_, _>>>()?;
     for profile in profiles {
         let app = p.app(&profile)?;
         if !rooms.iter().any(|r| {
@@ -1053,6 +1098,11 @@ fn sync(p: &Profiles) -> Result<()> {
                             .unwrap_or(key)
                     })
                     .collect::<Vec<_>>();
+                let handoff_owned = {
+                    let c = app.db.0.lock().unwrap();
+                    crate::collaboration::has_requests(&c, &run_id)? || crate::collaboration::is_child(&c, &run_id)?
+                };
+                let coordinator = if handoff_owned { None } else { coordinators.get(&r.id).and_then(|id| id.as_deref()) };
                 let mut c = p.registry.lock().unwrap();
                 let tx = c.transaction()?;
                 let parent:Option<(String,i64)>=tx.query_row("SELECT m.round_id,m.depth FROM server_jobs j JOIN server_messages m ON m.seq=j.seq WHERE j.run_id=? AND j.participant=?",params![run_id,bot.id],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
@@ -1060,7 +1110,7 @@ fn sync(p: &Profiles) -> Result<()> {
                 let inserted=tx.execute("INSERT OR IGNORE INTO server_messages(room_id,sender,body,created,round_id,depth,source_profile,source_seq) VALUES(?,?,?,?,?,?,?,?)",params![r.id,bot.id,text,db::now(),round,depth,profile,local])?;
                 if inserted > 0 {
                     let seq = tx.last_insert_rowid();
-                    route(&tx, r, seq, &text, &explicit, true, &bot.id, &round, depth)?;
+                    route(&tx, r, seq, &text, &explicit, true, &bot.id, &round, depth, coordinator)?;
                 }
                 tx.commit()?;
             }
@@ -1134,8 +1184,8 @@ fn sync(p: &Profiles) -> Result<()> {
                 }
             }
             for bot in members {
-                let jobs:Vec<(i64,String,String,i64)>=p.registry.lock().unwrap().prepare("SELECT j.seq,m.body,m.round_id,m.depth FROM server_jobs j JOIN server_messages m ON m.seq=j.seq WHERE j.participant=? AND j.run_id='' AND m.room_id=? ORDER BY j.seq")?.query_map(params![bot.id,r.id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?.collect::<rusqlite::Result<_>>()?;
-                for (seq, text, round, depth) in jobs {
+                let jobs:Vec<(i64,String,String,i64,i64)>=p.registry.lock().unwrap().prepare("SELECT j.seq,m.body,m.round_id,m.depth,j.coordinator_update FROM server_jobs j JOIN server_messages m ON m.seq=j.seq WHERE j.participant=? AND j.run_id='' AND m.room_id=? ORDER BY j.seq")?.query_map(params![bot.id,r.id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?.collect::<rusqlite::Result<_>>()?;
+                for (seq, text, round, depth, coordinator_update) in jobs {
                         let sender:String=p.registry.lock().unwrap().query_row("SELECT sender FROM server_messages WHERE seq=?",[seq],|r|r.get(0))?;
                         let author=r.participants.iter().find(|m|m.id==sender).map(|m|format!("{} [{}] ({})",m.name,m.id,m.kind)).unwrap_or(sender.clone());
                     let result = (|| -> Result<String> {
@@ -1157,6 +1207,11 @@ fn sync(p: &Profiles) -> Result<()> {
                             author,
                             crate::runtime::bounded(&text, 48000)
                         );
+                        let prompt = match coordinator_update {
+                            1 => format!("{}\n\n{prompt}", crate::team_chats::COORDINATOR_UPDATE_GUIDANCE),
+                            2 => format!("This addressed request continues a coordinator-triggered task. Preserve the owner's saved scope and the requester's stopping boundary. Prepare drafts for owner review; this teammate message does not authorize sending them.\n\n{prompt}"),
+                            _ => prompt,
+                        };
                         let run = crate::chats::insert_run(
                             &tx,
                             &chat,
@@ -1167,6 +1222,10 @@ fn sync(p: &Profiles) -> Result<()> {
                             depth,
                         )?;
                         if sender.starts_with("person:") { crate::chats::record_recipient(&tx, &run)?; }
+                        if coordinator_update != 0 {
+                            let local_seq: i64 = tx.query_row("SELECT local_seq FROM server_chat_imports WHERE global_seq=?", [seq], |r| r.get(0))?;
+                            crate::team_chats::record_coordinator_update(&tx, &run, local_seq, &sender)?;
+                        }
                         tx.execute(
                             "INSERT INTO server_chat_jobs VALUES(?,?,?)",
                             params![seq, bot.bot_id, run],

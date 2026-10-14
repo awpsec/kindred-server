@@ -878,15 +878,146 @@ async fn general_room_messages_select_one_bot_but_broadcasts_and_quotes_keep_the
     let detail=f.ok("GET",&path,&token,Value::Null).await;
     let seq=detail["messages"].as_array().unwrap().iter().find(|m|m["text"]=="The report is ready").unwrap()["seq"].clone();
     f.ok("POST",&(path.clone()+"/messages"),&token,json!({"prompt":"Please shorten it","reply_to":seq,"request_id":db::id()})).await;
-    let runs=app.db.runs(None).unwrap();assert_eq!(runs.len(),4);assert_eq!(runs.iter().find(|r|r.prompt.contains("Please shorten it")).unwrap().bot_id,helper.id);
+    let runs=app.db.runs(None).unwrap();assert_eq!(runs.len(),5);assert_eq!(runs.iter().find(|r|r.prompt.contains("Please shorten it")).unwrap().bot_id,helper.id);
     f.ok("POST",&(path.clone()+"/messages"),&token,json!({"prompt":"What did Casey ask for again @Atlas","request_id":db::id()})).await;
-    let runs=app.db.runs(None).unwrap();assert_eq!(runs.len(),5);
+    let runs=app.db.runs(None).unwrap();assert_eq!(runs.len(),6);
     let tagged=runs.iter().find(|r|r.prompt.contains("What did Casey ask for again")).unwrap();
     assert_eq!(tagged.bot_id,helper.id);assert!(app.db.group_activity_started(&tagged.id).unwrap());
     assert!(crate::runtime::instructions(&app,&helper,tagged).unwrap().contains("Recipient selection is complete"));
     f.ok("POST",&(path.clone()+"/messages"),&token,json!({"prompt":"Don't worry about this further Atlas, lets move on.","request_id":db::id()})).await;
-    let runs=app.db.runs(None).unwrap();assert_eq!(runs.len(),6);
+    let runs=app.db.runs(None).unwrap();assert_eq!(runs.len(),7);
     assert_eq!(runs.iter().find(|r|r.prompt.contains("Don't worry about this further Atlas")).unwrap().bot_id,helper.id);
     let detail=f.ok("GET",&path,&token,Value::Null).await;
-    assert!(detail["workers"].as_array().unwrap().iter().all(|w|w["id"].is_string() && w["activity_started"]==true));
+    assert!(detail["workers"].as_array().unwrap().iter().all(|w|w["id"].is_string()));
+    let coordinator = runs.iter().find(|r| r.prompt.contains("Message from Atlas") && r.prompt.contains("The report is ready")).unwrap();
+    assert_eq!(coordinator.bot_id, lead.id);
+    assert!(app.db.events(&coordinator.id).unwrap().iter().any(|e| e["kind"] == "coordinator_update"));
+}
+
+#[tokio::test]
+async fn unaddressed_teammate_updates_reach_only_the_owners_primary_and_survive_retries() {
+    let f = Fixture::new();
+    let (token, identity, app) = f.account("Owner");
+    let lead = bot(&app, "Coordinator");
+    let helper = bot(&app, "Inbox");
+    let other = bot(&app, "Validator");
+    crate::primary_bot::set(&app.db, Some(&lead.id)).unwrap();
+    let room = f.ok("POST", "/api/server-chats", &token, json!({
+        "name":"Team", "description":"Coordinator is my assistant. They lead the chat and own delegation.",
+        "participants":[bot_key(&identity,&lead),bot_key(&identity,&helper),bot_key(&identity,&other)],
+        "all_messages":true,"bot_to_bot":true
+    })).await;
+    let key = room["id"].as_str().unwrap();
+    let chat = app.db.chat(key).unwrap();
+    let source = crate::chats::insert_run(&app.db.0.lock().unwrap(), &chat, &helper.id, "Inbox check", &db::id(), "", 0).unwrap();
+    let run = app.db.run(&source).unwrap();
+    let post = json!({"chat_id":key,"key":"reply","message":"The client replied with the updated information. A follow-up is needed.","mentions":[]});
+    let receipt = app.db.bot_chat_post(&helper, &run, &post).unwrap();
+    f.sync(); f.sync();
+    app.db.bot_chat_post(&helper, &run, &post).unwrap();
+    f.sync();
+    let leads = app.db.runs(Some(&lead.id)).unwrap();
+    assert_eq!(leads.len(), 1, "One durable continuation, including retries");
+    assert!(app.db.runs(Some(&other.id)).unwrap().is_empty());
+    assert!(leads[0].prompt.contains("consult standing_work_rules"));
+    let events = app.db.events(&leads[0].id).unwrap();
+    let event = events.iter().find(|e| e["kind"] == "coordinator_update").unwrap();
+    assert_eq!(event["body"]["message_seq"], receipt["message_seq"]);
+    // A second update must not disappear just because the coordinator is already queued.
+    app.db.bot_chat_post(&helper, &run, &json!({"chat_id":key,"key":"second","message":"The attachment is also ready.","mentions":[]})).unwrap();
+    f.sync();
+    assert_eq!(app.db.runs(Some(&lead.id)).unwrap().len(), 2);
+    // The coordinator's own update must not wake another bot or bounce back.
+    app.db.bot_chat_post(&lead, &leads[0], &json!({"chat_id":key,"key":"own","message":"I have prepared the follow-up draft.","mentions":[]})).unwrap();
+    f.sync();
+    assert_eq!(app.db.runs(None).unwrap().len(), 3);
+    // Explicit addressing wins over the primary fallback.
+    app.db.bot_chat_post(&helper, &run, &json!({"chat_id":key,"key":"addressed","message":"Please check the attachment.","mentions":[bot_key(&identity,&other)]})).unwrap();
+    f.sync();
+    assert_eq!(app.db.runs(Some(&lead.id)).unwrap().len(), 2);
+    assert_eq!(app.db.runs(Some(&other.id)).unwrap().len(), 1);
+    assert!(!app.db.events(&app.db.runs(Some(&other.id)).unwrap()[0].id).unwrap().iter().any(|e| e["kind"] == "coordinator_update"));
+}
+
+#[tokio::test]
+async fn coordinator_fallback_requires_opt_ins_membership_and_no_existing_handoff() {
+    for scenario in ["all_messages_off", "bot_to_bot_off", "no_primary", "primary_outside_room", "archived_primary", "handoff_child", "handoff_parent"] {
+        let f = Fixture::new();
+        let (token, identity, app) = f.account("Owner");
+        let lead = bot(&app, "Coordinator");
+        let helper = bot(&app, "Inbox");
+        if scenario != "no_primary" { crate::primary_bot::set(&app.db, Some(&lead.id)).unwrap(); }
+        let mut participants = vec![bot_key(&identity,&helper)];
+        if scenario != "primary_outside_room" { participants.push(bot_key(&identity,&lead)); }
+        let room = f.ok("POST", "/api/server-chats", &token, json!({"name":"Team","participants":participants,"all_messages":scenario!="all_messages_off","bot_to_bot":scenario!="bot_to_bot_off"})).await;
+        let key = room["id"].as_str().unwrap();
+        let chat = app.db.chat(key).unwrap();
+        let source = crate::chats::insert_run(&app.db.0.lock().unwrap(), &chat, &helper.id, "Inbox check", &db::id(), "", 0).unwrap();
+        let run = app.db.run(&source).unwrap();
+        if scenario == "archived_primary" {
+            let mut archived = lead.clone(); archived.profile.archived = true; app.db.save_bot(&archived).unwrap();
+        }
+        if scenario.starts_with("handoff_") {
+            let peer = crate::chats::insert_run(&app.db.0.lock().unwrap(), &chat, &helper.id, "Existing delegation", &db::id(), "", 0).unwrap();
+            let (child, parent) = if scenario == "handoff_child" { (&source, &peer) } else { (&peer, &source) };
+            app.db.0.lock().unwrap().execute("INSERT INTO collaboration_requests(child_run_id,parent_run_id,source_chat_id) VALUES(?,?,?)",params![child,parent,key]).unwrap();
+        }
+        app.db.bot_chat_post(&helper, &run, &json!({"chat_id":key,"key":"reply","message":"The client replied with updated information.","mentions":[]})).unwrap();
+        f.sync();
+        assert!(app.db.runs(Some(&lead.id)).unwrap().is_empty(), "{scenario}");
+        if scenario.starts_with("handoff_") {
+            app.db.bot_chat_post(&helper, &run, &json!({"chat_id":key,"key":"explicit","message":"Please review this distinct question.","mentions":[bot_key(&identity,&lead)]})).unwrap();
+            f.sync();
+            assert_eq!(app.db.runs(Some(&lead.id)).unwrap().len(), 1, "Explicit routing still works for {scenario}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_guests_primary_does_not_become_the_room_coordinator() {
+    let f = Fixture::new();
+    let (owner, _, _) = f.account("Owner");
+    let (guest, guest_id, guest_app) = f.account("Guest");
+    let primary = bot(&guest_app, "Guest primary");
+    let helper = bot(&guest_app, "Inbox");
+    crate::primary_bot::set(&guest_app.db, Some(&primary.id)).unwrap();
+    for bot in [&primary, &helper] {
+        f.ok("PUT", "/api/server-chats/sharing", &guest, json!({"bot_id":bot.id,"shared":true})).await;
+    }
+    let room = f.ok("POST", "/api/server-chats", &owner, json!({"name":"Team","participants":[format!("person:{}",guest_id.account),bot_key(&guest_id,&primary),bot_key(&guest_id,&helper)],"all_messages":true,"bot_to_bot":true})).await;
+    let key = room["id"].as_str().unwrap();
+    let chat = guest_app.db.chat(key).unwrap();
+    let source = crate::chats::insert_run(&guest_app.db.0.lock().unwrap(), &chat, &helper.id, "Inbox check", &db::id(), "", 0).unwrap();
+    guest_app.db.bot_chat_post(&helper, &guest_app.db.run(&source).unwrap(), &json!({"chat_id":key,"key":"reply","message":"The client replied.","mentions":[]})).unwrap();
+    f.sync();
+    assert!(guest_app.db.runs(Some(&primary.id)).unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn coordinator_review_boundary_follows_an_explicit_reply_into_another_profile() {
+    let f = Fixture::new();
+    let (owner, owner_id, owner_app) = f.account("Owner");
+    let (guest, guest_id, guest_app) = f.account("Guest");
+    let lead = bot(&owner_app, "Coordinator");
+    let helper = bot(&guest_app, "Inbox");
+    crate::primary_bot::set(&owner_app.db, Some(&lead.id)).unwrap();
+    f.ok("PUT", "/api/server-chats/sharing", &guest, json!({"bot_id":helper.id,"shared":true})).await;
+    let room = f.ok("POST", "/api/server-chats", &owner, json!({"name":"Team","participants":[format!("person:{}",guest_id.account),bot_key(&owner_id,&lead),bot_key(&guest_id,&helper)],"all_messages":true,"bot_to_bot":true})).await;
+    let key = room["id"].as_str().unwrap();
+    let chat = guest_app.db.chat(key).unwrap();
+    let source = crate::chats::insert_run(&guest_app.db.0.lock().unwrap(), &chat, &helper.id, "Inbox check", &db::id(), "", 0).unwrap();
+    guest_app.db.bot_chat_post(&helper, &guest_app.db.run(&source).unwrap(), &json!({"chat_id":key,"key":"reply","message":"The client replied with updated information.","mentions":[]})).unwrap();
+    f.sync(); f.sync();
+    let lead_run = owner_app.db.runs(Some(&lead.id)).unwrap().remove(0);
+    assert!(crate::work_rules::coordinator_round(&owner_app.db, &lead_run).unwrap());
+    owner_app.db.bot_chat_post(&lead, &lead_run, &json!({"chat_id":key,"key":"check","message":"Check this distinct item; prepare a draft only.","mentions":[bot_key(&guest_id,&helper)]})).unwrap();
+    f.sync(); f.sync();
+    let helper_runs = guest_app.db.runs(Some(&helper.id)).unwrap();
+    assert_eq!(helper_runs.len(), 2);
+    let addressed = helper_runs.iter().find(|r| r.id != source).unwrap();
+    assert_eq!(addressed.round_id, lead_run.round_id);
+    assert!(crate::work_rules::coordinator_round(&guest_app.db, addressed).unwrap());
+    assert!(addressed.prompt.contains("This addressed request continues a coordinator-triggered task"));
+    assert!(!addressed.prompt.contains("routed to you as the conversation coordinator"));
+    assert_eq!(owner_app.db.runs(Some(&lead.id)).unwrap().len(), 1);
 }

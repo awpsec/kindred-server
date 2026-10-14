@@ -536,6 +536,16 @@ pub fn budget_packet(
         + estimated_tokens(&json!(tools).to_string());
     let mut omitted = Vec::new();
     if window < 64000 {
+        // These repeat the compact core contract. Keep saved scopes and their
+        // stopping boundaries intact instead of spending context on boilerplate.
+        packet["context_limits"] = json!("Audience-scoped context: shared rooms exclude private memory and other chats. Missing history is not proof of absence.");
+        for (section, keys) in [("task", ["long_tasks", "current_request"]), ("environment", ["snapshot", "vm_readiness"])] {
+            if let Some(values) = packet[section].as_object_mut() {
+                for key in keys { values.remove(key); }
+            }
+        }
+        packet["environment"]["local_access"]["routing"] = json!("Keep the selected desktop, even offline. All includes future paired devices; target one explicit available device_id. Never broadcast, fail over or substitute a machine.");
+        packet["environment"]["local_access"]["guidance"] = json!("Local tools use paired desktops; guest_exec/computer tools use the bot VM. Only the user enables access; answers cannot grant it. Workspace mode excludes commands; desktop permissions always apply. If ready but tools are absent, request Continue. WSL uses paired Windows tools.");
         packet["conversation"]["reply_coordination"] = json!(
             "Recipient selection is complete. Answer the assigned human request; address teammate messages to their named owner. Avoid duplicate replies."
         );

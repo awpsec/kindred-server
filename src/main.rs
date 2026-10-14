@@ -1,6 +1,7 @@
 mod document_preview;
 mod progress_updates;
 mod primary_bot;
+mod work_rules;
 mod artifact_export;
 mod chat_edit;
 mod artifact_library;
