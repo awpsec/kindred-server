@@ -270,6 +270,7 @@ impl Db {
         crate::conversation_updates::migrate(&c)?;
         crate::team_chats::migrate(&c)?;
         crate::continuity::migrate(&c)?;
+        crate::memory_maintenance::migrate(&c)?;
         crate::work_rules::migrate(&c)?;
         crate::visual_panels::migrate(&c)?;
         crate::workspace_artifacts::migrate(&c)?;
@@ -402,7 +403,9 @@ impl Db {
         );
         let limit = if field == "instructions" { BOT_INSTRUCTIONS_MAX_BYTES } else { BOT_MEMORY_MAX_BYTES };
         ensure!(value.len() <= limit, "Text is limited to {limit} UTF-8 bytes");
-        let changed = self.0.lock().unwrap().execute(
+        let mut c = self.0.lock().unwrap();
+        let tx = c.transaction()?;
+        let changed = tx.execute(
             &format!("UPDATE bots SET {field}=?1 WHERE id=?2 AND (?3 IS NULL OR {field}=?3)"),
             params![value, id, expected],
         )?;
@@ -410,6 +413,8 @@ impl Db {
             changed == 1,
             "This text changed while you were editing. Reopen the editor to review the latest version; your edits are still here."
         );
+        if field == "memory" { crate::memory_maintenance::editor_replaced(&tx, id, value)?; }
+        tx.commit()?;
         Ok(())
     }
     pub fn setting(&self, key: &str) -> Result<Option<Value>> {

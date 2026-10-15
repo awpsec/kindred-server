@@ -35,6 +35,7 @@ mod email_contacts;
 mod connector_policy;
 mod connector_records;
 mod continuity;
+mod memory_maintenance;
 #[cfg(test)]
 mod continuity_tests;
 mod visual_panels;

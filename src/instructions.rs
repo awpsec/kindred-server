@@ -7,7 +7,7 @@ use anyhow::{Result, bail};
 use rusqlite::OptionalExtension;
 use serde_json::{Value, json};
 
-pub const VERSION: &str = "39";
+pub const VERSION: &str = "40";
 pub const CORE: &str = include_str!("prompts/00-core.md");
 pub const BOUNDED_CORE: &str = include_str!("prompts/00-bounded-core.md");
 pub const CHAPTERS: &[(&str, &str)] = &[
@@ -311,6 +311,7 @@ pub fn build(
         "generated_at_unix_utc":db::now(),"timezone":crate::timezone::context(&app.db, db::now())?,
         "bot":{"id":bot.id,"name":bot.name,"role_label":bot.profile.label,"role_description":bot.profile.description,
             "role_instructions":bot.instructions,"durable_memory":crate::continuity::store::memory(&app.db,run,&bot.memory)?,
+            "memory_maintenance":crate::memory_maintenance::context(&app.db,run)?,
             "configured_provider":bot.provider,"configured_model_selector":bot.model,"configured_reasoning_effort":bot.reasoning_effort},
         "user_identity_preferences":if private_destination {general["identity"].as_str().unwrap_or("")}else{""},
         "task":{"run_id":run.id,"created_unix_utc":run.created,"status":run.status,"trigger":trigger,"is_scheduled":is_routine,

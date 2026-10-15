@@ -68,6 +68,9 @@ const TABLES: &[&str] = &[
     "continuity_note_meta",
     "continuity_source_state",
     "continuity_memory_guard",
+    "memory_overflow",
+    "memory_snapshots",
+    "memory_versions",
     "continuity_obligations",
     "continuity_sessions",
     "continuity_dependencies",
@@ -292,6 +295,9 @@ impl Db {
                     | "continuity_note_meta"
                     | "continuity_source_state"
                     | "continuity_memory_guard"
+                    | "memory_versions"
+                    | "memory_overflow"
+                    | "memory_snapshots"
                     | "continuity_obligations"
                     | "continuity_sessions"
                     | "continuity_dependencies"
@@ -330,6 +336,9 @@ impl Db {
                     | "continuity_note_meta"
                     | "continuity_source_state"
                     | "continuity_memory_guard"
+                    | "memory_versions"
+                    | "memory_overflow"
+                    | "memory_snapshots"
                     | "continuity_obligations"
                     | "continuity_sessions"
                     | "continuity_dependencies"
@@ -361,6 +370,9 @@ impl Db {
             let rows = tables[*table]["rows"]
                 .as_array()
                 .ok_or_else(|| anyhow::anyhow!("Invalid workspace rows"))?;
+            // Imported memory/guard rows fire ordinary revision triggers. Restore
+            // the source version last so its immutable snapshots retain their CAS.
+            if *table == "memory_versions" { tx.execute("DELETE FROM memory_versions", [])?; }
             let sql = format!(
                 "INSERT INTO {table} VALUES({})",
                 vec!["?"; names.len()].join(",")
@@ -375,6 +387,10 @@ impl Db {
                 statement.execute(rusqlite::params_from_iter(values))?;
             }
         }
+        // Never revive an invalidated original, including in older packages or
+        // packages whose snapshots were inserted after the guard trigger fired.
+        tx.execute("UPDATE memory_snapshots SET invalidated=1 WHERE bot_id IN(SELECT bot_id FROM continuity_memory_guard WHERE invalidated=1)", [])?;
+        tx.execute("UPDATE memory_overflow SET status='invalidated' WHERE status<>'invalidated' AND bot_id IN(SELECT bot_id FROM continuity_memory_guard WHERE invalidated=1)", [])?;
         ensure!(tx.query_row("SELECT COUNT(*) FROM runs WHERE status IN ('queued','running','awaiting_user','awaiting_approval','cancelling')",[],|r|r.get::<_,i64>(0))?==0,"A workspace with unfinished tasks cannot be imported");
         // Older packages infer folders from document metadata; register those too.
         crate::workspace_artifacts::migrate(&tx)?;

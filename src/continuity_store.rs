@@ -625,11 +625,36 @@ pub fn budget_packet(
             omitted.push(path.to_owned());
         }
     }
+    // Under memory pressure a small-context model must still be able to start
+    // maintenance. Keep the readback/checkpoint metadata, not duplicate prose;
+    // the prepared snapshot is paged and cannot be committed before a full read.
+    if packet["bot"]["memory_maintenance"]["due"] == true
+        && fixed + estimated_tokens(&packet.to_string()) > ceiling.saturating_sub(256)
+    {
+        // Tool schemas are already supplied separately. Avoid repeating their
+        // names when a full memory needs the remaining input budget to recover.
+        if let Some(environment) = packet["environment"].as_object_mut() {
+            environment.remove("available_tool_names");
+        }
+        let maintenance = &mut packet["bot"]["memory_maintenance"];
+        *maintenance = json!({"due":true,"pending_count":maintenance["pending_count"],
+            "pending_shortened":maintenance["pending_count"].as_u64().unwrap_or(0)>0,
+            "read_pending_offset":maintenance["read_pending_offset"]});
+        omitted.push("/bot/memory_maintenance/pending_additions".into());
+        while fixed + estimated_tokens(&packet.to_string()) > ceiling.saturating_sub(256) {
+            let Some(memory) = packet["bot"]["durable_memory"].as_str().filter(|s| !s.is_empty()) else { break; };
+            let next = crate::runtime::bounded(memory, memory.len() / 2).to_owned();
+            let offset = next.len();
+            packet["bot"]["durable_memory"] = json!(next);
+            packet["bot"]["memory_shortened"] = json!(true);
+            packet["bot"]["memory_read_next_offset"] = json!(offset);
+        }
+    }
     let mut omitted_sections = std::collections::BTreeMap::new();
     for path in &omitted {
         *omitted_sections.entry(path).or_insert(0usize) += 1;
     }
-    packet["context_selection"] = json!({"estimated":true,"window_tokens":window,"reserved_output_tokens":reserve,"omitted_sections":omitted_sections,"instructions":"Omitted records remain available through tools. Pending counts do not imply their records were all loaded. Do not infer absence or completion."});
+    packet["context_selection"] = json!({"estimated":true,"window_tokens":window,"reserved_output_tokens":reserve,"omitted_sections":omitted_sections,"instructions":"Read omissions with tools; missing is not absent or completed."});
     let used = fixed + estimated_tokens(&packet.to_string());
     ensure!(
         used <= ceiling,

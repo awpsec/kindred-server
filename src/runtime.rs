@@ -296,7 +296,7 @@ pub fn tool_specs() -> Vec<Value> {
         ),
         (
             "remember",
-            "Save your own durable memory from any conversation, including bot-to-bot rooms. For new lasting rules, responsibilities or preferences, use mode=append with only the new facts: Kindred preserves existing memory without exposing it, so memory_read and a separate DM are not required. Required before acknowledging a responsibility assigned to YOU, including one relayed by a teammate. mode=replace is allowed only in your owner DM: read the full current memory first and preserve unrelated facts. Omitting mode retains legacy behavior (replacement in your DM, server-side merge elsewhere). Total memory is limited to 64,000 UTF-8 bytes; rejected saves preserve prior memory. Keep detailed work in continuity notes. Preserve attribution for facts about teammates. Never store passwords. For owner-granted ongoing action scope, use work_rule_save instead: ordinary memory is not action authorization and is withheld in shared chats.",
+            "Save lasting facts before acknowledging. Append only new facts; overflow is retained. Replacement requires full memory_read in owner DM; preserve unrelated facts. Input ≤64,000 UTF-8 bytes. No passwords. Action scope: work_rule_save.",
             json!({"text":{"type":"string"},"mode":{"type":"string","enum":["append","replace"]}}),
             vec!["text"],
         ),
@@ -471,13 +471,25 @@ pub fn tool_specs() -> Vec<Value> {
         ),
         (
             "memory_read",
-            "Read this bot's private durable memory in the owner's DM. Offset is a UTF-8 byte position; follow next_offset. Invalidated memory is withheld pending reconstruction from sources. Private memory cannot be read into a shared destination. To save new facts there, use remember with mode=append; it preserves existing memory without requiring this read.",
-            json!({"offset":{"type":"integer","minimum":0}}),
+            "Owner-DM memory/pending read. Page with next_offset (UTF-8 bytes); retain snapshot_id when reading originals.",
+            json!({"offset":{"type":"integer","minimum":0},"snapshot_id":{"type":"string"}}),
+            vec![],
+        ),
+        (
+            "memory_compact",
+            "Owner-DM compaction: prepare with no arguments; follow receipt and read all snapshot pages; commit snapshot_id/text. Preserve rules/facts. Base only, ≤40,000 UTF-8 bytes. See memory_team guide.",
+            json!({"snapshot_id":{"type":"string"},"text":{"type":"string","maxLength":40000}}),
+            vec![],
+        ),
+        (
+            "memory_history",
+            "Owner-DM originals: read via memory_read(snapshot_id,offset), page via before. Historical, not current authority.",
+            json!({"before":{"type":"integer"}}),
             vec![],
         ),
         (
             "continuity_read",
-            "Read this bot's continuity notes. Defaults to the current conversation; optional chat_id must satisfy the destination disclosure boundary. Pass a topic for its complete current revision, or before to page older notes. Includes closed notes so corrected decisions can be inspected and revised.",
+            "Read continuity notes, including closed ones. Defaults to current chat; chat_id respects disclosure boundaries. topic returns its complete current revision; before pages older notes.",
             json!({"chat_id":{"type":"string"},"topic":{"type":"string"},"before":{"type":"integer","minimum":1}}),
             vec![],
         ),
@@ -888,14 +900,13 @@ async fn call_tool_inner(
         "receipts_read" => json!({"text":crate::continuity::store::receipts(&app.db,run,string(&args,"run_id")?,args["before"].as_i64().unwrap_or(i64::MAX))?.to_string()}),
         "work_rule_save" => json!({"text":crate::work_rules::save(&app.db,run,&args)?.to_string()}),
         "work_rules_read" => json!({"text":crate::work_rules::read(&app.db,run,true)?.to_string()}),
-        "memory_read" => {
-            let current=app.db.bot(&bot.id)?;
-            let memory=crate::continuity::store::memory(&app.db,run,&current.memory)?;
-            let text=memory.as_str().ok_or_else(||anyhow::anyhow!("Private memory is unavailable in this destination or invalidated; reconstruct from allowed sources"))?;
-            let offset=args["offset"].as_u64().unwrap_or(0) as usize;
-            ensure!(offset<=text.len() && text.is_char_boundary(offset),"Invalid memory offset");
-            let part=bounded(&text[offset..],8000);
-            json!({"text":json!({"memory":part,"offset":offset,"next_offset":if offset+part.len()<text.len(){Some(offset+part.len())}else{None}}).to_string()})
+        "memory_read" => json!({"text":crate::memory_maintenance::read(&app.db,run,&args)?.to_string()}),
+        "memory_history" => json!({"text":crate::memory_maintenance::history(&app.db,run,&args)?.to_string()}),
+        "memory_compact" => {
+            let result=if args.get("snapshot_id").is_none() && args.get("text").is_none() {
+                crate::memory_maintenance::snapshot(&app.db,run)?
+            } else { crate::memory_maintenance::compact(&app.db,run,&args)? };
+            json!({"text":result.to_string()})
         }
         "continuity_read" => {
             let mut source=run.clone();
@@ -1012,29 +1023,7 @@ async fn call_tool_inner(
         "apps_list" => {
             json!({"text":serde_json::to_string(&app.db.setting("apps")?.unwrap_or_else(crate::connections::default_apps))?})
         }
-        "remember" => {
-            ensure!(crate::continuity::store::session_valid(&app.db.0.lock().unwrap(),&run.id)?,"Sources changed during this session; rebuild context before replacing memory");
-            let invalid:bool=app.db.0.lock().unwrap().query_row("SELECT EXISTS(SELECT 1 FROM continuity_memory_guard WHERE bot_id=? AND invalidated=1)",[&bot.id],|r|r.get(0))?;
-            ensure!(!invalid || run.chat_id==format!("dm-{}",bot.id),"Private memory needs reconstruction in the owner DM; save current shared facts with continuity_save");
-            let current=app.db.bot(&bot.id)?;
-            let proposed=string(&args,"text")?;
-            let mode=args.get("mode").map(|value| value.as_str().unwrap_or("")).unwrap_or("legacy");
-            ensure!(matches!(mode,"legacy"|"append"|"replace"),"Memory mode must be append or replace");
-            ensure!(mode!="replace" || run.chat_id==format!("dm-{}",bot.id),"Memory replacement requires your owner DM. Use remember with mode=append to save new facts here without reading private memory");
-            let merged=if mode=="append" {
-                ensure!(!invalid,"Private memory needs reconstruction before appending; save current facts with continuity_save");
-                let addition=proposed.trim();
-                ensure!(!addition.is_empty(),"Memory addition must not be empty");
-                // Exact retained blocks are idempotent. Never return prior memory to the caller.
-                if current.memory.is_empty() { addition.to_owned() }
-                else if format!("\n\n{}\n\n",current.memory).contains(&format!("\n\n{addition}\n\n")) { current.memory.clone() }
-                else { format!("{}\n\n{addition}",current.memory) }
-            } else if run.chat_id==format!("dm-{}",bot.id) || current.memory.is_empty() || proposed.contains(&current.memory) {proposed.to_owned()} else {format!("{}\n{}",current.memory,proposed)};
-            // Shared contexts never receive the private prior text. Merge locally
-            // instead of letting a replacement discard facts the model cannot see.
-            app.db.save_bot_text(&bot.id,"memory",&merged,Some(&current.memory))?;
-            json!({"text":"Memory saved locally."})
-        }
+        "remember" => json!({"text":crate::memory_maintenance::remember(&app.db,run,&args)?.to_string()}),
         "skills_list" => {
             let mut skills=app.db.skills()?;
             for skill in &mut skills {

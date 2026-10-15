@@ -926,7 +926,12 @@ async fn memory_append_rejections_preserve_prior_memory_and_invalidation() {
     let (b, run) = setup(&app.db);
     let prior = "x".repeat(crate::db::BOT_MEMORY_MAX_BYTES - 2);
     app.db.save_bot_text(&b.id, "memory", &prior, None).unwrap();
-    for args in [json!({"mode":"append","text":"too large"}), json!({"mode":"append","text":"  "}), json!({"mode":"bogus","text":"replace"})] {
+    let overflow = crate::runtime::call_tool(&app, &b, &run, "remember", json!({"mode":"append","text":"New standing rule retained beyond the working-memory cap."})).await.unwrap();
+    assert_ne!(overflow["failed"], true, "{overflow}");
+    assert_eq!(app.db.bot(&b.id).unwrap().memory, prior);
+    let all = crate::memory_maintenance::read(&app.db, &run, &json!({"offset":prior.len()})).unwrap();
+    assert!(all.to_string().contains("New standing rule retained beyond"));
+    for args in [json!({"mode":"append","text":"  "}), json!({"mode":"bogus","text":"replace"})] {
         let result = crate::runtime::call_tool(&app, &b, &run, "remember", args).await.unwrap();
         assert_eq!(result["failed"], true);
         assert_eq!(app.db.bot(&b.id).unwrap().memory, prior);
