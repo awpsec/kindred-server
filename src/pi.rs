@@ -97,6 +97,7 @@ fn provider_error(frame: &Value) -> String {
             format!("OpenRouter returned HTTP {status}. Verify model availability, balance and ZDR eligibility; no alternate provider was used.")
         }
         "budget" => "Tool-step budget exhausted. Review activity and continue with a narrower task.".into(),
+        "empty_result" => "The custom model returned no visible answer after a summary-only retry. Completed actions are preserved; review Activity before continuing.".into(),
         "truncated" => "Model output was truncated at its token limit.".into(),
         "aborted" => "Pi task was cancelled.".into(),
         "request_limit" | "response_limit" | "output_limit" | "frame_limit" => "Pi task reached a request, response or output size limit. Continue with a narrower task.".into(),
@@ -198,7 +199,9 @@ async fn run_worker(
                     "Invalid Pi progress state"
                 );
                 app.db
-                    .event(&run.id, "model_progress", json!({"state":state}))?;
+                    .event(&run.id, "model_progress", if bot.provider.starts_with("custom-") {
+                        json!({"state":state,"custom_provider":true,"streamed":frame["streamed"] == true && state != "waiting"})
+                    } else { json!({"state":state}) })?;
             }
             "assistant" if ready => {
                 let text = runtime::string(&frame, "text")?;

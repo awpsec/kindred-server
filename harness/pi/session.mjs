@@ -16,6 +16,22 @@ export class HarnessError extends Error {
   constructor(code, status) { super(code); this.code = code; this.status = status; }
 }
 
+// Custom endpoints can spend a long time streaming reasoning. Count only actual
+// nonempty SDK deltas, never timers or connection keepalives. No token text leaves
+// this process; the small activity receipt is throttled to once per five seconds.
+export function progressReporter(emit, custom = false, now = () => performance.now()) {
+  const phases = new Set();
+  let lastActivity = -Infinity;
+  return (state, delta = '') => {
+    const streamed = custom && typeof delta === 'string' && delta.length > 0;
+    const tick = now();
+    if (phases.has(state) && (!streamed || tick - lastActivity < 5000)) return;
+    phases.add(state);
+    if (streamed) lastActivity = tick;
+    emit({ type: 'progress', state, ...(streamed ? { streamed: true } : {}) });
+  };
+}
+
 // Unknown output limits are left to the provider; this estimate is only SDK metadata.
 function outputLimit(info) {
   if (info.max_tokens != null && (!Number.isSafeInteger(info.max_tokens) || info.max_tokens < 1 || info.max_tokens > info.context_window)) throw new HarnessError('model');
@@ -197,12 +213,9 @@ export async function runSession(request, callTool, emit, signal, options = {}) 
   const failure = { value: null };
   let modelCalls = 0, toolCalls = 0, outputBytes = 0;
   const output = [];
-  let progressPhases = new Set();
-  const progress = state => {
-    if (progressPhases.has(state)) return;
-    progressPhases.add(state);
-    emit({ type: 'progress', state });
-  };
+  const custom = request.provider.startsWith('custom-');
+  let recoveringResult = false, emptyEnding = false, finalAnswer = false;
+  let progress = progressReporter(emit, custom);
   try {
     const modelRuntime = await ModelRuntime.create({
       credentials: new InMemoryCredentialStore(), modelsStore: new InMemoryModelsStore(),
@@ -236,7 +249,7 @@ export async function runSession(request, callTool, emit, signal, options = {}) 
         failure.value = new HarnessError('budget'); throw failure.value;
       }
       const requestId = modelCalls;
-      progressPhases = new Set();
+      progress = progressReporter(emit, custom);
       progress('waiting');
       emit({type:"usage",request_id:requestId,input_tokens:0,output_tokens:0,cached_tokens:0,cost:null,cost_source:"unknown",tokens_reported:false});
       const beforePayload = streamOptions.onPayload;
@@ -269,6 +282,7 @@ export async function runSession(request, callTool, emit, signal, options = {}) 
       name: tool.name, label: tool.name, description: tool.description, parameters: tool.inputSchema,
       executionMode: 'sequential',
       execute: async (id, args, toolSignal) => {
+        if (recoveringResult) throw new HarnessError('empty_result');
         if (++toolCalls > request.max_steps && request.max_steps > 0) { failure.value = new HarnessError('budget'); throw failure.value; }
         if (signal?.aborted || toolSignal?.aborted) throw new HarnessError('aborted');
         const result = await callTool(id, tool.name, args, toolSignal);
@@ -302,17 +316,17 @@ export async function runSession(request, callTool, emit, signal, options = {}) 
       return { ...original, isError: context.isError || original?.isError || context.result.details?.failed === true };
     };
     const shouldStop = session.agent.shouldStopAfterTurn;
-    session.agent.shouldStopAfterTurn = async (context, toolSignal) => Boolean(failure.value) || Boolean(await shouldStop?.(context, toolSignal));
+    session.agent.shouldStopAfterTurn = async (context, toolSignal) => recoveringResult || Boolean(failure.value) || Boolean(await shouldStop?.(context, toolSignal));
     const abort = () => { session.agent.abort(); session.abortCompaction(); };
     signal?.addEventListener('abort', abort, { once: true });
     session.subscribe(event => {
       // Report phases, never private reasoning or partially formed tool arguments.
-      // At most four small frames per request, regardless of token count.
+      // Hosted adapters retain phase-only reporting; custom adapters also report real activity.
       if (event.type === 'message_update') {
         const kind = event.assistantMessageEvent?.type;
-        if (kind === 'thinking_delta') progress('thinking');
-        if (kind === 'text_delta') progress('writing');
-        if (kind === 'toolcall_start' || kind === 'toolcall_delta') progress('preparing');
+        if (kind === 'thinking_delta') progress('thinking', event.assistantMessageEvent.delta);
+        if (kind === 'text_delta') progress('writing', event.assistantMessageEvent.delta);
+        if (kind === 'toolcall_start' || kind === 'toolcall_delta') progress('preparing', event.assistantMessageEvent.delta);
       }
       if (event.type === 'message_end' && event.message.role === 'assistant') {
         if (['opencode', 'opencode-go'].includes(request.provider) && adapter.model.api !== 'openai-completions' && event.message.usage) {
@@ -326,6 +340,9 @@ export async function runSession(request, callTool, emit, signal, options = {}) 
           return;
         }
         const text = event.message.content.filter(part => part.type === 'text').map(part => part.text).join('');
+        const hasTools = event.message.content.some(part => part.type === 'toolCall');
+        emptyEnding = !text.trim() && !hasTools;
+        finalAnswer = !!text.trim() && !hasTools;
         if (text) {
           outputBytes += Buffer.byteLength(text);
           if (outputBytes > MAX_OUTPUT) { failure.value = new HarnessError('output_limit'); abort(); return; }
@@ -341,7 +358,20 @@ export async function runSession(request, callTool, emit, signal, options = {}) 
     try {
       let prompt=request.prompt;
       while (true) {
+        emptyEnding = false;
         await session.prompt(prompt, { expandPromptTemplates: false });
+        if (custom && emptyEnding && !failure.value && !signal?.aborted) {
+          // One same-context, tools-disabled summary. Do not replay any action.
+          recoveringResult = true;
+          session.setActiveToolsByName([]);
+          try {
+            await session.prompt('Your last response ended without a user-visible answer. Give a concise final response based only on the existing conversation and tool results. State what was completed and what remains unresolved. Do not perform or repeat any actions, and do not claim unverified success.', { expandPromptTemplates: false });
+            if (!finalAnswer) failure.value ||= new HarnessError('empty_result');
+          } finally {
+            recoveringResult = false;
+            session.setActiveToolsByName(names);
+          }
+        }
         if(signal?.aborted) throw new HarnessError('aborted');
         if (failure.value) throw failure.value;
         if (!options.nextTurn) break;

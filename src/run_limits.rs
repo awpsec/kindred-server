@@ -60,6 +60,10 @@ fn snapshot_since(db: &Db, run: &str, mut previous: Snapshot) -> Result<Snapshot
         let body: Value = serde_json::from_str(&raw)?;
         if kind == "model_progress" {
             previous.progress = Some((seq, body["state"].as_str().unwrap_or("").into()));
+            if body["custom_provider"] == true && body["streamed"] == true
+                && matches!(body["state"].as_str(), Some("thinking" | "writing" | "preparing")) {
+                previous.work_seq = seq;
+            }
         } else if kind != "assistant" || body["text"].as_str().is_some_and(|s| !s.trim().is_empty()) {
             previous.work_seq = seq;
         }
@@ -268,6 +272,27 @@ mod tests {
         assert_eq!(stop.reason, Reason::Idle);
         assert!(stop.outstanding_tool.is_some());
     }
+    #[test]
+    fn custom_streamed_tokens_are_progress_but_status_and_other_providers_are_not() {
+        let db = Db::open(":memory:").unwrap();
+        let bot = crate::tests::bot(&db, "openrouter");
+        let id = db.queue(&bot.id, "Work", 0).unwrap();
+        let start = Instant::now();
+        let mut watch = Watch::new(limits(30, None), start, snapshot(&db, &id).unwrap());
+        for minute in [20, 40, 60] {
+            db.event(&id, "model_progress", json!({"state":"thinking","custom_provider":true,"streamed":true})).unwrap();
+            assert!(watch.observe(start + MIN * minute, snapshot(&db, &id).unwrap()).is_none());
+        }
+        let last = snapshot(&db, &id).unwrap().work_seq;
+        for body in [json!({"state":"thinking","custom_provider":true}), json!({"state":"waiting","custom_provider":true,"streamed":true}), json!({"state":"thinking","streamed":true})] {
+            db.event(&id, "model_progress", body).unwrap();
+            assert_eq!(snapshot(&db, &id).unwrap().work_seq, last);
+        }
+        assert_eq!(watch.observe(start + MIN * 90, snapshot(&db, &id).unwrap()).unwrap().reason, Reason::Idle);
+        assert_eq!(crate::runtime::activity("running", Some(&json!({"kind":"model_progress","body":{"state":"waiting","custom_provider":true}}))).1, "Processing model request");
+        assert_eq!(crate::runtime::activity("running", Some(&json!({"kind":"model_progress","body":{"state":"waiting"}}))).1, "Waiting for model");
+    }
+
     #[test]
     fn legacy_config_maps_to_limits() {
         let mut c = Config::default();

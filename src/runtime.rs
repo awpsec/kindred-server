@@ -1308,6 +1308,7 @@ pub fn activity<'a>(status: &str, event: Option<&Value>) -> (&'a str, &'a str) {
     };
     if e["kind"] == "model_progress" {
         return match e["body"]["state"].as_str() {
+            Some("waiting") if e["body"]["custom_provider"] == true => ("think", "Processing model request"),
             Some("waiting") => ("think", "Waiting for model"),
             Some("writing") => ("think", "Writing a response"),
             Some("preparing") => ("think", "Preparing an action"),

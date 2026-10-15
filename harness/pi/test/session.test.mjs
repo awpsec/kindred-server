@@ -406,3 +406,66 @@ test('pinned native steer is a user message before the next model call, not tool
   });
   assert.equal(bodies.length,2);assert.deepEqual(boundaries,['native-1']);
 });
+
+function customRequest() {
+  return request({provider:'custom-11111111-1111-4111-8111-111111111111',endpoint:'http://localhost:8080/v1/chat/completions'});
+}
+test('custom reasoning-only ending gets one tools-disabled summary without replaying completed actions', async()=>{
+  const events=[],bodies=[];let actions=0;
+  const result=await runSession(customRequest(),async()=>{actions++;return {text:'Saved the record.'};},e=>events.push(e),undefined,{fetch:async req=>{
+    const body=await req.json();bodies.push(body);
+    if(bodies.length===1)return sse({role:'assistant',tool_calls:[toolCall('remember',{text:'record'})]},'tool_calls');
+    if(bodies.length===2)return sse({role:'assistant',reasoning_content:'private reasoning'});
+    assert.equal(body.tools?.length||0,0);
+    assert(body.messages.some(m=>m.role==='tool'&&m.content.includes('Saved the record.')));
+    return sse({role:'assistant',content:'The record was saved.'});
+  }});
+  assert.equal(actions,1);assert.equal(bodies.length,3);assert.equal(result.output,'The record was saved.');
+  assert(events.some(e=>e.type==='progress'&&e.state==='thinking'&&e.streamed===true));
+  assert(!JSON.stringify(events).includes('private reasoning'));
+});
+test('custom empty summary fails once without a loop or fabricated successful result',async()=>{
+  let requests=0;
+  await assert.rejects(runSession(customRequest(),async()=>{throw Error('No tools allowed');},()=>{},undefined,{fetch:async()=>{requests++;return sse({role:'assistant',content:''});}}),e=>e.code==='empty_result');
+  assert.equal(requests,2);
+});
+test('custom summary recovery cannot invoke a tool even if the provider ignores the empty tool list',async()=>{
+  let requests=0,actions=0;
+  await assert.rejects(runSession(customRequest(),async()=>{actions++;return {text:'unexpected'};},()=>{},undefined,{fetch:async()=>{
+    requests++;return requests===1?sse({role:'assistant',content:''}):sse({role:'assistant',tool_calls:[toolCall('remember',{text:'must not execute'})]},'tool_calls');
+  }}),e=>e.code==='empty_result');
+  assert.equal(requests,2);assert.equal(actions,0);
+});
+test('hosted empty endings retain the existing single request behavior',async()=>{
+  let requests=0;const events=[];
+  const result=await runSession(request(),async()=>{},e=>events.push(e),undefined,{fetch:async()=>{requests++;return sse({role:'assistant',reasoning_content:'private'});}});
+  assert.equal(requests,1);assert.equal(result.output,'');assert(!events.some(e=>e.streamed));
+});
+test('real custom deltas refresh activity while keepalives and hosted phase labels do not',async()=>{
+  const {progressReporter}=await import('../session.mjs');let now=0;const events=[];
+  const report=progressReporter(e=>events.push(e),true,()=>now);
+  report('waiting');report('thinking','first token');
+  now=4999;report('thinking','next token');assert.equal(events.length,2);
+  now=5000;report('thinking','next token');assert.equal(events.length,3);
+  now=40000;report('thinking');report('thinking','');assert.equal(events.length,3);
+  report('thinking','new token');assert.equal(events.length,4);
+  assert(events.slice(1).every(e=>e.streamed===true));assert(!JSON.stringify(events).includes('token'));
+  const hosted=[];const other=progressReporter(e=>hosted.push(e),false,()=>now);
+  other('thinking','first');now+=6000;other('thinking','second');assert.deepEqual(hosted,[{type:'progress',state:'thinking'}]);
+});
+
+test('custom summary recovery restores tools for a subsequent queued user turn',async()=>{
+  let requests=0,actions=0,boundaries=0;
+  const result=await runSession({...customRequest(),followup_protocol:1},async()=>{actions++;return {text:'Saved only for the followup.'};},()=>{},undefined,{
+    nextTurn:async()=>++boundaries===1?{offer_id:'next-user-turn',prompt:'Now save a new record.'}:null,
+    fetch:async req=>{
+      const body=await req.json();requests++;
+      if(requests===1)return sse({role:'assistant',reasoning_content:'private'});
+      if(requests===2){assert.equal(body.tools?.length||0,0);return sse({role:'assistant',content:'First answer.'});}
+      assert.equal(body.tools.length,1);
+      if(requests===3)return sse({role:'assistant',tool_calls:[toolCall('remember',{text:'new record'})]},'tool_calls');
+      return sse({role:'assistant',content:'New record saved.'});
+    }
+  });
+  assert.equal(actions,1);assert.equal(requests,4);assert(result.output.endsWith('New record saved.'));
+});
