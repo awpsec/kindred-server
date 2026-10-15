@@ -348,6 +348,7 @@ async def worker(provider):
     bridge_ready = False
     completed = False
     native_results=set()
+    initialized_inputs=set()
     can_followup=provider!='claude-code'
     input_id = 'initial'
     prompt_id = 'prompt'
@@ -510,10 +511,15 @@ async def worker(provider):
                         continue
                     if p.get('type')=='system' and p.get('subtype')=='init':
                         validate_claude_tools(p,tools)
-                        if bridge_ready: raise ToolBridgeError('Unexpected duplicate Claude tool initialization')
-                        bridge_ready=True
-                        emit({'type':'ready','protocol':1,'provider':provider,'model':request['model'],'reasoning_effort':effort,'tool_bridge_verified':True,'tool_count':len(tools),'connectors':connectors})
-                        bridge_event.set()
+                        # Claude emits init again for each stream-json user turn.
+                        # Validate every catalogue, but only handshake with the
+                        # backend once. A duplicate within one input is invalid.
+                        if input_id in initialized_inputs: raise ToolBridgeError('Unexpected duplicate Claude tool initialization')
+                        initialized_inputs.add(input_id)
+                        if not bridge_ready:
+                            bridge_ready=True
+                            emit({'type':'ready','protocol':1,'provider':provider,'model':request['model'],'reasoning_effort':effort,'tool_bridge_verified':True,'tool_count':len(tools),'connectors':connectors})
+                            bridge_event.set()
                     if p.get('type') == 'assistant':
                         message = p.get('message', {})
                         text = ''.join(c.get('text','') for c in message.get('content',[]) if c.get('type') == 'text')

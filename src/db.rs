@@ -283,6 +283,7 @@ impl Db {
         // An interrupted external action must never be replayed automatically.
         let interrupted=c.execute("UPDATE runs SET status='interrupted',error='Service restarted during this run. Review tool activity before retrying.' WHERE status IN ('running','awaiting_user','awaiting_approval','cancelling')", [])?;
         c.execute("UPDATE followup_offers SET state='uncertain' WHERE state IN ('dispatching','transported') AND EXISTS(SELECT 1 FROM runs parent WHERE parent.id=followup_offers.run_id AND parent.status IN ('interrupted','failed','completed','cancelled'))",[])?;
+        crate::conversation_updates::repair_completed_followup_parents(&c)?;
         c.execute(
             "UPDATE local_requests SET status='expired' WHERE status IN ('queued','claimed')",
             [],
