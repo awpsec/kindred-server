@@ -155,13 +155,34 @@ impl Db {
   let (file,bytes)=self.workspace_artifact_file(id,value["revision"].as_i64().unwrap())?;
   Ok(json!({"filename":file["name"],"content_type":file["content_type"],"data_base64":base64::engine::general_purpose::STANDARD.encode(bytes),"revision":value["revision"],"sha256":file["sha256"],"original":true}))
  }
+ /// Office viewers read one saved revision. Native documents are exported in
+ /// memory; opening a preview never replaces their editable source or creates
+ /// a new attachment. Original files keep their existing identity/hash checks.
+ pub fn workspace_artifact_view_file(&self,id:&str,revision:i64)->Result<(Value,Vec<u8>)>{
+  use base64::Engine;
+  let mut value={
+   let c=self.0.lock().unwrap();let current=record(&c,id)?;
+   ensure!(revision>0&&revision<=current["revision"].as_i64().unwrap(),"Artifact revision not found");
+   let body:String=c.query_row("SELECT body FROM workspace_artifact_versions WHERE artifact_id=? AND revision=?",params![id,revision],|r|r.get(0)).context("Artifact revision not found")?;
+   serde_json::from_str::<Value>(&body)?
+  };
+  if value["language"]=="file"{return self.workspace_artifact_file(id,revision);}
+  ensure!(matches!(value["kind"].as_str(),Some("document"|"sheet"))||(value["kind"].is_null()&&value["language"]=="markdown"),"This artifact is not an office document");
+  value["id"]=json!(id);value["revision"]=json!(revision);
+  let exported=crate::artifact_export::export(&value)?;
+  let name=exported["filename"].as_str().context("Missing export filename")?;
+  let extension=name.rsplit('.').next().unwrap_or("");
+  ensure!(matches!(extension,"docx"|"xlsx"),"This artifact does not have an office document export");
+  let bytes=base64::engine::general_purpose::STANDARD.decode(exported["data_base64"].as_str().context("Missing document export")?)?;
+  Ok((json!({"name":name,"extension":extension,"content_type":exported["content_type"],"revision":revision,"size":bytes.len(),"original":false}),bytes))
+ }
 }
 pub async fn original(State(app):State<Shared>,Path((id,revision)):Path<(String,i64)>)->Result<axum::response::Response,crate::web::Error>{
- let (file,bytes)=app.db.workspace_artifact_file(&id,revision)?;
+ let (file,bytes)=app.db.workspace_artifact_view_file(&id,revision)?;
  Ok(crate::web::download_file_response(file["name"].as_str().unwrap().to_owned(),bytes))
 }
 pub async fn page_preview(State(app):State<Shared>,Path((id,revision)):Path<(String,i64)>)->Result<axum::response::Response,crate::web::Error>{
- use axum::{response::IntoResponse,http::header};let (file,bytes)=app.db.workspace_artifact_file(&id,revision)?;let pdf=crate::document_preview::render(file["name"].as_str().unwrap().to_owned(),bytes).await?;
+ use axum::{response::IntoResponse,http::header};let (file,bytes)=app.db.workspace_artifact_view_file(&id,revision)?;let pdf=crate::document_preview::render(file["name"].as_str().unwrap().to_owned(),bytes).await?;
  Ok(([(header::CONTENT_TYPE,"application/pdf"),(header::CACHE_CONTROL,"no-store")],pdf).into_response())
 }
 pub async fn folder_list(State(app):State<Shared>)->Result<Json<Value>,crate::web::Error>{Ok(Json(app.db.workspace_artifact_folders()?))}
@@ -418,6 +439,37 @@ mod office_folder_tests {
 #[cfg(test)] mod file_tests {
  use super::*;use base64::Engine;
  fn fixture()->(Shared,crate::db::Bot,Run){let app=crate::tests::app();let bot=crate::tests::bot(&app.db,"codex");let run=app.db.run(&app.db.queue(&bot.id,"Publish original",0).unwrap()).unwrap();(app,bot,run)}
+ fn office_part(bytes:&[u8],name:&str)->String{use std::io::Read;let mut archive=zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();let mut text=String::new();archive.by_name(name).unwrap().read_to_string(&mut text).unwrap();text}
+ #[test] fn native_document_view_uses_requested_saved_revision_without_mutation(){
+  let (app,_,run)=fixture();let db=&app.db;
+  let first=db.workspace_artifact_create(&run,&json!({"key":"native","title":"Report","language":"markdown","source":"# First saved report\n\n**Reviewed**"})).unwrap();let id=first["id"].as_str().unwrap();
+  let second=db.workspace_artifact_update(id,&json!({"expected_revision":1,"source":"# Corrected report","title":"Revised report"})).unwrap();
+  let (file,bytes)=db.workspace_artifact_view_file(id,1).unwrap();assert_eq!(file["name"],"Report.docx");assert_eq!(file["revision"],1);let xml=office_part(&bytes,"word/document.xml");assert!(xml.contains("First saved report")&&xml.contains("Reviewed"));assert!(!xml.contains("Corrected report"));
+  let (file,bytes)=db.workspace_artifact_view_file(id,2).unwrap();assert_eq!(file["name"],"Revised report.docx");assert!(office_part(&bytes,"word/document.xml").contains("Corrected report"));
+  assert_eq!(db.workspace_artifact_read(id).unwrap(),second);for revision in [-1,0,3]{assert!(db.workspace_artifact_view_file(id,revision).is_err());}
+  assert!(db.workspace_artifact_view_file("missing",1).is_err());
+  let c=db.0.lock().unwrap();assert_eq!(c.query_row("SELECT COUNT(*) FROM deliverables",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+ }
+ #[test] fn native_office_view_preserves_sheet_cells_and_rich_document_formatting(){
+  let (app,_,run)=fixture();let db=&app.db;
+  let sheet=db.workspace_artifact_create(&run,&json!({"key":"sheet","title":"Workbook","kind":"sheet","language":"html","source":"<!--kindred-sheet-v1-->","state":{"rows":[["00123","=SUM(A2:A3)"],["2","3"]]}})).unwrap();
+  let (file,bytes)=db.workspace_artifact_view_file(sheet["id"].as_str().unwrap(),1).unwrap();assert_eq!(file["extension"],"xlsx");let xml=office_part(&bytes,"xl/worksheets/sheet1.xml");assert!(xml.contains(">00123</t>")&&xml.contains("<f>SUM(A2:A3)</f>"));
+  let html="<p>Human edit</p>";let doc=db.workspace_artifact_create(&run,&json!({"key":"rich","title":"Rich report","kind":"document","language":"html","source":format!("<!--kindred-document-v1--><main>{html}</main>"),"state":{"kindredDocument":{"html":html,"document":{"type":"doc","content":[{"type":"paragraph","content":[{"type":"text","text":"Human edit","marks":[{"type":"bold"}]}]}]}}}})).unwrap();
+  let (file,bytes)=db.workspace_artifact_view_file(doc["id"].as_str().unwrap(),1).unwrap();assert_eq!(file["extension"],"docx");let xml=office_part(&bytes,"word/document.xml");assert!(xml.contains("Human edit")&&xml.contains("<w:b/>"));
+  db.workspace_artifact_update(doc["id"].as_str().unwrap(),&json!({"expected_revision":1,"source":"<!--kindred-document-v1--><main>Changed source</main>"})).unwrap();assert!(db.workspace_artifact_view_file(doc["id"].as_str().unwrap(),2).is_err());
+  for (key,kind) in [("custom-doc","document"),("custom-sheet","sheet"),("app","app")] {let custom=db.workspace_artifact_create(&run,&json!({"key":key,"title":"Custom","kind":kind,"language":"html","source":"<script>custom app</script>","state":{}})).unwrap();assert!(db.workspace_artifact_view_file(custom["id"].as_str().unwrap(),1).is_err());}
+ }
+ #[tokio::test] async fn native_view_routes_authenticate_account_and_revision(){
+  use tower::ServiceExt;use axum::{body::{Body,to_bytes},http::Request};
+  let (app,_,run)=fixture();let foreign=crate::tests::app();let doc=app.db.workspace_artifact_create(&run,&json!({"key":"native","title":"Report","language":"markdown","source":"# Private saved report"})).unwrap();
+  for route in ["file","preview"] {
+   let uri=format!("/api/workspace-artifacts/{}/{route}/1",doc["id"].as_str().unwrap());let request=|token:&str|Request::builder().uri(&uri).header("authorization",format!("Bearer {token}")).body(Body::empty()).unwrap();
+   assert_eq!(crate::web::router(app.clone()).oneshot(request("wrong")).await.unwrap().status(),401);
+   assert!(!crate::web::router(foreign.clone()).oneshot(request(&foreign.token)).await.unwrap().status().is_success());
+   if route=="file"{let response=crate::web::router(app.clone()).oneshot(request(&app.token)).await.unwrap();assert_eq!(response.status(),200);let bytes=to_bytes(response.into_body(),1024*1024).await.unwrap();assert!(office_part(&bytes,"word/document.xml").contains("Private saved report"));}
+   let future=format!("/api/workspace-artifacts/{}/{route}/2",doc["id"].as_str().unwrap());assert!(!crate::web::router(app.clone()).oneshot(Request::builder().uri(future).header("authorization",format!("Bearer {}",app.token)).body(Body::empty()).unwrap()).await.unwrap().status().is_success());
+  }
+ }
  #[test] fn original_file_revisions_preserve_bytes_and_native_copy(){
   let (app,_,run)=fixture();let db=&app.db;let first=db.attach_file(&run,"/workspace/report.docx",b"original Word bytes").unwrap();
   let args=json!({"key":"original","title":"Client report","file_id":first["id"]});let a=db.workspace_artifact_create(&run,&args).unwrap();let id=a["id"].as_str().unwrap();assert_eq!(a["language"],"file");assert_eq!(a["file"]["name"],"report.docx");assert_eq!(db.workspace_artifact_create(&run,&args).unwrap()["id"],id);
