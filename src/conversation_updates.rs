@@ -28,6 +28,11 @@ fn push_targets(c: &Connection) -> Result<Vec<(String,String)>> {
 /// dispatch and no provider activity afterward. Never infer completion from prose.
 /// The held user message remains interrupted; nothing is automatically replayed.
 pub fn repair_completed_followup_parents(c: &rusqlite::Connection) -> Result<()> {
+    // Db::open calls this in autocommit mode. Keep candidate selection, parent
+    // completion, notice suppression and receipt atomic; any error rolls back.
+    // The unchecked API accepts &Connection but still rejects a nested transaction.
+    let tx = c.unchecked_transaction()?;
+    let c = &tx;
     let rows:Vec<(String,String,i64)>=c.prepare("SELECT DISTINCT r.id,m.body,m.seq FROM runs r JOIN followup_offers o ON o.run_id=r.id AND o.state='uncertain' JOIN events d ON d.run_id=r.id AND d.kind='followup_dispatch' AND json_extract(d.body,'$.offer_id')=o.id JOIN chat_messages m ON m.run_id=r.id AND m.source_event_seq<d.seq AND m.suppressed=0 JOIN message_progress p ON p.message_seq=m.seq AND p.phase='final_answer' WHERE r.status='failed' AND r.error='Follow-up handoff did not complete. Review source activity and explicitly continue the held message; automatic replay is disabled.' AND EXISTS(SELECT 1 FROM events model WHERE model.run_id=r.id AND model.kind='model_selected' AND json_extract(model.body,'$.provider')='claude-code') AND NOT EXISTS(SELECT 1 FROM events later WHERE later.run_id=r.id AND later.seq>m.source_event_seq AND later.kind IN ('assistant','tool_requested','tool_started'))")?
         .query_map([],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?.collect::<rusqlite::Result<_>>()?;
     for (id,output,seq) in rows {
@@ -35,6 +40,7 @@ pub fn repair_completed_followup_parents(c: &rusqlite::Connection) -> Result<()>
         c.execute("UPDATE chat_messages SET suppressed=1 WHERE run_id=? AND kind='result' AND body LIKE 'failed: Follow-up handoff did not complete.%'",[&id])?;
         c.execute("INSERT INTO events(run_id,kind,body,created) VALUES(?,'followup_parent_recovered',?,?)",params![id,json!({"completed_message_seq":seq}).to_string(),db::now()])?;
     }
+    tx.commit()?;
     Ok(())
 }
 
@@ -976,6 +982,44 @@ mod tests {
     fn never_dispatched_followup_can_edit_after_owner_ends_and_transfer_keeps_uncertainty() {
         let app=tests::app();let bot=tests::bot(&app.db,"codex");app.db.queue(&bot.id,"Root",0).unwrap();let run=app.db.claim_bot(&bot.id).unwrap().unwrap();let source=app.db.chat_send(&run.chat_id,"Unsent",&[]).unwrap()[0].clone();let seq=app.db.0.lock().unwrap().query_row("SELECT message_seq FROM run_message_sources WHERE run_id=?",[&source],|r|r.get::<_,i64>(0)).unwrap();app.db.request_steering(&source,&run.id).unwrap();app.db.offer_followups(&run).unwrap();app.db.finish(&run.id,"failed","","Before dispatch").unwrap();app.db.edit_queued_message(&run.chat_id,seq,"Unsent","Edited unsent").unwrap();assert_eq!(app.db.run(&source).unwrap().prompt,"Edited unsent");
         app.db.cancel(&source).unwrap();let package=app.db.prepare_transfer(&db::id(),"Followup fixture").unwrap();let destination=tests::app();destination.db.import_transfer(&package).unwrap();assert_eq!(destination.db.run(&source).unwrap().prompt,"Edited unsent");
+    }
+
+    #[test]
+    fn legacy_completed_parent_repair_rolls_back_failed_writes_and_retries_once() {
+        for failure in ["suppression", "receipt"] {
+            let app=tests::app();let bot=tests::bot(&app.db,"claude-code");
+            app.db.queue(&bot.id,"Original",0).unwrap();let run=app.db.claim_bot(&bot.id).unwrap().unwrap();
+            app.db.event(&run.id,"model_selected",json!({"provider":"claude-code"})).unwrap();
+            app.db.event(&run.id,"assistant",json!({"text":"Finished original."})).unwrap();
+            crate::progress_updates::finish_message(&app.db,&run.id,"Finished original.").unwrap();
+            let source=app.db.chat_send(&run.chat_id,"Held followup",&[]).unwrap()[0].clone();
+            app.db.request_steering(&source,&run.id).unwrap();let offer=app.db.offer_followups(&run).unwrap().unwrap();
+            app.db.dispatch_followup(&run,offer["id"].as_str().unwrap()).unwrap();
+            app.db.finish(&run.id,"failed","","Follow-up handoff did not complete. Review source activity and explicitly continue the held message; automatic replay is disabled.").unwrap();
+            app.db.deliver_pending_completions().unwrap();
+            let c=app.db.0.lock().unwrap();
+            let snapshot=|c:&Connection|->(String,String,String,i64,i64) {
+                let (status,output,error)=c.query_row("SELECT status,output,error FROM runs WHERE id=?",[&run.id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+                let suppressed=c.query_row("SELECT sum(suppressed) FROM chat_messages WHERE run_id=? AND kind='result'",[&run.id],|r|r.get(0)).unwrap();
+                let receipts=c.query_row("SELECT count(*) FROM events WHERE run_id=? AND kind='followup_parent_recovered'",[&run.id],|r|r.get(0)).unwrap();
+                (status,output,error,suppressed,receipts)
+            };
+            let before=snapshot(&c);
+            let trigger=if failure=="suppression" {
+                "CREATE TRIGGER reject_repair BEFORE UPDATE OF suppressed ON chat_messages BEGIN SELECT RAISE(ABORT,'injected suppression failure'); END;"
+            } else {
+                "CREATE TRIGGER reject_repair BEFORE INSERT ON events WHEN NEW.kind='followup_parent_recovered' BEGIN SELECT RAISE(ABORT,'injected receipt failure'); END;"
+            };
+            c.execute_batch(trigger).unwrap();
+            assert!(repair_completed_followup_parents(&c).is_err());
+            assert_eq!(snapshot(&c),before,"all repair writes must roll back after {failure} failure");
+            assert!(c.is_autocommit(),"failed repair must release its transaction");
+            c.execute_batch("DROP TRIGGER reject_repair").unwrap();
+            for _ in 0..2 {repair_completed_followup_parents(&c).unwrap();}
+            let after=snapshot(&c);assert_eq!(after.0,"completed");assert_eq!(after.1,"Finished original.");assert_eq!(after.2,"");assert!(after.3>0);assert_eq!(after.4,1);
+            assert_eq!(c.query_row("SELECT status FROM runs WHERE id=?",[&source],|r|r.get::<_,String>(0)).unwrap(),"interrupted");
+            assert_eq!(c.query_row("SELECT count(*) FROM runs WHERE status='queued'",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+        }
     }
 
     #[test]
