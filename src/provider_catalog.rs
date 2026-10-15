@@ -143,6 +143,8 @@ pub fn parse(value: &Value) -> Result<Vec<CustomModel>> {
             &entry["max_model_len"],
             &entry["max_context_length"],
             &entry["top_provider"]["context_length"],
+            // Strata reports the loaded model's configured window here.
+            &entry["meta"]["n_ctx"],
         ]
         .into_iter()
         .find_map(|v| number(v).filter(|n| *n >= 1024.0 && *n <= 10_000_000.0 && n.fract() == 0.0))
@@ -383,6 +385,28 @@ mod tests {
         assert!(!model_vision(&json!({"input_modalities":["text"]}), id));
         assert!(!model_vision(&json!({}), "unknown-qwen"));
         assert!(model_vision(&json!({"supports_vision":true}), "opaque"));
+    }
+
+    #[test]
+    fn strata_context_uses_loaded_window_and_validates_metadata() {
+        let mut entry = json!({
+            "id":"orcarouter-qwen3.8-flash-next-uncensored-iq3_xxs",
+            "object":"model", "status":{"value":"loaded"},
+            "meta":{"n_ctx":262144},
+            "architecture":{"input_modalities":["text","image"],"output_modalities":["text"]}
+        });
+        let model = |entry: &Value| parse(&json!({"object":"list","data":[entry]})).unwrap().remove(0);
+        assert_eq!(model(&entry).context_window, 262144);
+        assert!(model(&entry).vision);
+        entry["meta"]["n_ctx"] = json!("262144");
+        assert_eq!(model(&entry).context_window, 262144);
+        for invalid in [json!(null), json!(0), json!(-1), json!(512), json!(262144.5), json!(10000001), json!("invalid")] {
+            entry["meta"]["n_ctx"] = invalid;
+            assert_eq!(model(&entry).context_window, 32768);
+        }
+        entry["meta"]["n_ctx"] = json!(262144);
+        entry["context_window"] = json!(65536);
+        assert_eq!(model(&entry).context_window, 65536);
     }
 
     #[test]
