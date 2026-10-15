@@ -150,7 +150,9 @@ impl Db {
             )?;
         }
         tx.execute(
-            "UPDATE chat_messages SET kind='withdrawn' WHERE seq=?",
+            // Keep the claim and original attachments for retries and audit, but
+            // withdrawing a send removes it from every visible history surface.
+            "UPDATE chat_messages SET kind='withdrawn',suppressed=1 WHERE seq=?",
             [seq],
         )?;
         let payload = json!({"text":expected,"files":files,"mentions":deliveries.iter().map(|(_,_,bot)|bot).collect::<Vec<_>>(),"reply_to":reply,"message_seq":seq,"chat_id":chat});
@@ -549,6 +551,12 @@ mod tests {
                 .is_err()
         );
         assert_eq!(app.db.run(&ids[0]).unwrap().status, "withdrawn");
+        assert!(!app.db.chat_messages(&chat).unwrap().iter().any(|m| m["seq"] == seq));
+        let page = app.db.chat_message_page(&chat, None, None, 1).unwrap();
+        assert_eq!(page["messages"][0]["text"], "Working");
+        assert_eq!(page["page"]["has_after"], false);
+        assert_eq!(app.db.chat(&chat).unwrap().last_message.unwrap()["text"], "Working");
+        assert!(crate::continuity::search_for(&app.db, &run, None, &format!("message:{seq}")).unwrap()["items"].as_array().unwrap().is_empty());
         assert!(app.db.test_completed_followups(&run).unwrap().is_empty());
         assert_eq!(app.db.message_uploads(seq).unwrap()[0]["id"], file["id"]);
         app.db.finish(&first[0], "completed", "Done", "").unwrap();
@@ -558,6 +566,44 @@ mod tests {
             .chat_send_request_mode(&chat, "Edited", &[], &[fresh_file], None, None, "queue")
             .unwrap();
         assert_eq!(app.db.claim_bot(&bot.id).unwrap().unwrap().prompt, "Edited");
+        let visible = app.db.chat_messages(&chat).unwrap();
+        assert_eq!(visible.iter().filter(|m| m["sender"] == "user" && m["text"] == "Edited").count(), 1);
+        assert!(!visible.iter().any(|m| m["text"] == "Original"));
+    }
+
+    #[test]
+    fn legacy_withdrawn_sends_disappear_on_reopen_without_losing_claims() {
+        let root = std::env::temp_dir().join(format!("kindred-withdrawn-{}", db::id()));
+        let path = root.join("kindred.db").to_string_lossy().into_owned();
+        let db = Db::open(&path).unwrap();
+        let bot = tests::bot(&db, "codex");
+        let chat = format!("dm-{}", bot.id);
+        let original = db.queue(&bot.id, "Discarded saffron instruction", 0).unwrap();
+        let seq = db.chat_messages(&chat).unwrap()[0]["seq"].as_i64().unwrap();
+        let claim = db::id();
+        let payload = db.restore_queued_message(&chat, seq, "Discarded saffron instruction", &claim).unwrap();
+        // Reproduce the previous release's durable state, then use real startup.
+        db.0.lock().unwrap().execute("UPDATE chat_messages SET suppressed=0 WHERE seq=?", [seq]).unwrap();
+        drop(db);
+        for _ in 0..2 {
+            let db = Db::open(&path).unwrap();
+            assert!(db.chat_messages(&chat).unwrap().is_empty());
+            assert!(db.chat(&chat).unwrap().last_message.is_none());
+            let page = db.chat_message_page(&chat, None, None, 1).unwrap();
+            assert!(page["messages"].as_array().unwrap().is_empty());
+            assert_eq!(page["page"]["has_before"], false);
+            assert_eq!(page["page"]["has_after"], false);
+            // Old cursor IDs and claim retries remain valid after the repair.
+            assert!(db.chat_message_window(&chat, Some(seq), Some(seq), 1, true).unwrap()["messages"].as_array().unwrap().is_empty());
+            assert_eq!(db.restore_queued_message(&chat, seq, "Discarded saffron instruction", &claim).unwrap(), payload);
+            assert_eq!(db.run(&original).unwrap().status, "withdrawn");
+            assert!(db.claim_bot(&bot.id).unwrap().is_none());
+            let run = db.run(&original).unwrap();
+            assert!(crate::continuity::search_for(&db, &run, None, "saffron").unwrap()["items"].as_array().unwrap().is_empty());
+            let row: (String, String, i64) = db.0.lock().unwrap().query_row("SELECT body,kind,suppressed FROM chat_messages WHERE seq=?", [seq], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+            assert_eq!(row, ("Discarded saffron instruction".into(), "withdrawn".into(), 1));
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn composer_restore_refuses_partially_consumed_multi_recipient_send() {

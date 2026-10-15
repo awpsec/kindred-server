@@ -118,6 +118,9 @@ pub fn migrate(c: &Connection) -> Result<()> {
 // Chat rows are a presentation of the immutable run/event history. Retain IDs,
 // reactions and quoted-message references while hiding old duplicate deliveries.
 pub fn repair_projection(c: &Connection) -> Result<()> {
+    // Old composer restores left withdrawn user sends in the timeline. Retain
+    // their rows/claims for retries without showing removed text or recalling it.
+    c.execute("UPDATE chat_messages SET suppressed=1 WHERE sender='user' AND kind='withdrawn' AND suppressed=0", [])?;
     c.execute_batch("UPDATE chat_messages SET suppressed=1 WHERE kind='assistant' AND EXISTS(SELECT 1 FROM routine_runs rr WHERE rr.run_id=chat_messages.run_id);
       UPDATE chat_messages SET suppressed=1 WHERE kind='result' AND EXISTS(SELECT 1 FROM runs r WHERE r.id=chat_messages.run_id AND r.status='completed' AND r.error='' AND (trim(chat_messages.body)='' OR EXISTS(SELECT 1 FROM routine_runs rr WHERE rr.run_id=r.id AND rr.quiet=1) OR EXISTS(SELECT 1 FROM events e WHERE e.run_id=r.id AND e.kind IN ('question_wait','process_wait'))));
       UPDATE chat_messages SET suppressed=1 WHERE kind='assistant' AND source_event_seq=(SELECT max(e.seq) FROM events e WHERE e.run_id=chat_messages.run_id AND e.kind='assistant') AND EXISTS(SELECT 1 FROM chat_messages result JOIN runs r ON r.id=result.run_id WHERE result.run_id=chat_messages.run_id AND result.kind='result' AND result.suppressed=0 AND r.status='completed' AND r.error='' AND trim(result.body,char(9)||char(10)||char(13)||' ')=trim(chat_messages.body,char(9)||char(10)||char(13)||' '));")?;
