@@ -24,6 +24,20 @@ fn push_targets(c: &Connection) -> Result<Vec<(String,String)>> {
     Ok(c.prepare("SELECT s.id,t.id FROM runs s JOIN runs t ON t.bot_id=s.bot_id AND t.chat_id=s.chat_id JOIN run_message_sources m ON m.run_id=s.id JOIN chat_messages msg ON msg.seq=m.message_seq WHERE s.status='queued' AND t.status IN ('running','awaiting_approval') AND s.rowid>t.rowid AND s.depth=0 AND s.reply_to='' AND msg.sender='user' AND msg.kind='message' AND msg.suppressed=0 AND NOT EXISTS(SELECT 1 FROM queue_push_requests WHERE source_run_id=s.id) AND NOT EXISTS(SELECT 1 FROM followup_offer_sources WHERE source_run_id=s.id) AND NOT EXISTS(SELECT 1 FROM run_commands WHERE run_id=s.id) AND NOT EXISTS(SELECT 1 FROM routine_runs WHERE run_id=s.id) AND NOT EXISTS(SELECT 1 FROM questions WHERE continuation_run_id=s.id) ORDER BY s.rowid")?.query_map([],|r|Ok((r.get(0)?,r.get(1)?)))?.collect::<rusqlite::Result<_>>()?)
 }
 
+/// Repair only the old Claude failure shape with a recorded final answer before
+/// dispatch and no provider activity afterward. Never infer completion from prose.
+/// The held user message remains interrupted; nothing is automatically replayed.
+pub fn repair_completed_followup_parents(c: &rusqlite::Connection) -> Result<()> {
+    let rows:Vec<(String,String,i64)>=c.prepare("SELECT DISTINCT r.id,m.body,m.seq FROM runs r JOIN followup_offers o ON o.run_id=r.id AND o.state='uncertain' JOIN events d ON d.run_id=r.id AND d.kind='followup_dispatch' AND json_extract(d.body,'$.offer_id')=o.id JOIN chat_messages m ON m.run_id=r.id AND m.source_event_seq<d.seq AND m.suppressed=0 JOIN message_progress p ON p.message_seq=m.seq AND p.phase='final_answer' WHERE r.status='failed' AND r.error='Follow-up handoff did not complete. Review source activity and explicitly continue the held message; automatic replay is disabled.' AND EXISTS(SELECT 1 FROM events model WHERE model.run_id=r.id AND model.kind='model_selected' AND json_extract(model.body,'$.provider')='claude-code') AND NOT EXISTS(SELECT 1 FROM events later WHERE later.run_id=r.id AND later.seq>m.source_event_seq AND later.kind IN ('assistant','tool_requested','tool_started'))")?
+        .query_map([],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?.collect::<rusqlite::Result<_>>()?;
+    for (id,output,seq) in rows {
+        c.execute("UPDATE runs SET status='completed',output=?,error='' WHERE id=? AND status='failed'",params![output,id])?;
+        c.execute("UPDATE chat_messages SET suppressed=1 WHERE run_id=? AND kind='result' AND body LIKE 'failed: Follow-up handoff did not complete.%'",[&id])?;
+        c.execute("INSERT INTO events(run_id,kind,body,created) VALUES(?,'followup_parent_recovered',?,?)",params![id,json!({"completed_message_seq":seq}).to_string(),db::now()])?;
+    }
+    Ok(())
+}
+
 impl Db {
     pub fn edit_queued_message(&self, chat: &str, seq: i64, expected: &str, text: &str) -> Result<()> {
         ensure!(!text.trim().is_empty() && text.len() <= 64000, "Message must be 1..64000 bytes");
@@ -964,6 +978,26 @@ mod tests {
         app.db.cancel(&source).unwrap();let package=app.db.prepare_transfer(&db::id(),"Followup fixture").unwrap();let destination=tests::app();destination.db.import_transfer(&package).unwrap();assert_eq!(destination.db.run(&source).unwrap().prompt,"Edited unsent");
     }
 
+    #[test]
+    fn legacy_completed_parent_repair_keeps_only_unfinished_followup_recovery() {
+        for later_activity in [false,true] {
+            let app=tests::app();let bot=tests::bot(&app.db,"claude-code");
+            app.db.queue(&bot.id,"Original",0).unwrap();let run=app.db.claim_bot(&bot.id).unwrap().unwrap();
+            app.db.event(&run.id,"model_selected",json!({"provider":"claude-code"})).unwrap();
+            app.db.event(&run.id,"assistant",json!({"text":"Finished original."})).unwrap();
+            crate::progress_updates::finish_message(&app.db,&run.id,"Finished original.").unwrap();
+            let source=app.db.chat_send(&run.chat_id,"Unfinished followup",&[]).unwrap()[0].clone();app.db.request_steering(&source,&run.id).unwrap();
+            let offer=app.db.offer_followups(&run).unwrap().unwrap();app.db.dispatch_followup(&run,offer["id"].as_str().unwrap()).unwrap();
+            if later_activity {app.db.event(&run.id,"tool_requested",json!({"tool":"fixture"})).unwrap();}
+            app.db.finish(&run.id,"failed","","Follow-up handoff did not complete. Review source activity and explicitly continue the held message; automatic replay is disabled.").unwrap();app.db.deliver_pending_completions().unwrap();
+            for _ in 0..2 {repair_completed_followup_parents(&app.db.0.lock().unwrap()).unwrap();}
+            assert_eq!(app.db.run(&run.id).unwrap().status,if later_activity {"failed"}else{"completed"});
+            assert_eq!(app.db.run(&source).unwrap().status,"interrupted");
+            let rows=app.db.chat_messages(&run.chat_id).unwrap();
+            assert_eq!(rows.iter().filter(|m|m["status_notice"].is_object()).count(),if later_activity {2}else{1});
+            assert_eq!(app.db.events(&run.id).unwrap().iter().filter(|e|e["kind"]=="followup_parent_recovered").count(),usize::from(!later_activity));
+        }
+    }
     #[test]
     fn followup_restart_exposes_recovery_and_new_continuation_retains_identity() {
         let root=std::env::temp_dir().join(format!("followup-startup-{}",db::id()));let path=root.join("data.db").to_string_lossy().into_owned();let db=Db::open(&path).unwrap();let bot=tests::bot(&db,"codex");db.queue(&bot.id,"Original external action",0).unwrap();let run=db.claim_bot(&bot.id).unwrap().unwrap();let source=db.chat_send(&run.chat_id,"Only followup request",&[]).unwrap()[0].clone();db.request_steering(&source,&run.id).unwrap();let offer=db.offer_followups(&run).unwrap().unwrap();let id=offer["id"].as_str().unwrap().to_owned();db.dispatch_followup(&run,&id).unwrap();db.followup_transported(&run,&id).unwrap();drop(db);

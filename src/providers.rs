@@ -394,6 +394,7 @@ async fn codex_rpc(app: &App, bot: &Bot, run: &Run, rpc: &mut Rpc) -> Result<Str
                 crate::progress_updates::finish_message(&app.db,&run.id,&output)?;
                 ensure!(!app.account_disabled(),"This account is disabled");
                 if let Some(offer)=app.db.offer_followups(run)? {
+                    app.db.event(&run.id,"followup_parent_completed",json!({"offer_id":offer["id"],"output":output}))?;
                     app.db.dispatch_followup(run,runtime::string(&offer,"id")?)?;
                     let next=rpc.request("turn/start",json!({"threadId":thread_id,"effort":effort,"input":[{"type":"text","text":crate::conversation_updates::followup_prompt(&offer)?}]})).await?;
                     let turn=next.pointer("/turn/id").and_then(Value::as_str).context("Codex follow-up turn identity missing")?;

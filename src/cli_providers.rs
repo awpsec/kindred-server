@@ -405,7 +405,7 @@ async fn run_child(app:&App,bot:&Bot,run:&Run,mut child:tokio::process::Child)->
                 ensure!(!app.account_disabled(),"This account is disabled");
                 let offer=app.db.offer_followups(run)?;
                 let decision=if let Some(offer)=&offer {json!({"type":"turn_decision","id":format!("turn-{input_id}"),"offer_id":offer["id"],"prompt":crate::conversation_updates::followup_prompt(offer)?})} else {json!({"type":"turn_decision","id":format!("turn-{input_id}"),"finish":true})};
-                if let Some(offer)=&offer {app.db.dispatch_followup(run,runtime::string(offer,"id")?)?;}
+                if let Some(offer)=&offer {app.db.event(&run.id,"followup_parent_completed",json!({"offer_id":offer["id"],"output":final_reply}))?;app.db.dispatch_followup(run,runtime::string(offer,"id")?)?;}
                 crate::pi::send(&mut input,decision).await?;
                 if let Some(offer)=offer {let id=runtime::string(&offer,"id")?;app.db.followup_transported(run,id)?;followup_offer=Some(id.into());}
             }

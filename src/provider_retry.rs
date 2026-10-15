@@ -114,7 +114,20 @@ where
             }
             Err(error) => {
                 let uncertain:bool=app.db.0.lock().unwrap().query_row("SELECT EXISTS(SELECT 1 FROM followup_offers WHERE run_id=? AND state IN ('dispatching','transported','uncertain'))",[&run.id],|r|r.get(0))?;
-                if uncertain {return Err(error.context("Follow-up handoff did not complete. Review source activity and explicitly continue the held message; automatic replay is disabled."));}
+                if uncertain {
+                    // A later conversational turn failing cannot undo the last
+                    // completed turn. Its held source owns recovery, not a replay
+                    // of the already-finished parent request.
+                    let completed:Option<String>={
+                        use rusqlite::OptionalExtension;
+                        app.db.0.lock().unwrap().query_row("SELECT json_extract(e.body,'$.output') FROM events e JOIN followup_offers o ON o.id=json_extract(e.body,'$.offer_id') AND o.run_id=e.run_id WHERE e.run_id=? AND e.kind='followup_parent_completed' AND o.state IN ('dispatching','transported','uncertain') ORDER BY e.seq DESC LIMIT 1",[&run.id],|r|r.get(0)).optional()?
+                    };
+                    if let Some(output)=completed {
+                        app.db.event(&run.id,"followup_delivery_failed",json!({"reason":error.to_string()}))?;
+                        return Ok(output);
+                    }
+                    return Err(error.context("Follow-up handoff did not complete. Review source activity and explicitly continue the held message; automatic replay is disabled."));
+                }
                 if !transient(&error) || !can_resume(app, run)? || app.db.turn_deferred(&run.id)? {
                     return Err(error);
                 }
@@ -162,6 +175,25 @@ mod tests {
         let app=crate::tests::app();let bot=crate::tests::bot(&app.db,"codex");app.db.queue(&bot.id,"Root action",0).unwrap();let run=app.db.claim_bot(&bot.id).unwrap().unwrap();let source=app.db.chat_send(&run.chat_id,"Followup",&[]).unwrap()[0].clone();app.db.request_steering(&source,&run.id).unwrap();let offer=app.db.offer_followups(&run).unwrap().unwrap();app.db.dispatch_followup(&run,offer["id"].as_str().unwrap()).unwrap();let calls=AtomicUsize::new(0);
         let result=retry(&app,&run,||async {calls.fetch_add(1,Ordering::SeqCst);bail!("Subscription provider timed out")},&[Duration::ZERO;5]).await;
         assert!(result.unwrap_err().to_string().contains("automatic replay is disabled"));assert_eq!(calls.load(Ordering::SeqCst),1);assert_eq!(app.db.run(&source).unwrap().status,"interrupted");assert!(!app.db.events(&run.id).unwrap().iter().any(|e|e["kind"]=="provider_retry"));
+    }
+    #[tokio::test]
+    async fn completed_parent_survives_failed_followup_without_replaying_either_turn() {
+        let app=tests::app();let bot=tests::bot(&app.db,"claude-code");
+        app.db.queue(&bot.id,"Original action",0).unwrap();let run=app.db.claim_bot(&bot.id).unwrap().unwrap();
+        app.db.event(&run.id,"assistant",json!({"text":"Original action done."})).unwrap();
+        let source=app.db.chat_send(&run.chat_id,"Different followup",&[]).unwrap()[0].clone();app.db.request_steering(&source,&run.id).unwrap();
+        let offer=app.db.offer_followups(&run).unwrap().unwrap();
+        app.db.event(&run.id,"followup_parent_completed",json!({"offer_id":offer["id"],"output":"Original action done."})).unwrap();
+        app.db.dispatch_followup(&run,offer["id"].as_str().unwrap()).unwrap();
+        let calls=Cell::new(0);
+        let output=retry(&app,&run,||{calls.set(calls.get()+1);ready(Err(blip()))},&[Duration::ZERO;5]).await.unwrap();
+        assert_eq!(calls.get(),1);assert_eq!(output,"Original action done.");
+        app.db.finish(&run.id,"completed",&output,"").unwrap();app.db.deliver_pending_completions().unwrap();
+        assert_eq!(app.db.run(&run.id).unwrap().status,"completed");assert!(app.db.continue_task(&run.id).is_err());
+        assert_eq!(app.db.run(&source).unwrap().status,"interrupted");
+        let messages=app.db.chat_messages(&run.chat_id).unwrap();
+        assert_eq!(messages.iter().filter(|m|m["status_notice"].is_object()).count(),1);
+        let next=app.db.continue_task(&source).unwrap();assert_eq!(app.db.run(&next).unwrap().prompt,"Different followup");
     }
     #[tokio::test]
     async fn lost_computer_receipt_blocks_provider_replay_and_more_input_but_not_readback() {
