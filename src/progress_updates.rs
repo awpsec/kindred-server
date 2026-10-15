@@ -113,7 +113,7 @@ fn ensure_task_marker(c:&rusqlite::Connection,run:&str)->Result<()> {
 // message sequence boundaries may already be referenced by questions/continuations.
 pub fn repair_task_markers(c:&rusqlite::Connection)->Result<()> {
     let tx=c.unchecked_transaction()?;
-    let runs:Vec<String>=c.prepare("SELECT r.id FROM runs r WHERE r.progress_mode='summaries' AND EXISTS(SELECT 1 FROM events WHERE run_id=r.id AND kind='task_work') AND NOT EXISTS(SELECT 1 FROM message_progress WHERE run_id=r.id AND phase='commentary' AND mode='summaries')")?.query_map([],|r|r.get(0))?.collect::<rusqlite::Result<_>>()?;
+    let runs:Vec<String>=c.prepare("SELECT r.id FROM runs r WHERE r.progress_mode='summaries' AND EXISTS(SELECT 1 FROM events WHERE run_id=r.id AND kind='task_work')")?.query_map([],|r|r.get(0))?.collect::<rusqlite::Result<_>>()?;
     for run in runs {ensure_task_marker(c,&run)?;}
     tx.commit()?;
     Ok(())
@@ -231,6 +231,38 @@ mod tests {
                 let rows=app.db.chat_messages(&run.chat_id).unwrap();let anchors:Vec<_>=rows.iter().filter(|m|m["kind"]=="task_progress").collect();
                 assert_eq!(anchors.len(),if mode=="summaries"{2}else{0});
                 if anchors.len()==2 {assert_ne!(anchors[0]["progress"]["group_id"],anchors[1]["progress"]["group_id"]);}
+            }
+        }
+    }
+
+    #[test]
+    fn latest_silent_phase_repair_preserves_old_and_narrated_phases() {
+        for (new_work,narrated) in [(true,false),(false,false),(true,true),(false,true)] {
+            let app=tests::app();let bot=tests::bot(&app.db,"codex");
+            let id=app.db.queue(&bot.id,"Earlier phase then a followup",0).unwrap();let run=app.db.claim_bot(&bot.id).unwrap().unwrap();
+            // An earlier real-work phase has written progress and a final answer.
+            app.db.0.lock().unwrap().execute("INSERT INTO events(run_id,kind,body,created) VALUES(?,'task_work','{\"title\":\"Earlier task\"}',100)",[&id]).unwrap();
+            app.db.event(&id,"assistant",json!({"phase":"commentary","text":"Earlier written update"})).unwrap();
+            app.db.event(&id,"assistant",json!({"phase":"final_answer","text":"Earlier final answer"})).unwrap();
+            let old=app.db.chat_messages(&run.chat_id).unwrap();
+            // Simulate event-proven legacy work lacking its new phase marker.
+            if new_work {
+                app.db.0.lock().unwrap().execute("INSERT INTO events(run_id,kind,body,created) VALUES(?,'task_work','{\"title\":\"Latest task\"}',200)",[&id]).unwrap();
+            } else {
+                app.db.event(&id,"tool_started",json!({"tool":"remember"})).unwrap();
+            }
+            if narrated {app.db.event(&id,"assistant",json!({"phase":"commentary","text":"Current written update"})).unwrap();}
+            for _ in 0..2 {repair_task_markers(&app.db.0.lock().unwrap()).unwrap();}
+            let rows=app.db.chat_messages(&run.chat_id).unwrap();
+            let markers:Vec<_>=rows.iter().filter(|m|m["kind"]=="task_progress").collect();
+            assert_eq!(markers.len(),usize::from(new_work&&!narrated),"latest-phase work only; prior commentary must not exclude new silent work");
+            if let Some(marker)=markers.first() {
+                assert_eq!(marker["text"],"");assert_eq!(marker["progress"]["task_title"],"Latest task");
+                assert_ne!(marker["progress"]["group_id"],old.iter().find(|m|m["text"]=="Earlier written update").unwrap()["progress"]["group_id"]);
+            }
+            for previous in old {
+                let current=rows.iter().find(|m|m["seq"]==previous["seq"]).unwrap();
+                assert_eq!(current["text"],previous["text"]);assert_eq!(current["progress"],previous["progress"],"historical phase metadata must stay immutable");
             }
         }
     }
