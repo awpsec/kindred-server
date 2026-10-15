@@ -84,12 +84,48 @@ fn qualify_as(c:&rusqlite::Connection,run:&str,title:&str,replace:bool)->Result<
     if !active{return Ok(());}
     let previous=phase_title(c,run)?;
     let selected=if replace {title.to_owned()}else{previous.clone().unwrap_or_else(||title.to_owned())};
-    if previous.as_deref()==Some(selected.as_str()){return Ok(());}
+    let (boundary,event_boundary)=phase_boundary(c,run)?;
+    let recorded:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM events WHERE run_id=? AND kind='task_work' AND seq>?)",rusqlite::params![run,event_boundary],|r|r.get(0))?;
+    if previous.as_deref()==Some(selected.as_str()) && recorded {return ensure_task_marker(c,run);}
     c.execute("UPDATE runs SET task_title=? WHERE id=?",rusqlite::params![selected,run])?;
-    let (boundary,_)=phase_boundary(c,run)?;
     c.execute("INSERT INTO events(run_id,kind,body,created) VALUES(?,'task_work',?,?)",rusqlite::params![run,json!({"title":selected}).to_string(),crate::db::now()])?;
     c.execute("UPDATE message_progress SET work_qualified=1,task_title=? WHERE run_id=? AND message_seq>? AND work_qualified IS NOT NULL",rusqlite::params![selected,run,boundary])?;
+    ensure_task_marker(c,run)
+}
+
+// A task is real even when the provider does not narrate it. This is a timeline
+// anchor, not an assistant message: no invented prose, notification or model input.
+fn ensure_task_marker(c:&rusqlite::Connection,run:&str)->Result<()> {
+    use rusqlite::OptionalExtension;
+    let (boundary,event_boundary)=phase_boundary(c,run)?;
+    let hidden:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM routine_runs WHERE run_id=?1) OR EXISTS(SELECT 1 FROM routine_execution WHERE run_id=?1) OR EXISTS(SELECT 1 FROM events WHERE run_id=?1 AND kind='tool_result' AND json_extract(body,'$.tool')='finish_quietly' AND COALESCE(json_extract(body,'$.failed'),0)=0)",[run],|r|r.get(0))?;
+    if hidden || emission_mode(c,run)?!="summaries" {return Ok(());}
+    let existing:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM message_progress WHERE run_id=? AND message_seq>? AND mode='summaries' AND phase='commentary')",rusqlite::params![run,boundary],|r|r.get(0))?;
+    if existing {return Ok(());}
+    let source:Option<(i64,i64)>=c.query_row("SELECT seq,created FROM events WHERE run_id=? AND kind='task_work' AND seq>? ORDER BY seq LIMIT 1",rusqlite::params![run,event_boundary],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+    let Some((source,created))=source else{return Ok(());};
+    let changed=c.execute("INSERT INTO chat_messages(chat_id,sender,body,kind,run_id,created,source_event_seq,history_order) SELECT r.chat_id,r.bot_id,'','task_progress',r.id,?2,?3,(SELECT printf('%020d:%020d',MIN(m.seq)-1,?3) FROM chat_messages m WHERE m.run_id=r.id AND m.created=?2 AND (m.source_event_seq>?3 OR m.kind='result') HAVING MIN(m.seq) IS NOT NULL) FROM runs r JOIN chats chat ON chat.id=r.chat_id WHERE r.id=?1 AND NOT EXISTS(SELECT 1 FROM chat_messages WHERE source_event_seq=?3)",rusqlite::params![run,created,source])?;
+    if changed>0 {record_message(c,c.last_insert_rowid(),run,"commentary")?;}
     Ok(())
+}
+
+// Repair only the latest event-proven phase. Older phases are immutable: their
+// message sequence boundaries may already be referenced by questions/continuations.
+pub fn repair_task_markers(c:&rusqlite::Connection)->Result<()> {
+    let tx=c.unchecked_transaction()?;
+    let runs:Vec<String>=c.prepare("SELECT r.id FROM runs r WHERE r.progress_mode='summaries' AND EXISTS(SELECT 1 FROM events WHERE run_id=r.id AND kind='task_work') AND NOT EXISTS(SELECT 1 FROM message_progress WHERE run_id=r.id AND phase='commentary' AND mode='summaries')")?.query_map([],|r|r.get(0))?.collect::<rusqlite::Result<_>>()?;
+    for run in runs {ensure_task_marker(c,&run)?;}
+    tx.commit()?;
+    Ok(())
+}
+
+fn emission_mode(c:&rusqlite::Connection,run:&str)->Result<String> {
+    use rusqlite::OptionalExtension;
+    let profile:String=c.query_row("SELECT b.profile FROM bots b JOIN runs r ON r.bot_id=b.id WHERE r.id=?",[run],|r|r.get(0))?;
+    let profile:Value=serde_json::from_str(&profile)?;
+    let general:Option<String>=c.query_row("SELECT value FROM settings WHERE key='general'",[],|r|r.get(0)).optional()?;
+    let general:Value=serde_json::from_str(general.as_deref().unwrap_or("{}"))?;
+    Ok(profile["progress_updates"].as_str().filter(|v|valid(v)).or_else(||general["progress_updates"].as_str().filter(|v|valid(v))).unwrap_or("summaries").into())
 }
 pub fn observe_tool(c:&rusqlite::Connection,run:&str,tool:&str)->Result<()> {
     if let Some(title)=work_title(tool){qualify(c,run,title)?;}Ok(())
@@ -99,11 +135,7 @@ pub fn record_message(c:&rusqlite::Connection,seq:i64,run:&str,phase:&str)->Resu
     use rusqlite::OptionalExtension;
     // Resolve the preference when this message is emitted. Existing rows are
     // immutable, so switching a running task never reformats its history.
-    let profile:String=c.query_row("SELECT b.profile FROM bots b JOIN runs r ON r.bot_id=b.id WHERE r.id=?",[run],|r|r.get(0))?;
-    let profile:Value=serde_json::from_str(&profile)?;
-    let general:Option<String>=c.query_row("SELECT value FROM settings WHERE key='general'",[],|r|r.get(0)).optional()?;
-    let general:Value=serde_json::from_str(general.as_deref().unwrap_or("{}"))?;
-    let mode=profile["progress_updates"].as_str().filter(|v|valid(v)).or_else(||general["progress_updates"].as_str().filter(|v|valid(v))).unwrap_or("summaries");
+    let mode=emission_mode(c,run)?;
     let previous:Option<(String,String,String)>=c.query_row("SELECT mode,phase,group_id FROM message_progress WHERE run_id=? ORDER BY message_seq DESC LIMIT 1",[run],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
     // A question answer is a persisted continuation, not a new unrelated task.
     // Bind bot and chat again at emission; never merge cross-chat delivery.
@@ -154,6 +186,83 @@ pub fn message(c:&rusqlite::Connection,seq:i64)->Result<Value> {
 mod tests {
     use super::*;
     use crate::{conversation_updates, tests};
+
+    #[test]
+    fn silent_work_has_one_durable_anchor_without_becoming_a_message() {
+        let app=tests::app();let bot=tests::bot(&app.db,"codex");
+        let id=app.db.queue(&bot.id,"Review the workspace",0).unwrap();let run=app.db.claim_bot(&bot.id).unwrap().unwrap();
+        let attention=app.db.attention().unwrap();let last=app.db.chat(&run.chat_id).unwrap().last_message;
+        for _ in 0..28 {app.db.event(&id,"tool_started",json!({"tool":"guest_exec","args":{}})).unwrap();}
+        set_task_title(&app.db,&run,"Review workspace scope").unwrap();
+        let rows=app.db.chat_messages(&run.chat_id).unwrap();
+        let markers:Vec<_>=rows.iter().filter(|m|m["kind"]=="task_progress").collect();assert_eq!(markers.len(),1);
+        let marker=markers[0];assert_eq!(marker["text"],"");assert_eq!(marker["progress"]["work_qualified"],true);assert_eq!(marker["progress"]["task_title"],"Review workspace scope");
+        assert_eq!(app.db.attention().unwrap()["chats"],attention["chats"]);assert_eq!(app.db.chat(&run.chat_id).unwrap().last_message,last);
+        assert!(!crate::instructions::build(&app,&bot,&run,&[],Some(262144)).unwrap().contains("task_progress"));
+        assert!(!app.db.bot_chat_read(&bot.id,&run.chat_id,0,30).unwrap()["messages"].as_array().unwrap().iter().any(|m|m["kind"]=="task_progress"));
+        let connector=crate::connector_artifacts::create(&app.db,&run,&json!({"toolkit":"googledrive","tool_slug":"read_record","input":{}})).unwrap();
+        let receipt=crate::connector_artifacts::record(&app.db.0.lock().unwrap(),&connector).unwrap();
+        assert_eq!(receipt["progress_message_seq"],marker["seq"]);
+        app.db.event(&id,"assistant",json!({"phase":"commentary","text":"Found the scope documents."})).unwrap();
+        let rows=app.db.chat_messages(&run.chat_id).unwrap();let update=rows.iter().find(|m|m["text"]=="Found the scope documents.").unwrap();
+        assert_eq!(marker["progress"]["group_id"],update["progress"]["group_id"]);
+        app.db.event(&id,"assistant",json!({"phase":"final_answer","text":"Review complete."})).unwrap();app.db.finish(&id,"completed","Review complete.","").unwrap();
+        let rows=app.db.chat_messages(&run.chat_id).unwrap();assert_eq!(rows.iter().filter(|m|m["kind"]=="task_progress").count(),1);
+        assert_eq!(rows.iter().find(|m|m["text"]=="Review complete.").unwrap()["progress"]["phase"],"final_answer");
+    }
+
+    #[test]
+    fn silent_anchor_respects_final_fences_preferences_and_routines() {
+        for mode in ["summaries","calm"] {
+            for routine in [false,true] {
+                let app=tests::app();let bot=tests::bot(&app.db,"codex");app.db.save_setting("general",&json!({"progress_updates":mode})).unwrap();
+                let id=app.db.queue(&bot.id,"Task",0).unwrap();let run=app.db.claim_bot(&bot.id).unwrap().unwrap();
+                if routine {app.db.0.lock().unwrap().execute("INSERT INTO routine_runs VALUES(?,'fixture',0)",[&id]).unwrap();}
+                app.db.event(&id,"tool_started",json!({"tool":"remember"})).unwrap();assert!(!app.db.chat_messages(&run.chat_id).unwrap().iter().any(|m|m["kind"]=="task_progress"));
+                set_task_title(&app.db,&run,"Inspect documents").unwrap();
+                let first=app.db.chat_messages(&run.chat_id).unwrap();assert_eq!(first.iter().filter(|m|m["kind"]=="task_progress").count(),usize::from(mode=="summaries"&&!routine));
+                if routine {continue;}
+                app.db.event(&id,"assistant",json!({"phase":"final_answer","text":"Done"})).unwrap();
+                app.db.event(&id,"assistant",json!({"phase":"commentary","text":"An ordinary conversation"})).unwrap();
+                repair_task_markers(&app.db.0.lock().unwrap()).unwrap();
+                let rows=app.db.chat_messages(&run.chat_id).unwrap();assert_eq!(rows.iter().find(|m|m["text"]=="An ordinary conversation").unwrap()["progress"]["work_qualified"],false);
+                app.db.event(&id,"assistant",json!({"phase":"final_answer","text":"You are welcome"})).unwrap();
+                app.db.event(&id,"tool_started",json!({"tool":"local_read"})).unwrap();
+                let rows=app.db.chat_messages(&run.chat_id).unwrap();let anchors:Vec<_>=rows.iter().filter(|m|m["kind"]=="task_progress").collect();
+                assert_eq!(anchors.len(),if mode=="summaries"{2}else{0});
+                if anchors.len()==2 {assert_ne!(anchors[0]["progress"]["group_id"],anchors[1]["progress"]["group_id"]);}
+            }
+        }
+    }
+
+    #[test]
+    fn silent_existing_task_backfill_is_event_based_ordered_and_idempotent() {
+        let app=tests::app();let bot=tests::bot(&app.db,"codex");let id=app.db.queue(&bot.id,"Existing quiet task",0).unwrap();let run=app.db.claim_bot(&bot.id).unwrap().unwrap();
+        let c=app.db.0.lock().unwrap();
+        c.execute("INSERT INTO events(run_id,kind,body,created) VALUES(?,'task_work','{\"title\":\"Existing document review\"}',100)",[&id]).unwrap();
+        c.execute("UPDATE runs SET task_title='Existing document review',status='completed',output='Done' WHERE id=?",[&id]).unwrap();
+        c.execute("INSERT INTO chat_messages(chat_id,sender,body,kind,run_id,created) VALUES(?,?,'Done','result',?,100)",rusqlite::params![run.chat_id,bot.id,id]).unwrap();
+        repair_task_markers(&c).unwrap();repair_task_markers(&c).unwrap();drop(c);
+        let rows=app.db.chat_messages(&run.chat_id).unwrap();let marker=rows.iter().position(|m|m["kind"]=="task_progress").unwrap();let result=rows.iter().position(|m|m["text"]=="Done").unwrap();
+        assert!(marker<result);assert_eq!(rows[marker]["created"],100);assert_eq!(rows.iter().filter(|m|m["kind"]=="task_progress").count(),1);
+    }
+
+    #[tokio::test]
+    async fn silent_question_continuation_keeps_group_and_can_finish_quietly() {
+        let app=tests::app();let bot=tests::bot(&app.db,"codex");let id=app.db.queue(&bot.id,"Prepare a report",0).unwrap();let run=app.db.claim_bot(&bot.id).unwrap().unwrap();
+        set_task_title(&app.db,&run,"Prepare report").unwrap();
+        let marker=app.db.chat_messages(&run.chat_id).unwrap().into_iter().find(|m|m["kind"]=="task_progress").unwrap();
+        app.db.ask_question(&run,crate::questions::QuestionInput{topic_key:"report".into(),question:"Publish report?".into(),context:"The report is ready.".into(),options:vec!["Publish".into(),"Keep draft".into()]}).unwrap();
+        let q=app.db.pending_questions().unwrap().remove(0);assert_eq!(q.task_group_id,marker["progress"]["group_id"].as_str().unwrap());
+        app.db.finish(&id,"completed","","").unwrap();app.db.answer_question(&q.id,crate::questions::Answer{selected:Some(1),custom:None}).unwrap();let follow=app.db.claim_bot(&bot.id).unwrap().unwrap();
+        app.db.event(&follow.id,"tool_started",json!({"tool":"artifact_read"})).unwrap();
+        let marker2=app.db.chat_messages(&run.chat_id).unwrap().into_iter().find(|m|m["kind"]=="task_progress"&&m["run_id"]==follow.id).unwrap();
+        assert_eq!(marker["progress"]["group_id"],marker2["progress"]["group_id"]);
+        let quiet=crate::runtime::call_tool(&app,&bot,&follow,"finish_quietly",json!({})).await.unwrap();assert_eq!(quiet["finish_quietly"],true);
+        assert!(!app.db.chat_messages(&run.chat_id).unwrap().iter().any(|m|m["kind"]=="task_progress"&&m["run_id"]==follow.id));
+        repair_task_markers(&app.db.0.lock().unwrap()).unwrap();
+        assert!(!app.db.chat_messages(&run.chat_id).unwrap().iter().any(|m|m["kind"]=="task_progress"&&m["run_id"]==follow.id));
+    }
 
     #[test]
     fn classification_qualification_metadata_is_not_repeated_and_untagged_finals_fence_next_phase() {

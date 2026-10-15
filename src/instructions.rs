@@ -236,6 +236,7 @@ pub fn build(
             members = app.db.server_chat_participants(&run.chat_id)?;
         }
         let mut messages = app.db.chat_messages(&run.chat_id)?;
+        messages.retain(|message|message["kind"]!="task_progress");
         let candidates:Vec<i64>=messages.iter().filter_map(|m|m["seq"].as_i64()).collect();
         let hidden=crate::continuity::store::hidden_sources(&app.db,&run.chat_id,&candidates)?;
         messages.retain(|m|!m["seq"].as_i64().is_some_and(|seq|hidden.contains(&seq)));

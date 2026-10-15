@@ -31,6 +31,29 @@ fn packet(text: &str) -> Value {
 }
 
 #[test]
+fn task_timeline_markers_are_not_recall_sources_or_conversational_antecedents() {
+    let app=app();let b=bot(&app.db,"codex");
+    let mut first=None;
+    for index in 0..3 {
+        app.db.queue(&b.id,"Inspect workspace",0).unwrap();let run=app.db.claim_bot(&b.id).unwrap().unwrap();
+        if index==0 {message(&app.db,&run,"Juniper dossier deadline Thursday");first=Some(run.clone());}
+        crate::progress_updates::set_task_title(&app.db,&run,"Inspect workspace").unwrap();
+        app.db.finish(&run.id,"completed","","").unwrap();
+    }
+    let first=first.unwrap();
+    let exact=continuity::search_for(&app.db,&first,None,&first.id).unwrap();
+    assert_eq!(exact["items"].as_array().unwrap().len(),1);
+    assert_eq!(exact["items"][0]["excerpt"],"Juniper dossier deadline Thursday");
+    let marker=app.db.chat_messages(&first.chat_id).unwrap().into_iter().find(|m|m["kind"]=="task_progress").unwrap();
+    assert!(continuity::search_for(&app.db,&first,None,&format!("message:{}",marker["seq"])).unwrap()["items"].as_array().unwrap().is_empty());
+    let mut indirect=first.clone();indirect.id="new-request".into();indirect.prompt="What did we decide about that?".into();
+    let recalled=continuity::context(&app.db,&indirect).unwrap();
+    let rows=recalled["relevant_history"]["items"].as_array().unwrap();
+    assert!(rows.iter().any(|m|m["excerpt"]=="Juniper dossier deadline Thursday"&&m["selection_reason"]=="recent_conversation_antecedent"));
+    assert!(!rows.iter().any(|m|m["kind"]=="task_progress"));
+}
+
+#[test]
 fn saved_knowledge_is_retrieved_across_allowed_rooms_and_keeps_provenance() {
     let db = Db::open(":memory:").unwrap();
     let (b, dm) = setup(&db);

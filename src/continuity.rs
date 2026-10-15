@@ -90,10 +90,10 @@ pub fn search_for(db: &Db, run: &Run, chat: Option<&str>, query: &str) -> Result
         .unwrap_or(query.trim())
         .parse::<i64>()
         .ok();
-    let mut exact_ids=c.prepare("SELECT m.seq FROM continuity_current_messages m WHERE m.chat_id IN(SELECT value FROM json_each(?1)) AND (m.seq=?2 OR m.run_id=?3) AND m.suppressed=0 AND NOT EXISTS(SELECT 1 FROM continuity_source_state s WHERE s.message_seq=m.seq AND s.status<>'active') ORDER BY m.seq DESC LIMIT 8")?.query_map(params![allowed,exact,query.trim()],|r|r.get::<_,i64>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut exact_ids=c.prepare("SELECT m.seq FROM continuity_current_messages m WHERE m.chat_id IN(SELECT value FROM json_each(?1)) AND (m.seq=?2 OR m.run_id=?3) AND m.suppressed=0 AND m.kind!='task_progress' AND NOT EXISTS(SELECT 1 FROM continuity_source_state s WHERE s.message_seq=m.seq AND s.status<>'active') ORDER BY m.seq DESC LIMIT 8")?.query_map(params![allowed,exact,query.trim()],|r|r.get::<_,i64>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
     ids.append(&mut exact_ids);
     if !words.is_empty() {
-        let found=c.prepare("SELECT m.seq FROM continuity_search JOIN continuity_current_messages m ON m.seq=continuity_search.rowid WHERE continuity_search MATCH ?1 AND m.chat_id IN(SELECT value FROM json_each(?2)) AND m.suppressed=0 AND NOT EXISTS(SELECT 1 FROM continuity_source_state s WHERE s.message_seq=m.seq AND s.status<>'active') ORDER BY rank,m.seq DESC LIMIT 8")?.query_map(params![words,allowed],|r|r.get::<_,i64>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let found=c.prepare("SELECT m.seq FROM continuity_search JOIN continuity_current_messages m ON m.seq=continuity_search.rowid WHERE continuity_search MATCH ?1 AND m.chat_id IN(SELECT value FROM json_each(?2)) AND m.suppressed=0 AND m.kind!='task_progress' AND NOT EXISTS(SELECT 1 FROM continuity_source_state s WHERE s.message_seq=m.seq AND s.status<>'active') ORDER BY rank,m.seq DESC LIMIT 8")?.query_map(params![words,allowed],|r|r.get::<_,i64>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
         for id in found {
             if !ids.contains(&id) {
                 ids.push(id);
@@ -111,7 +111,7 @@ pub fn search_for(db: &Db, run: &Run, chat: Option<&str>, query: &str) -> Result
                 .split(" OR ")
                 .map(|s| s.trim_matches('"').to_string())
                 .collect();
-            let found=c.prepare("SELECT m.seq FROM continuity_current_messages m WHERE m.chat_id IN(SELECT value FROM json_each(?1)) AND m.suppressed=0 AND NOT EXISTS(SELECT 1 FROM continuity_source_state s WHERE s.message_seq=m.seq AND s.status<>'active') AND EXISTS(SELECT 1 FROM json_each(?2) WHERE instr(lower(m.body),value)>0) ORDER BY m.seq DESC LIMIT 8")?.query_map(params![allowed,json!(terms).to_string()],|r|r.get::<_,i64>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            let found=c.prepare("SELECT m.seq FROM continuity_current_messages m WHERE m.chat_id IN(SELECT value FROM json_each(?1)) AND m.suppressed=0 AND m.kind!='task_progress' AND NOT EXISTS(SELECT 1 FROM continuity_source_state s WHERE s.message_seq=m.seq AND s.status<>'active') AND EXISTS(SELECT 1 FROM json_each(?2) WHERE instr(lower(m.body),value)>0) ORDER BY m.seq DESC LIMIT 8")?.query_map(params![allowed,json!(terms).to_string()],|r|r.get::<_,i64>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
             for id in found {
                 if !ids.contains(&id) {
                     ids.push(id);
@@ -149,7 +149,7 @@ fn automatic_search(db: &Db, run: &Run) -> Result<Value> {
     if indirect || result["items"].as_array().unwrap().is_empty() {
         let anchors = {
             let c = db.0.lock().unwrap();
-            c.prepare("SELECT body FROM continuity_current_messages m WHERE chat_id=? AND suppressed=0 AND run_id<>? AND NOT EXISTS(SELECT 1 FROM continuity_source_state s WHERE s.message_seq=m.seq AND s.status<>'active') ORDER BY seq DESC LIMIT 3")?.query_map(params![run.chat_id,run.id],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?
+            c.prepare("SELECT body FROM continuity_current_messages m WHERE chat_id=? AND suppressed=0 AND m.kind!='task_progress' AND run_id<>? AND NOT EXISTS(SELECT 1 FROM continuity_source_state s WHERE s.message_seq=m.seq AND s.status<>'active') ORDER BY seq DESC LIMIT 3")?.query_map(params![run.chat_id,run.id],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?
         };
         for anchor in anchors {
             let expanded = search_for(db, run, None, crate::runtime::bounded(&anchor, 4000))?;

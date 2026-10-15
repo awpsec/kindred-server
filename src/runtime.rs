@@ -861,6 +861,7 @@ async fn call_tool_inner(
                 routine || decision || shared,
                 "Only a routine, shared conversation or assigned question continuation can finish quietly"
             );
+            c.execute("UPDATE chat_messages SET suppressed=1 WHERE run_id=? AND kind='task_progress'",[&run.id])?;
             c.commit()?;
             json!({"finish_quietly":true,"text":"Finished quietly. No additional reply or completion notification is needed."})
         }

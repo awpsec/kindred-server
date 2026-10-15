@@ -298,6 +298,7 @@ impl Db {
         )?;
         c.execute_batch("INSERT INTO chat_messages(chat_id,sender,body,kind,run_id,created) SELECT chat_id,bot_id,CASE WHEN error='' THEN output ELSE error END,'result',id,max(created,COALESCE((SELECT max(m.created) FROM chat_messages m WHERE m.run_id=runs.id),created)) FROM runs WHERE chat_id!='' AND status IN ('completed','failed','interrupted','cancelled') AND NOT EXISTS(SELECT 1 FROM routine_execution WHERE run_id=runs.id) AND NOT EXISTS(SELECT 1 FROM chat_messages WHERE run_id=runs.id AND kind='result') AND NOT (status='completed' AND error='' AND (trim(output)='' OR EXISTS(SELECT 1 FROM routine_runs WHERE run_id=runs.id AND quiet=1) OR EXISTS(SELECT 1 FROM events WHERE run_id=runs.id AND kind IN ('question_wait','process_wait'))));")?;
         crate::chats::repair_projection(&c)?;
+        crate::progress_updates::repair_task_markers(&c)?;
         crate::routine_controls::remove_archived_bot_schedules(&c)?;
         crate::chats::archive_inactive_bot_chats(&c)?;
         let db = Self(Mutex::new(c), lock);
