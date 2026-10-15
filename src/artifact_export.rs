@@ -14,6 +14,11 @@ fn xml(s: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
 }
+// Explicit Word styles keep Office renderers from substituting unspaced
+// Times New Roman paragraphs for native Kindred documents.
+fn table_properties() -> &'static str {
+    r#"<w:tblPr><w:tblW w:w="5000" w:type="pct"/><w:tblBorders><w:top w:val="single" w:sz="4" w:color="D1D5DB"/><w:left w:val="single" w:sz="4" w:color="D1D5DB"/><w:bottom w:val="single" w:sz="4" w:color="D1D5DB"/><w:right w:val="single" w:sz="4" w:color="D1D5DB"/><w:insideH w:val="single" w:sz="4" w:color="D1D5DB"/><w:insideV w:val="single" w:sz="4" w:color="D1D5DB"/></w:tblBorders><w:tblCellMar><w:top w:w="100" w:type="dxa"/><w:left w:w="120" w:type="dxa"/><w:bottom w:w="100" w:type="dxa"/><w:right w:w="120" w:type="dxa"/></w:tblCellMar></w:tblPr>"#
+}
 fn docx(source: &str) -> Result<Vec<u8>> {
     use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
     let mut body = String::new();
@@ -22,6 +27,9 @@ fn docx(source: &str) -> Result<Vec<u8>> {
     let mut italic = false;
     let mut cell = false;
     let mut head = false;
+    let mut head_start = 0;
+    let mut head_has_text = false;
+    let mut empty_head = None;
     let mut strike = false;
     let mut lists: Vec<Option<u64>> = Vec::new();
     let mut links: Vec<String> = Vec::new();
@@ -57,22 +65,31 @@ fn docx(source: &str) -> Result<Vec<u8>> {
             Event::End(TagEnd::Emphasis) => italic = false,
             Event::Start(Tag::Table(_)) => {
                 close(&mut body, &mut paragraph);
-                body.push_str("<w:tbl><w:tblPr><w:tblW w:w=\"0\" w:type=\"auto\"/><w:tblBorders><w:top w:val=\"single\" w:sz=\"4\"/><w:left w:val=\"single\" w:sz=\"4\"/><w:bottom w:val=\"single\" w:sz=\"4\"/><w:right w:val=\"single\" w:sz=\"4\"/><w:insideH w:val=\"single\" w:sz=\"4\"/><w:insideV w:val=\"single\" w:sz=\"4\"/></w:tblBorders></w:tblPr>");
+                body.push_str("<w:tbl>");
+                body.push_str(table_properties());
             }
-            Event::End(TagEnd::Table) => body.push_str("</w:tbl>"),
+            Event::End(TagEnd::Table) => { empty_head = None; body.push_str("</w:tbl>"); },
             Event::Start(Tag::TableHead) => {
                 head = true;
-                body.push_str("<w:tr>");
+                head_has_text = false;
+                head_start = body.len();
+                body.push_str("<w:tr><w:trPr><w:tblHeader/><w:cantSplit/></w:trPr>");
             }
             Event::End(TagEnd::TableHead) => {
                 head = false;
                 body.push_str("</w:tr>");
+                if !head_has_text { empty_head = Some(head_start); }
             }
-            Event::Start(Tag::TableRow) => body.push_str("<w:tr>"),
+            Event::Start(Tag::TableRow) => {
+                // An otherwise empty table still needs its only row to remain valid.
+                if let Some(start) = empty_head.take() { body.truncate(start); }
+                body.push_str("<w:tr>");
+            },
             Event::End(TagEnd::TableRow) => body.push_str("</w:tr>"),
             Event::Start(Tag::TableCell) => {
                 cell = true;
-                body.push_str("<w:tc><w:p>");
+                body.push_str(if head { r#"<w:tc><w:tcPr><w:shd w:fill="F3F4F6"/></w:tcPr>"# } else { "<w:tc>" });
+                body.push_str(r#"<w:p><w:pPr><w:pStyle w:val="TableText"/></w:pPr>"#);
                 paragraph = true;
             }
             Event::End(TagEnd::TableCell) => {
@@ -117,6 +134,7 @@ fn docx(source: &str) -> Result<Vec<u8>> {
             }
             Event::End(TagEnd::Item) => close(&mut body, &mut paragraph),
             Event::Text(text) | Event::Code(text) => {
+                if head && !text.trim().is_empty() { head_has_text = true; }
                 if !paragraph {
                     body.push_str("<w:p>");
                     paragraph = true;
@@ -153,16 +171,17 @@ fn word_package_options(body: &str, page:Option<&Value>, links:&[String]) -> Res
     let (mut width,mut height)=if page.is_some_and(|p|p["size"]=="a4"){(11906,16838)}else{(12240,15840)};
     let landscape=page.is_some_and(|p|p["orientation"]=="landscape");if landscape{std::mem::swap(&mut width,&mut height);}
     let orientation=if landscape{" w:orient=\"landscape\""}else{""};
-    let margin=if page.is_some_and(|p|p["margins"]=="normal"){1440}else{720};
+    let margin=if page.is_some_and(|p|p["margins"]=="narrow"){720}else{1440};
 
     let document = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?><w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"><w:body>{body}<w:sectPr><w:pgSz w:w=\"{width}\" w:h=\"{height}\"{orientation}/><w:pgMar w:top=\"{margin}\" w:right=\"{margin}\" w:bottom=\"{margin}\" w:left=\"{margin}\"/></w:sectPr></w:body></w:document>"
     );
     let mut styles = String::from(
-        r#"<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:docDefaults><w:rPrDefault><w:rPr><w:rFonts w:ascii="Inter" w:hAnsi="Inter"/><w:sz w:val="22"/></w:rPr></w:rPrDefault></w:docDefaults>"#,
+        r#"<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:docDefaults><w:rPrDefault><w:rPr><w:rFonts w:ascii="Arial" w:hAnsi="Arial" w:cs="Arial"/><w:sz w:val="22"/><w:szCs w:val="22"/></w:rPr></w:rPrDefault><w:pPrDefault><w:pPr><w:spacing w:after="160" w:line="276" w:lineRule="auto"/></w:pPr></w:pPrDefault></w:docDefaults><w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/><w:qFormat/><w:pPr><w:spacing w:after="160" w:line="276" w:lineRule="auto"/><w:widowControl/></w:pPr><w:rPr><w:rFonts w:ascii="Arial" w:hAnsi="Arial" w:cs="Arial"/><w:sz w:val="22"/><w:szCs w:val="22"/></w:rPr></w:style><w:style w:type="paragraph" w:styleId="TableText"><w:name w:val="Table Text"/><w:basedOn w:val="Normal"/><w:pPr><w:spacing w:before="0" w:after="0" w:line="252" w:lineRule="auto"/></w:pPr><w:rPr><w:sz w:val="20"/><w:szCs w:val="20"/></w:rPr></w:style>"#,
     );
-    for i in 1..=6 {
-        styles.push_str(&format!("<w:style w:type=\"paragraph\" w:styleId=\"Heading{i}\"><w:name w:val=\"heading {i}\"/><w:pPr><w:spacing w:before=\"240\" w:after=\"120\"/></w:pPr><w:rPr><w:b/><w:sz w:val=\"{}\"/></w:rPr></w:style>",36-i*2));
+    for (i, size) in [40, 32, 28, 24, 22, 22].iter().enumerate() {
+        let level = i + 1;
+        styles.push_str(&format!(r#"<w:style w:type="paragraph" w:styleId="Heading{level}"><w:name w:val="heading {level}"/><w:basedOn w:val="Normal"/><w:next w:val="Normal"/><w:qFormat/><w:pPr><w:keepNext/><w:keepLines/><w:spacing w:before="280" w:after="140"/><w:outlineLvl w:val="{i}"/></w:pPr><w:rPr><w:b/><w:sz w:val="{size}"/><w:szCs w:val="{size}"/></w:rPr></w:style>"#));
     }
     styles.push_str("</w:styles>");
     let mut relationships=r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="styles" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>"#.to_owned();
@@ -216,7 +235,7 @@ fn rich_blocks(v: &Value, depth: usize, links:&mut Vec<String>) -> Result<String
             if let Some(align)=v["attrs"]["textAlign"].as_str().filter(|s|["left","center","right","justify"].contains(s)){props.push_str(&format!("<w:jc w:val=\"{}\"/>",if align=="justify"{"both"}else{align}));}
             body=format!("<w:p><w:pPr>{props}</w:pPr>{}</w:p>",rich_runs(v,links,depth+1)?);
         },
-        "table"=>{body.push_str("<w:tbl><w:tblPr><w:tblBorders><w:top w:val=\"single\" w:sz=\"4\"/><w:left w:val=\"single\" w:sz=\"4\"/><w:bottom w:val=\"single\" w:sz=\"4\"/><w:right w:val=\"single\" w:sz=\"4\"/><w:insideH w:val=\"single\" w:sz=\"4\"/><w:insideV w:val=\"single\" w:sz=\"4\"/></w:tblBorders></w:tblPr>");for c in children{body.push_str(&rich_blocks(c,depth+1,links)?);}body.push_str("</w:tbl>");},
+        "table"=>{body.push_str("<w:tbl>");body.push_str(table_properties());for c in children{body.push_str(&rich_blocks(c,depth+1,links)?);}body.push_str("</w:tbl>");},
         "tableRow"=>{body.push_str("<w:tr>");for c in children{body.push_str(&rich_blocks(c,depth+1,links)?);}body.push_str("</w:tr>");},
         "tableCell"|"tableHeader"=>{body.push_str("<w:tc>");for c in children{body.push_str(&rich_blocks(c,depth+1,links)?);}if children.is_empty()||children.last().is_some_and(|c|c["type"]=="table"){body.push_str("<w:p/>");}body.push_str("</w:tc>");},
         "bulletList"|"orderedList"=>{let start=v["attrs"]["start"].as_u64().unwrap_or(1);for (i,c) in children.iter().enumerate(){let mut item=rich_blocks(c,depth+1,links)?;let prefix=if v["type"]=="orderedList"{format!("{}. ",start+i as u64)}else{"• ".into()};let run=format!("<w:r><w:t xml:space=\"preserve\">{prefix}</w:t></w:r>");if let Some(at)=item.find("</w:pPr>"){item.insert_str(at+"</w:pPr>".len(),&run);}body.push_str(&item);}},
@@ -361,6 +380,20 @@ mod office_export_tests {
   let html="<p>Review the report</p>";let v=json!({"title":"Report","language":"html","kind":"document","revision":3,"source":format!("<!--kindred-document-v1--><style></style><main>{html}</main>"),"state":{"kindredDocument":{"html":html,"page":{"size":"a4","orientation":"landscape","margins":"normal"},"document":{"type":"doc","content":[{"type":"heading","attrs":{"level":1},"content":[{"type":"text","text":"Review the report","marks":[{"type":"bold"},{"type":"link","attrs":{"href":"https://example.com/report?a=1&b=2"}}]}]}]}}}});
   let out=export(&v).unwrap();let b=bytes(&out);let doc=part(&b,"word/document.xml");let rels=part(&b,"word/_rels/document.xml.rels");
   for expected in ["w:w=\"16838\" w:h=\"11906\"","w:orient=\"landscape\"","w:top=\"1440\"","<w:hyperlink r:id=\"link0\"","Review the report"]{assert!(doc.contains(expected),"{expected}: {doc}");}assert!(rels.contains("https://example.com/report?a=1&amp;b=2"));save("Report.docx",&b);
+ }
+ #[test]
+ fn native_document_exports_readable_styles_without_empty_markdown_header_rows(){
+  let source="# Example Security\n\n## Web Application Assessment Report\n\n### Example Client — Case Management System\n\n| | |\n| --- | --- |\n| Client | Example Client |\n| Assessment type | Web Application Assessment |\n| Application | Case management portal |\n| Environment | Production |\n| Version | 0.1 — internal draft |\n\n## Revision History\n\n| Version | Date | Author | Description |\n| --- | --- | --- | --- |\n| 0.1 | 10/15/26 | Example Security | Initial draft for internal review |\n\n## Introduction\n\nThe assessment reviewed the application and documented the observed results. Each finding includes evidence, impact and recommended remediation. The report separates confirmed results from work that remains incomplete.\n\nThe team verified the affected workflows and recorded the scope of each issue. Remediation should be checked against the original evidence before the finding is closed.\n\n## Goals\n\n1. Review the application within the agreed scope.\n2. Record verified findings and recommendations.";
+  let v=json!({"title":"Native document","language":"markdown","kind":"document","revision":8,"source":source});let before=v.clone();
+  let out=export(&v).unwrap();let b=bytes(&out);let doc=part(&b,"word/document.xml");let styles=part(&b,"word/styles.xml");
+  assert_eq!(v,before);assert_eq!(out["revision"],8);
+  assert_eq!(doc.matches("<w:tr>").count(),7,"Five data rows and one real header/data pair; no placeholder header row");
+  assert_eq!(doc.matches("<w:tblHeader/>").count(),1);
+  for expected in ["Initial draft for internal review","The team verified", "w:top=\"1440\"", "<w:tblCellMar>", "w:val=\"TableText\""]{assert!(doc.contains(expected),"Missing {expected}");}
+  for expected in ["w:default=\"1\" w:styleId=\"Normal\"", "w:ascii=\"Arial\"", "w:line=\"276\"", "w:after=\"160\"", "<w:keepNext/>"]{assert!(styles.contains(expected),"Missing {expected}");}
+  let empty=docx("| | |\n| --- | --- |").unwrap();
+  assert_eq!(part(&empty,"word/document.xml").matches("<w:tr>").count(),1,"An empty table keeps one valid row");
+  save("Native-document.docx",&b);
  }
  #[test]
  fn office_document_does_not_silently_drop_images(){
