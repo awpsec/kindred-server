@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { runSession, providerAdapter, customToolContext, customSkillListing, responseBudget, pruneScreenshots, guardedFetch, HarnessError } from '../session.mjs';
+import { runSession, providerAdapter, customToolContext, customSkillListing, responseBudget, progressReminder, pruneScreenshots, guardedFetch, HarnessError } from '../session.mjs';
 
 const remember = { name: 'remember', description: 'Save a short fact.', inputSchema: {
   type: 'object', properties: { text: { type: 'string' } }, required: ['text'], additionalProperties: false,
@@ -620,4 +620,17 @@ test('actual SDK successful catalogue projection keeps full source result and se
  if(calls===4){assert.equal(body.tools?.length||0,0);return sse({role:'assistant',content:'First complete'});}
  return sse({role:'assistant',content:'Second complete'});
  }});assert.equal(calls,5);assert.equal(actions,2);assert.equal(JSON.stringify(listing),original);
+});
+
+
+test('silent custom runs request milestones only at tool boundaries and respect cadence', () => {
+  let now = 0;
+  const reminder = progressReminder(() => now);
+  assert.equal(reminder.afterTool(), '');
+  now = 89999; assert.equal(reminder.afterTool(), '');
+  now = 90000; assert.match(reminder.afterTool(), /brief milestone/);
+  assert.equal(reminder.afterTool(), '');
+  reminder.written(); now = 180000;
+  assert.equal(reminder.afterTool(), '', 'one action alone is not long work');
+  assert.match(reminder.afterTool(), /Honor explicit quiet-work instructions/);
 });

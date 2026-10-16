@@ -70,6 +70,22 @@ export function customSkillListing(text) {
   } catch { return text; }
 }
 
+// Ask for a milestone at the next model boundary, never interrupt an active
+// generation or issue a competing request to a single-slot local endpoint.
+export function progressReminder(now = Date.now) {
+  let lastText = now(), lastReminder = lastText, actions = 0;
+  return {
+    written() { lastText = now(); actions = 0; },
+    afterTool() {
+      actions++;
+      const time = now();
+      if (actions < 2 || time - Math.max(lastText, lastReminder) < 90000) return '';
+      lastReminder = time;
+      return 'Kindred progress reminder: If progress updates are appropriate for this conversation, give the user a brief milestone before your next tool call: what the recorded results establish and what remains. Do not reveal private reasoning, credentials, or raw tool arguments. Do not claim an action succeeded without its result. Honor explicit quiet-work instructions.';
+    },
+  };
+}
+
 export function responseBudget(model, context) {
   const input = context.messages.reduce((sum, message) => sum + estimateTokens(message), 0)
     + Math.ceil(((context.systemPrompt || '').length + JSON.stringify(context.tools || []).length) / 3);
@@ -249,6 +265,7 @@ export async function runSession(request, callTool, emit, signal, options = {}) 
   let modelCalls = 0, toolCalls = 0, outputBytes = 0;
   const output = [];
   const custom = request.provider.startsWith('custom-');
+  const reminders = custom ? progressReminder() : null;
   let recoveringResult = false, emptyEnding = false, finalAnswer = false;
   let progress = progressReporter(emit, custom);
   try {
@@ -329,6 +346,8 @@ export async function runSession(request, callTool, emit, signal, options = {}) 
         }
         const text = custom && tool.name === 'skills_list' && result.failed !== true ? customSkillListing(result.text || '') : result.text || '';
         const content = [{ type: 'text', text }];
+        const reminder = reminders?.afterTool();
+        if (reminder) content.push({ type: 'text', text: reminder });
         if (result.image) {
           const match = /^data:(image\/(?:png|jpeg|gif|webp));base64,([A-Za-z0-9+/=]+)$/.exec(result.image);
           if (!match || match[2].length > 7 * 1024 * 1024) throw new HarnessError('image');
@@ -381,6 +400,7 @@ export async function runSession(request, callTool, emit, signal, options = {}) 
         emptyEnding = !text.trim() && !hasTools;
         finalAnswer = !!text.trim() && !hasTools;
         if (text) {
+          reminders?.written();
           outputBytes += Buffer.byteLength(text);
           if (outputBytes > MAX_OUTPUT) { failure.value = new HarnessError('output_limit'); abort(); return; }
           output.push(text); emit({ type: 'assistant', text,

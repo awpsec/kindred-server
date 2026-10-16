@@ -177,15 +177,60 @@ pub fn set_task_title(db: &Db, run: &crate::db::Run, title: &str) -> Result<Valu
     Ok(json!({"title":title,"text":"Task title saved."}))
 }
 
+// Read only protocol metadata. Raw arguments, results and private reasoning never
+// become progress prose. Phase bounds keep later work out of historical groups.
+fn activity(c:&rusqlite::Connection,seq:i64,run:&str)->Result<Value> {
+    let boundary:i64=c.query_row("SELECT COALESCE(MAX(m.source_event_seq),0) FROM message_progress p JOIN chat_messages m ON m.seq=p.message_seq WHERE p.run_id=? AND p.phase='final_answer' AND p.message_seq<?",rusqlite::params![run,seq],|r|r.get(0))?;
+    let mut end:i64=c.query_row("SELECT COALESCE(MIN(m.source_event_seq),9223372036854775807) FROM message_progress p JOIN chat_messages m ON m.seq=p.message_seq WHERE p.run_id=? AND p.phase='final_answer' AND m.source_event_seq>?",rusqlite::params![run,boundary],|r|r.get(0))?;
+    let finished:i64=c.query_row("SELECT COALESCE(MIN(seq),9223372036854775807) FROM events WHERE run_id=? AND seq>? AND kind='run_finished'",rusqlite::params![run,boundary],|r|r.get(0))?;
+    end=end.min(finished);
+    let mut query=c.prepare("SELECT kind,COALESCE(json_extract(body,'$.tool'),''),COALESCE(json_extract(body,'$.failed'),0),created FROM events WHERE run_id=? AND seq>? AND seq<=? AND kind IN ('tool_started','tool_result') ORDER BY seq")?;
+    let rows=query.query_map(rusqlite::params![run,boundary,end],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,bool>(2)?,r.get::<_,i64>(3)?)))?;
+    let(mut actions,mut completed,mut failed,mut first)=(0,0,0,0);let mut recent:Vec<Value>=vec![];
+    for row in rows {let(kind,tool,error,created)=row?;if work_title(&tool).is_none(){continue;}
+        if kind=="tool_started" {actions+=1;if first==0 {first=created;}}
+        else {if error {failed+=1;} else {completed+=1;}
+            let label=match tool.as_str(){"local_read"=>"Read local file","local_list"=>"List local files","local_exec"=>"Run local command","guest_exec"|"command_start"=>"Run computer command","share_file"=>"Share file",_=>work_title(&tool).unwrap()};
+            if let Some(last)=recent.last_mut().filter(|last|last["label"]==label&&last["failed"]==error){last["count"]=json!(last["count"].as_u64().unwrap_or(1)+1);last["created"]=json!(created);}
+            else {recent.push(json!({"label":label,"failed":error,"count":1,"created":created}));if recent.len()>4 {recent.remove(0);}}
+        }
+    }
+    let last:i64=c.query_row("SELECT COALESCE(MAX(created),0) FROM events WHERE run_id=? AND seq>? AND seq<=?",rusqlite::params![run,boundary,end],|r|r.get(0))?;
+    use rusqlite::OptionalExtension;
+    let phase:Option<String>=c.query_row("SELECT json_extract(body,'$.state') FROM events WHERE run_id=? AND seq>? AND seq<=? AND kind='model_progress' ORDER BY seq DESC LIMIT 1",rusqlite::params![run,boundary,end],|r|r.get(0)).optional()?;
+    Ok(json!({"actions":actions,"completed":completed,"failed":failed,"seconds":if first>0 {(last-first).max(0)}else{0},"recent":recent,"phase":phase,"last_at":last}))
+}
+
 pub fn message(c:&rusqlite::Connection,seq:i64)->Result<Value> {
     use rusqlite::OptionalExtension;
-    Ok(c.query_row("SELECT p.run_id,p.mode,p.phase,p.group_id,COALESCE(p.task_title,r.task_title),p.work_qualified FROM message_progress p JOIN runs r ON r.id=p.run_id WHERE p.message_seq=?",[seq],|r|Ok(json!({"run_id":r.get::<_,String>(0)?,"mode":r.get::<_,String>(1)?,"phase":r.get::<_,String>(2)?,"group_id":r.get::<_,String>(3)?,"task_title":r.get::<_,String>(4)?,"work_qualified":r.get::<_,Option<bool>>(5)?}))).optional()?.unwrap_or(Value::Null))
+    let mut value=c.query_row("SELECT p.run_id,p.mode,p.phase,p.group_id,COALESCE(p.task_title,r.task_title),p.work_qualified FROM message_progress p JOIN runs r ON r.id=p.run_id WHERE p.message_seq=?",[seq],|r|Ok(json!({"run_id":r.get::<_,String>(0)?,"mode":r.get::<_,String>(1)?,"phase":r.get::<_,String>(2)?,"group_id":r.get::<_,String>(3)?,"task_title":r.get::<_,String>(4)?,"work_qualified":r.get::<_,Option<bool>>(5)?}))).optional()?.unwrap_or(Value::Null);
+    if value["mode"]=="summaries" && value["phase"]=="commentary" {value["activity"]=activity(c,seq,value["run_id"].as_str().unwrap())?;}
+    Ok(value)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{conversation_updates, tests};
+
+    #[test]
+    fn activity_distinguishes_slow_single_actions_and_bounds_each_phase() {
+        let app=tests::app();let bot=tests::bot(&app.db,"codex");
+        let id=app.db.queue(&bot.id,"Do work",0).unwrap();let run=app.db.claim_bot(&bot.id).unwrap().unwrap();
+        app.db.event(&id,"tool_started",json!({"tool":"claude_connector","args":{"secret":"NEVER_EXPOSE"}})).unwrap();
+        app.db.0.lock().unwrap().execute("UPDATE events SET created=? WHERE run_id=?",rusqlite::params![crate::db::now()-200,id]).unwrap();
+        app.db.event(&id,"tool_result",json!({"tool":"claude_connector","text":"NEVER_EXPOSE","failed":false})).unwrap();
+        let rows=app.db.chat_messages(&run.chat_id).unwrap();let a=&rows.iter().find(|m|m["kind"]=="task_progress").unwrap()["progress"]["activity"];
+        assert_eq!(a["actions"],1);assert_eq!(a["completed"],1);assert!(a["seconds"].as_i64().unwrap()>=200);assert!(!a.to_string().contains("NEVER_EXPOSE"));
+        for failed in [false,true] {app.db.event(&id,"tool_started",json!({"tool":"local_read"})).unwrap();app.db.event(&id,"tool_result",json!({"tool":"local_read","failed":failed})).unwrap();}
+        app.db.event(&id,"assistant",json!({"phase":"final_answer","text":"Phase done"})).unwrap();
+        let old=app.db.chat_messages(&run.chat_id).unwrap().into_iter().find(|m|m["kind"]=="task_progress").unwrap();
+        assert_eq!(old["progress"]["activity"]["actions"],3);assert_eq!(old["progress"]["activity"]["completed"],2);assert_eq!(old["progress"]["activity"]["failed"],1);
+        app.db.event(&id,"tool_started",json!({"tool":"guest_exec"})).unwrap();
+        let rows=app.db.chat_messages(&run.chat_id).unwrap();
+        assert_eq!(rows.iter().find(|m|m["seq"]==old["seq"]).unwrap()["progress"]["activity"],old["progress"]["activity"]);
+        assert_eq!(rows.iter().rev().find(|m|m["kind"]=="task_progress").unwrap()["progress"]["activity"]["actions"],1);
+    }
 
     #[test]
     fn silent_work_has_one_durable_anchor_without_becoming_a_message() {
