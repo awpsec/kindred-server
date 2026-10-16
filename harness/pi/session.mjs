@@ -39,6 +39,15 @@ function outputLimit(info) {
   if (info.max_tokens != null && (!Number.isSafeInteger(info.max_tokens) || info.max_tokens < 1 || info.max_tokens > info.context_window)) throw new HarnessError('model');
   return info.max_tokens ?? Math.min(32768, Math.floor(info.context_window / 2));
 }
+// Pi appends its host cwd even with a custom system prompt. Kindred's tools
+// execute in the bot VM, so that ephemeral host path is not a usable workspace.
+export function customToolContext(context, harnessDirectory) {
+  const suffix = `\nCurrent working directory: ${harnessDirectory.replace(/\\/g, '/')}\n`;
+  const prompt = context.systemPrompt || '';
+  return { ...context, systemPrompt: (prompt.endsWith(suffix) ? prompt.slice(0, -suffix.length) : prompt)
+    + '\n\nKindred tool environment: guest_exec and computer tools run in the bot VM, not in this model harness process. Use /workspace for VM working files. Chat uploads are not staged there until read_attachment is called with the exact attachment ID from the conversation; use the path it returns. Do not search the host temporary directory or scan the filesystem to locate chat uploads. Local-desktop tools, when available, target their explicitly selected device.\n' };
+}
+
 export function responseBudget(model, context) {
   const input = context.messages.reduce((sum, message) => sum + estimateTokens(message), 0)
     + Math.ceil(((context.systemPrompt || '').length + JSON.stringify(context.tools || []).length) / 3);
@@ -252,6 +261,7 @@ export async function runSession(request, callTool, emit, signal, options = {}) 
       if (++modelCalls > request.max_steps + 1 && request.max_steps > 0) {
         failure.value = new HarnessError('budget'); throw failure.value;
       }
+      if (custom) context = customToolContext(context, temporary);
       const requestId = modelCalls;
       progress = progressReporter(emit, custom);
       progress('waiting');

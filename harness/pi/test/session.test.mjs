@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { runSession, providerAdapter, responseBudget, pruneScreenshots, guardedFetch, HarnessError } from '../session.mjs';
+import { runSession, providerAdapter, customToolContext, responseBudget, pruneScreenshots, guardedFetch, HarnessError } from '../session.mjs';
 
 const remember = { name: 'remember', description: 'Save a short fact.', inputSchema: {
   type: 'object', properties: { text: { type: 'string' } }, required: ['text'], additionalProperties: false,
@@ -506,4 +506,30 @@ test('custom truncation preserves completed actions, rejects truncated tool call
   }}),e=>e.code==='custom_truncated');
   assert.equal(calls,2);assert.equal(actions,1);
   assert.equal(events.filter(e=>e.type==='assistant').length,0);
+});
+
+
+test('custom environment correction removes only the SDK cwd suffix and preserves the caller context',()=>{
+ const context={systemPrompt:'Keep this exact instruction.\nA quoted /tmp/kindred-pi-example is data.\nCurrent working directory: /tmp/kindred-pi-owned\n',messages:[],tools:[]};
+ const fixed=customToolContext(context,'/tmp/kindred-pi-owned');
+ assert(fixed.systemPrompt.startsWith('Keep this exact instruction.\nA quoted /tmp/kindred-pi-example is data.'));
+ assert(!fixed.systemPrompt.includes('Current working directory:'));
+ assert(fixed.systemPrompt.includes('read_attachment'));assert(fixed.systemPrompt.includes('/workspace'));
+ assert(context.systemPrompt.endsWith('/tmp/kindred-pi-owned\n'));
+ assert.strictEqual(fixed.messages,context.messages);
+});
+
+test('actual custom requests and summary recovery get the VM environment, hosted requests stay unchanged',async()=>{
+ for(const custom of [true,false]){
+  let calls=0;const value=custom?customRequest():request();
+  const result=await runSession(value,async()=>({text:'unused'}),()=>{},undefined,{fetch:async req=>{
+   calls++;const body=await req.json();const system=body.messages.find(m=>m.role==='system').content;
+   assert(system.startsWith(value.instructions));
+   assert.equal(system.includes('Current working directory: /tmp/kindred-pi-'),!custom);
+   assert.equal(system.includes('Kindred tool environment:'),custom);
+   if(custom&&calls===1)return sse({role:'assistant',reasoning_content:'private reasoning'});
+   return sse({role:'assistant',content:'Finished.'});
+  }});
+  assert.equal(result.output,'Finished.');assert.equal(calls,custom?2:1);
+ }
 });
