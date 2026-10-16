@@ -2,9 +2,11 @@
 """Observe a managed screen without starting services or restoring applications."""
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
+import time
 
 
 def classify(properties, display_ready=False, dock_ready=False, ports_ready=False):
@@ -28,6 +30,25 @@ def command(args, env):
     return subprocess.run(args, env=env, capture_output=True, text=True, timeout=3)
 
 
+def rfb_ready(port):
+    deadline = time.monotonic() + 0.5
+    try:
+        with socket.create_connection(('127.0.0.1', port), timeout=0.5) as connection:
+            banner = bytearray()
+            while len(banner) < 12:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                connection.settimeout(remaining)
+                chunk = connection.recv(12 - len(banner))
+                if not chunk:
+                    return False
+                banner.extend(chunk)
+            return time.monotonic() <= deadline and re.fullmatch(rb'RFB [0-9]{3}\.[0-9]{3}\n', banner) is not None
+    except OSError:
+        return False
+
+
 def observe(screen, control_port=5900, view_port=5901):
     if not 1 <= screen <= 32:
         raise ValueError('Invalid screen')
@@ -44,11 +65,7 @@ def observe(screen, control_port=5900, view_port=5901):
     dock = display and command(['xdotool', 'search', '--onlyvisible', '--name', '^Kindred Dock$'], env).returncode == 0
     ports = True
     for port in (control_port + (screen - 1) * 2, view_port + (screen - 1) * 2):
-        try:
-            with socket.create_connection(('127.0.0.1', port), timeout=0.5) as connection:
-                ports = ports and connection.recv(12).startswith(b'RFB ')
-        except OSError:
-            ports = False
+        ports = rfb_ready(port) and ports
     return {'state': classify(properties, display, dock, ports)}
 
 
