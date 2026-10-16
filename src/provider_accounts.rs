@@ -182,6 +182,7 @@ pub async fn save(
         return Err(anyhow::anyhow!("At most 20 custom providers are allowed").into());
     }
     let old = all.iter().find(|old| old.id == p.id);
+    crate::provider_output_overrides::check_current(&app)?;
     let previous_key = crate::connections::credential(&app, &p.id, "").unwrap_or_default();
     let endpoint_changed = old.is_some_and(|old| old.base_url != p.base_url);
     let key = if p.no_auth || endpoint_changed && v["key"].as_str().is_none() {
@@ -200,14 +201,14 @@ pub async fn save(
         p.models = old.unwrap().models.clone();
         p.catalog = old.unwrap().catalog.clone();
     }
+    let reset_output_identity = old.is_none() || endpoint_changed;
     crate::connections::save_credential(&app, &p.id, "", key)?;
     if let Some(index) = all.iter().position(|old| old.id == p.id) {
         all[index] = p.clone();
     } else {
         all.push(p.clone());
     }
-    app.db
-        .save_setting("custom_providers", &serde_json::to_value(all)?)?;
+    crate::provider_output_overrides::persist_config(&app,&all,if reset_output_identity {Some(&p.id)} else {None})?;
     drop(guard);
     if (changed || p.catalog.checked_at.is_none()) && (p.no_auth || !key.is_empty()) {
         let app = app.clone();
@@ -227,9 +228,10 @@ pub async fn remove(
     let mut all = custom(&app)?;
     let index = all.iter().position(|p| p.id == id)
         .context("Custom provider is no longer configured")?;
+    crate::provider_output_overrides::check_current(&app)?;
     all.remove(index);
     crate::connections::save_credential(&app, &id, "", "")?;
-    app.db.save_setting("custom_providers", &serde_json::to_value(all)?)?;
+    crate::provider_output_overrides::persist_config(&app,&all,Some(&id))?;
     Ok(Json(json!({"removed":id})))
 }
 
@@ -244,7 +246,7 @@ pub async fn models(
     if p.catalog.checked_at.is_none() || app.catalogues.busy(&id) {
         p = crate::provider_catalog::refresh(&app, &id).await?;
     }
-    Ok(Json(crate::provider_catalog::response(&p)))
+    Ok(Json(crate::provider_output_overrides::catalogue_response(&app,&p)?))
 }
 pub async fn refresh_models(
     State(app): State<Shared>,
@@ -261,12 +263,11 @@ pub async fn refresh_models(
             .is_some_and(|time| (0..60).contains(&(db::now() - time)))
             && !app.catalogues.busy(&id)
         {
-            return Ok(Json(crate::provider_catalog::response(&p)));
+            return Ok(Json(crate::provider_output_overrides::catalogue_response(&app,&p)?));
         }
     }
-    Ok(Json(crate::provider_catalog::response(
-        &crate::provider_catalog::refresh(&app, &id).await?,
-    )))
+    let p=crate::provider_catalog::refresh(&app, &id).await?;
+    Ok(Json(crate::provider_output_overrides::catalogue_response(&app,&p)?))
 }
 pub async fn run(app: &App, bot: &Bot, run: &Run) -> Result<String> {
     let p = custom(app)?
@@ -285,7 +286,7 @@ pub async fn run(app: &App, bot: &Bot, run: &Run) -> Result<String> {
         .iter()
         .find(|m| m.model == bot.model)
         .context("Choose a model from the provider catalogue in the bot settings; refresh models in Connections if needed")?;
-    let info = json!({"no_auth":p.no_auth,"id":m.model,"context_window":m.context_window,"max_tokens":m.max_output_tokens,"reasoning":m.reasoning,"vision":m.vision,"input_cost":m.input_cost,"output_cost":m.output_cost});
+    let info = json!({"no_auth":p.no_auth,"id":m.model,"context_window":m.context_window,"max_tokens":crate::provider_output_overrides::effective(app,&p,m)?,"reasoning":m.reasoning,"vision":m.vision,"input_cost":m.input_cost,"output_cost":m.output_cost});
     crate::pi::custom(
         app,
         bot,
@@ -706,7 +707,7 @@ mod tests {
         bot.model = "test/model".into();
         bot.reasoning_effort.clear();
         app.db.save_bot(&bot).unwrap();
-        app.db.save_setting("custom_providers",&json!([{"id":id,"name":"Keyless fixture","base_url":url,"no_auth":true,"models":[{"model":"test/model","context_window":32000}]}])).unwrap();
+        app.db.save_setting("custom_providers",&json!([{"id":id,"name":"Keyless fixture","base_url":url,"no_auth":true,"models":[{"model":"test/model","context_window":65536}]}])).unwrap();
         app.db.queue(&bot.id, "Remember a fact", 0).unwrap();
         let task = app.db.claim().unwrap().unwrap();
         assert_eq!(
