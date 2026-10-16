@@ -32,7 +32,9 @@ export function progressReporter(emit, custom = false, now = () => performance.n
   };
 }
 
-// Unknown output limits are left to the provider; this estimate is only SDK metadata.
+// Hosted endpoints retain their provider default when no output limit is advertised.
+// Custom endpoints receive this bounded fallback: some local servers otherwise
+// generate until the entire context window is full, including hidden reasoning.
 function outputLimit(info) {
   if (info.max_tokens != null && (!Number.isSafeInteger(info.max_tokens) || info.max_tokens < 1 || info.max_tokens > info.context_window)) throw new HarnessError('model');
   return info.max_tokens ?? Math.min(32768, Math.floor(info.context_window / 2));
@@ -132,7 +134,9 @@ export function providerAdapter(request) {
       delete payload.prompt_cache_key; delete payload.prompt_cache_retention;
       delete payload.parallel_tool_calls;
       if (request.reasoning_effort) payload.reasoning_effort = request.reasoning_effort;
-      return providerDefault(payload, info);
+      // Keep the context-aware response budget even when the catalogue does not
+      // advertise an output maximum. Never leave local generation unbounded.
+      return payload;
     } };
   }
   const factory = Object.hasOwn(adapters, request.provider) && adapters[request.provider];
@@ -336,7 +340,7 @@ export async function runSession(request, callTool, emit, signal, options = {}) 
         }
 
         if (['error', 'aborted', 'length'].includes(event.message.stopReason)) {
-          failure.value ||= new HarnessError(event.message.stopReason === 'length' ? 'truncated' : 'provider_response');
+          failure.value ||= new HarnessError(event.message.stopReason === 'length' ? (custom ? 'custom_truncated' : 'truncated') : 'provider_response');
           return;
         }
         const text = event.message.content.filter(part => part.type === 'text').map(part => part.text).join('');

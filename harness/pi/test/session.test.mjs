@@ -289,14 +289,14 @@ test('OpenCode Anthropic and Responses models return normal Kindred answers',asy
 });
 
 
-test('API output budgets use model limits and leave unknown limits to the provider', async () => {
+test('API output budgets bound custom generation and preserve hosted defaults', async () => {
   for (const provider of ['openrouter','custom-11111111-1111-4111-8111-111111111111','opencode','opencode-go']) {
     for (const limit of (provider.startsWith('opencode')?[131072]:[131072,2048,null])) {
       const model=provider.startsWith('opencode')?'glm-5.3-flash':'test/model';
       const endpoint=provider==='openrouter'?'https://openrouter.ai/api/v1/chat/completions':provider.startsWith('custom-')?'http://localhost:8000/v1/chat/completions':`https://opencode.ai/zen/${provider==='opencode-go'?'go/':''}v1/chat/completions`;
       let calls=0;
       const result=await runSession(request({provider,model,endpoint,session_id:'bot:chat',reasoning_effort:'',model_info:{id:model,context_window:1000000,reasoning:true,max_tokens:limit}}),async()=>({text:'ok'}),()=>{},undefined,{fetch:async req=>{
-        calls++;const body=await req.json();assert.equal(body.max_tokens,limit??undefined);assert.equal(body.max_completion_tokens,undefined);
+        calls++;const body=await req.json();assert.equal(body.max_tokens,limit??(provider.startsWith('custom-')?32768:undefined));assert.equal(body.max_completion_tokens,undefined);
         return sse({role:'assistant',content:'Complete response.'});
       }});
       assert.equal(calls,1);assert.equal(result.output,'Complete response.');
@@ -468,4 +468,42 @@ test('custom summary recovery restores tools for a subsequent queued user turn',
     }
   });
   assert.equal(actions,1);assert.equal(requests,4);assert(result.output.endsWith('New record saved.'));
+});
+
+
+test('262k custom model without an advertised output limit gets a bounded wire budget', async()=>{
+  const value=customRequest();
+  value.model_info={id:value.model,context_window:262144,reasoning:false};
+  value.reasoning_effort='';
+  let calls=0;
+  const result=await runSession(value,async()=>({text:'unused'}),()=>{},undefined,{fetch:async req=>{
+    calls++;const body=await req.json();
+    assert.equal(body.max_tokens,32768);
+    assert.equal(body.max_completion_tokens,undefined);
+    return sse({role:'assistant',content:'Finished.'});
+  }});
+  assert.equal(calls,1);assert.equal(result.output,'Finished.');
+});
+
+test('custom wire budget shrinks near context capacity, including without a configured maximum',async()=>{
+  for(const maximum of [undefined,30000]){
+    const value=customRequest();value.reasoning_effort='';
+    value.model_info={id:value.model,context_window:32768,max_tokens:maximum};
+    value.instructions='I'.repeat(60000);
+    await runSession(value,async()=>({text:'unused'}),()=>{},undefined,{fetch:async req=>{
+      const body=await req.json();assert(body.max_tokens>0&&body.max_tokens<14000);
+      return sse({role:'assistant',content:'Finished.'});
+    }});
+  }
+});
+
+test('custom truncation preserves completed actions, rejects truncated tool calls and never retries them',async()=>{
+  let calls=0,actions=0;const events=[];
+  await assert.rejects(runSession(customRequest(),async()=>{actions++;return {text:'Saved once.'};},e=>events.push(e),undefined,{fetch:async()=>{
+    calls++;
+    if(calls===1)return sse({role:'assistant',tool_calls:[toolCall('remember',{text:'Completed action'})]},'tool_calls');
+    return sse({role:'assistant',content:'Incomplete answer',tool_calls:[toolCall('remember',{text:'Must not execute'},'partial')]},'length');
+  }}),e=>e.code==='custom_truncated');
+  assert.equal(calls,2);assert.equal(actions,1);
+  assert.equal(events.filter(e=>e.type==='assistant').length,0);
 });

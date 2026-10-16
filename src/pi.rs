@@ -98,6 +98,7 @@ fn provider_error(frame: &Value) -> String {
         }
         "budget" => "Tool-step budget exhausted. Review activity and continue with a narrower task.".into(),
         "empty_result" => "The custom model returned no visible answer after a summary-only retry. Completed actions are preserved; review Activity before continuing.".into(),
+        "custom_truncated" => "The custom model reached a generation limit before finishing its response. This includes reasoning tokens and does not mean the configured context window is too small. Completed actions are preserved; review Activity before continuing with a narrower step or lower reasoning setting.".into(),
         "truncated" => "Model output was truncated at its token limit.".into(),
         "aborted" => "Pi task was cancelled.".into(),
         "request_limit" | "response_limit" | "output_limit" | "frame_limit" => "Pi task reached a request, response or output size limit. Continue with a narrower task.".into(),
