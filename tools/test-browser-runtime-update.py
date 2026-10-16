@@ -25,7 +25,7 @@ class RuntimeTests(unittest.TestCase):
             old=(ROOT/'tools/fixtures/original-managed-launchers'/name).read_bytes();(self.root/name).write_bytes(old);(self.root/name).chmod(0o755)
             self.payload[name]={'source':(ROOT/'deploy'/name).read_text(),'previous_sha256':hashlib.sha256(old).hexdigest()}
         self.payload['browser-launch.py']={'source':(ROOT/'deploy/browser-launch.py').read_text(),'previous_sha256':[None,hashlib.sha256((ROOT/'deploy/browser-launch.py').read_bytes()).hexdigest()]}
-        for name in ('ensure-screen','screen-ownership.py'):
+        for name in ('ensure-screen','screen-ownership.py','wait-screen-ready'):
             if name=='ensure-screen':
                 old=(ROOT/'deploy'/name).read_bytes()
                 (self.root/name).write_bytes(old);(self.root/name).chmod(0o755)

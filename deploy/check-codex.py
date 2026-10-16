@@ -6,6 +6,7 @@ Keep this probe in step with the pinned package when upgrading Codex.
 """
 import json
 import os
+import re
 from pathlib import Path
 import select
 import shutil
@@ -19,7 +20,14 @@ FILES = ('bin/codex', 'bin/codex-code-mode-host', 'codex-package.json',
 
 
 def validate(root):
-    for name in FILES:
+    metadata = json.loads((root / 'codex-package.json').read_text())
+    version=metadata.get('version','')
+    if not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+',version):
+        raise ValueError('Unexpected Codex package version')
+    # Official 0.163 removed bundled zsh. Older packages must still contain it;
+    # validate it when present in newer packages as well.
+    names=FILES if tuple(map(int,version.split('.'))) < (0,163,0) or (root / FILES[-1]).exists() else FILES[:-1]
+    for name in names:
         path = root / name
         if not path.is_file() or path.is_symlink():
             raise ValueError('Codex runtime is missing a regular file: ' + name)
@@ -30,7 +38,6 @@ def validate(root):
                 raise ValueError('Expected an x86_64 Linux executable: ' + name)
             if not os.access(path, os.X_OK):
                 raise ValueError('Codex runtime file is not executable: ' + name)
-    metadata = json.loads((root / 'codex-package.json').read_text())
     for key, value in {'layoutVersion': 1, 'target': 'x86_64-unknown-linux-musl',
                        'entrypoint': 'bin/codex', 'resourcesDir': 'codex-resources',
                        'pathDir': 'codex-path'}.items():

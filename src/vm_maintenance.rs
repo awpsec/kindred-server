@@ -112,7 +112,7 @@ fn due(db: &Db, now: i64, reserve: bool) -> Result<bool> {
     Ok(ready)
 }
 pub fn request(db: &Db) -> Result<State> {
-    db.0.lock().unwrap().execute("UPDATE vm_maintenance SET requested=1,error='' WHERE id=1 AND phase NOT IN ('starting','updating','checking','rebooting')", [])?;
+    db.0.lock().unwrap().execute("UPDATE vm_maintenance SET requested=1,error='',detail='' WHERE id=1 AND phase NOT IN ('starting','updating','checking','rebooting')", [])?;
     state(db)
 }
 pub struct Leases {
@@ -141,6 +141,7 @@ async fn update_guest_runtime(app: &App) -> Result<()> {
     // Only known managed launcher bytes are replaced. Custom launchers fail
     // before the runtime switches; existing browsers/profiles are untouched.
     let launchers=serde_json::json!({
+        "wait-screen-ready":{"source":include_str!("../deploy/wait-screen-ready"),"previous_sha256":["69e2c4b24709917c9a0b038e17dd9b1e2f6f028859d66b1078dd026f22c35eff",null]},
         "browser-launch.py":{"source":include_str!("../deploy/browser-launch.py"),"previous_sha256":["f0d21bee517c16ce234a4ac233dfbf8b1009ddcc70ec0063bbaadd3bd4ded9a8","1166f7ad32848fa71b4084960825bc40c9bbe03300d8c23c0d6710533efd8ee2",null]},
         "desktop-launch":{"source":include_str!("../deploy/desktop-launch"),"previous_sha256":["b8b477780f13889b14176510d6d2c805b4eb9c6e6d73ade8c3793c41cddf9645", "ee430558ef4fd501d1dd55a453e4de9c9d9fc58018464a1091dee7adfccaa1df", "8cae9194cb3d1dc53606cb52aa254a531364bce3c006c0444d93088def9c2ba3"]},
         "start-desktop.sh":{"source":include_str!("../deploy/start-desktop.sh"),"previous_sha256":["df6b0b492f39da89f743df24793606ad35244fb8616e3ad88ad3dae3c4cf467c", "45eb0cdb9e2ea03b86f8c6d21d96f769ebaa07d86d04e2f442da6732b6aaf3c6", "3d10321fd71359ceac432daa657b299d346aeb6142d07fe33a42d372733803d4"]},
@@ -159,6 +160,7 @@ async fn update_guest_runtime(app: &App) -> Result<()> {
 pub(crate) fn managed_launcher_hashes() -> Value {
     let mut values=serde_json::Map::new();
     for (name, source) in [
+        ("wait-screen-ready",include_str!("../deploy/wait-screen-ready")),
         ("browser-launch.py",include_str!("../deploy/browser-launch.py")),
         ("desktop-launch",include_str!("../deploy/desktop-launch")),
         ("start-desktop.sh",include_str!("../deploy/start-desktop.sh")),
@@ -348,14 +350,17 @@ pub async fn worker(app: Shared) {
                 }
             } else if due(&app.db,db::now(),false)? {
                 // Do not boot an offline computer for maintenance.
-                if vm::control(&app.config.vm,"domstate").await?.trim()!="running" {return Ok(());}
+                if vm::control(&app.config.vm,"domstate").await?.trim()!="running" {
+                    app.db.0.lock().unwrap().execute("UPDATE vm_maintenance SET detail='Computer is off. Start the computer to install the queued update.' WHERE id=1 AND requested=1",[])?;
+                    return Ok(());
+                }
                 let acquired=match leases(&app) {Ok(value)=>value,Err(_)=>{touch(&app.db.0.lock().unwrap())?;return Ok(());}};
                 // Verify guest identity and noninteractive sudo before reserving
                 // a package attempt. A missing prerequisite must not stall tasks.
                 let status=match guest(&app,"status",None).await {
                     Ok(value)=>value,
                     Err(_)=>{
-                        app.db.0.lock().unwrap().execute("UPDATE vm_maintenance SET requested=0,phase='failed',attempted=?,next_check=?,idle_since=0,error='Could not verify the bot computer and its update permissions. Check the computer connection and try again.' WHERE id=1",params![db::now(),db::now()+INTERVAL])?;
+                        app.db.0.lock().unwrap().execute("UPDATE vm_maintenance SET detail='Computer is running, but its update service is not ready. Waiting for the guest connection and update permissions.',idle_since=0 WHERE id=1",[])?;
                         return Ok(());
                     }
                 };
@@ -436,6 +441,33 @@ mod tests {
                 [at - IDLE],
             )
             .unwrap();
+    }
+    #[tokio::test]
+    async fn computer_power_reads_do_not_start_offline_guest_or_fail_queued_update() {
+        let root=std::env::temp_dir().join(format!("kindred-power-{}",db::id()));
+        std::fs::create_dir(&root).unwrap();
+        let manager=root.join("manager.py");
+        std::fs::write(&manager,"import sys,json\nassert sys.argv[1]=='domstate'\nprint(json.dumps({'state':'shut off'}))\n").unwrap();
+        let mut app=crate::tests::app();
+        let config=&mut std::sync::Arc::get_mut(&mut app).unwrap().config.vm;
+        config.manager=manager.to_str().unwrap().into();config.managed_id=db::id();
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url=format!("http://{}/api/computer/state",listener.local_addr().unwrap());
+        let router=crate::web::router(app.clone());
+        let server=tokio::spawn(async move {axum::serve(listener,router).await.unwrap()});
+        let client=reqwest::Client::new();
+        assert_eq!(client.get(&url).send().await.unwrap().status(),401);
+        let value:Value=client.get(&url).bearer_auth(&app.token).send().await.unwrap().json().await.unwrap();
+        assert_eq!(value["state"],"shut off");
+        request(&app.db).unwrap();
+        let task=tokio::spawn(worker(app.clone()));
+        tokio::time::timeout(Duration::from_secs(5),async {
+            while state(&app.db).unwrap().detail.is_empty(){tokio::time::sleep(Duration::from_millis(10)).await;}
+        }).await.unwrap();
+        let saved=state(&app.db).unwrap();
+        assert!(saved.requested);assert!(saved.error.is_empty());assert_eq!(saved.attempted,0);
+        assert!(saved.detail.contains("Computer is off"));
+        task.abort();server.abort();std::fs::remove_dir_all(root).unwrap();
     }
     #[tokio::test]
     async fn authenticated_preference_and_public_audio_asset() {

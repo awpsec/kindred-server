@@ -31,7 +31,7 @@ def extract(archive,root):
                 raise ValueError('Unexpected Codex package member: '+member.name)
             if not 0<member.size<=512*1024*1024:raise ValueError('Invalid Codex package member size')
             members[member.name]=member
-        if not set(FILES).issubset(members):raise ValueError('Official Codex package is incomplete')
+        if not set(FILES[:-1]).issubset(members):raise ValueError('Official Codex package is incomplete')
         for name,member in members.items():
             target=root/name;target.parent.mkdir(parents=True,exist_ok=True)
             with tar.extractfile(member) as source,target.open('wb') as out:shutil.copyfileobj(source,out)
