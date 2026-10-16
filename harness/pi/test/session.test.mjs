@@ -634,3 +634,66 @@ test('silent custom runs request milestones only at tool boundaries and respect 
   assert.equal(reminder.afterTool(), '', 'one action alone is not long work');
   assert.match(reminder.afterTool(), /Honor explicit quiet-work instructions/);
 });
+
+
+// Rust str::trim uses Unicode White_Space. NEL is blank; BOM and zero-width
+// space are retained text. Do not rewrite any model content to reset cadence.
+const backendWhitespace = '\t\n\v\f\r \u0085\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000';
+async function reminderPackets({ texts = ['', ''], hosted = false, quiet = false, reasoning = '' } = {}) {
+  const custom = 'custom-11111111-1111-4111-8111-111111111111';
+  let clock = 1700000000000, calls = 0, actions = 0;
+  const packets = [], events = [], original = Date.now;
+  Date.now = () => clock;
+  try {
+    const result = await runSession(request({
+      ...(hosted ? {} : { provider: custom, endpoint: 'http://localhost:8080/v1/chat/completions' }),
+      max_steps: texts.length + 1,
+      instructions: quiet ? 'Work quietly. Do not send progress updates.' : 'Use the supplied tools.',
+    }), async () => {
+      actions++; clock += 45000;
+      return { text: 'OWNED_RESULT_' + actions };
+    }, event => events.push(event), undefined, { fetch: async req => {
+      packets.push(await req.json()); calls++;
+      if (calls <= texts.length) return sse({ role: 'assistant', content: texts[calls - 1],
+        ...(reasoning ? { reasoning_content: reasoning } : {}),
+        tool_calls: [toolCall('remember', { text: 'Tool arguments are not written milestones' }, 'owned-' + calls)],
+      }, 'tool_calls');
+      return sse({ role: 'assistant', content: 'Finished owned work.' });
+    } });
+    assert.equal(calls, texts.length + 1, 'no extra model request');
+    assert.equal(actions, texts.length, 'each tool executes once');
+    assert.equal(result.model_calls, calls); assert.equal(result.tool_calls, actions);
+    for (const text of texts.filter(Boolean))
+      assert(events.some(event => event.type === 'assistant' && event.text === text), 'raw assistant text is retained');
+    assert(!events.some(event => event.type === 'assistant' && event.text.includes('PRIVATE_REASONING')));
+    return packets.at(-1).messages.filter(message => message.role === 'tool').map(message => message.content);
+  } finally { Date.now = original; }
+}
+for (const [label, text] of [['empty', ''], ['ASCII whitespace', ' \t\n\r'], ['Unicode White_Space', backendWhitespace]]) {
+  test('actual SDK reminder ignores ' + label + ' as a written update', async () => {
+    const results = await reminderPackets({ texts: [text, text] });
+    assert(!results[0].includes('Kindred progress reminder:'));
+    assert.match(results[1], /Kindred progress reminder:/);
+  });
+}
+for (const [label, text] of [['ordinary milestone', 'Owned milestone.'], ['Unicode milestone', '完了しました。'], ['BOM retained by backend', '\ufeff'], ['zero width space retained by backend', '\u200b']]) {
+  test('actual SDK reminder resets for ' + label, async () => {
+    const results = await reminderPackets({ texts: ['', text] });
+    assert(!results.some(result => result.includes('Kindred progress reminder:')));
+  });
+}
+test('actual SDK reminder ignores private reasoning and tool argument text', async () => {
+  const results = await reminderPackets({ reasoning: 'PRIVATE_REASONING is not a written milestone' });
+  assert.match(results[1], /Kindred progress reminder:/);
+});
+test('actual SDK reminder retains hosted and quiet-work behavior', async () => {
+  const hosted = await reminderPackets({ hosted: true, texts: [' \n', backendWhitespace] });
+  assert(!hosted.some(result => result.includes('Kindred progress reminder:')));
+  const quiet = await reminderPackets({ quiet: true, texts: [' \n', backendWhitespace] });
+  assert.match(quiet[1], /If progress updates are appropriate/);
+  assert.match(quiet[1], /Honor explicit quiet-work instructions/);
+});
+test('actual SDK reminder preserves ninety-second cadence across blank tool turns', async () => {
+  const results = await reminderPackets({ texts: ['', ' \n', backendWhitespace, ''] });
+  assert.deepEqual(results.map(result => result.includes('Kindred progress reminder:')), [false, true, false, true]);
+});

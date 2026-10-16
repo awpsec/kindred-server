@@ -400,7 +400,9 @@ export async function runSession(request, callTool, emit, signal, options = {}) 
         emptyEnding = !text.trim() && !hasTools;
         finalAnswer = !!text.trim() && !hasTools;
         if (text) {
-          reminders?.written();
+          // Db::event persists assistant text only when Rust trim is nonempty.
+          // Unicode White_Space matches that contract (unlike JS trim: NEL/BOM).
+          if (/[^\p{White_Space}]/u.test(text)) reminders?.written();
           outputBytes += Buffer.byteLength(text);
           if (outputBytes > MAX_OUTPUT) { failure.value = new HarnessError('output_limit'); abort(); return; }
           output.push(text); emit({ type: 'assistant', text,
