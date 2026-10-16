@@ -182,6 +182,7 @@ pub async fn save(
         return Err(anyhow::anyhow!("At most 20 custom providers are allowed").into());
     }
     let old = all.iter().find(|old| old.id == p.id);
+    crate::provider_output_overrides::check_current(&app)?;
     let previous_key = crate::connections::credential(&app, &p.id, "").unwrap_or_default();
     let endpoint_changed = old.is_some_and(|old| old.base_url != p.base_url);
     let key = if p.no_auth || endpoint_changed && v["key"].as_str().is_none() {
@@ -227,6 +228,7 @@ pub async fn remove(
     let mut all = custom(&app)?;
     let index = all.iter().position(|p| p.id == id)
         .context("Custom provider is no longer configured")?;
+    crate::provider_output_overrides::check_current(&app)?;
     all.remove(index);
     crate::connections::save_credential(&app, &id, "", "")?;
     crate::provider_output_overrides::persist_config(&app,&all,Some(&id))?;

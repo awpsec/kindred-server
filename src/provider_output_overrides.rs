@@ -32,7 +32,8 @@ pub(crate) fn validate(value:&Value, providers:&[CustomProvider])->Result<Store>
 }
 fn read(c:&Connection)->Result<Store> {
     let raw:Option<String>=c.query_row("SELECT value FROM settings WHERE key=?",[KEY],|r|r.get(0)).optional()?;
-    Ok(raw.map(|raw|serde_json::from_str(&raw)).transpose()?.unwrap_or_default())
+    let value = raw.map(|raw|serde_json::from_str::<Value>(&raw)).transpose()?.unwrap_or(json!({}));
+    validate(&value, &providers(c)?)
 }
 pub(crate) fn export(c:&Connection,providers:&[CustomProvider])->Result<Value> {
     let value=serde_json::to_value(read(c)?)?;validate(&value,providers)?;Ok(value)
@@ -41,10 +42,18 @@ fn write(c:&Connection,key:&str,value:&Value)->Result<()> {
     c.execute("INSERT INTO settings(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",params![key,value.to_string()])?;Ok(())
 }
 fn matching<'a>(store:&'a Store,p:&CustomProvider)->Option<&'a Overrides> {store.get(&p.id).filter(|row|row.origin==p.base_url)}
-fn provider(c:&Connection,id:&str)->Result<CustomProvider> {
+fn providers(c:&Connection)->Result<Vec<CustomProvider>> {
     let raw:Option<String>=c.query_row("SELECT value FROM settings WHERE key='custom_providers'",[],|r|r.get(0)).optional()?;
-    let all:Vec<CustomProvider>=serde_json::from_str(raw.as_deref().unwrap_or("[]"))?;
-    all.into_iter().find(|p|p.id==id).context("Provider not found")
+    Ok(serde_json::from_str(raw.as_deref().unwrap_or("[]"))?)
+}
+fn provider(c:&Connection,id:&str)->Result<CustomProvider> {
+    providers(c)?.into_iter().find(|p|p.id==id).context("Provider not found")
+}
+/// Caller holds CONFIG_LOCK; reject existing corruption before credential-file writes.
+/// persist_config revalidates within its SQLite transaction as well.
+pub(crate) fn check_current(app:&App)->Result<()> {
+    read(&app.db.0.lock().unwrap())?;
+    Ok(())
 }
 pub fn effective(app:&App,p:&CustomProvider,m:&CustomModel)->Result<Option<u64>> {
     let store=read(&app.db.0.lock().unwrap())?;
@@ -102,9 +111,11 @@ fn change(app:&App,id:&str,v:&Value)->Result<Value> {
 /// Caller holds CONFIG_LOCK. Identity reset and provider settings commit together.
 pub(crate) fn persist_config(app:&App,providers:&[CustomProvider],reset:Option<&str>)->Result<()> {
     let mut c=app.db.0.lock().unwrap();let tx=c.transaction()?;
-    if let Some(id)=reset {
-        let mut store=read(&tx)?;store.remove(id);write(&tx,KEY,&serde_json::to_value(store)?)?;
-    }
+    let mut store=read(&tx)?;
+    if let Some(id)=reset {store.remove(id);}
+    let value=serde_json::to_value(store)?;
+    validate(&value,providers)?;
+    if reset.is_some() {write(&tx,KEY,&value)?;}
     write(&tx,"custom_providers",&serde_json::to_value(providers)?)?;tx.commit()?;Ok(())
 }
 
@@ -264,5 +275,110 @@ mod tests {
         assert_eq!(get(State(f.app.clone()),Path(other.id.clone())).await.ok().unwrap().0,before);
         assert_eq!(effective(&f.app,&other,&other.models[0]).unwrap(),Some(4096));
     }
+
+}
+
+#[cfg(test)]
+mod validation_tests {
+use serde_json::{json,Value};
+use crate::{provider_output_overrides as output,provider_accounts::CustomProvider,runtime::Shared};
+use axum::{extract::{State,Path},Json};
+fn fixture()->(Shared,CustomProvider){
+ let app=crate::tests::app();let id=format!("custom-{}",crate::db::id());
+ let p:CustomProvider=serde_json::from_value(json!({"id":id,"name":"Owned review","base_url":"https://owned.invalid/v1","no_auth":false,"revision":crate::db::id(),"catalog":{"checked_at":1},"models":[{"model":"owned/a","context_window":262144},{"model":"owned/b","context_window":64000}]})).unwrap();
+ app.db.save_setting("custom_providers",&json!([p])).unwrap();(app,p)
+}
+fn seed(p:&CustomProvider,revision:&str)->Value{json!({p.id.clone():{"origin":p.base_url,"revision":revision,"models":{"owned/a":262144}}})}
+#[tokio::test]
+async fn mobile_invalid_stored_revision_must_not_be_consumed_as_explicit_intent(){
+ let(app,p)=fixture();let bad=seed(&p,"invalid-not-a-uuid");assert!(output::validate(&bad,&[p.clone()]).is_err());app.db.save_setting(output::KEY,&bad).unwrap();
+ let effective=output::effective(&app,&p,&p.models[0]);let api=output::get(State(app.clone()),Path(p.id.clone())).await;
+ println!("invalid revision runtime={effective:?}, GET accepted={}",api.is_ok());
+ assert!(effective.is_err(),"Runtime must refuse the same malformed store rejected by source validator");assert!(api.is_err());
+}
+#[test]
+fn mobile_malformed_store_rename_must_refuse_without_config_partial_write(){
+ let(app,p)=fixture();app.db.save_setting(output::KEY,&Value::Null).unwrap();let before=app.db.setting("custom_providers").unwrap();
+ let mut renamed=p;renamed.name="Renamed despite malformed store".into();
+ let result=output::persist_config(&app,&[renamed],None);let after=app.db.setting("custom_providers").unwrap();
+ println!("malformed-store config save accepted={}, provider unchanged={}",result.is_ok(),before==after);
+ assert!(result.is_err(),"Configuration persistence must fail closed on malformed explicit store");assert_eq!(after,before);
+}
+#[tokio::test]
+async fn mobile_cross_model_cas_cannot_clear_newer_intent_and_unrelated_settings_survive(){
+ let(app,p)=fixture();app.db.save_setting("owned_unrelated",&json!({"keep":"OWNED_CANARY"})).unwrap();
+ let first=output::get(State(app.clone()),Path(p.id.clone())).await.ok().unwrap().0;
+ let request=|model:&str,n:Value,rev:&Value|json!({"model":model,"max_output_tokens":n,"provider_revision":first["provider_revision"],"revision":rev});
+ let a=output::put(State(app.clone()),Path(p.id.clone()),Json(request("owned/a",json!(262144),&first["revision"]))).await.ok().unwrap().0;
+ assert!(output::put(State(app.clone()),Path(p.id.clone()),Json(request("owned/b",json!(4096),&first["revision"]))).await.is_err());
+ let b=output::put(State(app.clone()),Path(p.id.clone()),Json(request("owned/b",json!(4096),&a["revision"]))).await.ok().unwrap().0;
+ assert!(output::put(State(app.clone()),Path(p.id.clone()),Json(request("owned/a",Value::Null,&a["revision"]))).await.is_err());
+ assert_eq!(output::effective(&app,&p,&p.models[0]).unwrap(),Some(262144));assert_eq!(output::effective(&app,&p,&p.models[1]).unwrap(),Some(4096));
+ let cleared=output::put(State(app.clone()),Path(p.id.clone()),Json(request("owned/a",Value::Null,&b["revision"]))).await.ok().unwrap().0;assert_ne!(b["revision"],cleared["revision"]);
+ assert_eq!(output::effective(&app,&p,&p.models[0]).unwrap(),None);assert_eq!(app.db.setting("owned_unrelated").unwrap(),Some(json!({"keep":"OWNED_CANARY"})));
+}
+#[tokio::test]
+async fn malformed_store_refuses_every_surface_and_preserves_raw_bytes() {
+ let(app,p)=fixture();let good=seed(&p,&crate::db::id());let mut cases=vec![Value::Null,json!([])];
+ for (field,value) in [("revision",json!("bad")),("origin",json!("https://foreign.invalid/v1")),("extra",json!(true))] {
+  let mut bad=good.clone();bad[&p.id][field]=value;cases.push(bad);
+ }
+ for value in [json!(0),json!(1.25),json!("4096"),json!(10000001)] {let mut bad=good.clone();bad[&p.id]["models"]["owned/a"]=value;cases.push(bad);}
+ let foreign=format!("custom-{}",crate::db::id());cases.push(json!({foreign:good[&p.id]}));
+ let mut empty_name=good.clone();empty_name[&p.id]["models"]=json!({"":4096});cases.push(empty_name);
+ let before=app.db.setting("custom_providers").unwrap();
+ for bad in cases {
+  app.db.save_setting(output::KEY,&bad).unwrap();
+  let raw:String=app.db.0.lock().unwrap().query_row("SELECT value FROM settings WHERE key=?",[output::KEY],|r|r.get(0)).unwrap();
+  assert!(output::effective(&app,&p,&p.models[0]).is_err());
+  assert!(output::get(State(app.clone()),Path(p.id.clone())).await.is_err());
+  assert!(output::catalogue_response(&app,&p).is_err());
+  assert!(output::export(&app.db.0.lock().unwrap(),&[p.clone()]).is_err());
+  let body=json!({"model":"owned/a","max_output_tokens":null,"provider_revision":p.revision,"revision":""});
+  assert!(output::put(State(app.clone()),Path(p.id.clone()),Json(body)).await.is_err());
+  assert!(output::persist_config(&app,&[p.clone()],None).is_err());
+  assert!(output::persist_config(&app,&[],Some(&p.id)).is_err(),"reset must not normalize corruption");
+  assert_eq!(app.db.setting("custom_providers").unwrap(),before);
+  let after:String=app.db.0.lock().unwrap().query_row("SELECT value FROM settings WHERE key=?",[output::KEY],|r|r.get(0)).unwrap();assert_eq!(after,raw);
+ }
+ app.db.0.lock().unwrap().execute("UPDATE settings SET value='{' WHERE key=?",[output::KEY]).unwrap();
+ assert!(output::effective(&app,&p,&p.models[0]).is_err());assert!(output::persist_config(&app,&[p],None).is_err());
+ let raw:String=app.db.0.lock().unwrap().query_row("SELECT value FROM settings WHERE key=?",[output::KEY],|r|r.get(0)).unwrap();assert_eq!(raw,"{");
+}
+#[tokio::test]
+async fn missing_key_valid_rename_clear_and_dormant_records_remain_supported() {
+ let(app,p)=fixture();assert_eq!(output::effective(&app,&p,&p.models[0]).unwrap(),None);
+ let first=output::get(State(app.clone()),Path(p.id.clone())).await.ok().unwrap().0;assert_eq!(first["revision"],"");
+ let mut renamed=p.clone();renamed.name="New name".into();output::persist_config(&app,&[renamed.clone()],None).unwrap();
+ assert_eq!(app.db.setting(output::KEY).unwrap(),None,"missing store need not be materialized by rename");
+ let state=output::put(State(app.clone()),Path(p.id.clone()),Json(json!({"model":"owned/a","max_output_tokens":4096,"provider_revision":p.revision,"revision":""}))).await.ok().unwrap().0;
+ let saved=app.db.setting(output::KEY).unwrap();renamed.models.clear();output::persist_config(&app,&[renamed.clone()],None).unwrap();
+ assert_eq!(app.db.setting(output::KEY).unwrap(),saved);assert_eq!(output::get(State(app.clone()),Path(p.id.clone())).await.ok().unwrap().0["overrides"][0]["available"],false);
+ let cleared=output::put(State(app.clone()),Path(p.id.clone()),Json(json!({"model":"owned/a","max_output_tokens":null,"provider_revision":p.revision,"revision":state["revision"]}))).await.ok().unwrap().0;
+ assert_ne!(cleared["revision"],state["revision"]);assert!(cleared["overrides"].as_array().unwrap().is_empty());
+}
+#[test]
+fn next_provider_binding_must_validate_before_any_write_and_scoped_reset_preserves_others() {
+ let(app,p)=fixture();let mut other=p.clone();other.id=format!("custom-{}",crate::db::id());other.revision=crate::db::id();
+ app.db.save_setting("custom_providers",&json!([p,other])).unwrap();let mut store=seed(&p,&crate::db::id());store.as_object_mut().unwrap().extend(seed(&other,&crate::db::id()).as_object().unwrap().clone());app.db.save_setting(output::KEY,&store).unwrap();
+ let before=app.db.setting("custom_providers").unwrap();let mut moved=p.clone();moved.base_url="https://new-owned.invalid/v1".into();moved.revision=crate::db::id();
+ assert!(output::persist_config(&app,&[moved.clone(),other.clone()],None).is_err());assert_eq!(app.db.setting("custom_providers").unwrap(),before);assert_eq!(app.db.setting(output::KEY).unwrap(),Some(store.clone()));
+ output::persist_config(&app,&[moved.clone(),other.clone()],Some(&p.id)).unwrap();let after=app.db.setting(output::KEY).unwrap().unwrap();assert!(after.get(&p.id).is_none());assert_eq!(after[&other.id],store[&other.id]);
+ output::persist_config(&app,&[other.clone()],Some(&moved.id)).unwrap();assert_eq!(output::effective(&app,&other,&other.models[0]).unwrap(),Some(262144));
+ let mut new=other.clone();new.id=format!("custom-{}",crate::db::id());new.revision=crate::db::id();output::persist_config(&app,&[other,new.clone()],Some(&new.id)).unwrap();
+ assert_eq!(output::effective(&app,&new,&new.models[0]).unwrap(),None);
+}
+#[tokio::test]
+async fn malformed_store_precheck_prevents_existing_save_and_remove_credential_writes() {
+ let(mut app,p)=fixture();let root=std::env::temp_dir().join(format!("kindred-override-validation-{}",crate::db::id()));std::fs::create_dir(&root).unwrap();
+ std::sync::Arc::get_mut(&mut app).unwrap().config.database=root.join("owned.db").to_string_lossy().into();
+ let path=std::path::PathBuf::from(format!("{}.credentials",app.config.database));let raw=serde_json::to_vec(&json!({p.id.clone():"OWNED_ORIGINAL_KEY"})).unwrap();std::fs::write(&path,&raw).unwrap();
+ app.db.save_setting(output::KEY,&Value::Null).unwrap();let config=app.db.setting("custom_providers").unwrap();let mut renamed=p.clone();renamed.name="Must refuse".into();
+ assert!(crate::provider_accounts::save(State(app.clone()),Json(json!({"provider":renamed,"key":"OWNED_REPLACEMENT_KEY"}))).await.is_err());
+ assert_eq!(std::fs::read(&path).unwrap(),raw);assert_eq!(app.db.setting("custom_providers").unwrap(),config);
+ assert!(crate::provider_accounts::remove(State(app.clone()),Path(p.id.clone())).await.is_err());
+ assert_eq!(std::fs::read(&path).unwrap(),raw);assert_eq!(app.db.setting("custom_providers").unwrap(),config);assert_eq!(app.db.setting(output::KEY).unwrap(),Some(Value::Null));
+ assert_eq!(std::fs::read_dir(&root).unwrap().count(),1,"no credential temporary file");std::fs::remove_dir_all(root).unwrap();
+}
 
 }
