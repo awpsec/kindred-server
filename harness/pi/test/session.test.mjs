@@ -536,13 +536,13 @@ test('actual custom requests and summary recovery get the VM environment, hosted
 
 
 test('custom skill discovery preserves maintenance metadata and malformed receipts',()=>{
- const skill={name:'sample',description:'Useful workflow',body:'Instructions that must be loaded explicitly.',parameters:[{name:'target'}],command:'sample',current_hash:'guard-hash',import:null};
+ const skill={name:'sample',description:'Useful workflow',body:'Instructions that must be loaded explicitly.',parameters:[{name:'target'}],command:'sample',current_hash:'a'.repeat(64),import:null};
  assert.deepEqual(JSON.parse(customSkillListing(JSON.stringify([skill]))),[{name:skill.name,description:skill.description,parameters:skill.parameters,command:skill.command,current_hash:skill.current_hash,import:null}]);
  for(const raw of ['failed: unavailable','{"error":"unavailable"}','[null]'])assert.equal(customSkillListing(raw),raw);
 });
 
 test('actual custom skill listing is compact but skill_load and hosted listings retain complete bodies',async()=>{
- const skills=[{name:'sample',description:'Synthetic skill',command:'sample',current_hash:'guard-hash',parameters:[],body:'Complete selected workflow.'}];
+ const skills=[{name:'sample',description:'Synthetic skill',command:'sample',current_hash:'a'.repeat(64),parameters:[],import:null,body:'Complete selected workflow.'}];
  const tools=[{name:'skills_list',description:'List available skills.',inputSchema:{type:'object',properties:{}}},{name:'skill_load',description:'Read a selected skill.',inputSchema:{type:'object',properties:{name:{type:'string'}},required:['name']}}];
  for(const custom of [true,false]){
   let calls=0;
@@ -552,11 +552,72 @@ test('actual custom skill listing is compact but skill_load and hosted listings 
    if(calls===1)return sse({role:'assistant',tool_calls:[toolCall('skills_list',{})]},'tool_calls');
    const results=body.messages.filter(m=>m.role==='tool');
    assert.equal(JSON.parse(results[0].content)[0].body,custom?undefined:skills[0].body);
-   assert.equal(JSON.parse(results[0].content)[0].current_hash,'guard-hash');
+   assert.equal(JSON.parse(results[0].content)[0].current_hash,'a'.repeat(64));
    if(calls===2)return sse({role:'assistant',tool_calls:[toolCall('skill_load',{name:'sample'},'selected-skill')]},'tool_calls');
    assert.equal(JSON.parse(results.at(-1).content).body,skills[0].body);
    return sse({role:'assistant',content:'Read the selected skill.'});
   }});
   assert.equal(calls,3);
  }
+});
+
+
+test('skill catalogue projection refuses unknown error and incomplete shapes without rewriting any bytes',()=>{
+ const valid={name:'owned',description:'description',command:'owned',current_hash:'a'.repeat(64),parameters:[],import:null,body:'PRIVATE_BODY'};
+ const receipts=[
+  '[{"body":"OWNED_ERROR_BODY","error":"unavailable"}]', '[{"body":"OWNED_NOT_A_SKILL"}]',
+  ...Object.keys(valid).map(key=>{const row={...valid};delete row[key];return JSON.stringify([row]);}),
+  ...[{name:3},{description:null},{command:[]},{current_hash:'not-a-hash'},{parameters:{}},{import:false},{body:{error:'PRIVATE_BODY'}},{error:'unavailable'},{failed:true},{isError:true}].map(change=>JSON.stringify([{...valid,...change}])),
+  JSON.stringify([valid,{...valid,body:'OTHER_PRIVATE_BODY'}]),
+  JSON.stringify([{name:'same',body:'A'},{name:'same',body:'B'}]),
+  JSON.stringify([valid,{body:'error',error:'unavailable'}]),JSON.stringify([valid,null]),JSON.stringify([valid,[]]),
+  JSON.stringify({skills:[valid]}),'null','false','42','"body"','[]  ',
+ ];
+ // Empty catalogues need no projection; preserving their serialization is safest.
+ for(const raw of receipts)assert.equal(customSkillListing(raw),raw,raw);
+});
+
+test('skill catalogue success keeps arbitrary nested metadata and imported rows without mutation',()=>{
+ const ordinary={name:'owned',description:'description',command:'owned',current_hash:'a'.repeat(64),parameters:[{name:'target',schema:{enum:['one','two']}}],import:null,body:'PRIVATE_BODY',future:{body:'nested metadata'}};
+ const imported={...ordinary,name:'imported',import:{source:'local',hash:'b'.repeat(64),files:2,origin:{device_id:'synthetic'},future:{body:'import metadata'}}};delete imported.body;
+ const rows=Object.freeze([Object.freeze(ordinary),Object.freeze(imported)]),raw=JSON.stringify(rows);
+ const expected=JSON.parse(raw);delete expected[0].body;
+ assert.deepEqual(JSON.parse(customSkillListing(raw)),expected);
+ assert.equal(JSON.stringify(rows),raw);assert.equal(ordinary.body,'PRIVATE_BODY');
+});
+
+test('actual skills_list error and failed receipts remain exact in custom and hosted provider packets',async()=>{
+ const tools=[{name:'skills_list',description:'List available skills.',inputSchema:{type:'object',properties:{}}}];
+ const valid={name:'owned',description:'description',command:'owned',current_hash:'a'.repeat(64),parameters:[],import:null,body:'PRIVATE_BODY'};
+ for(const custom of [true,false])for(const receipt of [
+  {text:' [ {"body":"OWNED_ERROR_BODY","error":"unavailable"} ] '},
+  {text:JSON.stringify([valid]),failed:true},
+ ]){
+  let calls=0;
+  await runSession({...custom?customRequest():request(),tools},async()=>receipt,()=>{},undefined,{fetch:async req=>{
+   const body=await req.json();calls++;
+   if(calls===1)return sse({role:'assistant',tool_calls:[toolCall('skills_list',{})]},'tool_calls');
+   assert.equal(body.messages.find(m=>m.role==='tool').content,receipt.text);
+   return sse({role:'assistant',content:'Receipt preserved.'});
+  }});assert.equal(calls,2);
+ }
+});
+
+test('actual SDK successful catalogue projection keeps full source result and selected load; recovery and queued turn do not leak other bodies',async()=>{
+ const rows=[{name:'one',body:'PRIVATE_BODY_ONE',current_hash:'a'.repeat(64),description:'one',command:'one',parameters:[{name:'x',default:'v'}],import:null},{name:'two',body:'PRIVATE_BODY_TWO',current_hash:'b'.repeat(64),description:'two',command:'two',parameters:[],import:null}];
+ const listing=Object.freeze({text:JSON.stringify(rows),structuredContent:{catalogue:'unmodified'}});const original=JSON.stringify(listing);
+ const selected=Object.freeze({text:JSON.stringify(rows[0])});let calls=0,actions=0,boundaries=0;
+ const tools=['skills_list','skill_load'].map(name=>({name,description:name,inputSchema:{type:'object',properties:{}}}));
+ await runSession({...customRequest(),tools,followup_protocol:1},async(id,name)=>{actions++;return name==='skills_list'?listing:selected},()=>{},undefined,{
+ nextTurn:async()=>++boundaries===1?{offer_id:'owned-next',prompt:'Next owned question'}:null,
+ fetch:async req=>{const body=await req.json();calls++;
+ if(calls===1)return sse({role:'assistant',tool_calls:[toolCall('skills_list',{})]},'tool_calls');
+ const wire=JSON.stringify(body.messages);assert(!wire.includes('PRIVATE_BODY_TWO'));
+ const results=body.messages.filter(m=>m.role==='tool');assert.equal(JSON.parse(results[0].content)[0].body,undefined);assert.equal(JSON.parse(results[0].content)[0].current_hash,'a'.repeat(64));
+ if(calls===2)return sse({role:'assistant',tool_calls:[toolCall('skill_load',{name:'one'},'owned-load')]},'tool_calls');
+ assert.deepEqual(JSON.parse(results[1].content),rows[0]);
+ if(calls===3)return sse({role:'assistant',reasoning_content:'owned thinking'});
+ if(calls===4){assert.equal(body.tools?.length||0,0);return sse({role:'assistant',content:'First complete'});}
+ return sse({role:'assistant',content:'Second complete'});
+ }});assert.equal(calls,5);assert.equal(actions,2);assert.equal(JSON.stringify(listing),original);
 });

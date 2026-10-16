@@ -54,7 +54,18 @@ export function customToolContext(context, harnessDirectory) {
 export function customSkillListing(text) {
   try {
     const skills = JSON.parse(text);
-    if (!Array.isArray(skills) || !skills.every(skill => skill && typeof skill === 'object' && !Array.isArray(skill))) return text;
+    // Match commands::skills and runtime's imported-body omission. An unknown
+    // receipt (including a mixed success/error array) must remain byte-exact.
+    const catalogueRow = skill => skill && typeof skill === 'object' && !Array.isArray(skill)
+      && !Object.hasOwn(skill, 'error') && skill.failed !== true && skill.isError !== true
+      && typeof skill.name === 'string' && skill.name.trim().length > 0
+      && typeof skill.description === 'string' && typeof skill.command === 'string'
+      && typeof skill.current_hash === 'string' && /^[a-f0-9]{64}$/.test(skill.current_hash)
+      && Array.isArray(skill.parameters)
+      && (skill.import === null || (typeof skill.import === 'object' && !Array.isArray(skill.import)))
+      && (typeof skill.body === 'string' || (!Object.hasOwn(skill, 'body') && skill.import !== null));
+    if (!Array.isArray(skills) || skills.length === 0 || !skills.every(catalogueRow)) return text;
+    if (new Set(skills.map(skill => skill.name)).size !== skills.length) return text;
     return JSON.stringify(skills.map(({body, ...metadata}) => metadata));
   } catch { return text; }
 }
