@@ -637,3 +637,30 @@ mod tests {
         let _ = std::fs::remove_file(format!("{}.credentials", path.display()));
     }
 }
+
+#[cfg(test)]
+mod output_override_continuity_tests {
+    use super::*;
+    #[tokio::test]
+    async fn explicit_allowance_survives_refresh_into_actual_pi_start_packet() {
+        use axum::{Router,routing::get};use std::sync::Arc;
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url=format!("http://{}/v1",listener.local_addr().unwrap());
+        let server=tokio::spawn(async move {axum::serve(listener,Router::new().route("/v1/models",get(||async {axum::Json(json!({"data":[{"id":"owned/model","context_length":262144}]}))}))).await.unwrap()});
+        let root=std::env::temp_dir().join(format!("kindred-output-packet-{}",db::id()));std::fs::create_dir(&root).unwrap();
+        let packet=root.join("packet.json");let script=root.join("worker.py");
+        std::fs::write(&script,format!("import sys,json,pathlib\nv=json.loads(sys.stdin.readline())\npathlib.Path({}).write_text(json.dumps(v['model_info']))\nprint(json.dumps({{'type':'ready','protocol':1,'sdk_version':'0.85.1','provider':v['provider'],'model':v['model']}}),flush=True)\nprint(json.dumps({{'type':'assistant','text':'Captured owned request'}}),flush=True)\nprint(json.dumps({{'type':'complete','output':'Captured owned request'}}),flush=True)\n",serde_json::to_string(packet.to_str().unwrap()).unwrap())).unwrap();
+        let mut app=crate::tests::app();let config=&mut Arc::get_mut(&mut app).unwrap().config;
+        config.pi.node_binary="/usr/bin/python3".into();config.pi.worker_script=script.to_string_lossy().into();
+        let id=format!("custom-{}",db::id());
+        app.db.save_setting("custom_providers",&json!([{"id":id,"name":"Owned","base_url":url,"no_auth":true,"revision":db::id(),"models":[{"model":"owned/model","context_window":262144,"max_output_tokens":262144}]}])).unwrap();
+        app.db.save_setting("custom_provider_output_overrides",&json!({id.clone():{"origin":url,"revision":db::id(),"models":{"owned/model":262144}}})).unwrap();
+        let p=refresh(&app,&id).await.unwrap();assert_eq!(p.models[0].max_output_tokens,None,"Discovery omission stays discovery metadata");
+        let mut bot=crate::tests::bot(&app.db,&id);bot.model="owned/model".into();
+        let run=app.db.run(&app.db.queue(&bot.id,"Capture a synthetic request",0).unwrap()).unwrap();
+        assert_eq!(crate::provider_accounts::run(&app,&bot,&run).await.unwrap(),"Captured owned request");
+        let info:Value=serde_json::from_slice(&std::fs::read(&packet).unwrap()).unwrap();
+        assert_eq!(info["max_tokens"],262144,"Catalogue refresh erased explicit output intent before Pi transport");
+        server.abort();std::fs::remove_dir_all(root).unwrap();
+    }
+}

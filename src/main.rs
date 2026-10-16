@@ -69,6 +69,7 @@ mod workspace_artifacts;
 mod plans_tests;
 mod profiles;
 mod provider_accounts;
+mod provider_output_overrides;
 mod provider_catalog;
 mod provider_inbox;
 mod provider_retry;

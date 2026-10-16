@@ -214,6 +214,7 @@ pub fn router(app: Shared) -> Router {
             get(crate::provider_accounts::list).post(crate::provider_accounts::save),
         )
         .route("/providers/{id}", axum::routing::delete(crate::provider_accounts::remove))
+        .route("/providers/{id}/output-overrides", get(crate::provider_output_overrides::get).put(crate::provider_output_overrides::put))
         .route(
             "/providers/{id}/models",
             get(crate::provider_accounts::models).post(crate::provider_accounts::refresh_models),

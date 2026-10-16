@@ -208,7 +208,9 @@ impl Db {
             crate::provider_accounts::validate(provider)?;
         }
         let primary=crate::primary_bot::selected(&tx)?;
-        let settings = json!({"primary_bot":primary,"general":general.map(|s|serde_json::from_str::<Value>(&s)).transpose()?.unwrap_or(json!({})),"custom_providers":custom});
+        let explicit=crate::provider_output_overrides::export(&tx,&custom)?;
+        let mut settings = json!({"primary_bot":primary,"general":general.map(|s|serde_json::from_str::<Value>(&s)).transpose()?.unwrap_or(json!({})),"custom_providers":custom});
+        settings[crate::provider_output_overrides::KEY]=explicit;
         let package = json!({"format":"kindred-workspace","format_version":1,"id":id,"name":name,"created":db::now(),"tables":tables,"settings":settings});
         let serialized = serde_json::to_string(&package)?;
         ensure!(
@@ -419,6 +421,9 @@ impl Db {
             crate::provider_accounts::validate(provider)?;
         }
         tx.execute("INSERT INTO settings(key,value) VALUES('custom_providers',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[serde_json::to_string(&custom)?])?;
+        let explicit=package["settings"].get(crate::provider_output_overrides::KEY).cloned().unwrap_or(json!({}));
+        crate::provider_output_overrides::validate(&explicit,&custom)?;
+        tx.execute("INSERT INTO settings(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",rusqlite::params![crate::provider_output_overrides::KEY,explicit.to_string()])?;
         tx.execute(
             "INSERT INTO settings VALUES('_workspace_import',?)",
             [receipt.to_string()],
