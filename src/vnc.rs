@@ -182,6 +182,11 @@ impl Drop for SessionGuard {
         self.0.vnc.sessions.fetch_sub(1, Ordering::SeqCst);
     }
 }
+fn view_start_lease(app:&Shared,slot:i64)->anyhow::Result<Option<OwnedMutexGuard<()>>> {
+    let lease=app.screen_lock(slot).try_lock_owned().map_err(|_|anyhow::anyhow!("Computer startup is busy"))?;
+    crate::vm_maintenance::available(&app.db)?;
+    Ok(Some(lease))
+}
 async fn bridge(
     mut socket: WebSocket,
     app: Shared,
@@ -193,6 +198,9 @@ async fn bridge(
 ) {
     let slot=identity.slot;
     if app.db.screen_identity(&identity.owner,slot).ok().as_ref()!=Some(&identity) {return}
+    let start_lease=if control {None} else {
+        match view_start_lease(&app,slot) {Ok(v)=>v,Err(_)=>{let _=socket.send(Message::Close(None)).await;return;}}
+    };
     if crate::vm::guest_screen_identity(&app.config.vm, slot, "screen_ensure", json!({}),Some(&identity))
         .await
         .is_err()
@@ -200,6 +208,7 @@ async fn bridge(
         let _ = socket.send(Message::Close(None)).await;
         return;
     }
+    drop(start_lease); // Passive streaming itself does not block maintenance.
     let port = (if control {
         app.config.vm.vnc_port
     } else {
@@ -264,4 +273,22 @@ mod tests {
         }
         assert!(state.issue(false, identity.clone()).is_err());
     }
+}
+
+#[cfg(test)]
+mod runtime_start_tests {
+    use super::*;
+    #[tokio::test]
+    async fn passive_screen_ensure_cannot_bypass_maintenance_mutex() {
+        let app=crate::tests::app();let held=app.screen_lock(5).try_lock_owned().unwrap();
+        assert!(view_start_lease(&app,5).is_err(),"view-only screen_ensure bypassed the maintenance lease");
+        drop(held);let start=view_start_lease(&app,5).unwrap();assert!(app.screen_lock(5).try_lock().is_err());
+        drop(start);assert!(app.screen_lock(5).try_lock().is_ok(),"passive stream must release the startup mutex");
+    }
+    #[test]
+    fn passive_start_admission_rechecks_durable_maintenance_state() {
+        let app=crate::tests::app();app.db.0.lock().unwrap().execute("UPDATE vm_maintenance SET phase='checking' WHERE id=1",[]).unwrap();
+        assert!(view_start_lease(&app,5).is_err());assert!(app.screen_lock(5).try_lock().is_ok());
+    }
+
 }

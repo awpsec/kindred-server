@@ -1989,8 +1989,15 @@ fn static_assets<S: Clone + Send + Sync + 'static>() -> Router<S> {
 async fn maintenance(State(app): State<Shared>) -> Result<Json<crate::vm_maintenance::State>> {
     Ok(Json(crate::vm_maintenance::state(&app.db)?))
 }
-async fn request_maintenance(State(app): State<Shared>) -> Result<Json<crate::vm_maintenance::State>> {
-    Ok(Json(crate::vm_maintenance::request(&app.db)?))
+async fn request_maintenance(State(app): State<Shared>, body: axum::body::Bytes) -> Result<Json<crate::vm_maintenance::State>> {
+    let scope=if body.is_empty() {serde_json::json!({})} else {serde_json::from_slice::<Value>(&body)?};
+    require!(scope.is_object() && scope.as_object().unwrap().keys().all(|k| k=="scope"),"Unknown maintenance request");
+    match scope.get("scope").and_then(Value::as_str) {
+        None if scope.get("scope").is_none()=>Ok(Json(crate::vm_maintenance::request(&app.db)?)),
+        Some("full")=>Ok(Json(crate::vm_maintenance::request(&app.db)?)),
+        Some("runtime")=>Ok(Json(crate::vm_maintenance::request_runtime(&app).await?)),
+        _=>Err(anyhow::anyhow!("Unknown maintenance scope").into()),
+    }
 }
 async fn save_maintenance(
     State(app): State<Shared>,
