@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { runSession, providerAdapter, customToolContext, responseBudget, pruneScreenshots, guardedFetch, HarnessError } from '../session.mjs';
+import { runSession, providerAdapter, customToolContext, customSkillListing, responseBudget, pruneScreenshots, guardedFetch, HarnessError } from '../session.mjs';
 
 const remember = { name: 'remember', description: 'Save a short fact.', inputSchema: {
   type: 'object', properties: { text: { type: 'string' } }, required: ['text'], additionalProperties: false,
@@ -531,5 +531,32 @@ test('actual custom requests and summary recovery get the VM environment, hosted
    return sse({role:'assistant',content:'Finished.'});
   }});
   assert.equal(result.output,'Finished.');assert.equal(calls,custom?2:1);
+ }
+});
+
+
+test('custom skill discovery preserves maintenance metadata and malformed receipts',()=>{
+ const skill={name:'sample',description:'Useful workflow',body:'Instructions that must be loaded explicitly.',parameters:[{name:'target'}],command:'sample',current_hash:'guard-hash',import:null};
+ assert.deepEqual(JSON.parse(customSkillListing(JSON.stringify([skill]))),[{name:skill.name,description:skill.description,parameters:skill.parameters,command:skill.command,current_hash:skill.current_hash,import:null}]);
+ for(const raw of ['failed: unavailable','{"error":"unavailable"}','[null]'])assert.equal(customSkillListing(raw),raw);
+});
+
+test('actual custom skill listing is compact but skill_load and hosted listings retain complete bodies',async()=>{
+ const skills=[{name:'sample',description:'Synthetic skill',command:'sample',current_hash:'guard-hash',parameters:[],body:'Complete selected workflow.'}];
+ const tools=[{name:'skills_list',description:'List available skills.',inputSchema:{type:'object',properties:{}}},{name:'skill_load',description:'Read a selected skill.',inputSchema:{type:'object',properties:{name:{type:'string'}},required:['name']}}];
+ for(const custom of [true,false]){
+  let calls=0;
+  await runSession({...custom?customRequest():request(),tools},async(id,name)=>({text:JSON.stringify(name==='skills_list'?skills:skills[0])}),()=>{},undefined,{fetch:async req=>{
+   const body=await req.json();calls++;
+   assert.equal(body.tools.find(t=>t.function.name==='skills_list').function.description.includes('metadata only'),custom);
+   if(calls===1)return sse({role:'assistant',tool_calls:[toolCall('skills_list',{})]},'tool_calls');
+   const results=body.messages.filter(m=>m.role==='tool');
+   assert.equal(JSON.parse(results[0].content)[0].body,custom?undefined:skills[0].body);
+   assert.equal(JSON.parse(results[0].content)[0].current_hash,'guard-hash');
+   if(calls===2)return sse({role:'assistant',tool_calls:[toolCall('skill_load',{name:'sample'},'selected-skill')]},'tool_calls');
+   assert.equal(JSON.parse(results.at(-1).content).body,skills[0].body);
+   return sse({role:'assistant',content:'Read the selected skill.'});
+  }});
+  assert.equal(calls,3);
  }
 });

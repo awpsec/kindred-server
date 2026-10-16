@@ -48,6 +48,17 @@ export function customToolContext(context, harnessDirectory) {
     + '\n\nKindred tool environment: guest_exec and computer tools run in the bot VM, not in this model harness process. Use /workspace for VM working files. Chat uploads are not staged there until read_attachment is called with the exact attachment ID from the conversation; use the path it returns. Do not search the host temporary directory or scan the filesystem to locate chat uploads. Local-desktop tools, when available, target their explicitly selected device.\n' };
 }
 
+// Discovery should not inject every ordinary skill's instructions into a local
+// model turn. Keep identifiers, descriptions, parameters and guarded-edit hashes;
+// skill_load still returns the selected skill's complete instructions unchanged.
+export function customSkillListing(text) {
+  try {
+    const skills = JSON.parse(text);
+    if (!Array.isArray(skills) || !skills.every(skill => skill && typeof skill === 'object' && !Array.isArray(skill))) return text;
+    return JSON.stringify(skills.map(({body, ...metadata}) => metadata));
+  } catch { return text; }
+}
+
 export function responseBudget(model, context) {
   const input = context.messages.reduce((sum, message) => sum + estimateTokens(message), 0)
     + Math.ceil(((context.systemPrompt || '').length + JSON.stringify(context.tools || []).length) / 3);
@@ -293,7 +304,7 @@ export async function runSession(request, callTool, emit, signal, options = {}) 
       });
     };
     const customTools = request.tools.map(tool => ({
-      name: tool.name, label: tool.name, description: tool.description, parameters: tool.inputSchema,
+      name: tool.name, label: tool.name, description: tool.description + (custom && tool.name === 'skills_list' ? ' Returns metadata only; use skill_load(name) to read the selected skill instructions before using or editing them.' : ''), parameters: tool.inputSchema,
       executionMode: 'sequential',
       execute: async (id, args, toolSignal) => {
         if (recoveringResult) throw new HarnessError('empty_result');
@@ -305,7 +316,8 @@ export async function runSession(request, callTool, emit, signal, options = {}) 
           if(request.followup_protocol!==1||currentInputId!=='initial'||typeof next.offer_id!=='string'||typeof next.prompt!=='string'||!next.prompt.trim()) throw new HarnessError('protocol');
           await session.steer(next.prompt);currentInputId=next.offer_id;
         }
-        const content = [{ type: 'text', text: result.text || '' }];
+        const text = custom && tool.name === 'skills_list' && result.failed !== true ? customSkillListing(result.text || '') : result.text || '';
+        const content = [{ type: 'text', text }];
         if (result.image) {
           const match = /^data:(image\/(?:png|jpeg|gif|webp));base64,([A-Za-z0-9+/=]+)$/.exec(result.image);
           if (!match || match[2].length > 7 * 1024 * 1024) throw new HarnessError('image');
