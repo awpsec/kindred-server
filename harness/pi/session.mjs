@@ -3,7 +3,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  estimateTokens, createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager,
+  estimateTokens, getLastAssistantUsage, createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager,
 } from '@earendil-works/pi-coding-agent';
 import { InMemoryCredentialStore, InMemoryModelsStore } from '@earendil-works/pi-ai';
 
@@ -84,6 +84,20 @@ export function progressReminder(now = Date.now) {
       return 'Kindred progress reminder: If progress updates are appropriate for this conversation, give the user a brief milestone before your next tool call: what the recorded results establish and what remains. Do not reveal private reasoning, credentials, or raw tool arguments. Do not claim an action succeeded without its result. Honor explicit quiet-work instructions.';
     },
   };
+}
+
+// Reserve more headroom for custom endpoints, whose tokenizers and usage
+// reporting vary. Pi owns compaction; adjust its budget, not its agent loop.
+export function compactionSettings(model, context) {
+  const custom = model.provider.startsWith('custom-');
+  const reserve = Math.min(custom ? 32768 : 8192, Math.floor(model.contextWindow / 4));
+  // Reported context usage already includes system/tools and generated output.
+  // Pi's no-usage fallback only estimates messages, so reserve the omitted fixed
+  // input here exactly once. Never add it to provider-reported usage again.
+  const fixed = custom && context && !getLastAssistantUsage(context.messages.map(message => ({ type: 'message', message })))
+    ? Math.ceil(((context.systemPrompt || '').length + JSON.stringify(context.tools || []).length) / 3) : 0;
+  return { enabled: true, reserveTokens: Math.min(model.contextWindow, reserve + fixed),
+    keepRecentTokens: Math.min(12000, Math.floor(model.contextWindow / 3)) };
 }
 
 export function responseBudget(model, context) {
@@ -282,10 +296,14 @@ export async function runSession(request, callTool, emit, signal, options = {}) 
       enableAnalytics: false, enableInstallTelemetry: false, enableSkillCommands: false,
       packages: [], extensions: [], skills: [], prompts: [], themes: [], defaultTools: [],
       retry: { enabled: false, provider: { maxRetries: 0, timeoutMs } },
-      compaction: { enabled: true, reserveTokens: Math.min(8192, Math.floor(adapter.model.contextWindow / 4)),
-        keepRecentTokens: Math.min(12_000, Math.floor(adapter.model.contextWindow / 3)) },
+      compaction: compactionSettings(adapter.model),
       images: { autoResize: false, blockImages: false },
     });
+    if (custom) {
+      settingsManager.getCompactionSettings = () => compactionSettings(adapter.model,
+        session ? customToolContext({ messages: session.agent.state.messages,
+          systemPrompt: session.agent.state.systemPrompt, tools: session.agent.state.tools }, temporary) : undefined);
+    }
     const loader = new DefaultResourceLoader({
       cwd: temporary, agentDir: temporary, settingsManager,
       noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,

@@ -123,3 +123,25 @@ not prevent task startup. Unique tool names, schema validation, transport limits
 and dispatcher permissions remain enforced. Regression coverage submits 80 tools
 with unlimited calls. Stage 0.44.5 with the matching server for the next release;
 the 0.44.4 progress-frame compatibility requirement above still applies.
+
+
+### Earlier compaction for custom providers
+
+Custom providers reserve up to 32,768 tokens (bounded to one quarter of smaller
+context windows) for automatic compaction. With a 262,144-token window, Pi checks
+for compaction above 229,376 tokens. Hosted providers retain the existing reserve
+of up to 8,192 tokens. Recent-history retention remains up to 12,000 tokens.
+
+When no valid assistant usage is available, Pi estimates messages only. The custom
+settings adapter additionally reserves the estimated system prompt and serialized
+tool definitions, including Kindred's VM environment instructions. This lowers the
+message-only threshold by that fixed input cost. Once valid usage is available,
+that extra deduction is removed: reported input already includes system/tools,
+and Pi accounts for the response and subsequent tool results. No duplicate usage
+or synthetic messages are inserted into the conversation.
+
+This remains approximate, and Pi needs a safe history cut point: an oversized
+single recent tool result cannot always be compacted immediately. The change does
+not add retries for generic HTTP 400 responses or change the configured output
+ceiling. Release packaging must include the updated harness; a source push does
+not change running workers.

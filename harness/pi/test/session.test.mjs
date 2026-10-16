@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { runSession, providerAdapter, customToolContext, customSkillListing, responseBudget, progressReminder, pruneScreenshots, guardedFetch, HarnessError } from '../session.mjs';
+import { runSession, providerAdapter, customToolContext, customSkillListing, responseBudget, compactionSettings, progressReminder, pruneScreenshots, guardedFetch, HarnessError } from '../session.mjs';
 
 const remember = { name: 'remember', description: 'Save a short fact.', inputSchema: {
   type: 'object', properties: { text: { type: 'string' } }, required: ['text'], additionalProperties: false,
@@ -696,4 +696,49 @@ test('actual SDK reminder retains hosted and quiet-work behavior', async () => {
 test('actual SDK reminder preserves ninety-second cadence across blank tool turns', async () => {
   const results = await reminderPackets({ texts: ['', ' \n', backendWhitespace, ''] });
   assert.deepEqual(results.map(result => result.includes('Kindred progress reminder:')), [false, true, false, true]);
+});
+
+
+test('custom compaction reserves 32K while hosted providers keep their existing threshold', () => {
+  const model = { provider: 'custom-local', contextWindow: 262144 };
+  assert.equal(model.contextWindow - compactionSettings(model).reserveTokens, 229376);
+  assert.equal(compactionSettings(model).keepRecentTokens, 12000);
+  assert.equal(compactionSettings({ ...model, provider: 'openrouter' }).reserveTokens, 8192);
+  assert.equal(compactionSettings({ ...model, contextWindow: 16000 }).reserveTokens, 4000);
+});
+
+test('custom fallback includes fixed instructions and tools without double counting reported usage', () => {
+  const model = { provider: 'custom-local', contextWindow: 262144 };
+  const context = { messages: [], systemPrompt: 'x'.repeat(30000), tools: [remember] };
+  const fixed = Math.ceil((context.systemPrompt.length + JSON.stringify(context.tools).length) / 3);
+  assert.equal(compactionSettings(model, context).reserveTokens, 32768 + fixed);
+  context.messages.push({ role: 'assistant', stopReason: 'toolUse', content: [],
+    usage: { input: 100000, output: 2000, cacheRead: 1000, cacheWrite: 0, totalTokens: 103000 } });
+  assert.equal(compactionSettings(model, context).reserveTokens, 32768);
+  context.messages.push({ role: 'toolResult', content: [{ type: 'text', text: 'New tool output' }] });
+  assert.equal(compactionSettings(model, context).reserveTokens, 32768);
+  context.messages[0].usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0 };
+  assert.equal(compactionSettings(model, context).reserveTokens, 32768 + fixed);
+  assert.equal(compactionSettings({ ...model, provider: 'openrouter' }, context).reserveTokens, 8192);
+});
+
+test('custom SDK compacts a tool loop before 32K headroom is consumed, including fixed input without usage', async () => {
+  const events = []; let normal = 0, summaries = 0, actions = 0;
+  const custom = request({ provider: 'custom-11111111-1111-4111-8111-111111111111', endpoint: 'https://custom.example/v1/chat/completions',
+    instructions: 'Standing instructions. '.repeat(900), max_steps: 8,
+    model_info: { id: 'test/model', reasoning: true, vision: false, context_window: 262144, max_tokens: 4096 } });
+  const result = await runSession(custom, async () => {
+    actions++; return { text: 'Evidence '.repeat(actions <= 2 ? 49000 : 3000) };
+  }, event => events.push(event), undefined, { fetch: async req => {
+    const body = await req.json();
+    if (!body.tools?.length) { summaries++; return sse({ role: 'assistant', content: 'Evidence collected. Finish the task.' }); }
+    normal++;
+    if (normal <= 3) assert.equal(summaries, 0, 'below the early threshold');
+    if (normal === 4) assert(summaries > 0, 'must compact before the next model request');
+    return normal <= 3 ? sse({ role: 'assistant', tool_calls: [toolCall('remember', { text: 'Observe' }, 'early_' + normal)] }, 'tool_calls')
+      : sse({ role: 'assistant', content: 'Done.' });
+  } });
+  assert.equal(result.output, 'Done.');
+  assert.equal(actions, 3, 'compaction must not repeat completed actions');
+  assert(events.some(e => e.type === 'context' && e.state === 'compacted'));
 });
