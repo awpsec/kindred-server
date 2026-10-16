@@ -85,6 +85,7 @@ pub fn router(app: Shared) -> Router {
         .route("/chats/{id}/pin", put(pin_chat))
         .route("/bots/{id}/pin", put(pin_bot))
         .route("/computer/resources", get(resources))
+        .route("/computer/state", get(computer_power_state))
         .route(
             "/computer/maintenance",
             get(maintenance).put(save_maintenance).post(request_maintenance),
@@ -1343,6 +1344,12 @@ pub(crate) fn download_file_response(name: String, bytes: Vec<u8>) -> Response {
         bytes,
     )
         .into_response()
+}
+// Read the hypervisor without starting a guest or taking screen leases.
+async fn computer_power_state(State(app): State<Shared>) -> Result<Json<Value>> {
+    let power=tokio::time::timeout(std::time::Duration::from_secs(5),vm::control(&app.config.vm,"domstate")).await
+        .map_err(|_|anyhow::anyhow!("Computer power state check timed out"))??;
+    Ok(Json(json!({"state":power.trim()})))
 }
 async fn resources(State(app): State<Shared>) -> Result<Json<Value>> {
     Ok(Json(

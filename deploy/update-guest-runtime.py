@@ -18,7 +18,7 @@ LAUNCHERS = None
 def stage_launchers(root, payload):
     if payload is None:
         return []
-    names = ('browser-launch.py', 'desktop-launch', 'start-desktop.sh', 'ensure-screen', 'screen-ownership.py')
+    names = ('browser-launch.py', 'desktop-launch', 'start-desktop.sh', 'ensure-screen', 'screen-ownership.py', 'wait-screen-ready')
     if set(payload) != set(names):
         raise RuntimeError('Incomplete managed browser launcher set.')
     staged = []

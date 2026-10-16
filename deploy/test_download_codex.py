@@ -27,6 +27,17 @@ class CodexPackage(unittest.TestCase):
             with self.assertRaises(ValueError):package.update(Path('/fixture/bin/codex'))
             download.assert_not_called()
 
+    def test_0163_package_without_bundled_zsh_is_valid_but_old_packages_require_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);archive=root/'package.tar.gz'
+            with patch.object(package,'VERSION','0.163.0'):
+                self.archive(archive,omit='codex-resources/zsh/bin/zsh')
+                package.extract(archive,root/'new')
+                package.CHECKER['check'](root/'new/bin/codex',execute=False)
+            self.archive(archive,omit='codex-resources/zsh/bin/zsh')
+            with self.assertRaisesRegex(ValueError,'missing a regular file'):
+                package.extract(archive,root/'old')
+
     def test_complete_runtime_survives_relocation_and_repeated_install(self):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory);archive=root/'package.tar.gz';self.archive(archive)
