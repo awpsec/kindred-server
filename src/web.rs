@@ -1576,6 +1576,7 @@ fn static_assets<S: Clone + Send + Sync + 'static>() -> Router<S> {
         .route("/settings-header-art.js", get(|| async { ([(header::CONTENT_TYPE,"text/javascript")], include_str!("../ui/settings-header-art.js")) }))
         .route("/artifact-editors.js", get(|| async { ([(header::CONTENT_TYPE,"text/javascript")], include_str!("../ui/artifact-editors.js")) }))
         .route("/editor-vendor.js", get(|| async { ([(header::CONTENT_TYPE,"text/javascript")], include_str!("../ui/editor-vendor.js")) }))
+        .route("/chat-media.js", get(|| async { ([(header::CONTENT_TYPE,"text/javascript; charset=utf-8")], include_str!("../ui/chat-media.js")) }))
         .route("/workspace-artifacts.js", get(|| async { ([(header::CONTENT_TYPE,"text/javascript")], include_str!("../ui/workspace-artifacts.js")) }))
         .route(
             "/artifacts.js",
