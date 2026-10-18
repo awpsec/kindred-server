@@ -7,7 +7,7 @@ use anyhow::{Result, bail};
 use rusqlite::OptionalExtension;
 use serde_json::{Value, json};
 
-pub const VERSION: &str = "40";
+pub const VERSION: &str = "41";
 pub const CORE: &str = include_str!("prompts/00-core.md");
 pub const BOUNDED_CORE: &str = include_str!("prompts/00-bounded-core.md");
 pub const CHAPTERS: &[(&str, &str)] = &[
@@ -119,7 +119,10 @@ pub fn build(
         [&run.id],
         |r| r.get(0),
     )?;
-    let trigger = if app.db.recipient_selected(&run.id)? {
+    let initiative = crate::initiative::context(&app.db, run)?;
+    let trigger = if initiative["is_initiative"] == true {
+        "optional background initiative check; act within saved permissions, report useful results in the owner DM, finish quietly when nothing useful changed"
+    } else if app.db.recipient_selected(&run.id)? {
         "human message assigned to you. Recipient selection is complete, including explicit @mentions anywhere in the message. Begin the requested work; do not reconsider whether you should reply or narrate routing. Respect later corrections and work already completed."
     } else if crate::mail_watch::for_run(&app.db, &run.id)? {
         "new Gmail inbox messages detected by the saved inbox monitor"
@@ -319,7 +322,7 @@ pub fn build(
             "chat_id":run.chat_id,"round_id":run.round_id,"reply_to_run_id":run.reply_to,"handoff_depth":run.depth,
             "current_request":"Supplied separately as the current user input; do not replace it with an excerpt from history",
             "max_tool_steps":app.config.task_action_limit(),
-            "task_duration_limit_seconds":app.config.task_timeout_seconds(),
+            "task_duration_limit_seconds":if initiative["is_initiative"]==true {900}else{app.config.task_timeout_seconds()},
             "long_tasks":"Productive tasks may run for hours. This does not schedule a wake-up or enforce a testing window written in chat. Use durable routines or command_wait for later work; never claim a timer or monitoring exists without its saved receipt."},
         "environment":{"computer_and_guest_exec":"shared Linux bot VM; /workspace; per-bot screen and browser profile",
             "local_access":crate::local_access::status(app,&bot.id)?,"snapshot":"fresh configuration; recheck after setting changes",
@@ -334,6 +337,8 @@ pub fn build(
         "available_conversations":memberships,"recent_shared_conversations":shared,
         "context_limits":"Context is destination-scoped. Private memory and other conversations are withheld in shared destinations. Other bots' memories and private DMs are excluded. chats_list and chat_read retrieve membership-scoped history, including the bot's own prior posts. Empty groups are real conversations. Excerpts may be shortened; omitted history is not proof of absence. Preserve attribution and audience privacy."
     });
+    if bot.profile.initiative { packet["bot"]["initiative_enabled"] = json!(true); }
+    if !initiative.is_null() { packet["initiative"] = initiative.clone(); }
     if let Some(recovery)=app.db.followup_recovery(run)? {packet["followup_delivery_recovery"]=recovery;}
     let mut output = String::with_capacity(110_000);
     output.push_str(if context_window.is_some_and(|n|n<64000) {BOUNDED_CORE} else {CORE});
@@ -347,6 +352,10 @@ pub fn build(
         "\n\nCurrent task trigger: {trigger}.\nCurrent task run ID: {}.\n",
         run.id
     ));
+    if initiative["is_initiative"] == true {
+        output.push_str("\n\n");
+        output.push_str(include_str!("prompts/09-initiative.md"));
+    }
     if is_routine {
         output.push_str("\nScheduled reporting: work quietly. Report only new information meeting notification criteria, real failures or needed input; do not repeat delivered updates. For a successful check with nothing new, call the actual finish_quietly tool directly, without preamble or final explanation. Otherwise use routine_complete(outcome=report, report=the finding), or outcome=error with an actionable reason. Successful terminal checks require one structured outcome; prose alone is insufficient. The tool ends the turn: no second final reply. Honor explicit requests to report every run. Never treat a failed or incomplete check as an all-clear.\n");
     }

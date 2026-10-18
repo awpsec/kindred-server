@@ -99,7 +99,7 @@ fn ensure_task_marker(c:&rusqlite::Connection,run:&str)->Result<()> {
     use rusqlite::OptionalExtension;
     let (boundary,event_boundary)=phase_boundary(c,run)?;
     let hidden:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM routine_runs WHERE run_id=?1) OR EXISTS(SELECT 1 FROM routine_execution WHERE run_id=?1) OR EXISTS(SELECT 1 FROM events WHERE run_id=?1 AND kind='tool_result' AND json_extract(body,'$.tool')='finish_quietly' AND COALESCE(json_extract(body,'$.failed'),0)=0)",[run],|r|r.get(0))?;
-    if hidden || emission_mode(c,run)?!="summaries" {return Ok(());}
+    if hidden || crate::initiative::is_run(c,run)? || emission_mode(c,run)?!="summaries" {return Ok(());}
     let existing:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM message_progress WHERE run_id=? AND message_seq>? AND mode='summaries' AND phase='commentary')",rusqlite::params![run,boundary],|r|r.get(0))?;
     if existing {return Ok(());}
     let source:Option<(i64,i64)>=c.query_row("SELECT seq,created FROM events WHERE run_id=? AND kind='task_work' AND seq>? ORDER BY seq LIMIT 1",rusqlite::params![run,event_boundary],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;

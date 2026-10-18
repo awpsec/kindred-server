@@ -135,7 +135,7 @@ impl Db {
                         continue;
                     }
                     let silent:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM events WHERE run_id=?1 AND kind IN ('question_wait','process_wait')) OR EXISTS(SELECT 1 FROM routine_runs WHERE run_id=?1 AND quiet=1) OR EXISTS(SELECT 1 FROM events WHERE run_id=?1 AND kind='tool_result' AND json_extract(body,'$.tool')='finish_quietly' AND json_extract(body,'$.failed')=0) OR EXISTS(SELECT 1 FROM collaboration_requests WHERE parent_run_id=?1)",[&run_id],|r|r.get(0))?;
-                    if silent {
+                    if silent || crate::initiative::is_quiet(&c, &run_id)? {
                         continue;
                     }
                     let replacement =

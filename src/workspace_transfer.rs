@@ -47,6 +47,8 @@ const TABLES: &[&str] = &[
     "group_wakeups",
     "run_chat_reads",
     "routine_runs",
+    "initiative_state",
+    "initiative_runs",
     "provider_inbox_routines",
     "provider_inbox_runs",
     "routine_run_requests",
@@ -306,6 +308,8 @@ impl Db {
                     | "standing_work_rules"
                     | "command_jobs"
                     | "command_waits"
+                    | "initiative_state"
+                    | "initiative_runs"
 
                         | "chat_completion_pending"
                         | "provider_inbox_routines"
@@ -347,6 +351,8 @@ impl Db {
                     | "standing_work_rules"
                     | "command_jobs"
                     | "command_waits"
+                    | "initiative_state"
+                    | "initiative_runs"
 
                     | "chat_completion_pending"
                     | "provider_inbox_routines"
@@ -400,6 +406,8 @@ impl Db {
         tx.execute("UPDATE bots SET profile=json_set(profile,'$.local_access',json('false'),'$.local_device_id','')",[])?;
         tx.execute("UPDATE screens SET takeover=0,quiet_until=0", [])?;
         tx.execute("UPDATE routines SET enabled=0", [])?;
+        // Preserve follow-ups and spent budget, but require fresh opt-in on the new server.
+        tx.execute("UPDATE bots SET profile=json_set(profile,'$.initiative',json('false'))", [])?;
         tx.execute("UPDATE connector_artifacts SET status='interrupted',revision=revision+1 WHERE status IN ('preparing','pending','ready','approved','executing')",[])?;
         tx.execute(
             "UPDATE reminders SET status='paused',revision=revision+1 WHERE status='pending'",
@@ -437,5 +445,68 @@ impl Db {
         );
         tx.commit()?;
         Ok(receipt)
+    }
+}
+
+
+#[cfg(test)]
+mod initiative_transfer_tests {
+    use super::*;
+
+    fn package() -> (Db, Value, String, String, String) {
+        let db = Db::open(":memory:").unwrap();
+        let mut bot = crate::tests::bot(&db, "codex");
+        bot.profile.initiative = true;
+        bot.profile.initiative_instructions = "Follow the contract draft".into();
+        db.save_bot(&bot).unwrap();
+        let root = db.queue(&bot.id, "Initiative check", 0).unwrap();
+        let teammate = crate::tests::bot(&db, "codex");
+        let child = db.queue(&teammate.id, "Research contract terms", 0).unwrap();
+        {
+            let c = db.0.lock().unwrap();
+            c.execute("INSERT INTO initiative_runs(run_id,bot_id) VALUES(?,?)", params![root,bot.id]).unwrap();
+            c.execute("INSERT INTO collaboration_requests(child_run_id,parent_run_id,source_chat_id,resolved,continuation_run_id) VALUES(?,?,?,1,'completed')", params![child,root,format!("dm-{}",bot.id)]).unwrap();
+            c.execute("UPDATE initiative_state SET next_check=1792425600,last_day='2026-10-18',checks_today=2,notes='Contract drafted; await updated terms' WHERE bot_id=?", [&bot.id]).unwrap();
+            crate::initiative::mark_quiet(&c, &root).unwrap();
+        }
+        db.finish(&child, "completed", "Terms researched", "").unwrap();
+        db.finish(&root, "completed", "", "").unwrap();
+        let package = db.prepare_transfer(&db::id(), "Initiative workspace").unwrap();
+        (db, package, bot.id, root, child)
+    }
+
+    #[test]
+    fn initiative_transfer_preserves_followups_budget_and_lineage_but_pauses_opt_in() {
+        let (source, package, bot, root, child) = package();
+        let destination = Db::open(":memory:").unwrap();
+        let receipt = destination.import_transfer(&package).unwrap();
+        assert_eq!(destination.import_transfer(&package).unwrap(), receipt);
+        assert!(source.bot(&bot).unwrap().profile.initiative);
+        let imported = destination.bot(&bot).unwrap();
+        assert!(!imported.profile.initiative);
+        assert_eq!(imported.profile.initiative_instructions, "Follow the contract draft");
+        let c = destination.0.lock().unwrap();
+        let state: (i64, String, i64, String) = c.query_row("SELECT next_check,last_day,checks_today,notes FROM initiative_state WHERE bot_id=?", [&bot], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
+        assert_eq!(state, (1792425600, "2026-10-18".into(), 2, "Contract drafted; await updated terms".into()));
+        assert_eq!(crate::initiative::root(&c, &root).unwrap(), Some(root.clone()));
+        assert_eq!(crate::initiative::root(&c, &child).unwrap(), Some(root.clone()));
+        assert!(crate::initiative::is_quiet(&c, &root).unwrap());
+        assert!(!crate::initiative::active(&c, &child).unwrap());
+        assert!(!c.prepare("PRAGMA foreign_key_check").unwrap().exists([]).unwrap());
+    }
+
+    #[test]
+    fn initiative_transfer_accepts_legacy_packages_without_initiative_tables() {
+        let (_, mut package, bot, _, _) = package();
+        let tables = package["tables"].as_object_mut().unwrap();
+        tables.remove("initiative_state");
+        tables.remove("initiative_runs");
+        let destination = Db::open(":memory:").unwrap();
+        destination.import_transfer(&package).unwrap();
+        assert!(!destination.bot(&bot).unwrap().profile.initiative);
+        let c = destination.0.lock().unwrap();
+        for table in ["initiative_state", "initiative_runs"] {
+            assert_eq!(c.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get::<_,i64>(0)).unwrap(), 0);
+        }
     }
 }

@@ -238,7 +238,7 @@ pub fn create(db: &Db, run: &Run, args: &Value) -> Result<String> {
     let progress_message_seq:i64=tx.query_row("SELECT CASE WHEN mode='summaries' AND phase='commentary' AND COALESCE(work_qualified,1)=1 THEN message_seq ELSE 0 END FROM message_progress WHERE run_id=? ORDER BY message_seq DESC LIMIT 1",[&run.id],|r|r.get(0)).optional()?.unwrap_or(0);
     tx.execute("INSERT INTO connector_artifacts(id,run_id,chat_id,bot_id,body,status,created,progress_message_seq) VALUES(?,?,?,?,?,'preparing',?,?)",params![id,run.id,run.chat_id,run.bot_id,body.to_string(),db::now(),progress_message_seq])?;
     {
-        tx.execute("INSERT INTO chat_messages(chat_id,sender,body,kind,run_id,created) VALUES(?,?,?,'connector_artifact',?,?)",params![run.chat_id,run.bot_id,id,run.id,db::now()])?;
+        tx.execute("INSERT INTO chat_messages(chat_id,sender,body,kind,run_id,created,suppressed) VALUES(?,?,?,'connector_artifact',?,?,?)",params![run.chat_id,run.bot_id,id,run.id,db::now(),crate::initiative::is_run(&tx,&run.id)?])?;
     }
     tx.commit()?;
     Ok(id)
@@ -255,7 +255,17 @@ pub async fn review(
         .as_str()
         .context("Connector card missing")?
         .to_owned();
-    let allowed = runtime::approve_required(app, bot, run, tool, args, force).await?;
+    let allowed = match runtime::approve_required(app, bot, run, tool, args, force).await {
+        Ok(allowed) => allowed,
+        Err(error) => {
+            if crate::initiative::is_run(&app.db.0.lock().unwrap(), &run.id)? {
+                // A background check reports the proposed next step; it never
+                // leaves a connector card spinning for an approval it cannot request.
+                complete(&app.db, &id, &json!({"text":error.to_string(),"failed":true}), true)?;
+            }
+            return Err(error);
+        }
+    };
     let value = record(&app.db.0.lock().unwrap(), &id)?;
     if !allowed {
         let feedback = value["feedback"].as_str().unwrap_or("");
@@ -565,6 +575,9 @@ pub fn complete(db: &Db, id: &str, result: &Value, failed: bool) -> Result<()> {
     }
     // Also publish receipts for calls created by an older server before upgrade.
     tx.execute("INSERT INTO chat_messages(chat_id,sender,body,kind,run_id,created) SELECT ?,?,?,'connector_artifact',?,? WHERE NOT EXISTS(SELECT 1 FROM chat_messages WHERE kind='connector_artifact' AND body=?)",params![value["chat_id"].as_str(),value["bot_id"].as_str(),id,value["run_id"].as_str(),value["created"].as_i64().unwrap_or_else(db::now),id])?;
+    if crate::initiative::is_run(&tx, value["run_id"].as_str().unwrap_or(""))? {
+        tx.execute("UPDATE chat_messages SET suppressed=1 WHERE kind='connector_artifact' AND body=?",[id])?;
+    }
     if value["email_send"]==true {
         value["delivery_state"]=json!(if failed {if value["status"]=="executing" {"unknown"} else {"not_sent"}} else {"sent"});
         value["completed_at"]=json!(db::now());

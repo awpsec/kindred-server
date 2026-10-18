@@ -100,6 +100,8 @@ pub fn migrate(c: &Connection) -> Result<()> {
       SELECT r.chat_id,r.bot_id,json_extract(e.body,'$.text'),'assistant',r.id,e.created,e.seq,(SELECT printf('%020d:%020d',m.seq,e.seq) FROM chat_messages m WHERE m.run_id=r.id AND m.kind='result' LIMIT 1) FROM events e JOIN runs r ON r.id=e.run_id JOIN chats c ON c.id=r.chat_id
       WHERE e.kind='assistant' AND json_type(e.body,'$.text')='text' AND trim(json_extract(e.body,'$.text'))!=''
       AND NOT EXISTS(SELECT 1 FROM routine_runs rr WHERE rr.run_id=r.id)
+      AND NOT EXISTS(SELECT 1 FROM initiative_runs i WHERE i.run_id=r.id)
+      AND NOT EXISTS(SELECT 1 FROM events background WHERE background.run_id=r.id AND background.kind='initiative_background')
       AND NOT EXISTS(SELECT 1 FROM chat_messages m WHERE m.run_id=r.id AND m.kind='result' AND instr(m.body,json_extract(e.body,'$.text'))>0) ORDER BY e.seq;
       UPDATE chat_messages SET kind='result' WHERE kind='assistant'
       AND source_event_seq=(SELECT max(e.seq) FROM events e WHERE e.run_id=chat_messages.run_id AND e.kind='assistant')
@@ -121,8 +123,8 @@ pub fn repair_projection(c: &Connection) -> Result<()> {
     // Old composer restores left withdrawn user sends in the timeline. Retain
     // their rows/claims for retries without showing removed text or recalling it.
     c.execute("UPDATE chat_messages SET suppressed=1 WHERE sender='user' AND kind='withdrawn' AND suppressed=0", [])?;
-    c.execute_batch("UPDATE chat_messages SET suppressed=1 WHERE kind='assistant' AND EXISTS(SELECT 1 FROM routine_runs rr WHERE rr.run_id=chat_messages.run_id);
-      UPDATE chat_messages SET suppressed=1 WHERE kind='result' AND EXISTS(SELECT 1 FROM runs r WHERE r.id=chat_messages.run_id AND r.status='completed' AND r.error='' AND (trim(chat_messages.body)='' OR EXISTS(SELECT 1 FROM routine_runs rr WHERE rr.run_id=r.id AND rr.quiet=1) OR EXISTS(SELECT 1 FROM events e WHERE e.run_id=r.id AND e.kind IN ('question_wait','process_wait'))));
+    c.execute_batch("UPDATE chat_messages SET suppressed=1 WHERE kind='assistant' AND (EXISTS(SELECT 1 FROM routine_runs rr WHERE rr.run_id=chat_messages.run_id) OR EXISTS(SELECT 1 FROM initiative_runs i WHERE i.run_id=chat_messages.run_id) OR EXISTS(SELECT 1 FROM events e WHERE e.run_id=chat_messages.run_id AND e.kind='initiative_background'));
+      UPDATE chat_messages SET suppressed=1 WHERE kind='result' AND EXISTS(SELECT 1 FROM runs r WHERE r.id=chat_messages.run_id AND r.status='completed' AND r.error='' AND (trim(chat_messages.body)='' OR EXISTS(SELECT 1 FROM routine_runs rr WHERE rr.run_id=r.id AND rr.quiet=1) OR EXISTS(SELECT 1 FROM events e WHERE e.run_id=r.id AND e.kind='initiative_quiet') OR EXISTS(SELECT 1 FROM events e WHERE e.run_id=r.id AND e.kind IN ('question_wait','process_wait'))));
       UPDATE chat_messages SET suppressed=1 WHERE kind='assistant' AND source_event_seq=(SELECT max(e.seq) FROM events e WHERE e.run_id=chat_messages.run_id AND e.kind='assistant') AND EXISTS(SELECT 1 FROM chat_messages result JOIN runs r ON r.id=result.run_id WHERE result.run_id=chat_messages.run_id AND result.kind='result' AND result.suppressed=0 AND r.status='completed' AND r.error='' AND trim(result.body,char(9)||char(10)||char(13)||' ')=trim(chat_messages.body,char(9)||char(10)||char(13)||' '));")?;
     crate::quiet_output::repair(c)?;
     crate::task_recovery::repair_legacy(c)?;
@@ -789,6 +791,7 @@ impl Db {
             [&run.id],
             |r| r.get(0),
         )?;
+        let quiet = quiet || crate::initiative::is_quiet(&tx, &run.id)?;
         let has_attachments:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM attachments WHERE run_id=?1) OR EXISTS(SELECT 1 FROM deliverables WHERE run_id=?1)",[&run.id],|r|r.get(0))?;
         let replacement = if done.status == "completed" && done.error.is_empty() {
             crate::quiet_output::routine_replacement(&tx, &run.id, &done.output)?

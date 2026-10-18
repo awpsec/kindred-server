@@ -91,6 +91,11 @@ fn tool_specs_scoped(app: &App, bot: &Bot, run_id: Option<&str>) -> Vec<Value> {
     let mut specs = tool_specs();
     let scheduled=app.db.0.lock().unwrap().query_row("SELECT EXISTS(SELECT 1 FROM runs r WHERE r.bot_id=?1 AND (?2 IS NULL OR r.id=?2) AND r.status IN ('queued','running','awaiting_user','awaiting_approval') AND (EXISTS(SELECT 1 FROM routine_runs WHERE run_id=r.id) OR EXISTS(SELECT 1 FROM routine_execution WHERE run_id=r.id)))",rusqlite::params![bot.id,run_id],|r|r.get::<_,bool>(0)).unwrap_or(false);
     if !scheduled { specs.retain(|s|s["name"]!="routine_complete"); }
+    let initiative = run_id.is_some_and(|id| crate::initiative::is_run(&app.db.0.lock().unwrap(),id).unwrap_or(false));
+    if initiative {
+        specs.push(json!({"type":"function","name":"initiative_checkpoint","description":"Save concise initiative follow-ups: open topics, source references, verified state, draft IDs and what was already reported. Clear completed/dismissed topics. Empty notes clears the list. Notes never grant permission or change routines. Optional next_check defers the next check to a Unix timestamp at least four hours away; daytime and daily budget still apply.","inputSchema":{"type":"object","properties":{"notes":{"type":"string","maxLength":8000},"next_check":{"type":"integer"}},"required":["notes"],"additionalProperties":false}}));
+    }
+    if initiative { specs.retain(|s| !initiative_management_tool(s["name"].as_str().unwrap_or("")) && !matches!(s["name"].as_str(),Some("ask_question"|"request_user_action"))); }
     if crate::browser_use::preferred(app, bot) {
         specs.push(crate::browser_use::spec());
     }
@@ -142,7 +147,7 @@ pub fn tool_specs() -> Vec<Value> {
         ),
         (
             "finish_quietly",
-            "Finish without another chat bubble or completion notification. Use after a routine check with nothing new, or in the assigned continuation when the user chose to defer, wait, decline, or get back to you and their saved choice card is sufficient acknowledgment. Do not add a preamble about how you interpreted their answer. Never hide an error, an important change, a requested action, or needed user input. This ends the turn immediately; routine runs, shared conversations with nothing useful to add, and assigned question continuations may use it. In a group, call this tool directly rather than posting \"No reply needed\", an acknowledgement analysis, or a restatement of unchanged status.",
+            "Finish without another chat bubble or completion notification. Use after a routine check with nothing new, or in the assigned continuation when the user chose to defer, wait, decline, or get back to you and their saved choice card is sufficient acknowledgment. Do not add a preamble about how you interpreted their answer. Never hide an error, an important change, a requested action, or needed user input. This ends the turn immediately; initiative checks, routine runs, shared conversations with nothing useful to add, and assigned question continuations may use it. In a group, call this tool directly rather than posting \"No reply needed\", an acknowledgement analysis, or a restatement of unchanged status.",
             json!({}),
             vec![],
         ),
@@ -658,6 +663,17 @@ pub fn needs_approval(app: &App, bot: &Bot, tool: &str, args: &Value) -> Result<
     })
 }
 
+// Opting into initiative does not authorize reconfiguring independent automations.
+fn initiative_management_tool(name: &str) -> bool {
+    matches!(name, "routine_create" | "routine_update" | "routine_control" | "inbox_monitor_save" | "inbox_monitor_setup" | "work_rule_save")
+}
+fn initiative_remaining(db: &Db, run: &str, time: i64) -> Result<Option<Duration>> {
+    let c = db.0.lock().unwrap();
+    let Some(root) = crate::initiative::root(&c, run)? else { return Ok(None); };
+    let created: i64 = c.query_row("SELECT created FROM runs WHERE id=?", [&root], |r|r.get(0))?;
+    Ok(Some(Duration::from_secs((created.saturating_add(900).saturating_sub(time)).clamp(0,900) as u64)))
+}
+
 pub async fn approve(app: &App, bot: &Bot, run: &Run, tool: &str, args: &Value) -> Result<bool> {
     approve_required(app, bot, run, tool, args, false).await
 }
@@ -669,6 +685,7 @@ pub async fn approve_required(
     args: &Value,
     force: bool,
 ) -> Result<bool> {
+    ensure!(crate::initiative::active(&app.db.0.lock().unwrap(), &run.id)?, "Initiative was turned off. This action was not executed.");
     ensure!(!app.db.pushed_followups_pending(&run.id)?, "The user pushed a new message. Finish this response now to receive it before starting another action. This call was not executed.");
     let force = force || (crate::connector_artifacts::email_send(args)
         && (crate::connector_artifacts::email_review_requested(&run.prompt) || crate::work_rules::coordinator_round(&app.db, run)?));
@@ -684,6 +701,8 @@ pub async fn approve_required(
     if !force && connector_override.unwrap_or(!needs_approval(app, bot, tool, args)?) {
         return Ok(true);
     }
+    ensure!(!crate::initiative::is_run(&app.db.0.lock().unwrap(), &run.id)?,
+        "This action needs approval. Background initiative cannot grant it or hold the bot waiting for approval. Prepare what you can and report the proposed action for the owner to request directly. Do not retry or switch connections to bypass this permission.");
     let id = app.db.request_approval(&run.id, tool, args)?;
     app.db.event(
         &run.id,
@@ -702,7 +721,10 @@ pub async fn approve_required(
     }
 }
 pub async fn call_tool(app: &App, bot: &Bot, run: &Run, name: &str, args: Value) -> Result<Value> {
+    ensure!(crate::initiative::active(&app.db.0.lock().unwrap(), &run.id)?, "Initiative was turned off. This action was not executed.");
     ensure!(!app.db.pushed_followups_pending(&run.id)?, "The user pushed a new message. Finish this response now to receive it before starting another action. This call was not executed.");
+    ensure!(initiative_remaining(&app.db, &run.id, db::now())?.is_none_or(|remaining| !remaining.is_zero()),
+        "This initiative check reached its 15-minute budget. Completed work is preserved.");
     crate::provider_retry::check_tool_budget(app, run)?;
     if !crate::desktop_sessions::uses_desktop(name, &args) && name != "request_user_action" {
         app.desktop_sessions.release(&run.id);
@@ -745,12 +767,17 @@ async fn call_tool_inner(
     name: &str,
     args: Value,
 ) -> Result<Value> {
+    let initiative = crate::initiative::is_run(&app.db.0.lock().unwrap(), &run.id)?;
+    ensure!(!initiative || !initiative_management_tool(name),
+        "Initiative cannot change routines, inbox monitors or standing permissions. Leave existing automation in place and report a suggested change to the owner.");
+    ensure!(!initiative || !matches!(name, "ask_question" | "request_user_action"),
+        "Background initiative should not hold the bot waiting for input. Report the useful draft, result or proposed next step in the owner DM; the owner's reply starts direct work.");
     crate::provider_inbox::guard_tool(&app.db, run, name, &args)?;
     if matches!(name, "computer_open_url" | "computer_click" | "computer_type" | "computer_key" | "computer_scroll" | "computer_browser_task" | "guest_exec" | "command_start") {
         crate::provider_retry::require_certain_guest_effect(app, run)?;
     }
     ensure!(
-        name == "computer_browser_task" || tool_specs()
+        matches!(name, "computer_browser_task" | "initiative_checkpoint") || tool_specs()
             .into_iter()
             .chain(crate::local_access::specs())
             .any(|t| t["name"] == name),
@@ -841,6 +868,7 @@ async fn call_tool_inner(
         "inbox_monitor_save" => {
             json!({"text":serde_json::to_string(&crate::mail_watch::save_for_bot(app,bot,&args).await?)?})
         }
+        "initiative_checkpoint" => crate::initiative::checkpoint(&app.db, run, &args)?,
         "routine_complete" => {
             if args["outcome"]=="quiet" {crate::provider_inbox::verify_success(&app.db,run)?;}
             let mut c=app.db.0.lock().unwrap();let tx=c.transaction()?;
@@ -855,11 +883,13 @@ async fn call_tool_inner(
                 crate::routine_completion::complete(&c,&run.id,&json!({"outcome":"quiet"}))?;
             } else if routine {c.execute("UPDATE routine_runs SET quiet=1 WHERE run_id=?",[&run.id])?;}
 
+            let initiative = crate::initiative::is_run(&c, &run.id)?;
+            if initiative { crate::initiative::mark_quiet(&c, &run.id)?; }
             let decision:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM questions WHERE continuation_run_id=?1 AND bot_id=?2 AND (chat_id=?3 OR delivery_chat_id=?3) AND status='answered')",rusqlite::params![run.id,bot.id,run.chat_id],|r|r.get(0))?;
             let shared:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM chats WHERE id=?1 AND id NOT LIKE 'dm-%' AND EXISTS(SELECT 1 FROM json_each(members) WHERE value=?2))",rusqlite::params![run.chat_id,bot.id],|r|r.get(0))?;
             ensure!(
-                routine || decision || shared,
-                "Only a routine, shared conversation or assigned question continuation can finish quietly"
+                routine || initiative || decision || shared,
+                "Only an initiative check, routine, shared conversation or assigned question continuation can finish quietly"
             );
             c.execute("UPDATE chat_messages SET suppressed=1 WHERE run_id=? AND kind='task_progress'",[&run.id])?;
             c.commit()?;
@@ -1471,6 +1501,9 @@ pub async fn scheduler(app: Shared) {
                 eprintln!("Pending chat delivery will be retried: {error}");
             }
             app.db.tick(db::now())?;
+            if let Err(error) = crate::initiative::tick(&app.db, db::now()) {
+                eprintln!("Initiative check could not be queued: {error}");
+            }
             for bot_id in app.db.queued_bots()? {
                 let bot = app.db.bot(&bot_id)?;
                 if bot.profile.archived {
@@ -1578,14 +1611,22 @@ pub(crate) async fn drive_run<F: std::future::Future<Output = Result<String>>>(
     tokio::pin!(work);
     let mut tick = tokio::time::interval(Duration::from_millis(100));
     // Stop and human handoff stay on the 100ms tick; limit activity is read at most once per POLL.
+    let mut limits = crate::run_limits::Limits::from_config(&app.config);
+    if let Some(remaining) = initiative_remaining(&app.db, &run.id, db::now())? {
+        limits.total = Some(limits.total.unwrap_or(remaining).min(remaining));
+    }
     let mut watch = crate::run_limits::Watch::new(
-        crate::run_limits::Limits::from_config(&app.config),
+        limits,
         tokio::time::Instant::now(),
         crate::run_limits::snapshot(&app.db, &run.id)?,
     );
     let stop_reason = || {
         if app.account_disabled() {
             Some("This account was disabled by the server administrator.")
+        } else if !crate::initiative::active(&app.db.0.lock().unwrap(), &run.id).unwrap_or(false) {
+            Some("Initiative was turned off. Completed actions are preserved.")
+        } else if initiative_remaining(&app.db, &run.id, db::now()).ok().flatten().is_some_and(|remaining| remaining.is_zero()) {
+            Some("This initiative check reached its 15-minute budget. Completed work is preserved; you can ask to continue it.")
         } else if app.db.cancelled(&run.id) {
             Some("Stopped by the user. Completed external actions are not undone.")
         } else {
@@ -1652,5 +1693,128 @@ mod computer_receipt_tests {
         assert_eq!(result["failed"],true);
         let rejection = tool_error_result(anyhow::anyhow!("x outside supported range"));
         assert!(rejection["uncertain_effect"].is_null());
+    }
+}
+
+
+#[cfg(test)]
+mod initiative_runtime_tests {
+    use super::*;
+    use rusqlite::params;
+    fn fixture() -> (Shared, Bot, Run) {
+        let app = crate::tests::app();
+        let mut bot = crate::tests::bot(&app.db,"codex");
+        bot.profile.initiative=true;
+        bot.approval_mode="full".into();
+        app.db.save_bot(&bot).unwrap();
+        let id=app.db.queue(&bot.id,"Synthetic initiative check",0).unwrap();
+        app.db.0.lock().unwrap().execute("INSERT INTO initiative_runs(run_id,bot_id) VALUES(?,?)",params![id,bot.id]).unwrap();
+        let run=app.db.claim_bot(&bot.id).unwrap().unwrap();
+        (app,bot,run)
+    }
+    #[test]
+    fn initiative_packet_has_distinct_trigger_and_scoped_tools() {
+        let (app,bot,run)=fixture();
+        let specs=tool_specs_for_run(&app,&bot,&run);
+        assert!(specs.iter().any(|s|s["name"]=="initiative_checkpoint"));
+        assert!(!specs.iter().any(|s|s["name"]=="routine_create"));
+        assert!(!specs.iter().any(|s|s["name"]=="routine_complete"));
+        let checkpoint=specs.iter().find(|s|s["name"]=="initiative_checkpoint").unwrap();
+        assert_eq!(checkpoint["inputSchema"]["properties"]["next_check"]["type"],"integer");
+        let packet=crate::instructions::build(&app,&bot,&run,&specs,Some(262144)).unwrap();
+        assert!(packet.contains("Current task trigger: optional background initiative check"));
+        assert!(packet.contains("initiative_enabled"));
+        let other=app.db.queue(&bot.id,"An ordinary direct request",0).unwrap();
+        let direct=app.db.run(&other).unwrap();
+        let specs=tool_specs_for_run(&app,&bot,&direct);
+        assert!(specs.iter().any(|s|s["name"]=="routine_create"));
+        assert!(!specs.iter().any(|s|s["name"]=="initiative_checkpoint"));
+    }
+    #[tokio::test]
+    async fn initiative_uses_live_permissions_without_creating_waiting_approvals() {
+        let (app,mut bot,run)=fixture();
+        assert!(approve(&app,&bot,&run,"guest_exec",&json!({"action_scope":"routine_vm"})).await.unwrap());
+        bot.approval_mode="ask".into();app.db.save_bot(&bot).unwrap();
+        let error=approve(&app,&bot,&run,"guest_exec",&json!({"action_scope":"routine_vm"})).await.unwrap_err();
+        assert!(error.to_string().contains("needs approval"));
+        assert!(app.db.run_approvals(&run.id).unwrap().is_empty());
+        bot.approval_mode="full".into();app.db.save_bot(&bot).unwrap();
+        let error=approve_required(&app,&bot,&run,"codex_connector",&json!({"origin":"codex-account","permission_persistence_available":true,"account_key":"test","connector_key":"drive","forced":true}),false).await.unwrap_err();
+        assert!(error.to_string().contains("needs approval"));
+        bot.profile.initiative=false;app.db.save_bot(&bot).unwrap();
+        let error=approve(&app,&bot,&run,"guest_exec",&json!({"action_scope":"routine_vm"})).await.unwrap_err();
+        assert!(error.to_string().contains("turned off"));
+    }
+    #[tokio::test]
+    async fn initiative_connector_review_error_finishes_card_without_chat_noise() {
+        let (app,mut bot,run)=fixture();
+        bot.approval_mode="ask".into();app.db.save_bot(&bot).unwrap();
+        for origin in ["codex-account","claude-account","kindred"] {
+            let mut args=json!({"origin":origin,"account_key":"fixture","connector_key":"drive","connection":"Drive","tool_name":"google_drive.search","arguments":{"query":"synthetic"},"forced":true,"read_only":true});
+            let id=crate::connector_artifacts::create(&app.db,&run,&args).unwrap();
+            args["artifact_id"]=json!(id);
+            let error=crate::connector_artifacts::review(&app,&bot,&run,"codex_connector",&mut args,true).await.unwrap_err();
+            assert!(error.to_string().contains("needs approval"));
+            let c=app.db.0.lock().unwrap();
+            let status:String=c.query_row("SELECT status FROM connector_artifacts WHERE id=?",[&id],|r|r.get(0)).unwrap();
+            assert_eq!(status,"failed");
+            let visible:i64=c.query_row("SELECT count(*) FROM chat_messages WHERE kind='connector_artifact' AND body=? AND suppressed=0",[&id],|r|r.get(0)).unwrap();
+            assert_eq!(visible,0);
+        }
+        assert!(app.db.run_approvals(&run.id).unwrap().is_empty());
+    }
+    #[tokio::test]
+    async fn initiative_cannot_modify_existing_automation_or_expand_permissions() {
+        let (app,bot,run)=fixture();
+        for name in ["routine_create","routine_update","routine_control","inbox_monitor_save","work_rule_save"] {
+            let value=call_tool(&app,&bot,&run,name,json!({})).await.unwrap();
+            assert_eq!(value["failed"],true,"{name}");
+            assert!(value["text"].as_str().unwrap().contains("cannot change routines"));
+        }
+        assert!(app.db.routines().unwrap().is_empty());
+    }
+    #[tokio::test]
+    async fn initiative_quiet_check_has_no_bubble_notification_or_progress() {
+        let (app,bot,run)=fixture();
+        let before=app.db.chat_messages(&run.chat_id).unwrap().len();
+        let cursor=app.db.notifications(None).unwrap()["cursor"].as_i64().unwrap();
+        app.db.event(&run.id,"assistant",json!({"text":"Private scratch work"})).unwrap();
+        let value=call_tool(&app,&bot,&run,"initiative_checkpoint",json!({"notes":"Order X: delivery date unchanged; already reported."})).await.unwrap();
+        assert_ne!(value["failed"],true);
+        let done=call_tool(&app,&bot,&run,"finish_quietly",json!({})).await.unwrap();
+        assert_eq!(done["finish_quietly"],true);
+        app.db.finish(&run.id,"completed","Nothing new today","").unwrap();
+        app.db.event(&run.id,"run_finished",json!({})).unwrap();
+        app.db.chat_complete(&run).unwrap();
+        assert_eq!(app.db.chat_messages(&run.chat_id).unwrap().len(),before);
+        assert!(app.db.notifications(Some(cursor)).unwrap()["items"].as_array().unwrap().is_empty());
+        assert!(crate::initiative::context(&app.db,&run).unwrap()["notes"].as_str().unwrap().contains("unchanged"));
+    }
+    #[test]
+    fn initiative_useful_report_is_delivered_exactly_once() {
+        let (app,_bot,run)=fixture();
+        app.db.event(&run.id,"assistant",json!({"text":"Working privately"})).unwrap();
+        app.db.finish(&run.id,"completed","Your draft is ready for review.","").unwrap();
+        app.db.chat_complete(&run).unwrap();app.db.chat_complete(&run).unwrap();
+        let messages=app.db.chat_messages(&run.chat_id).unwrap();
+        assert_eq!(messages.iter().filter(|m|m["text"]=="Your draft is ready for review.").count(),1);
+        assert!(!messages.iter().any(|m|m["text"]=="Working privately"));
+    }
+    #[test]
+    fn initiative_shared_budget_expires_and_ordinary_work_is_unlimited_by_it() {
+        let (app,bot,run)=fixture();
+        assert_eq!(initiative_remaining(&app.db,&run.id,run.created).unwrap(),Some(Duration::from_secs(900)));
+        assert_eq!(initiative_remaining(&app.db,&run.id,run.created+901).unwrap(),Some(Duration::ZERO));
+        let other=app.db.queue(&bot.id,"Direct task",0).unwrap();
+        assert_eq!(initiative_remaining(&app.db,&other,run.created+901).unwrap(),None);
+    }
+    #[test]
+    fn manually_continued_initiative_is_explicit_user_work_even_when_disabled() {
+        let (app,mut bot,run)=fixture();
+        app.db.finish(&run.id,"interrupted","Draft started","Budget reached").unwrap();
+        bot.profile.initiative=false;app.db.save_bot(&bot).unwrap();
+        let next=app.db.continue_task(&run.id).unwrap();
+        assert!(!crate::initiative::is_run(&app.db.0.lock().unwrap(),&next).unwrap());
+        assert!(crate::initiative::active(&app.db.0.lock().unwrap(),&next).unwrap());
     }
 }

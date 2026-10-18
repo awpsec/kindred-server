@@ -235,6 +235,8 @@ impl Db {
         Ok(json!({"status":"requested","run_id":target}))
     }
     pub fn offer_followups(&self, run: &Run) -> Result<Option<Value>> {
+        // Keep direct user sends independent of optional background work.
+        if crate::initiative::is_run(&self.0.lock().unwrap(), &run.id)? { return Ok(None); }
         if run.chat_id.is_empty() {
             return Ok(None);
         }
@@ -1300,7 +1302,8 @@ pub fn with_live_context(db: &Db, run: &Run, mut result: Value) -> Result<Value>
         |r| r.get(0),
     )?;
     let mode=crate::progress_updates::resolved(&db.bot(&run.bot_id)?, &db.setting("general")?.unwrap_or_default());
-    let update_due = !routine && db::now() - last_reply >= crate::progress_updates::seconds(&mode);
+    let initiative = crate::initiative::is_run(&db.0.lock().unwrap(), &run.id)?;
+    let update_due = !routine && !initiative && db::now() - last_reply >= crate::progress_updates::seconds(&mode);
     // Context enrichment must never turn an already-completed tool action into
     // a failure if conversation membership changes while that action runs.
     let planning = db

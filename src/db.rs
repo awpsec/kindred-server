@@ -81,6 +81,8 @@ pub struct BotProfile {
     pub local_access: bool,
     pub local_device_id: String,
     pub progress_updates: String,
+    pub initiative: bool,
+    pub initiative_instructions: String,
 }
 impl Default for BotProfile {
     fn default() -> Self {
@@ -97,6 +99,8 @@ impl Default for BotProfile {
             local_access: false,
             local_device_id: String::new(),
             progress_updates: "inherit".into(),
+            initiative: false,
+            initiative_instructions: String::new(),
         }
     }
 }
@@ -256,6 +260,7 @@ impl Db {
         crate::schedules::migrate(&c)?;
         crate::provider_inbox::migrate(&c)?;
         crate::routine_completion::migrate(&c)?;
+        crate::initiative::init(&c)?;
         crate::chats::migrate(&c)?;
         crate::workspace_transfer::migrate(&c)?;
         crate::workspace_import::migrate(&c)?;
@@ -296,7 +301,7 @@ impl Db {
             "UPDATE approvals SET status='expired' WHERE status='pending'",
             [],
         )?;
-        c.execute_batch("INSERT INTO chat_messages(chat_id,sender,body,kind,run_id,created) SELECT chat_id,bot_id,CASE WHEN error='' THEN output ELSE error END,'result',id,max(created,COALESCE((SELECT max(m.created) FROM chat_messages m WHERE m.run_id=runs.id),created)) FROM runs WHERE chat_id!='' AND status IN ('completed','failed','interrupted','cancelled') AND NOT EXISTS(SELECT 1 FROM routine_execution WHERE run_id=runs.id) AND NOT EXISTS(SELECT 1 FROM chat_messages WHERE run_id=runs.id AND kind='result') AND NOT (status='completed' AND error='' AND (trim(output)='' OR EXISTS(SELECT 1 FROM routine_runs WHERE run_id=runs.id AND quiet=1) OR EXISTS(SELECT 1 FROM events WHERE run_id=runs.id AND kind IN ('question_wait','process_wait'))));")?;
+        c.execute_batch("INSERT INTO chat_messages(chat_id,sender,body,kind,run_id,created) SELECT chat_id,bot_id,CASE WHEN error='' THEN output ELSE error END,'result',id,max(created,COALESCE((SELECT max(m.created) FROM chat_messages m WHERE m.run_id=runs.id),created)) FROM runs WHERE chat_id!='' AND status IN ('completed','failed','interrupted','cancelled') AND NOT EXISTS(SELECT 1 FROM routine_execution WHERE run_id=runs.id) AND NOT EXISTS(SELECT 1 FROM chat_messages WHERE run_id=runs.id AND kind='result') AND NOT (status='completed' AND error='' AND (trim(output)='' OR EXISTS(SELECT 1 FROM routine_runs WHERE run_id=runs.id AND quiet=1) OR EXISTS(SELECT 1 FROM events WHERE run_id=runs.id AND kind='initiative_quiet') OR EXISTS(SELECT 1 FROM events WHERE run_id=runs.id AND kind IN ('question_wait','process_wait'))));")?;
         crate::chats::repair_projection(&c)?;
         crate::progress_updates::repair_task_markers(&c)?;
         crate::routine_controls::remove_archived_bot_schedules(&c)?;
@@ -338,6 +343,7 @@ impl Db {
         )?;
         ensure!(!exists, "Bot already exists");
         write_bot(&tx, b, false)?;
+        crate::initiative::preferences_changed(&tx, b, false, now())?;
         tx.execute(
             "INSERT INTO chats(id,name,members) VALUES(?,?,?)",
             params![
@@ -367,7 +373,9 @@ impl Db {
             ensure!(!tx.query_row("SELECT EXISTS(SELECT 1 FROM runs WHERE bot_id=? AND status IN ('queued','running','awaiting_user','awaiting_approval','cancelling'))",[&b.id],|r| r.get::<_,bool>(0))?, "Wait for or stop this bot's tasks before archiving.");
 
         }
+        let was_enabled: bool = tx.query_row("SELECT COALESCE((SELECT json_extract(profile,'$.initiative') FROM bots WHERE id=?),0)", [&b.id], |r| r.get(0))?;
         write_bot(&tx, b, preserve_text)?;
+        crate::initiative::preferences_changed(&tx, b, was_enabled, now())?;
         if let Some((provider, model)) = previous {
             if provider != b.provider || model != b.model {
                 // Save the configuration and its notice atomically. No notice on creation,
@@ -565,8 +573,14 @@ impl Db {
         if crate::workspace_transfer::frozen(&tx)? || crate::vm_maintenance::busy(&tx)? {
             return Ok(None);
         }
-        let mut run=tx.query_row("SELECT * FROM runs WHERE status='queued' AND bot_id=?1 AND EXISTS(SELECT 1 FROM bots WHERE id=?1 AND COALESCE(json_extract(profile,'$.archived'),0)=0) AND NOT EXISTS(SELECT 1 FROM runs WHERE bot_id=?1 AND status IN ('running','awaiting_user','awaiting_approval','cancelling')) ORDER BY created,rowid LIMIT 1",[bot],run_row).optional()?;
+        crate::initiative::expire_queued(&tx, now())?;
+        let mut run=tx.query_row("SELECT * FROM runs WHERE status='queued' AND bot_id=?1 AND EXISTS(SELECT 1 FROM bots WHERE id=?1 AND COALESCE(json_extract(profile,'$.archived'),0)=0) AND NOT EXISTS(SELECT 1 FROM runs WHERE bot_id=?1 AND status IN ('running','awaiting_user','awaiting_approval','cancelling')) ORDER BY EXISTS(SELECT 1 FROM initiative_runs i WHERE i.run_id=runs.id),created,rowid LIMIT 1",[bot],run_row).optional()?;
         if let Some(r) = &mut run {
+            if !crate::initiative::active(&tx, &r.id)? {
+                Self::cancel_initiative_locked(&tx, &r.id)?;
+                tx.commit()?;
+                return Ok(None);
+            }
             crate::progress_updates::start(&tx, r)?;
             tx.execute("UPDATE runs SET status='running' WHERE id=?", [&r.id])?;
         }
@@ -665,6 +679,17 @@ impl Db {
         self.run(id)?;
         let mut c = self.0.lock().unwrap();
         let tx = c.transaction()?;
+        Self::cancel_locked(&tx, id)?;
+        tx.commit()?;
+        Ok(())
+    }
+    pub(crate) fn cancel_locked(tx: &Connection, id: &str) -> Result<()> {
+        Self::cancel_tree_locked(tx, id, false)
+    }
+    pub(crate) fn cancel_initiative_locked(tx: &Connection, id: &str) -> Result<()> {
+        Self::cancel_tree_locked(tx, id, true)
+    }
+    fn cancel_tree_locked(tx: &Connection, id: &str, initiative_only: bool) -> Result<()> {
         ensure!(!tx.query_row("SELECT EXISTS(SELECT 1 FROM followup_offer_sources s JOIN followup_offers o ON o.id=s.offer_id JOIN runs parent ON parent.id=o.run_id WHERE s.source_run_id=? AND parent.status IN ('running','awaiting_user','awaiting_approval') AND o.state IN ('dispatching','transported'))",[id],|r|r.get::<_,bool>(0))?,"This message has been handed to the active task. Stop that task instead; its external effects cannot be withdrawn.");
         // Stop this task and its descendants, never its parallel group siblings
         // or the user's independent queued messages.
@@ -674,6 +699,12 @@ impl Db {
         while at < affected.len() {
             let children:Vec<String>=tx.prepare("SELECT r.id FROM runs r WHERE r.id IN (SELECT child_run_id FROM collaboration_requests WHERE parent_run_id=?1 UNION SELECT continuation_run_id FROM collaboration_requests WHERE parent_run_id=?1 UNION SELECT continuation_run_id FROM questions WHERE run_id=?1 UNION SELECT continuation FROM command_waits WHERE run_id=?1 UNION SELECT w.run_id FROM group_wakeups w JOIN chat_messages m ON m.seq=w.message_seq WHERE m.run_id=?1)")?.query_map([&affected[at]],|r|r.get(0))?.collect::<rusqlite::Result<_>>()?;
             for child in children {
+                // Opting out stops background work, not a continuation the owner
+                // explicitly requested by answering a question. Explicit Stop
+                // retains the existing full dependency-tree semantics.
+                if initiative_only && !crate::initiative::is_run(tx, &child)? {
+                    continue;
+                }
                 if seen.insert(child.clone()) {
                     affected.push(child);
                 }
@@ -696,7 +727,6 @@ impl Db {
             tx.execute("INSERT INTO chat_messages(chat_id,sender,body,kind,run_id,created) VALUES(?,'system','Requested collaboration stopped. Other tasks continue.','notice',?,?)",params![chat,id,now()])?;
         }
         tx.execute("INSERT INTO chat_messages(chat_id,sender,body,kind,run_id,created) SELECT chat_id,bot_id,error,'result',id,?1 FROM runs WHERE status='cancelled' AND id IN(SELECT value FROM json_each(?2)) AND NOT EXISTS(SELECT 1 FROM chat_messages WHERE run_id=runs.id AND kind='result')",params![now(),ids])?;
-        tx.commit()?;
         Ok(())
     }
     pub fn cancelled(&self, id: &str) -> bool {
@@ -740,6 +770,10 @@ impl Db {
         let mut c = self.0.lock().unwrap();
         let tx = c.transaction()?;
         let created = now();
+        let initiative_assistant = kind == "assistant" && crate::initiative::is_run(&tx, run)?;
+        if initiative_assistant {
+            tx.execute("INSERT INTO events(run_id,kind,body,created) SELECT ?1,'initiative_background','{}',?2 WHERE NOT EXISTS(SELECT 1 FROM events WHERE run_id=?1 AND kind='initiative_background')",params![run,created])?;
+        }
         if kind=="run_finished" && crate::routine_completion::root(&tx,run)?.is_some() && (!crate::routine_completion::current(&tx,run)? || tx.query_row("SELECT EXISTS(SELECT 1 FROM events WHERE run_id=? AND kind='run_finished')",[run],|r|r.get::<_,bool>(0))?) {tx.commit()?;return Ok(());}
         tx.execute(
             "INSERT INTO events(run_id,kind,body,created) VALUES(?,?,?,?)",
@@ -747,6 +781,7 @@ impl Db {
         )?;
         if kind=="tool_started" {crate::progress_updates::observe_tool(&tx,run,body["tool"].as_str().unwrap_or(""))?;}
         if kind == "assistant"
+            && !initiative_assistant
             && !tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM routine_runs WHERE run_id=?1) OR EXISTS(SELECT 1 FROM routine_execution WHERE run_id=?1)",
                 [run],
@@ -1027,6 +1062,7 @@ pub(crate) fn validate_bot(b: &Bot) -> Result<()> {
                 .all(|v| v.is_ascii_lowercase() || v == b'_'),
         "invalid thinking level"
     );
+    ensure!(b.profile.initiative_instructions.len() <= 2000, "Initiative instructions are limited to 2,000 UTF-8 bytes");
     ensure!(b.profile.progress_updates == "inherit" || crate::progress_updates::valid(&b.profile.progress_updates), "Invalid progress updates setting");
     ensure!(
         b.profile.label.len() <= 80
