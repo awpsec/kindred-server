@@ -20,7 +20,7 @@ for line in sys.stdin:
  elif m=='config/read':
   assert p.get('cwd')=='/workspace'
   result={'config':{'apps':{'_default':{'default_tools_approval_mode':'prompt'}}} if mode=='verified-policy' else {}}
- elif m=='configRequirements/read': result={'requirements':None}
+ elif m=='configRequirements/read': result={'requirements':{'allowedLoginMethods':['chatgpt'],'allowedApprovalPolicies':None,'allowedApprovalsReviewers':None,'application':None}}
  elif m=='app/list':
   send({'id':v['id'],'error':{'code':-32000,'message':'failed to list apps: Request failed with status 403 Forbidden: <html><script>window._cf_chl_opt={secret:"fixture-challenge-token"}</script></html>'}});continue
  elif m=='app/installed':
@@ -415,6 +415,33 @@ async fn verified_codex_calls_follow_full_access_but_preserve_review_boundaries(
 }
 
 #[test]
+fn codex_chatgpt_login_requirement_does_not_force_connector_review() {
+    let config = json!({"config":{"apps":null,"approval_policy":null,"approvals_reviewer":null}});
+    let requirements = json!({"requirements":{
+        "allowedLoginMethods":["chatgpt"], "allowedApprovalPolicies":null,
+        "allowedApprovalsReviewers":null, "application":null, "network":null
+    }});
+    assert!(provider_default_policy(Some(&config), Some(&requirements)));
+    for (field, value) in [
+        ("allowedApprovalPolicies", json!(["on-request"])),
+        ("allowedApprovalsReviewers", json!(["user"])),
+        ("application", json!({"some_policy":true})),
+        ("network", json!({"enabled":false})),
+        ("futurePolicy", json!({})),
+        ("allowedLoginMethods", json!(["api_key"])),
+        ("allowedLoginMethods", json!(["chatgpt", "api_key"])),
+        ("allowedLoginMethods", json!([])),
+    ] {
+        let mut restricted = requirements.clone();
+        restricted["requirements"][field] = value;
+        assert!(!provider_default_policy(Some(&config), Some(&restricted)), "{field}");
+    }
+    for malformed in [json!({}), json!({"requirements":false}), json!({"requirements":[]})] {
+        assert!(!provider_default_policy(Some(&config), Some(&malformed)));
+    }
+}
+
+#[test]
 fn codex_nondefault_or_unknown_provider_policy_never_auto_allows() {
     assert!(!provider_default_policy(
         Some(&json!({"config":{"approval_policy":"on-request"}})),
@@ -523,10 +550,18 @@ fn codex_existing_ask_survives_verified_binding_and_read_revocation_is_checked()
 #[tokio::test]
 #[ignore = "requires an explicitly selected authenticated Codex runtime"]
 async fn codex_live_read_only_gateway() {
-    let command: Vec<String> = serde_json::from_str(
-        &std::env::var("KINDRED_CODEX_LIVE_COMMAND_JSON").expect("explicit live command"),
+    // The supplied SSH transport ends at the guest host. Append the same
+    // guest launcher as Rpc::connect, including authentication restrictions.
+    // A hand-built Codex command previously hid a production-only review bug.
+    let mut command: Vec<String> = serde_json::from_str(
+        &std::env::var("KINDRED_CODEX_LIVE_SSH_COMMAND_JSON").expect("explicit live SSH transport"),
     )
     .unwrap();
+    assert!(command.len() >= 3, "SSH transport must include a remote guest command");
+    let remote = command.last_mut().unwrap();
+    remote.push_str(" '");
+    remote.push_str(&crate::rpc::guest_command("/usr/local/bin/codex").replace('\'', "'\"'\"'"));
+    remote.push('\'');
     let mut child = tokio::process::Command::new(&command[0]);
     child.args(&command[1..]);
     let mut rpc = Rpc::spawn(child).await.unwrap();
@@ -544,6 +579,7 @@ async fn codex_live_read_only_gateway() {
     for (name, arguments) in [
         ("github.list_installed_accounts", json!({})),
         ("google_calendar.list_calendars", json!({"max_results":1})),
+        ("google_drive.search", json!({"query":"Aldabra","topn":1})),
     ] {
         let row = rows
             .iter()

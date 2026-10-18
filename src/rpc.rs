@@ -48,7 +48,7 @@ fn error_message(message: &str) -> String {
     }
     bounded.split_whitespace().collect::<Vec<_>>().join(" ")
 }
-fn guest_command(binary: &str) -> String {
+pub(crate) fn guest_command(binary: &str) -> String {
     // The VM config validates binary as a single safe executable path.
     // A successful initialize/account read does not exercise code mode.
     // This check uses no credentials, model calls or real Kindred tools.

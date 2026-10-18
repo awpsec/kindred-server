@@ -195,10 +195,23 @@ fn provider_default_policy(config: Option<&Value>, requirements: Option<&Value>)
     let Some(requirements) = requirements.filter(|v| v.get("requirements").is_some()) else {
         return false;
     };
+    // Kindred's launcher restricts authentication to ChatGPT. Codex reports
+    // that as managed requirements even when there is no action policy.
+    // fingerprint() independently verifies ChatGPT auth; this login restriction
+    // must not turn Full access into per-call review. Keep all other non-null
+    // requirements fail-closed, including future fields we do not recognize.
+    let requirements = &requirements["requirements"];
+    let login_only = requirements.is_null()
+        || requirements.as_object().is_some_and(|fields| {
+            fields.iter().all(|(key, value)| {
+                value.is_null()
+                    || (key == "allowedLoginMethods" && value == &json!(["chatgpt"]))
+            })
+        });
     config["apps"].is_null()
         && config["approval_policy"].is_null()
         && config["approvals_reviewer"].is_null()
-        && requirements["requirements"].is_null()
+        && login_only
 }
 async fn inventory(rpc: &mut Rpc, thread: &str) -> Result<Value> {
     let account = rpc
