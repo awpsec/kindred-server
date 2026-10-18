@@ -714,7 +714,22 @@ impl Db {
                 [&chat.id],
                 |r| r.get::<_, String>(0),
             )?)?;
-            tx.execute("INSERT INTO chat_messages(chat_id,sender,body,kind,run_id,created,linked_chat_id) SELECT ?,?,?, 'collaboration',?,?,? WHERE NOT EXISTS(SELECT 1 FROM chat_messages WHERE chat_id=? AND linked_chat_id=?)",params![source,sender.id,format!("{} started a chat with {}.",sender.name,recipient.name),run.id,db::now(),chat.id,source,chat.id])?;
+            // A hidden initiative link must not swallow a later direct handoff.
+            // Preserve deduplication for visible links and unrelated hidden history.
+            let links: Vec<(String, bool)> = tx.prepare("SELECT run_id,suppressed FROM chat_messages WHERE chat_id=? AND linked_chat_id=?")?
+                .query_map(params![source,chat.id], |r| Ok((r.get(0)?,r.get(1)?)))?
+                .collect::<rusqlite::Result<_>>()?;
+            let mut existing_link = false;
+            for (prior_run, suppressed) in links {
+                if !suppressed || !crate::initiative::is_run(&tx, &prior_run)? {
+                    existing_link = true;
+                    break;
+                }
+            }
+            if !existing_link {
+                // Background delegation keeps its history without an unsolicited DM link.
+                tx.execute("INSERT INTO chat_messages(chat_id,sender,body,kind,run_id,created,linked_chat_id,suppressed) VALUES(?,?,?,'collaboration',?,?,?,?)",params![source,sender.id,format!("{} started a chat with {}.",sender.name,recipient.name),run.id,db::now(),chat.id,crate::initiative::is_run(&tx,&run.id)?])?;
+            }
         }
         if !chat.members.iter().any(|id| id == target) {
             ensure!(

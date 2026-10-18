@@ -533,3 +533,124 @@ fn initiative_helper_intermediate_assistant_does_not_resurrect_after_restart() {
         let _ = std::fs::remove_file(format!("{path}{suffix}"));
     }
 }
+
+// Exercise the real delegation and quiet-completion APIs, not a synthetic edge.
+async fn initiative_quiet_handoff_roundtrip(
+    handoff: fn(&Db, &db::Run, &str, &str) -> anyhow::Result<String>,
+    initiative: bool,
+    useful: bool,
+) {
+    let path = std::env::temp_dir().join(format!("initiative-handoff-{}.db", db::id()));
+    let database = path.to_str().unwrap();
+    let owner_id;
+    let root_id;
+    let child_id;
+    let source_chat;
+    {
+        let mut app = crate::tests::app();
+        std::sync::Arc::get_mut(&mut app).unwrap().db = Db::open(database).unwrap();
+        let mut owner = bot(&app.db, "codex");
+        owner.profile.initiative = initiative;
+        app.db.save_bot(&owner).unwrap();
+        let helper = bot(&app.db, "codex");
+        owner_id = owner.id.clone();
+        root_id = app.db.queue(&owner.id, "Check an existing topic", 0).unwrap();
+        if initiative {
+            app.db.0.lock().unwrap().execute(
+                "INSERT INTO initiative_runs(run_id,bot_id) VALUES(?,?)",
+                params![root_id, owner.id],
+            ).unwrap();
+        }
+        let root = app.db.claim_bot(&owner.id).unwrap().unwrap();
+        source_chat = root.chat_id.clone();
+        child_id = handoff(&app.db, &root, &helper.id, "Research the existing topic").unwrap();
+        let child = app.db.claim_bot(&helper.id).unwrap().unwrap();
+        assert_eq!(child.id, child_id);
+        assert_eq!(initiative::root(&app.db.0.lock().unwrap(), &child_id).unwrap().is_some(), initiative);
+        assert_eq!(app.db.collaboration_waits(&source_chat).unwrap().len(), 1);
+        if initiative && !useful {
+            let outcome = crate::runtime::call_tool(&app, &helper, &child, "finish_quietly", json!({})).await.unwrap();
+            assert_eq!(outcome["finish_quietly"], true);
+        }
+        app.db.finish(&child_id, "completed", if useful { "Verified research result" } else { "" }, "").unwrap();
+        app.db.chat_complete(&child).unwrap();
+        if initiative && !useful {
+            let outcome = crate::runtime::call_tool(&app, &owner, &root, "finish_quietly", json!({})).await.unwrap();
+            assert_eq!(outcome["finish_quietly"], true);
+        }
+        app.db.finish(&root_id, "completed", if useful { "One useful owner update" } else { "" }, "").unwrap();
+        app.db.chat_complete(&root).unwrap();
+        app.db.chat_complete(&root).unwrap();
+        // Delegation/request history is preserved even when its UI link is quiet.
+        let c = app.db.0.lock().unwrap();
+        let stored: (i64, bool) = c.query_row(
+            "SELECT count(*),COALESCE(max(suppressed),0) FROM chat_messages WHERE chat_id=? AND kind='collaboration' AND run_id=?",
+            params![source_chat, root_id], |r| Ok((r.get(0)?,r.get(1)?)),
+        ).unwrap();
+        assert_eq!(stored.0, 1);
+        assert_eq!(c.query_row("SELECT count(*) FROM collaboration_requests WHERE child_run_id=? AND parent_run_id=?",params![child_id,root_id],|r|r.get::<_,i64>(0)).unwrap(),1);
+        drop(c);
+    }
+    // Restart twice: startup projections must not resurrect background links.
+    for _ in 0..2 {
+        let db = Db::open(database).unwrap();
+        assert_eq!(initiative::root(&db.0.lock().unwrap(), &child_id).unwrap().is_some(), initiative);
+        let visible = db.chat_messages(&source_chat).unwrap();
+        assert_eq!(visible.iter().filter(|m| m["kind"] == "collaboration").count(), usize::from(!initiative));
+        if initiative && !useful { assert!(visible.iter().all(|m|m["sender"]=="user"), "Quiet handoff left a visible owner-DM message: {visible:?}"); }
+        if useful { assert_eq!(visible.iter().filter(|m|m["text"]=="One useful owner update").count(),1); }
+        assert_eq!(db.bot(&owner_id).unwrap().profile.initiative,initiative);
+    }
+    for suffix in ["", ".lock", "-wal", "-shm"] { let _ = std::fs::remove_file(format!("{database}{suffix}")); }
+}
+
+#[tokio::test]
+async fn initiative_quiet_handoff_actual_api_survives_restart() {
+    initiative_quiet_handoff_roundtrip(Db::chat_handoff, true, false).await;
+}
+#[tokio::test]
+async fn initiative_quiet_handoff_ordinary_api_link_stays_visible() {
+    initiative_quiet_handoff_roundtrip(Db::chat_handoff, false, false).await;
+}
+#[tokio::test]
+async fn initiative_quiet_handoff_useful_final_still_delivers_once() {
+    initiative_quiet_handoff_roundtrip(Db::chat_handoff, true, true).await;
+}
+
+#[tokio::test]
+async fn initiative_quiet_handoff_later_ordinary_same_pair_has_one_visible_link() {
+    let app = crate::tests::app();
+    let mut owner = bot(&app.db, "codex");
+    owner.profile.initiative = true;
+    app.db.save_bot(&owner).unwrap();
+    let helper = bot(&app.db, "codex");
+    let root = app.db.queue(&owner.id, "Background check", 0).unwrap();
+    app.db.0.lock().unwrap().execute("INSERT INTO initiative_runs(run_id,bot_id) VALUES(?,?)",params![root,owner.id]).unwrap();
+    let background = app.db.claim_bot(&owner.id).unwrap().unwrap();
+    let first = app.db.chat_handoff(&background, &helper.id, "Check the topic").unwrap();
+    let child = app.db.claim_bot(&helper.id).unwrap().unwrap();
+    assert_eq!(child.id, first);
+    for (bot, run) in [(&helper,&child),(&owner,&background)] {
+        assert_eq!(crate::runtime::call_tool(&app,bot,run,"finish_quietly",json!({})).await.unwrap()["finish_quietly"],true);
+        app.db.finish(&run.id,"completed","","").unwrap();
+        app.db.chat_complete(run).unwrap();
+    }
+    let before = app.db.chat_messages(&background.chat_id).unwrap();
+    assert!(!before.iter().any(|m|m["kind"]=="collaboration"));
+    let direct_id = app.db.queue(&owner.id,"An explicit owner request",0).unwrap();
+    let direct = app.db.claim_bot(&owner.id).unwrap().unwrap();
+    assert_eq!(direct.id,direct_id);
+    assert!(!initiative::is_run(&app.db.0.lock().unwrap(),&direct.id).unwrap());
+    let direct_child = app.db.chat_handoff(&direct,&helper.id,"Direct work for the same pair").unwrap();
+    let repeated = app.db.chat_handoff(&direct,&helper.id,"Another direct request").unwrap();
+    assert_ne!(repeated,direct_child);
+    let visible = app.db.chat_messages(&direct.chat_id).unwrap();
+    assert_eq!(visible.iter().filter(|m|m["kind"]=="collaboration").count(),1);
+    assert_eq!(app.db.run(&first).unwrap().chat_id,app.db.run(&direct_child).unwrap().chat_id,"Reuse the exact same team conversation");
+    // Hidden non-initiative history retains its old deduplication semantics.
+    app.db.0.lock().unwrap().execute("UPDATE chat_messages SET suppressed=1 WHERE run_id=? AND kind='collaboration'",[&direct.id]).unwrap();
+    app.db.chat_handoff(&direct,&helper.id,"Do not resurrect an ordinary hidden link").unwrap();
+    assert!(!app.db.chat_messages(&direct.chat_id).unwrap().iter().any(|m|m["kind"]=="collaboration"));
+    owner.profile.initiative=false;app.db.save_bot(&owner).unwrap();
+    assert_eq!(app.db.run(&direct_child).unwrap().status,"queued","Off must preserve the independent direct delegation");
+}
