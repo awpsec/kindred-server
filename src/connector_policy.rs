@@ -103,6 +103,18 @@ fn permission(
     if let Some(allowed) = permission_override(c, bot, origin, account, connector)? {
         return Ok(allowed);
     }
+    if origin == "codex-account" {
+        // Older releases keyed Codex permissions by app id. Preserve an
+        // explicit Ask when moving to account-scoped runtime binding keys;
+        // never migrate an Allow to a newly linked account.
+        let rows: Option<String> = c.query_row("SELECT connections FROM connector_catalogue WHERE origin=? AND account_key=?", params![origin,account], |r|r.get(0)).optional()?;
+        if let Some(rows) = rows {
+            let rows: Vec<Value> = serde_json::from_str(&rows)?;
+            if let Some(app_id) = rows.iter().find(|r|r["connector_key"]==connector).and_then(|r|r["app_id"].as_str()) {
+                if permission_override(c,bot,origin,account,app_id)? == Some(false) { return Ok(false); }
+            }
+        }
+    }
     // An untouched connector inherits the bot's live access mode. An explicit
     // connector Ask remains a narrower restriction, including under Full access.
     let mode: String = c.query_row("SELECT approval_mode FROM bots WHERE id=?", [bot], |r| r.get(0))?;
@@ -140,7 +152,7 @@ pub(crate) fn approval_override_locked(
     bot: &str,
     args: &Value,
 ) -> Result<Option<bool>> {
-    if args["forced"] == true || args["origin"] == "codex-account" {
+    if args["forced"] == true || (args["origin"] == "codex-account" && args["permission_persistence_available"] != true) {
         return Ok(Some(false));
     }
     let sending = crate::connector_artifacts::email_send(args);
@@ -252,7 +264,7 @@ pub fn inventory(app: &App, bot: &Bot) -> Result<Value> {
     let mut rows = rows;
     for row in &mut rows {
         row["always_allow"] = json!(
-            origin != "codex-account" && row["permission_persistence_available"] != false
+            row["permission_persistence_available"] != false
                 && permission(
                     &c,
                     &bot.id,
@@ -326,7 +338,7 @@ pub fn inventory(app: &App, bot: &Bot) -> Result<Value> {
         }
     }
     result["routing_instruction"] = json!(
-        "Connected describes account authentication, not permission to act. Prefer provider means the current bot's provider_source: Codex connections for a Codex bot, Claude connections for a Claude bot. Kindred connections remain available alongside provider connections or alone. For duplicate services use preferred_source unless the user explicitly selects another source; ask when unconfigured or ask. A missing or unavailable preferred provider connection requires an explanation and a choice, not silent fallback. Source preference grants no permissions. Untouched Claude and Kindred connections inherit Full access; an explicit connector Ask overrides it. requires_approval and always_allow report this effective permission. Read-only account limits, email-specific policies, and provider-forced reviews still apply. execution_available=false means the connector cannot execute. permission_persistence_available=false means each call needs review and no standing grant can be saved. Never switch sources after denial or authorization failure. Use connector_configure to propose saved preferences or permissions; only the person's approval saves them."
+        "Connected describes account authentication, not permission to act. Prefer provider means the current bot's provider_source: Codex connections for a Codex bot, Claude connections for a Claude bot. Kindred connections remain available alongside provider connections or alone. For duplicate services use preferred_source unless the user explicitly selects another source; ask when unconfigured or ask. A missing or unavailable preferred provider connection requires an explanation and a choice, not silent fallback. Source preference grants no permissions. Untouched Claude, verified Codex, and Kindred connections inherit Full access; an explicit connector Ask overrides it. requires_approval and always_allow report this effective permission. Read-only account limits, email-specific policies, and provider-forced reviews still apply. execution_available=false means the connector cannot execute. permission_persistence_available=false means each call needs review and no standing grant can be saved. Never switch sources after denial or authorization failure. Use connector_configure to propose saved preferences or permissions; only the person's approval saves them."
     );
     Ok(result)
 }
@@ -364,8 +376,8 @@ fn grant(c: &Connection, bot: &str, args: &Value, allow: bool) -> Result<()> {
             "Provider connection changed. Refresh its connectors."
         );
         ensure!(
-            !allow || origin != "codex-account",
-            "Codex connections require per-call review until the runtime supplies stable linked-account identity; source preference does not grant permission"
+            !allow || origin != "codex-account" || rows.iter().any(|r| r["connector_key"] == connector && r["permission_persistence_available"] == true),
+            "This Codex connection requires per-call review; refresh its verified connection and provider policy first"
         );
     } else {
         ensure!(connector != "*", "Choose a specific Kindred connection");
@@ -531,15 +543,11 @@ fn save_email_permission(c: &Connection, bot: &str, args: &Value, allow: bool) -
     let account = key(args, "account_key")?;
     let connector = key(args, "connector_key")?;
     ensure!(
-        !allow || origin != "codex-account",
-        "Codex connections require per-call review"
-    );
-    ensure!(
         connector != "*" && args["forced"] != true,
         "Choose one email connection; required approvals cannot be bypassed"
     );
     c.execute_batch("SAVEPOINT validate_email_identity")?;
-    let validated = grant(c, bot, args, false);
+    let validated = grant(c, bot, args, allow);
     c.execute_batch("ROLLBACK TO validate_email_identity; RELEASE validate_email_identity")?;
     validated?;
     c.execute("INSERT INTO connector_action_grants VALUES(?,?,?,?,'email_send',?) ON CONFLICT(bot_id,origin,account_key,connector_key,action) DO UPDATE SET permission=excluded.permission",params![bot,origin,account,connector,if allow{"allow"}else{"ask"}])?;
@@ -606,35 +614,37 @@ pub async fn configure(app: &App, bot: &Bot, run: &Run, args: &Value) -> Result<
     } else {
         ensure!(
             args["request"] == "always_allow"
-                && (args["source"] == "provider" || args["source"] == "claude")
-                && bot.provider == "claude-code",
-            "Standing provider permissions are currently available only for Claude account connections; Codex requires per-call review"
+                && matches!(args["source"].as_str(), Some("provider" | "claude" | "codex"))
+                && provider_identity(&bot.provider).is_some(),
+            "Choose a verified provider connector for this bot"
         );
         let connector = if args["scope"] == "source" {
             "*"
         } else {
             runtime::string(args, "connector_key")?
         };
-        let row = inv["claude_connections"]
+        let row = inv["provider_connections"]
             .as_array()
-            .context("Refresh Claude connectors first")?
+            .context("Refresh provider connectors first")?
             .iter()
             .find(|r| r["connector_key"] == connector);
         ensure!(
             connector == "*" || row.is_some(),
-            "Unknown Claude connector"
+            "Unknown provider connector"
         );
+        ensure!(bot.provider != "codex" || row.is_some_and(|r| r["permission_persistence_available"] == true),
+            "Choose a verified Codex connection that supports saved permissions");
         ensure!(
-            inv["claude_account_key"].as_str().unwrap_or("").len() == 64,
-            "Refresh Claude connectors first"
+            inv["provider_account_key"].as_str().unwrap_or("").len() == 64,
+            "Refresh provider connectors first"
         );
         // Full access allows execution, but does not itself save a standing grant
         // that would outlive a later change to the bot's approval mode.
-        if permission_override(&app.db.0.lock().unwrap(), &bot.id, "claude-account",
-            inv["claude_account_key"].as_str().unwrap_or(""), connector)? == Some(true) {
+        if permission_override(&app.db.0.lock().unwrap(), &bot.id, inv["provider_origin"].as_str().unwrap_or(""),
+            inv["provider_account_key"].as_str().unwrap_or(""), connector)? == Some(true) {
             return Ok(json!({"text":"This bot already has Always allow for that scope."}));
         }
-        json!({"request":"always_allow","origin":"claude-account","account_key":inv["claude_account_key"],"connector_key":connector,"connection":row.map(|r|r["display_name"].clone()),"connections":inv["claude_connections"]})
+        json!({"request":"always_allow","origin":inv["provider_origin"],"account_key":inv["provider_account_key"],"connector_key":connector,"connection":row.map(|r|r["display_name"].clone()),"connections":inv["provider_connections"]})
     };
     let approved =
         runtime::approve_required(app, bot, run, "connector_configure", &proposal, true).await?;
@@ -1166,4 +1176,26 @@ mod tests {
             Some(false)
         );
     }
+    #[test]
+    fn verified_codex_grants_are_connection_scoped_and_relinks_require_new_consent() {
+        let app=crate::tests::app();let mut bot=crate::tests::bot(&app.db,"codex");bot.approval_mode="ask".into();app.db.save_bot(&bot).unwrap();
+        let account="c".repeat(64);
+        let row=json!({"origin":"codex-account","name":"codex Gmail","display_name":"Gmail","app_id":"app-mail","connector_key":"codex:old-binding","permission_persistence_available":true,"execution_available":true});
+        catalogue_for(&app.db,"codex-account",&account,&json!([row])).unwrap();
+        let mut args=json!({"origin":"codex-account","account_key":account,"connector_key":"codex:old-binding","connection":"Gmail","tool_name":"gmail.get_profile","permission_persistence_available":true});
+        grant(&app.db.0.lock().unwrap(),&bot.id,&args,true).unwrap();
+        assert_eq!(approval_override(&app.db,&bot.id,&args).unwrap(),Some(true));
+        args["tool_name"]=json!("gmail.send_email");
+        assert_eq!(approval_override(&app.db,&bot.id,&args).unwrap(),Some(false));
+        save_email_permission(&app.db.0.lock().unwrap(),&bot.id,&args,true).unwrap();
+        assert_eq!(approval_override(&app.db,&bot.id,&args).unwrap(),Some(true));
+        let mut changed=row;changed["connector_key"]=json!("codex:new-binding");
+        catalogue_for(&app.db,"codex-account",&account,&json!([changed])).unwrap();
+        assert!(grant(&app.db.0.lock().unwrap(),&bot.id,&args,true).is_err());
+        args["connector_key"]=json!("codex:new-binding");
+        assert_eq!(approval_override(&app.db,&bot.id,&args).unwrap(),Some(false));
+        args["tool_name"]=json!("gmail.get_profile");
+        assert_eq!(approval_override(&app.db,&bot.id,&args).unwrap(),Some(false));
+    }
+
 }

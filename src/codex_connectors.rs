@@ -1,4 +1,4 @@
-//! Imported Codex apps execute only through reviewed, turnless auxiliary RPCs.
+//! Imported Codex apps use verified runtime bindings and permission-checked, turnless RPCs.
 use crate::{
     connector_artifacts,
     db::{Bot, Run},
@@ -112,35 +112,93 @@ fn connections(metadata: &Value, installed: &Value, servers: &[Value]) -> Result
         // availability. Tool provenance and live schemas are still required.
         let available = app["enabled"] == true && app["callable"] == true;
         let mut tools = Vec::new();
-        if available && metas_for.len() == 1 {
-            for summary in metas_for[0]["toolSummaries"]
-                .as_array()
-                .into_iter()
-                .flatten()
-            {
-                let Some(tool) = summary["name"].as_str() else {
-                    continue;
-                };
-                if summary["isEnabled"] == false
-                    || !owners
-                        .get(tool)
-                        .is_some_and(|o| o.len() == 1 && o.contains(id))
-                {
-                    continue;
+        if available {
+            if let Some(server) = server {
+                for (tool, schema) in server["tools"].as_object().into_iter().flatten() {
+                    if schema["name"] != tool.as_str() || !schema["inputSchema"].is_object() {
+                        continue;
+                    }
+                    let provenance = schema["_meta"]["connector_id"].as_str();
+                    let summaries: Vec<_> = metas_for
+                        .iter()
+                        .flat_map(|m| m["toolSummaries"].as_array().into_iter().flatten())
+                        .filter(|t| {
+                            t["name"] == tool.as_str()
+                                || t["name"].as_str() == tool.rsplit_once('.').map(|(_, name)| name)
+                        })
+                        .collect();
+                    // Display summaries use bare names; the runtime uses qualified
+                    // names. Never guess app ownership from a prefix or suffix.
+                    let bound = match provenance {
+                        Some(owner) => owner == id,
+                        None => {
+                            metas_for.len() == 1
+                                && owners
+                                    .get(tool.as_str())
+                                    .is_some_and(|o| o.len() == 1 && o.contains(id))
+                        }
+                    };
+                    if !bound || summaries.iter().any(|s| s["isEnabled"] == false) {
+                        continue;
+                    }
+                    let link = schema["_meta"]["link_id"]
+                        .as_str()
+                        .filter(|s| !s.is_empty());
+                    tools.push(json!({"name":tool,"description":schema["description"],"inputSchema":schema["inputSchema"],
+                        "read_only":schema["annotations"]["readOnlyHint"]==true && !summaries.iter().any(|s| s["isReadOnly"]==false),
+                        "runtime_binding":if provenance == Some(id) {json!({"app_id":id,"link_id":link,"link_selector":schema["inputSchema"]["properties"]["link_id"]})} else {Value::Null}}));
                 }
-                let Some(schema) = server.and_then(|s| s["tools"].get(tool)) else {
-                    continue;
-                };
-                if schema["name"] != tool || !schema["inputSchema"].is_object() {
-                    continue;
-                }
-                tools.push(json!({"name":tool,"description":summary["description"],"inputSchema":schema["inputSchema"],"read_only":summary["isReadOnly"]==true && schema["annotations"]["readOnlyHint"]==true}));
             }
         }
         let executable = !tools.is_empty();
-        rows.push(json!({"origin":"codex-account","name":format!("codex {name}"),"display_name":name,"connector_key":id,"app_id":id,"server":"codex_apps","status":if executable{"connected"}else{"unavailable"},"execution_available":executable,"permission_persistence_available":false,"requires_approval":true,"always_allow":false,"linked_account_verified":false,"tools":tools.iter().map(|t|t["name"].clone()).collect::<Vec<_>>(),"tool_schemas":tools,"availability_message":if executable{"Each call needs review; Codex does not identify the linked service account."}else{"No unambiguous callable tool binding is available. Refresh or reconnect this app in Codex."}}));
+        // Include the runtime's account selector schema: multiplexed apps can
+        // expose several accounts behind one tool-level link id. A reconnect or
+        // changed account set must not inherit a grant for the previous binding.
+        let persistent = executable
+            && tools
+                .iter()
+                .all(|t| t["runtime_binding"]["link_id"].is_string());
+        let connector_key = if persistent {
+            let mut bindings: Vec<_> = tools
+                .iter()
+                .map(|t| t["runtime_binding"].to_string())
+                .collect();
+            bindings.sort();
+            bindings.dedup();
+            let bytes = json!({"app_id":id,"bindings":bindings}).to_string();
+            format!(
+                "codex:{}",
+                digest(&SHA256, bytes.as_bytes())
+                    .as_ref()
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>()
+            )
+        } else {
+            id.to_owned()
+        };
+        rows.push(json!({"origin":"codex-account","name":format!("codex {name}"),"display_name":name,"connector_key":connector_key,"app_id":id,"server":"codex_apps","status":if executable{"connected"}else{"unavailable"},"execution_available":executable,"permission_persistence_available":persistent,"requires_approval":true,"always_allow":false,"linked_account_verified":persistent,"tools":tools.iter().map(|t|t["name"].clone()).collect::<Vec<_>>(),"tool_schemas":tools,"availability_message":if persistent{"Uses this bot's connector permissions. Provider restrictions and email-send reviews still apply."}else if executable{"Each call needs review because Codex did not identify a stable connection."}else if !available{"This app is disabled or not callable in Codex. Check its connection settings."}else{"Codex returned no verified callable tools for this app. Refresh the connection; if it persists, check the bot computer's Codex runtime."}}));
     }
     Ok(rows)
+}
+// Direct MCP RPCs do not run a model turn's approval machinery. An
+// explicitly configured provider policy therefore remains review-only here;
+// automatic Kindred permission inheritance is limited to the provider default.
+// Keep unavailable/unknown policy snapshots fail-closed for automatic calls.
+fn provider_default_policy(config: Option<&Value>, requirements: Option<&Value>) -> bool {
+    let Some(config) = config
+        .and_then(|v| v.get("config"))
+        .filter(|v| v.is_object())
+    else {
+        return false;
+    };
+    let Some(requirements) = requirements.filter(|v| v.get("requirements").is_some()) else {
+        return false;
+    };
+    config["apps"].is_null()
+        && config["approval_policy"].is_null()
+        && config["approvals_reviewer"].is_null()
+        && requirements["requirements"].is_null()
 }
 async fn inventory(rpc: &mut Rpc, thread: &str) -> Result<Value> {
     let account = rpc
@@ -202,14 +260,35 @@ async fn inventory(rpc: &mut Rpc, thread: &str) -> Result<Value> {
             Err(error) => {
                 metadata.clear();
                 warning = Some(format!(
-                    "Installed apps were found, but their tools could not be verified. {} These connectors are unavailable until a refresh succeeds.",
+                    "App display metadata could not be loaded. {} Tools with verified runtime app identifiers remain available; unverified tools are unavailable.",
                     error
                 ));
                 break;
             }
         }
     }
-    let rows = connections(&json!({"apps":metadata}), &installed, &servers)?;
+    let config = rpc
+        .request_guarded(
+            "config/read",
+            json!({"includeLayers":false,"cwd":"/workspace"}),
+        )
+        .await
+        .ok();
+    let requirements = rpc
+        .request_guarded("configRequirements/read", json!({}))
+        .await
+        .ok();
+    let default_policy = provider_default_policy(config.as_ref(), requirements.as_ref());
+    let mut rows = connections(&json!({"apps":metadata}), &installed, &servers)?;
+    for row in &mut rows {
+        row["provider_requires_review"] = json!(!default_policy);
+        if !default_policy {
+            row["permission_persistence_available"] = json!(false);
+            row["availability_message"] = json!(
+                "This Codex connection has an explicit or unverified provider policy. Each call needs review."
+            );
+        }
+    }
     Ok(json!({"account_key":account_key,"connections":rows,"warning":warning}))
 }
 pub async fn refresh(app: &App) -> Result<Value> {
@@ -248,7 +327,9 @@ fn binding(inv: &Value, args: &Value) -> Result<Value> {
         .iter()
         .find(|s| s["name"] == tool)
         .context("Unknown or unavailable Codex app tool")?;
-    Ok(json!({"app_id":app_id,"server":server,"connection":row["display_name"],"tool":schema}))
+    Ok(
+        json!({"app_id":app_id,"server":server,"connection":row["display_name"],"connector_key":row["connector_key"],"permission_persistence_available":row["permission_persistence_available"],"provider_requires_review":row["provider_requires_review"],"tool":schema}),
+    )
 }
 fn current_bot(app: &App, bot: &Bot, run: &Run) -> Result<()> {
     ensure!(
@@ -279,10 +360,17 @@ async fn execute_rpc(
     let inv = inventory(rpc, &thread).await?;
     let identity = binding(&inv, args)?;
     crate::composio::validate_arguments(&identity["tool"]["inputSchema"], &args["arguments"])?;
-    let mut review = json!({"origin":"codex-account","account_key":args["account_key"],"connector_key":args["app_id"],"connection":identity["connection"],"account_name":"Linked account selected by Codex (not independently identified)","tool_name":args["tool_name"],"arguments":args["arguments"],"forced":true,"permission_persistence_available":false,"read_only":identity["tool"]["read_only"],"app_id":args["app_id"],"server":args["server"]});
+    crate::connector_policy::catalogue_for(
+        &app.db,
+        "codex-account",
+        runtime::string(&inv, "account_key")?,
+        &inv["connections"],
+    )?;
+    let force = identity["permission_persistence_available"] != true;
+    let mut review = json!({"origin":"codex-account","account_key":args["account_key"],"connector_key":identity["connector_key"],"connection":identity["connection"],"account_name":"Linked account selected by Codex (not independently identified)","tool_name":args["tool_name"],"arguments":args["arguments"],"forced":force,"permission_persistence_available":!force,"read_only":identity["tool"]["read_only"],"app_id":args["app_id"],"server":args["server"]});
     let id = connector_artifacts::create(&app.db, run, &review)?;
     review["artifact_id"] = json!(id);
-    if !connector_artifacts::review(app, bot, run, "codex_connector", &mut review, true).await? {
+    if !connector_artifacts::review(app, bot, run, "codex_connector", &mut review, force).await? {
         return Ok(
             json!({"text":"The user declined this action. Do not repeat it or switch sources.","failed":true}),
         );

@@ -50,6 +50,9 @@ pub fn email_send(args: &Value) -> bool {
         .split("__")
         .last()
         .unwrap_or("")
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
         .to_ascii_lowercase()
         .replace('_', "");
     matches!(
@@ -57,7 +60,7 @@ pub fn email_send(args: &Value) -> bool {
         "gmail" | "outlook" | "microsoftoutlook"
     ) && matches!(
         tool.as_str(),
-        "send" | "reply" | "replyall" | "forward" | "forwardemail" | "forwardmessage"
+        "send" | "reply" | "replyall" | "forward" | "forwardemail" | "forwardemails" | "forwardmessage"
             | "gmailreply" | "gmailforward" | "outlookreply" | "outlookforward"
             | "sendemail"
             | "sendmessage"
@@ -90,6 +93,9 @@ pub fn read_only_hint(args: &Value) -> bool {
     let tool = tool_name(args)
         .split("__")
         .last()
+        .unwrap_or("")
+        .rsplit('.')
+        .next()
         .unwrap_or("")
         .to_ascii_lowercase();
     // Presentation only: this hint never grants permission to execute a Claude tool.
@@ -284,11 +290,11 @@ pub fn dispatch(db: &Db, run: &Run, args: &Value) -> Result<()> {
     crate::connector_edits::validate_email_delivery(&card)?;
     ensure!(input(args) == &card["input"], "Connector inputs changed after review");
     let explicit: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM connector_artifacts f JOIN approvals a ON a.id=f.approval_id WHERE f.id=? AND a.status='approved')",[id],|r|r.get(0))?;
-    if !explicit && args["read_only"] != true {
+    if !explicit && (args["read_only"] != true || args["origin"] == "codex-account") {
         ensure!(
             crate::connector_policy::approval_override_locked(&c, &run.bot_id, args)?
                 .unwrap_or(true),
-            "Sending permission changed before dispatch. Review this action again."
+            "Connector permission changed before dispatch. Review this action again."
         );
     }
     let changed = c.execute("UPDATE connector_artifacts SET status='executing' WHERE id=? AND run_id=? AND status='ready' AND EXISTS(SELECT 1 FROM runs WHERE id=? AND status='running')",params![id,run.id,run.id])?;
