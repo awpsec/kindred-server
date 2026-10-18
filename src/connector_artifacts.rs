@@ -1431,7 +1431,32 @@ mod task_anchor_tests {
         let database=Db::open(path.to_str().unwrap()).unwrap();assert_eq!(record(&database.0.lock().unwrap(),&id).unwrap()["progress_message_seq"],seq);drop(database);std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
-    fn no_summary_anchor_is_not_backfilled_from_run_mode_or_input() {
-        let app=crate::tests::app();let bot=crate::tests::bot(&app.db,"codex");app.db.queue(&bot.id,"No summary",0).unwrap();let run=app.db.claim_bot(&bot.id).unwrap().unwrap();let id=create(&app.db,&run,&json!({"toolkit":"googledrive","tool_slug":"read_record","input":{"progress_message_seq":12}})).unwrap();assert_eq!(record(&app.db.0.lock().unwrap(),&id).unwrap()["progress_message_seq"],0);
+    fn silent_connector_anchor_uses_server_progress_mode_not_input() {
+        for mode in ["summaries", "calm"] {
+            let app = crate::tests::app();
+            let mut bot = crate::tests::bot(&app.db, "codex");
+            bot.profile.progress_updates = mode.into();
+            app.db.save_bot(&bot).unwrap();
+            app.db.queue(&bot.id, "No narration", 0).unwrap();
+            let run = app.db.claim_bot(&bot.id).unwrap().unwrap();
+            let id = create(&app.db, &run, &json!({
+                "toolkit":"googledrive", "tool_slug":"read_record",
+                "input":{"progress_message_seq":12}, "progress_message_seq":9999
+            })).unwrap();
+            let saved = record(&app.db.0.lock().unwrap(), &id).unwrap();
+            let messages = app.db.chat_messages(&run.chat_id).unwrap();
+            let markers: Vec<_> = messages.iter()
+                .filter(|message| message["kind"] == "task_progress")
+                .collect();
+            if mode == "summaries" {
+                assert_eq!(markers.len(), 1);
+                assert_eq!(saved["progress_message_seq"], markers[0]["seq"]);
+                assert_ne!(saved["progress_message_seq"], 12);
+                assert_ne!(saved["progress_message_seq"], 9999);
+            } else {
+                assert!(markers.is_empty());
+                assert_eq!(saved["progress_message_seq"], 0);
+            }
+        }
     }
 }
