@@ -665,13 +665,11 @@ pub fn needs_approval(app: &App, bot: &Bot, tool: &str, args: &Value) -> Result<
 
 // Opting into initiative does not authorize reconfiguring independent automations.
 fn initiative_management_tool(name: &str) -> bool {
-    matches!(name, "routine_create" | "routine_update" | "routine_control" | "inbox_monitor_save" | "inbox_monitor_setup" | "work_rule_save")
+    matches!(name, "routine_create" | "routine_update" | "routine_control" | "inbox_monitor_save" | "inbox_monitor_setup" | "work_rule_save" | "connector_configure" | "show_connector")
 }
 fn initiative_remaining(db: &Db, run: &str, time: i64) -> Result<Option<Duration>> {
     let c = db.0.lock().unwrap();
-    let Some(root) = crate::initiative::root(&c, run)? else { return Ok(None); };
-    let created: i64 = c.query_row("SELECT created FROM runs WHERE id=?", [&root], |r|r.get(0))?;
-    Ok(Some(Duration::from_secs((created.saturating_add(900).saturating_sub(time)).clamp(0,900) as u64)))
+    Ok(crate::initiative::remaining_seconds(&c, run, time)?.map(|seconds| Duration::from_secs(seconds as u64)))
 }
 
 pub async fn approve(app: &App, bot: &Bot, run: &Run, tool: &str, args: &Value) -> Result<bool> {
@@ -769,7 +767,7 @@ async fn call_tool_inner(
 ) -> Result<Value> {
     let initiative = crate::initiative::is_run(&app.db.0.lock().unwrap(), &run.id)?;
     ensure!(!initiative || !initiative_management_tool(name),
-        "Initiative cannot change routines, inbox monitors or standing permissions. Leave existing automation in place and report a suggested change to the owner.");
+        "Initiative cannot change routines, inbox monitors or standing permissions, or start interactive connector setup. Leave existing automation in place and report a suggested change to the owner.");
     ensure!(!initiative || !matches!(name, "ask_question" | "request_user_action"),
         "Background initiative should not hold the bot waiting for input. Report the useful draft, result or proposed next step in the owner DM; the owner's reply starts direct work.");
     crate::provider_inbox::guard_tool(&app.db, run, name, &args)?;
@@ -868,7 +866,11 @@ async fn call_tool_inner(
         "inbox_monitor_save" => {
             json!({"text":serde_json::to_string(&crate::mail_watch::save_for_bot(app,bot,&args).await?)?})
         }
-        "initiative_checkpoint" => crate::initiative::checkpoint(&app.db, run, &args)?,
+        "initiative_checkpoint" => {
+            let value = crate::initiative::checkpoint(&app.db, run, &args)?;
+            // Provider bridges consume the text channel, not arbitrary JSON fields.
+            json!({"text":serde_json::to_string(&value)?})
+        },
         "routine_complete" => {
             if args["outcome"]=="quiet" {crate::provider_inbox::verify_success(&app.db,run)?;}
             let mut c=app.db.0.lock().unwrap();let tx=c.transaction()?;

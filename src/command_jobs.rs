@@ -83,6 +83,11 @@ pub async fn start(app: &App, bot: &Bot, run: &Run, tool: &str, mut args: Value)
             |r| r.get(0),
         )?;
         ensure!(allowed, "Task stopped before command launch");
+        ensure!(crate::initiative::active(&tx, &run.id)?, "Initiative was turned off. This command was not started.");
+        if let Some(remaining) = crate::initiative::remaining_seconds(&tx, &run.id, db::now())? {
+            ensure!(remaining > 0, "This initiative check reached its 15-minute budget. This command was not started.");
+            args["max_seconds"] = json!(max.min(remaining as u64));
+        }
         let count: i64 = tx.query_row(
             &format!("SELECT count(*) FROM command_jobs WHERE status IN {ACTIVE}"),
             [],
@@ -364,7 +369,13 @@ pub fn resume(db: &Db) -> Result<()> {
     Ok(())
 }
 fn controls(db: &Db, device: &str) -> Result<Vec<Value>> {
-    Ok(db.0.lock().unwrap().prepare(&format!("SELECT j.id,j.stop,r.status,b.profile,EXISTS(SELECT 1 FROM events WHERE run_id=r.id AND kind='run_stop_requested'),c.archived FROM command_jobs j JOIN runs r ON r.id=j.run_id JOIN bots b ON b.id=j.bot_id JOIN chats c ON c.id=r.chat_id WHERE j.device_id=? AND j.status IN {ACTIVE} ORDER BY j.created LIMIT 16"))?.query_map([device],|r|{let profile:Value=serde_json::from_str(&r.get::<_,String>(3)?).unwrap_or_default();let stopped=r.get::<_,bool>(1)?||r.get::<_,String>(2)?=="cancelled"||profile["archived"]==true||r.get::<_,bool>(4)?||r.get::<_,bool>(5)?||(!device.is_empty()&&(profile["local_access"]!=true||!(profile["local_device_id"]==device||profile["local_device_id"]=="*")));Ok(json!({"id":r.get::<_,String>(0)?,"stop":stopped}))})?.collect::<rusqlite::Result<_>>()?)
+    let c = db.0.lock().unwrap();
+    let jobs = c.prepare(&format!("SELECT j.id,j.stop,r.status,b.profile,EXISTS(SELECT 1 FROM events WHERE run_id=r.id AND kind='run_stop_requested'),c.archived,j.run_id FROM command_jobs j JOIN runs r ON r.id=j.run_id JOIN bots b ON b.id=j.bot_id JOIN chats c ON c.id=r.chat_id WHERE j.device_id=? AND j.status IN {ACTIVE} ORDER BY j.created LIMIT 16"))?.query_map([device],|r|{let profile:Value=serde_json::from_str(&r.get::<_,String>(3)?).unwrap_or_default();let stopped=r.get::<_,bool>(1)?||r.get::<_,String>(2)?=="cancelled"||profile["archived"]==true||r.get::<_,bool>(4)?||r.get::<_,bool>(5)?||(!device.is_empty()&&(profile["local_access"]!=true||!(profile["local_device_id"]==device||profile["local_device_id"]=="*")));Ok((r.get::<_,String>(0)?, stopped, r.get::<_,String>(6)?))})?.collect::<rusqlite::Result<Vec<_>>>()?;
+    jobs.into_iter().map(|(id, stopped, run)| {
+        let stopped = stopped || !crate::initiative::active(&c, &run)?
+            || crate::initiative::remaining_seconds(&c, &run, db::now())?.is_some_and(|seconds| seconds == 0);
+        Ok(json!({"id":id,"stop":stopped}))
+    }).collect()
 }
 pub fn desktop_poll(app: &App, device: &str, v: &Value) -> Result<Vec<Value>> {
     if v["command_protocol"] == 1 {

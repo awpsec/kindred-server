@@ -573,8 +573,27 @@ impl Db {
         if crate::workspace_transfer::frozen(&tx)? || crate::vm_maintenance::busy(&tx)? {
             return Ok(None);
         }
-        crate::initiative::expire_queued(&tx, now())?;
-        let mut run=tx.query_row("SELECT * FROM runs WHERE status='queued' AND bot_id=?1 AND EXISTS(SELECT 1 FROM bots WHERE id=?1 AND COALESCE(json_extract(profile,'$.archived'),0)=0) AND NOT EXISTS(SELECT 1 FROM runs WHERE bot_id=?1 AND status IN ('running','awaiting_user','awaiting_approval','cancelling')) ORDER BY EXISTS(SELECT 1 FROM initiative_runs i WHERE i.run_id=runs.id),created,rowid LIMIT 1",[bot],run_row).optional()?;
+        crate::initiative::expire_queued(&tx, now(), bot)?;
+        let mut run = {
+            // Explicit owner and ordinary teammate work precede every automatic
+            // descendant, not just rows that directly own an initiative check.
+            // Scan FIFO order and stop at the first ordinary task; keep only the
+            // earliest automatic task as a fallback without loading the queue.
+            let mut queued = tx.prepare("SELECT * FROM runs WHERE status='queued' AND bot_id=?1 AND EXISTS(SELECT 1 FROM bots WHERE id=?1 AND COALESCE(json_extract(profile,'$.archived'),0)=0) AND NOT EXISTS(SELECT 1 FROM runs WHERE bot_id=?1 AND status IN ('running','awaiting_user','awaiting_approval','cancelling')) ORDER BY created,rowid")?;
+            let rows = queued.query_map([bot], run_row)?;
+            let mut ordinary = None;
+            let mut automatic = None;
+            for row in rows {
+                let candidate = row?;
+                if crate::initiative::is_run(&tx, &candidate.id)? {
+                    if automatic.is_none() { automatic = Some(candidate); }
+                } else {
+                    ordinary = Some(candidate);
+                    break;
+                }
+            }
+            ordinary.or(automatic)
+        };
         if let Some(r) = &mut run {
             if !crate::initiative::active(&tx, &r.id)? {
                 Self::cancel_initiative_locked(&tx, &r.id)?;
