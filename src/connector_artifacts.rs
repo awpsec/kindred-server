@@ -296,11 +296,17 @@ pub fn dispatch(db: &Db, run: &Run, args: &Value) -> Result<()> {
         .as_str()
         .context("Connector card missing")?;
     let c = db.0.lock().unwrap();
+    let initiative = crate::initiative::is_run(&c, &run.id)?;
+    if initiative {
+        ensure!(crate::initiative::active(&c, &run.id)?, "Initiative was turned off. This action was not executed.");
+        ensure!(crate::initiative::remaining_seconds(&c, &run.id, db::now())?.is_none_or(|seconds| seconds > 0),
+            "This initiative check reached its 15-minute budget. This action was not executed.");
+    }
     let card = record(&c, id)?;
     crate::connector_edits::validate_email_delivery(&card)?;
     ensure!(input(args) == &card["input"], "Connector inputs changed after review");
     let explicit: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM connector_artifacts f JOIN approvals a ON a.id=f.approval_id WHERE f.id=? AND a.status='approved')",[id],|r|r.get(0))?;
-    if !explicit && (args["read_only"] != true || args["origin"] == "codex-account") {
+    if !explicit && (initiative || args["read_only"] != true || args["origin"] == "codex-account") {
         ensure!(
             crate::connector_policy::approval_override_locked(&c, &run.bot_id, args)?
                 .unwrap_or(true),

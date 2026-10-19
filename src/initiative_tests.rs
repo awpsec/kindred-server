@@ -30,8 +30,11 @@ fn setup(time: i64) -> (Db, Bot) {
     )
     .unwrap();
     c.execute("INSERT INTO chat_messages(chat_id,sender,body,kind,created) VALUES(?,'user','Prepare the contract draft when useful','message',?)",params![format!("dm-{}",b.id),time]).unwrap();
-    c.execute("UPDATE initiative_state SET next_check=?", [time])
-        .unwrap();
+    c.execute(
+        "UPDATE initiative_state SET next_check=?1,enabled_after=?1",
+        [time],
+    )
+    .unwrap();
     drop(c);
     (db, b)
 }
@@ -282,7 +285,10 @@ fn initiative_frozen_archived_and_reenable_budget() {
     db.save_bot(&b).unwrap();
     db.0.lock()
         .unwrap()
-        .execute("UPDATE initiative_state SET next_check=?", [t])
+        .execute(
+            "UPDATE initiative_state SET next_check=?1,enabled_after=?1",
+            [t],
+        )
         .unwrap();
     initiative::tick(&db, t).unwrap();
     finish(&db);
@@ -294,7 +300,10 @@ fn initiative_frozen_archived_and_reenable_budget() {
     db.save_bot(&b).unwrap();
     db.0.lock()
         .unwrap()
-        .execute("UPDATE initiative_state SET next_check=?", [t + 28800])
+        .execute(
+            "UPDATE initiative_state SET next_check=?1,enabled_after=?1",
+            [t + 28800],
+        )
         .unwrap();
     initiative::tick(&db, t + 28800).unwrap();
     assert_eq!(roots(&db).len(), 2);
@@ -317,8 +326,11 @@ fn initiative_restart_keeps_queue_cadence_and_quiet_history() {
         db.finish(&user, "completed", "done", "").unwrap();
         {
             let c = db.0.lock().unwrap();
-            c.execute("UPDATE initiative_state SET next_check=?", [t])
-                .unwrap();
+            c.execute(
+                "UPDATE initiative_state SET next_check=?1,enabled_after=?1",
+                [t],
+            )
+            .unwrap();
             c.execute("UPDATE chat_messages SET created=?", [t])
                 .unwrap();
         }
@@ -531,5 +543,634 @@ fn initiative_helper_intermediate_assistant_does_not_resurrect_after_restart() {
     }
     for suffix in ["", ".lock", "-wal", "-shm"] {
         let _ = std::fs::remove_file(format!("{path}{suffix}"));
+    }
+}
+
+fn daytime_now_zone() -> &'static str {
+    use chrono::Timelike;
+    match Utc.timestamp_opt(db::now(), 0).single().unwrap().hour() {
+        0..=7 => "Etc/GMT-9",
+        8..=19 => "UTC",
+        _ => "Etc/GMT+8",
+    }
+}
+fn ready_now() -> (Db, Bot, i64) {
+    let t = db::now();
+    let (db, b) = setup(t);
+    db.save_setting("general", &json!({"timezone":daytime_now_zone()}))
+        .unwrap();
+    (db, b, t)
+}
+
+#[test]
+fn initiative_reliability_concurrent_tick_and_claim_starts_one_check() {
+    use std::sync::{Arc, Barrier, Mutex};
+    let (db, b, t) = ready_now();
+    let db = Arc::new(db);
+    let gate = Arc::new(Barrier::new(24));
+    let claimed = Arc::new(Mutex::new(Vec::new()));
+    std::thread::scope(|scope| {
+        for worker in 0..24 {
+            let db = db.clone();
+            let gate = gate.clone();
+            let claimed = claimed.clone();
+            let bot = b.id.clone();
+            scope.spawn(move || {
+                gate.wait();
+                for _ in 0..12 {
+                    if worker % 3 == 0 {
+                        initiative::tick(&db, t).unwrap();
+                    } else if let Some(run) = db.claim_bot(&bot).unwrap() {
+                        claimed.lock().unwrap().push(run.id);
+                    }
+                }
+            });
+        }
+    });
+    if let Some(run) = db.claim_bot(&b.id).unwrap() {
+        claimed.lock().unwrap().push(run.id);
+    }
+    assert_eq!(roots(&db).len(), 1);
+    assert_eq!(claimed.lock().unwrap().len(), 1);
+    let c = db.0.lock().unwrap();
+    assert_eq!(
+        c.query_row(
+            "SELECT count(*) FROM runs WHERE status='running'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        c.query_row(
+            "SELECT checks_today FROM initiative_state WHERE bot_id=?",
+            [&b.id],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn initiative_reliability_timezone_changes_cannot_reopen_spent_day() {
+    let t = at(18, 16);
+    let (db, _) = setup(t);
+    db.save_setting("general", &json!({"timezone":"UTC"}))
+        .unwrap();
+    initiative::tick(&db, t).unwrap();
+    finish(&db);
+    db.save_setting("general", &json!({"timezone":"Pacific/Kiritimati"}))
+        .unwrap();
+    initiative::tick(&db, t + 14400).unwrap();
+    finish(&db);
+    assert_eq!(roots(&db).len(), 2);
+    // Both prior checks now fall on October 18 in UTC-12. Changing the label
+    // from October 19 back to October 18 must not create a third check that day.
+    db.save_setting("general", &json!({"timezone":"Etc/GMT+12"}))
+        .unwrap();
+    initiative::tick(&db, t + 28800).unwrap();
+    assert_eq!(roots(&db).len(), 2);
+}
+
+#[test]
+fn initiative_reliability_clock_rollback_downtime_and_toggle_storm_keep_budget() {
+    let t = at(20, 14);
+    let (db, mut b) = setup(t);
+    initiative::tick(&db, t).unwrap();
+    for _ in 0..32 {
+        b.profile.initiative = false;
+        db.save_bot(&b).unwrap();
+        b.profile.initiative = true;
+        db.save_bot(&b).unwrap();
+    }
+    initiative::tick(&db, t - 3600).unwrap();
+    initiative::tick(&db, t + 14399).unwrap();
+    assert_eq!(roots(&db).len(), 1);
+    initiative::tick(&db, t + 14400).unwrap();
+    assert_eq!(roots(&db).len(), 2);
+    finish(&db);
+    for _ in 0..32 {
+        initiative::tick(&db, t + 28800).unwrap();
+    }
+    assert_eq!(roots(&db).len(), 2);
+    // Missed days coalesce into one check, never replay every missed interval.
+    initiative::tick(&db, t + 3 * 86400).unwrap();
+    initiative::tick(&db, t + 3 * 86400).unwrap();
+    assert_eq!(roots(&db).len(), 3);
+}
+
+#[test]
+fn initiative_reliability_accounts_and_bots_keep_separate_permissions_and_notes() {
+    let (first, mut owner, t) = ready_now();
+    owner.profile.initiative_instructions = "First account only".into();
+    first.save_bot(&owner).unwrap();
+    let other = bot(&first, "codex");
+    let inactive = bot(&first, "codex");
+    let mut no_history = other.clone();
+    no_history.profile.initiative = true;
+    first.save_bot(&no_history).unwrap();
+    first
+        .0
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE initiative_state SET next_check=?1,enabled_after=?1",
+            [t],
+        )
+        .unwrap();
+    initiative::tick(&first, t).unwrap();
+    assert_eq!(roots(&first).len(), 1);
+    assert!(!first.bot(&inactive.id).unwrap().profile.initiative);
+    let second = Db::open(":memory:").unwrap();
+    second
+        .save_setting("general", &json!({"timezone":daytime_now_zone()}))
+        .unwrap();
+    // Same bot identifier in a different account is still a separate namespace.
+    let mut copy = owner.clone();
+    copy.profile.initiative_instructions = "Second account only".into();
+    second.save_bot(&copy).unwrap();
+    let seed = second
+        .queue(&copy.id, "My separate account request", 0)
+        .unwrap();
+    second.finish(&seed, "completed", "", "").unwrap();
+    second
+        .0
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE initiative_state SET next_check=?1,enabled_after=?1",
+            [t],
+        )
+        .unwrap();
+    initiative::tick(&second, t).unwrap();
+    let r1 = first.claim_bot(&owner.id).unwrap().unwrap();
+    let r2 = second.claim_bot(&copy.id).unwrap().unwrap();
+    initiative::checkpoint(&first, &r1, &json!({"notes":"Private first account note"})).unwrap();
+    initiative::checkpoint(
+        &second,
+        &r2,
+        &json!({"notes":"Private second account note"}),
+    )
+    .unwrap();
+    assert_eq!(
+        initiative::context(&first, &r1).unwrap()["notes"],
+        "Private first account note"
+    );
+    assert_eq!(
+        initiative::context(&second, &r2).unwrap()["notes"],
+        "Private second account note"
+    );
+    assert!(initiative::checkpoint(&first, &r2, &json!({"notes":"Wrong account"})).is_err());
+    assert!(initiative::context(&first, &r2).unwrap().is_null());
+    owner.profile.initiative = false;
+    first.save_bot(&owner).unwrap();
+    assert!(initiative::active(&second.0.lock().unwrap(), &r2.id).unwrap());
+}
+
+#[test]
+fn initiative_reliability_late_descendant_after_disable_cannot_start() {
+    let (db, mut b, t) = ready_now();
+    initiative::tick(&db, t).unwrap();
+    let root = roots(&db)[0].clone();
+    b.profile.initiative = false;
+    db.save_bot(&b).unwrap();
+    let helper = bot(&db, "codex");
+    let late = db
+        .queue(&helper.id, "Late delegated response fixture", 0)
+        .unwrap();
+    let user = db.queue(&helper.id, "Unrelated owner task", 0).unwrap();
+    db.0.lock().unwrap().execute("INSERT INTO collaboration_requests(child_run_id,parent_run_id,source_chat_id) VALUES(?,?,?)",params![late,root,format!("dm-{}",b.id)]).unwrap();
+    assert!(db.claim_bot(&helper.id).unwrap().is_none());
+    assert_eq!(db.run(&late).unwrap().status, "cancelled");
+    assert_eq!(db.claim_bot(&helper.id).unwrap().unwrap().id, user);
+}
+
+#[test]
+fn initiative_reliability_all_active_statuses_and_unfinished_waits_defer() {
+    for status in [
+        "queued",
+        "running",
+        "awaiting_user",
+        "awaiting_approval",
+        "cancelling",
+    ] {
+        let (db, b, t) = ready_now();
+        let user = db.queue(&b.id, "Owner task", 0).unwrap();
+        db.0.lock()
+            .unwrap()
+            .execute("UPDATE runs SET status=? WHERE id=?", params![status, user])
+            .unwrap();
+        initiative::tick(&db, t).unwrap();
+        assert!(roots(&db).is_empty(), "scheduled while {status}");
+    }
+    let (db, b, t) = ready_now();
+    let user = db.queue(&b.id, "Command task", 0).unwrap();
+    db.finish(&user, "completed", "", "").unwrap();
+    db.0.lock()
+        .unwrap()
+        .execute(
+            "INSERT INTO command_waits(run_id,ids,context) VALUES(?,'[]','Waiting')",
+            [&user],
+        )
+        .unwrap();
+    initiative::tick(&db, t).unwrap();
+    assert!(roots(&db).is_empty());
+    db.0.lock()
+        .unwrap()
+        .execute(
+            "UPDATE command_waits SET continuation='finished' WHERE run_id=?",
+            [&user],
+        )
+        .unwrap();
+    let helper = bot(&db, "codex");
+    let child = db.queue(&helper.id, "Research", 0).unwrap();
+    db.finish(&child, "completed", "done", "").unwrap();
+    db.0.lock().unwrap().execute("INSERT INTO collaboration_requests(child_run_id,parent_run_id,source_chat_id) VALUES(?,?,?)",params![child,user,format!("dm-{}",b.id)]).unwrap();
+    initiative::tick(&db, t).unwrap();
+    assert!(roots(&db).is_empty());
+    db.0.lock()
+        .unwrap()
+        .execute("UPDATE collaboration_requests SET resolved=1", [])
+        .unwrap();
+    initiative::tick(&db, t).unwrap();
+    assert_eq!(roots(&db).len(), 1);
+}
+
+#[test]
+fn initiative_reliability_checkpoint_reports_actual_deferred_schedule_and_rejects_stale_write() {
+    let (db, mut b, t) = ready_now();
+    initiative::tick(&db, t).unwrap();
+    let run = db.claim_bot(&b.id).unwrap().unwrap();
+    let later = t + 7 * 86400;
+    let first = initiative::checkpoint(
+        &db,
+        &run,
+        &json!({"notes":"Check next week","next_check":later}),
+    )
+    .unwrap();
+    assert_eq!(first["next_check_not_before"], later);
+    let second = initiative::checkpoint(&db, &run, &json!({"notes":"Updated details"})).unwrap();
+    assert_eq!(second["next_check_not_before"], later);
+    b.profile.initiative = false;
+    db.save_bot(&b).unwrap();
+    assert!(initiative::checkpoint(&db, &run, &json!({"notes":"Late result"})).is_err());
+    assert_eq!(
+        db.0.lock()
+            .unwrap()
+            .query_row(
+                "SELECT notes FROM initiative_state WHERE bot_id=?",
+                [&b.id],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+        "Updated details"
+    );
+}
+
+#[test]
+fn initiative_reliability_checkpoint_disable_race_is_atomic() {
+    use std::sync::{Arc, Barrier};
+    let (db, mut b, t) = ready_now();
+    initiative::tick(&db, t).unwrap();
+    let run = db.claim_bot(&b.id).unwrap().unwrap();
+    let db = Arc::new(db);
+    let gate = Arc::new(Barrier::new(2));
+    b.profile.initiative = false;
+    std::thread::scope(|scope| {
+        let writer = db.clone();
+        let first = gate.clone();
+        let r = run.clone();
+        scope.spawn(move || {
+            first.wait();
+            let _ = initiative::checkpoint(&writer, &r, &json!({"notes":"Concurrent saved note"}));
+        });
+        let off = db.clone();
+        let second = gate.clone();
+        scope.spawn(move || {
+            second.wait();
+            off.save_bot(&b).unwrap();
+        });
+    });
+    assert!(!db.bot(&run.bot_id).unwrap().profile.initiative);
+    assert!(initiative::checkpoint(&db, &run, &json!({"notes":"Must not win after off"})).is_err());
+    let notes: String =
+        db.0.lock()
+            .unwrap()
+            .query_row(
+                "SELECT notes FROM initiative_state WHERE bot_id=?",
+                [&run.bot_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+    assert!(notes.is_empty() || notes == "Concurrent saved note");
+}
+
+#[test]
+fn initiative_reliability_real_file_restart_preserves_deferred_notes_and_single_writer() {
+    let path = std::env::temp_dir().join(format!("initiative-durable-{}.db", db::id()));
+    let path = path.to_str().unwrap();
+    let t = db::now();
+    let owner;
+    let root;
+    let later = t + 2 * 86400;
+    {
+        let db = Db::open(path).unwrap();
+        db.save_setting("general", &json!({"timezone":daytime_now_zone()}))
+            .unwrap();
+        let mut b = bot(&db, "codex");
+        b.profile.initiative = true;
+        db.save_bot(&b).unwrap();
+        owner = b.id.clone();
+        let seed = db.queue(&b.id, "Track my order", 0).unwrap();
+        db.finish(&seed, "completed", "", "").unwrap();
+        db.0.lock()
+            .unwrap()
+            .execute(
+                "UPDATE initiative_state SET next_check=?1,enabled_after=?1",
+                [t],
+            )
+            .unwrap();
+        initiative::tick(&db, t).unwrap();
+        let run = db.claim_bot(&owner).unwrap().unwrap();
+        root = run.id.clone();
+        initiative::checkpoint(
+            &db,
+            &run,
+            &json!({"notes":"Order in transit; report only a changed ETA","next_check":later}),
+        )
+        .unwrap();
+        assert!(Db::open(path).is_err());
+    }
+    {
+        let db = Db::open(path).unwrap();
+        assert_eq!(db.run(&root).unwrap().status, "interrupted");
+        for _ in 0..20 {
+            initiative::tick(&db, t + 10).unwrap();
+        }
+        assert_eq!(roots(&db), vec![root]);
+        let c = db.0.lock().unwrap();
+        let saved: (String, i64, i64) = c
+            .query_row(
+                "SELECT notes,next_check,checks_today FROM initiative_state WHERE bot_id=?",
+                [owner],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            saved,
+            (
+                "Order in transit; report only a changed ETA".into(),
+                later,
+                1
+            )
+        );
+    }
+    for suffix in ["", ".lock", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{path}{suffix}"));
+    }
+}
+
+#[test]
+fn initiative_reliability_expired_descendants_never_claim_and_recovery_settles() {
+    let (db, b, t) = ready_now();
+    initiative::tick(&db, t).unwrap();
+    let root = db.claim_bot(&b.id).unwrap().unwrap();
+    let helper = bot(&db, "codex");
+    let child = db
+        .chat_handoff(&root, &helper.id, "Prepare supporting research")
+        .unwrap();
+    db.finish(&root.id, "completed", "Draft progress already saved", "")
+        .unwrap();
+    db.0.lock()
+        .unwrap()
+        .execute(
+            "UPDATE runs SET created=? WHERE id=?",
+            params![t - 901, root.id],
+        )
+        .unwrap();
+    let c = db.0.lock().unwrap();
+    assert_eq!(
+        initiative::remaining_seconds(&c, &child, t).unwrap(),
+        Some(0)
+    );
+    assert_eq!(
+        initiative::remaining_seconds(&c, &child, t - 901).unwrap(),
+        Some(900)
+    );
+    drop(c);
+    assert!(db.claim_bot(&helper.id).unwrap().is_none());
+    let expired = db.run(&child).unwrap();
+    assert_eq!(expired.status, "interrupted");
+    assert!(expired.error.contains("15-minute budget"));
+    assert_eq!(
+        db.run(&root.id).unwrap().output,
+        "Draft progress already saved"
+    );
+    for _ in 0..4 {
+        db.deliver_pending_completions().unwrap();
+        assert!(db.claim_bot(&b.id).unwrap().is_none());
+        assert!(db.claim_bot(&helper.id).unwrap().is_none());
+    }
+    assert!(db.queued_bots().unwrap().is_empty());
+    let c = db.0.lock().unwrap();
+    assert_eq!(
+        c.query_row(
+            "SELECT count(*) FROM events WHERE run_id=? AND kind='run_finished'",
+            [child],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        c.query_row(
+            "SELECT count(*) FROM runs WHERE status='running'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn initiative_reliability_new_owner_topic_overrides_distant_defer_only_after_interval() {
+    let t = at(20, 14);
+    let (db, b) = setup(t);
+    initiative::tick(&db, t).unwrap();
+    let root = roots(&db)[0].clone();
+    let later = t + 30 * 86400;
+    db.0.lock()
+        .unwrap()
+        .execute(
+            "UPDATE initiative_state SET notes='Order arrives next month',next_check=?",
+            [later],
+        )
+        .unwrap();
+    finish(&db);
+    initiative::tick(&db, t + 14400).unwrap();
+    assert_eq!(
+        roots(&db).len(),
+        1,
+        "no new owner activity must honor deferred watch"
+    );
+    let message = db
+        .queue(
+            &b.id,
+            "Separate topic: help me prepare tomorrow's contract",
+            0,
+        )
+        .unwrap();
+    db.0.lock()
+        .unwrap()
+        .execute(
+            "UPDATE chat_messages SET created=? WHERE sender='user'",
+            [t],
+        )
+        .unwrap(); // Same-second ordering is captured by seq, not timestamps.
+    initiative::tick(&db, t + 14400).unwrap();
+    assert_eq!(roots(&db).len(), 1, "owner work remains higher priority");
+    db.finish(&message, "completed", "Conversation finished", "")
+        .unwrap();
+    initiative::tick(&db, t + 14399).unwrap();
+    assert_eq!(roots(&db).len(), 1);
+    initiative::tick(&db, t + 14400).unwrap();
+    assert_eq!(roots(&db).len(), 2);
+    assert_ne!(roots(&db)[1], root);
+    finish(&db);
+    initiative::tick(&db, t + 28800).unwrap();
+    assert_eq!(roots(&db).len(), 2, "new topic does not bypass daily spend");
+}
+
+#[test]
+fn initiative_reliability_reenable_reopens_distant_defer_but_keeps_cooldown_and_spend() {
+    let t = at(20, 14);
+    let (db, mut b) = setup(t);
+    initiative::tick(&db, t).unwrap();
+    finish(&db);
+    db.0.lock()
+        .unwrap()
+        .execute(
+            "UPDATE initiative_state SET notes='Keep this watch',next_check=?",
+            [t + 30 * 86400],
+        )
+        .unwrap();
+    b.profile.initiative = false;
+    db.save_bot(&b).unwrap();
+    b.profile.initiative = true;
+    db.save_bot(&b).unwrap();
+    let enabled = t + 14400;
+    {
+        let c = db.0.lock().unwrap();
+        initiative::preferences_changed(&c, &b, false, enabled).unwrap();
+    }
+    let message = db.queue(&b.id, "A new topic after enabling", 0).unwrap();
+    db.finish(&message, "completed", "", "").unwrap();
+    initiative::tick(&db, enabled + 299).unwrap();
+    assert_eq!(roots(&db).len(), 1);
+    initiative::tick(&db, enabled + 300).unwrap();
+    assert_eq!(roots(&db).len(), 2);
+    let c = db.0.lock().unwrap();
+    assert_eq!(
+        c.query_row(
+            "SELECT notes FROM initiative_state WHERE bot_id=?",
+            [&b.id],
+            |r| r.get::<_, String>(0)
+        )
+        .unwrap(),
+        "Keep this watch"
+    );
+    assert_eq!(
+        c.query_row(
+            "SELECT checks_today FROM initiative_state WHERE bot_id=?",
+            [&b.id],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        2
+    );
+}
+
+#[test]
+fn initiative_reliability_legacy_state_migration_preserves_defer_notes_and_spend() {
+    let t = at(20, 14);
+    let (db, b) = setup(t);
+    initiative::tick(&db, t).unwrap();
+    finish(&db);
+    let later = t + 30 * 86400;
+    {
+        let c = db.0.lock().unwrap();
+        c.execute_batch("ALTER TABLE initiative_state RENAME TO old_initiative_state;CREATE TABLE initiative_state(bot_id TEXT PRIMARY KEY REFERENCES bots(id),next_check INTEGER NOT NULL,last_day TEXT NOT NULL DEFAULT '',checks_today INTEGER NOT NULL DEFAULT 0,notes TEXT NOT NULL DEFAULT '');INSERT INTO initiative_state SELECT bot_id,next_check,last_day,checks_today,notes FROM old_initiative_state;DROP TABLE old_initiative_state;").unwrap();
+        c.execute(
+            "UPDATE initiative_state SET next_check=?,notes='Saved order watch'",
+            [later],
+        )
+        .unwrap();
+        initiative::init(&c).unwrap();
+        initiative::init(&c).unwrap();
+        let saved:(i64,i64,String,i64)=c.query_row("SELECT next_check,checks_today,notes,last_owner_seq FROM initiative_state WHERE bot_id=?",[&b.id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
+        assert_eq!(
+            (saved.0, saved.1, saved.2),
+            (later, 1, "Saved order watch".into())
+        );
+        assert!(saved.3 > 0);
+    }
+    initiative::tick(&db, t + 14400).unwrap();
+    assert_eq!(roots(&db).len(), 1);
+    let message = db
+        .queue(&b.id, "New conversation after migration", 0)
+        .unwrap();
+    db.finish(&message, "completed", "", "").unwrap();
+    initiative::tick(&db, t + 14400).unwrap();
+    assert_eq!(roots(&db).len(), 2);
+    assert!(db.bot(&b.id).unwrap().profile.initiative);
+}
+
+#[test]
+fn initiative_reliability_large_ordinary_queue_is_unchanged_by_unrelated_expiry() {
+    for history in [false, true] {
+        let (db, _, t) = ready_now();
+        if history {
+            initiative::tick(&db, t).unwrap();
+            finish(&db);
+        }
+        let ordinary = bot(&db, "codex");
+        let first = db.queue(&ordinary.id, "First owner request", 0).unwrap();
+        let start = db.run(&first).unwrap().created;
+        {
+            let c = db.0.lock().unwrap();
+            let mut insert=c.prepare("INSERT INTO runs(id,bot_id,prompt,status,created,chat_id,round_id) VALUES(?,?,'Ordinary owner queue','queued',?,?,?)").unwrap();
+            for index in 1..1000 {
+                let id = db::id();
+                insert
+                    .execute(params![
+                        id,
+                        ordinary.id,
+                        start + index,
+                        format!("dm-{}", ordinary.id),
+                        id
+                    ])
+                    .unwrap();
+            }
+        }
+        let before = std::time::Instant::now();
+        assert_eq!(db.claim_bot(&ordinary.id).unwrap().unwrap().id, first);
+        eprintln!(
+            "ordinary 1000-row claim, initiative history={history}: {:?}",
+            before.elapsed()
+        );
+        let c = db.0.lock().unwrap();
+        assert_eq!(
+            c.query_row(
+                "SELECT count(*) FROM runs WHERE bot_id=? AND status='queued'",
+                [&ordinary.id],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            999
+        );
+        assert_eq!(c.query_row("SELECT count(*) FROM events e JOIN runs r ON r.id=e.run_id WHERE r.bot_id=? AND e.kind IN ('initiative_quiet','run_finished')",[ordinary.id],|r|r.get::<_,i64>(0)).unwrap(),0);
     }
 }

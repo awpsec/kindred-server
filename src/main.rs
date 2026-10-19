@@ -1,6 +1,10 @@
 mod initiative;
 #[cfg(test)]
 mod initiative_tests;
+#[cfg(test)]
+mod initiative_integration_tests;
+#[cfg(test)]
+mod initiative_permission_tests;
 mod document_preview;
 mod progress_updates;
 mod primary_bot;

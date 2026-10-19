@@ -573,7 +573,7 @@ impl Db {
         if crate::workspace_transfer::frozen(&tx)? || crate::vm_maintenance::busy(&tx)? {
             return Ok(None);
         }
-        crate::initiative::expire_queued(&tx, now())?;
+        crate::initiative::expire_queued(&tx, now(), bot)?;
         let mut run=tx.query_row("SELECT * FROM runs WHERE status='queued' AND bot_id=?1 AND EXISTS(SELECT 1 FROM bots WHERE id=?1 AND COALESCE(json_extract(profile,'$.archived'),0)=0) AND NOT EXISTS(SELECT 1 FROM runs WHERE bot_id=?1 AND status IN ('running','awaiting_user','awaiting_approval','cancelling')) ORDER BY EXISTS(SELECT 1 FROM initiative_runs i WHERE i.run_id=runs.id),created,rowid LIMIT 1",[bot],run_row).optional()?;
         if let Some(r) = &mut run {
             if !crate::initiative::active(&tx, &r.id)? {

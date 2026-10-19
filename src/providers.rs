@@ -280,6 +280,14 @@ async fn codex_rpc(app: &App, bot: &Bot, run: &Run, rpc: &mut Rpc) -> Result<Str
                     json!({"decision":"decline"})
                 }
                 "item/tool/requestUserInput" => {
+                    // Native questions bypass Kindred's dynamic-tool dispatcher.
+                    // Keep autonomous checks out of human-wait state, but let the
+                    // model finish with a useful proposed step in its final report.
+                    let initiative = crate::initiative::is_run(&app.db.0.lock().unwrap(), &run.id)?;
+                    if initiative {
+                        rpc.send(json!({"id":frame["id"],"error":{"code":-32000,"message":"Background initiative cannot ask questions or request new permission. Continue only work already permitted, then report the proposed step for the owner to request directly. If nothing useful remains, use finish_quietly. Do not retry this question or request sensitive information."}})).await?;
+                        continue;
+                    }
                     let questions = p["questions"]
                         .as_array()
                         .context("Codex returned no questions")?;
@@ -451,6 +459,114 @@ mod memory_contract_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    async fn initiative_codex_protocol(mode: &str) {
+        let script = r#"
+import json,sys
+mode=sys.argv[1]
+def send(value):print(json.dumps(value),flush=True)
+def checkpoint():send({'id':'checkpoint','method':'item/tool/call','params':{'tool':'initiative_checkpoint','arguments':{'notes':'Checked synthetic contract; already reported.'}}})
+for line in sys.stdin:
+ value=json.loads(line);method=value.get('method')
+ if method=='initialized':continue
+ if method=='initialize':result={}
+ elif method=='account/read':result={'account':{'type':'chatgpt'}}
+ elif method=='model/list':result={'data':[{'model':'test/model','isDefault':True,'defaultReasoningEffort':'medium','supportedReasoningEfforts':[{'reasoningEffort':'medium'}]}],'nextCursor':None}
+ elif method=='config/read':result={'config':{}}
+ elif method=='thread/start':
+  names=[tool['name'] for tool in value['params']['dynamicTools']]
+  assert 'initiative_checkpoint' in names and 'ask_question' not in names and 'request_user_action' not in names
+  result={'thread':{'id':'initiative-thread'}}
+ elif method=='app/installed':result={'apps':[]}
+ elif method=='mcpServerStatus/list':result={'data':[],'nextCursor':None}
+ elif method=='turn/start':
+  send({'id':value['id'],'result':{'turn':{'id':'initiative-turn'}}})
+  send({'method':'item/completed','params':{'item':{'type':'agentMessage','phase':'commentary','text':'PRIVATE_SCRATCH_ONLY'}}})
+  if mode in ('question','secret'):
+   params={'questions':[{'question':'May I send this contract?','options':[{'label':'Send'},{'label':'Keep draft'}]}]} if mode=='question' else {'questions':[{'isSecret':True,'question':'PRIVATE_SECRET_QUESTION'}]}
+   send({'id':'native-question','method':'item/tool/requestUserInput','params':params})
+  else:checkpoint()
+  continue
+ elif value.get('id')=='native-question':
+  assert value['error']['code']==-32000 and 'Background initiative' in value['error']['message']
+  assert 'owner' in value['error']['message'] and 'finish_quietly' in value['error']['message']
+  checkpoint();continue
+ elif value.get('id')=='checkpoint':
+  assert value['result']['success'] is True
+  if mode=='quiet':
+   send({'id':'quiet','method':'item/tool/call','params':{'tool':'finish_quietly','arguments':{}}})
+   continue
+  text='Prepared a contract outline for your review.' if mode=='report' else 'Draft prepared. Sending needs your direct request.'
+  send({'method':'item/completed','params':{'item':{'type':'agentMessage','phase':'final_answer','text':text}}})
+  send({'method':'turn/completed','params':{'turn':{'id':'initiative-turn','status':'completed'}}})
+  break
+ elif value.get('id')=='quiet':raise AssertionError('Quiet completion must end the provider turn without another model step')
+ else:raise AssertionError('Unexpected RPC frame: '+str(value))
+ send({'id':value['id'],'result':result})
+"#;
+        let app = crate::tests::app();
+        let mut bot = crate::tests::bot(&app.db, "codex");
+        bot.profile.initiative = true;
+        app.db.save_bot(&bot).unwrap();
+        let id = app.db.queue(&bot.id, "Synthetic background contract check", 0).unwrap();
+        app.db.0.lock().unwrap().execute(
+            "INSERT INTO initiative_runs(run_id,bot_id) VALUES(?,?)",
+            rusqlite::params![id, bot.id],
+        ).unwrap();
+        let run = app.db.claim_bot(&bot.id).unwrap().unwrap();
+        let before = app.db.chat_messages(&run.chat_id).unwrap().len();
+        let cursor = app.db.notifications(None).unwrap()["cursor"].as_i64().unwrap();
+        let mut command = tokio::process::Command::new("python3");
+        command.args(["-u", "-c", script, mode]);
+        let mut rpc = Rpc::spawn(command).await.unwrap();
+        let output = tokio::time::timeout(Duration::from_secs(5), codex_rpc(&app, &bot, &run, &mut rpc))
+            .await.unwrap().unwrap();
+        drop(rpc);
+        assert!(app.db.pending_questions().unwrap().is_empty(), "{mode}: background question persisted");
+        assert!(app.db.run_approvals(&run.id).unwrap().is_empty());
+        assert!(app.db.pending_user_task(&run.id).unwrap().is_none());
+        assert_eq!(app.db.run(&run.id).unwrap().status, "running");
+        assert_eq!(crate::initiative::context(&app.db, &run).unwrap()["notes"], "Checked synthetic contract; already reported.");
+        app.db.finish(&run.id, "completed", &output, "").unwrap();
+        app.db.event(&run.id, "run_finished", json!({})).unwrap();
+        app.db.chat_complete(&run).unwrap();
+        app.db.chat_complete(&run).unwrap();
+        let messages = app.db.chat_messages(&run.chat_id).unwrap();
+        let notifications = app.db.notifications(Some(cursor)).unwrap();
+        assert!(!messages.iter().any(|message|message.to_string().contains("PRIVATE_")));
+        assert!(!notifications.to_string().contains("PRIVATE_"));
+        if mode == "quiet" {
+            assert!(output.is_empty());
+            assert_eq!(messages.len(), before);
+            assert!(notifications["items"].as_array().unwrap().is_empty());
+        } else {
+            let expected = if mode == "report" { "Prepared a contract outline for your review." } else { "Draft prepared. Sending needs your direct request." };
+            assert_eq!(output, expected);
+            assert_eq!(messages.iter().filter(|message|message["text"]==expected).count(), 1);
+            assert_eq!(notifications["items"].as_array().unwrap().len(), 1);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn initiative_codex_report_is_delivered_once_without_scratch_messages() {
+        initiative_codex_protocol("report").await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn initiative_codex_quiet_completion_has_no_messages_or_notifications() {
+        initiative_codex_protocol("quiet").await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn initiative_codex_native_questions_are_rejected_and_model_can_report_next_step() {
+        for mode in ["question", "secret"] {
+            initiative_codex_protocol(mode).await;
+        }
+    }
+
     #[test]
     fn native_executor_image_preserves_codex_content_and_applied_result() {
         use base64::{Engine, engine::general_purpose::STANDARD};
