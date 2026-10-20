@@ -625,17 +625,22 @@ pub fn budget_packet(
             omitted.push(path.to_owned());
         }
     }
+    // The callable schemas already carry this exact catalogue. Under pressure,
+    // drop only its duplicate list before rejecting an otherwise usable model.
+    // User instructions, saved scopes and the actual schemas remain intact.
+    if fixed + estimated_tokens(&packet.to_string()) > ceiling.saturating_sub(256) {
+        if let Some(environment) = packet["environment"].as_object_mut() {
+            if environment.remove("available_tool_names").is_some() {
+                omitted.push("/environment/available_tool_names".into());
+            }
+        }
+    }
     // Under memory pressure a small-context model must still be able to start
     // maintenance. Keep the readback/checkpoint metadata, not duplicate prose;
     // the prepared snapshot is paged and cannot be committed before a full read.
     if packet["bot"]["memory_maintenance"]["due"] == true
         && fixed + estimated_tokens(&packet.to_string()) > ceiling.saturating_sub(256)
     {
-        // Tool schemas are already supplied separately. Avoid repeating their
-        // names when a full memory needs the remaining input budget to recover.
-        if let Some(environment) = packet["environment"].as_object_mut() {
-            environment.remove("available_tool_names");
-        }
         let maintenance = &mut packet["bot"]["memory_maintenance"];
         *maintenance = json!({"due":true,"pending_count":maintenance["pending_count"],
             "pending_shortened":maintenance["pending_count"].as_u64().unwrap_or(0)>0,

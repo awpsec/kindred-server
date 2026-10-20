@@ -742,9 +742,12 @@ fn initiative_reliability_late_descendant_after_disable_cannot_start() {
         .unwrap();
     let user = db.queue(&helper.id, "Unrelated owner task", 0).unwrap();
     db.0.lock().unwrap().execute("INSERT INTO collaboration_requests(child_run_id,parent_run_id,source_chat_id) VALUES(?,?,?)",params![late,root,format!("dm-{}",b.id)]).unwrap();
+    // Ordinary owner work takes priority over queued automatic descendants.
+    assert_eq!(db.claim_bot(&helper.id).unwrap().unwrap().id, user);
+    assert_eq!(db.run(&late).unwrap().status, "queued");
+    db.finish(&user, "completed", "Owner task finished", "").unwrap();
     assert!(db.claim_bot(&helper.id).unwrap().is_none());
     assert_eq!(db.run(&late).unwrap().status, "cancelled");
-    assert_eq!(db.claim_bot(&helper.id).unwrap().unwrap().id, user);
 }
 
 #[test]

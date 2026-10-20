@@ -1446,7 +1446,11 @@ mod task_anchor_tests {
     fn completed_call_anchor_is_server_snapshot_not_model_input_and_survives_reload() {
         let root=std::env::temp_dir().join(format!("kindred-call-anchor-{}",db::id()));std::fs::create_dir_all(&root).unwrap();let path=root.join("kindred.db");let database=Db::open(path.to_str().unwrap()).unwrap();let bot=crate::tests::bot(&database,"codex");database.queue(&bot.id,"Read tracker",0).unwrap();let run=database.claim_bot(&bot.id).unwrap().unwrap();database.event(&run.id,"assistant",json!({"text":"Reading tracker","phase":"commentary"})).unwrap();
         let seq=database.chat_messages(&run.chat_id).unwrap().iter().find(|m|m["progress"].is_object()).unwrap()["seq"].as_i64().unwrap();
-        let id=create(&database,&run,&json!({"toolkit":"googledrive","tool_slug":"read_record","input":{"id":"synthetic"},"progress_message_seq":9999})).unwrap();complete(&database,&id,&json!({"text":"Synthetic read complete"}),false).unwrap();let saved=record(&database.0.lock().unwrap(),&id).unwrap();assert_eq!(saved["progress_message_seq"],seq);drop(database);
+        let id=create(&database,&run,&json!({"toolkit":"googledrive","tool_slug":"read_record","input":{"id":"synthetic"},"progress_message_seq":9999})).unwrap();complete(&database,&id,&json!({"text":"Synthetic read complete"}),false).unwrap();let saved=record(&database.0.lock().unwrap(),&id).unwrap();
+        let messages=database.chat_messages(&run.chat_id).unwrap();
+        assert!(messages.iter().any(|m|m["seq"]==seq&&m["text"]=="Reading tracker"),"Written progress retains its own timeline identity");
+        let seq=messages.iter().find(|m|m["kind"]=="task_progress").unwrap()["seq"].as_i64().unwrap();
+        assert_eq!(saved["progress_message_seq"],seq);assert_ne!(seq,9999);drop(database);
         let database=Db::open(path.to_str().unwrap()).unwrap();assert_eq!(record(&database.0.lock().unwrap(),&id).unwrap()["progress_message_seq"],seq);drop(database);std::fs::remove_dir_all(root).unwrap();
     }
     #[test]

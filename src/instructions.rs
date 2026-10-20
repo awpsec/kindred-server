@@ -7,7 +7,7 @@ use anyhow::{Result, bail};
 use rusqlite::OptionalExtension;
 use serde_json::{Value, json};
 
-pub const VERSION: &str = "41";
+pub const VERSION: &str = "42";
 pub const CORE: &str = include_str!("prompts/00-core.md");
 pub const BOUNDED_CORE: &str = include_str!("prompts/00-bounded-core.md");
 pub const CHAPTERS: &[(&str, &str)] = &[
@@ -309,6 +309,7 @@ pub fn build(
         "continuity":crate::continuity::bounded_context(&app.db,run,if full {16000}else{4000})?,
         "provider_retry":retry_context,
         "progress_updates":crate::progress_updates::context(&app.db,bot)?,
+        "task_presentation":crate::progress_updates::presentation_context(&app.db,run)?,
         "primary_bot":crate::primary_bot::context(&app.db,&bot.id,private_destination)?,
         "standing_work_rules":crate::work_rules::read(&app.db,run,false)?,
         "schema_version":1,"guide_version":VERSION,"guide_tier":if full_guide{"full"}else{"core_with_reference_tool"},
@@ -449,13 +450,14 @@ mod tests {
         assert_eq!(p["bot"]["role_instructions"], b.instructions);
         assert_eq!(p["bot"]["configured_model_selector"], b.model);
         assert!(!full.contains("OTHER_PRIVATE_MEMORY_SENTINEL"));
-        let names = p["environment"]["available_tool_names"].as_array().unwrap();
-        assert!(
-            names.contains(&json!("local_access_status"))
-                && names.contains(&json!("kindred_guide"))
-        );
+        let names:Vec<_> = tools.iter().map(|tool|tool["name"].clone()).collect();
+        assert!(names.contains(&json!("local_access_status"))&&names.contains(&json!("kindred_guide")));
         assert!(!names.contains(&json!("local_exec")));
-        assert_eq!(names.len(), tools.len());
+        if let Some(duplicate)=p["environment"]["available_tool_names"].as_array() {
+            assert_eq!(duplicate,&names);
+        } else {
+            assert_eq!(p["context_selection"]["omitted_sections"]["/environment/available_tool_names"],1);
+        }
     }
     #[test]
     fn renamed_bot_uses_current_identity_even_with_stale_invocation_and_old_role_text() {

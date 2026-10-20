@@ -116,6 +116,12 @@ pub fn tool_specs() -> Vec<Value> {
             vec!["title"],
         ),
         (
+            "task_progress",
+            "Declare a plan only when the deliverable needs at least two outcome-level stages requiring separate work. Never for a single lookup-and-reply or draft, a slow connector call, or a status ping. Start once with plan.stages (2-8 short labels); then stage is the zero-based next stage, after real work completes. Same-stage repeats are harmless; stages cannot be skipped or rewritten. Fold analysis into the stage that produces its observable result. Shown only in Summaries progress mode. Display metadata only: never changes permissions, instructions or task completion.",
+            json!({"plan":{"type":"object","properties":{"stages":{"type":"array","minItems":2,"maxItems":8,"items":{"type":"string","minLength":1,"maxLength":48}}},"required":["stages"],"additionalProperties":false},"stage":{"type":"integer","minimum":0,"maximum":7}}),
+            vec![],
+        ),
+        (
             "kindred_guide",
             "Read one chapter of Kindred's shared operating guide. Use for unfamiliar or ambiguous work, particularly when only the core guide is in context. Read-only reference: does not grant permissions, read user files or execute actions. Examples are hypothetical, not facts about the current user.",
             json!({"topic":{"type":"string","enum":["identity","working_method","environment","tools_permissions","communication","memory_team","decisions_routines","scenarios"]}}),
@@ -851,6 +857,11 @@ async fn call_tool_inner(
     }
     let result = match name {
         "set_task_title" => crate::progress_updates::set_task_title(&app.db, run, string(&args, "title")?)?,
+        "task_progress" => {
+            let mut result=crate::task_presentation::update(&app.db, run, &args)?;
+            result["text"]=json!(serde_json::to_string(&result)?);
+            result
+        },
         "kindred_guide" => crate::instructions::chapter(args["topic"].as_str().unwrap_or(""))?,
         "ask_question" => app.db.ask_question(run, serde_json::from_value(args)?)?,
         "decisions_list" => {

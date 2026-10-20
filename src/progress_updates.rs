@@ -100,7 +100,7 @@ fn ensure_task_marker(c:&rusqlite::Connection,run:&str)->Result<()> {
     let (boundary,event_boundary)=phase_boundary(c,run)?;
     let hidden:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM routine_runs WHERE run_id=?1) OR EXISTS(SELECT 1 FROM routine_execution WHERE run_id=?1) OR EXISTS(SELECT 1 FROM events WHERE run_id=?1 AND kind='tool_result' AND json_extract(body,'$.tool')='finish_quietly' AND COALESCE(json_extract(body,'$.failed'),0)=0)",[run],|r|r.get(0))?;
     if hidden || crate::initiative::is_run(c,run)? || emission_mode(c,run)?!="summaries" {return Ok(());}
-    let existing:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM message_progress WHERE run_id=? AND message_seq>? AND mode='summaries' AND phase='commentary')",rusqlite::params![run,boundary],|r|r.get(0))?;
+    let existing:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM message_progress p JOIN chat_messages m ON m.seq=p.message_seq WHERE p.run_id=? AND p.message_seq>? AND m.kind='task_progress' AND p.mode='summaries' AND p.phase='commentary')",rusqlite::params![run,boundary],|r|r.get(0))?;
     if existing {return Ok(());}
     let source:Option<(i64,i64)>=c.query_row("SELECT seq,created FROM events WHERE run_id=? AND kind='task_work' AND seq>? ORDER BY seq LIMIT 1",rusqlite::params![run,event_boundary],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
     let Some((source,created))=source else{return Ok(());};
@@ -179,18 +179,42 @@ pub fn set_task_title(db: &Db, run: &crate::db::Run, title: &str) -> Result<Valu
 
 // Read only protocol metadata. Raw arguments, results and private reasoning never
 // become progress prose. Phase bounds keep later work out of historical groups.
-fn activity(c:&rusqlite::Connection,seq:i64,run:&str)->Result<Value> {
+fn phase_range(c:&rusqlite::Connection,seq:i64,run:&str)->Result<(i64,i64)> {
     let boundary:i64=c.query_row("SELECT COALESCE(MAX(m.source_event_seq),0) FROM message_progress p JOIN chat_messages m ON m.seq=p.message_seq WHERE p.run_id=? AND p.phase='final_answer' AND p.message_seq<?",rusqlite::params![run,seq],|r|r.get(0))?;
     let mut end:i64=c.query_row("SELECT COALESCE(MIN(m.source_event_seq),9223372036854775807) FROM message_progress p JOIN chat_messages m ON m.seq=p.message_seq WHERE p.run_id=? AND p.phase='final_answer' AND m.source_event_seq>?",rusqlite::params![run,boundary],|r|r.get(0))?;
     let finished:i64=c.query_row("SELECT COALESCE(MIN(seq),9223372036854775807) FROM events WHERE run_id=? AND seq>? AND kind='run_finished'",rusqlite::params![run,boundary],|r|r.get(0))?;
     end=end.min(finished);
-    let mut query=c.prepare("SELECT kind,COALESCE(json_extract(body,'$.tool'),''),COALESCE(json_extract(body,'$.failed'),0),created FROM events WHERE run_id=? AND seq>? AND seq<=? AND kind IN ('tool_started','tool_result') ORDER BY seq")?;
-    let rows=query.query_map(rusqlite::params![run,boundary,end],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,bool>(2)?,r.get::<_,i64>(3)?)))?;
+    Ok((boundary,end))
+}
+
+pub fn presentation_context(db:&Db,run:&crate::db::Run)->Result<Value> {
+    let c=db.0.lock().unwrap();
+    let (_,boundary)=phase_boundary(&c,&run.id)?;
+    crate::task_presentation::presentation(&c,&run.id,boundary,i64::MAX)
+}
+
+fn activity_label(tool:&str)->Option<&'static str> {
+    match tool {
+        "local_read"=>Some("Read local file"),"local_list"=>Some("List local files"),
+        "local_exec"=>Some("Run local command"),"guest_exec"=>Some("Run computer command"),
+        "command_start"=>Some("Start computer command"),
+        "share_file"=>Some("Share file"),_=>work_title(tool),
+    }
+}
+fn activity(c:&rusqlite::Connection,seq:i64,run:&str)->Result<Value> {
+    let (boundary,end)=phase_range(c,seq,run)?;
+    let mut pending:Vec<(String,Option<String>)>=vec![];
+    let mut query=c.prepare("SELECT kind,COALESCE(json_extract(body,'$.tool'),''),COALESCE(json_extract(body,'$.failed'),0),created,json_extract(body,'$.call_id') FROM events WHERE run_id=? AND seq>? AND seq<=? AND kind IN ('tool_started','tool_result') ORDER BY seq")?;
+    let rows=query.query_map(rusqlite::params![run,boundary,end],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,bool>(2)?,r.get::<_,i64>(3)?,r.get::<_,Option<String>>(4)?)))?;
     let(mut actions,mut completed,mut failed,mut first)=(0,0,0,0);let mut recent:Vec<Value>=vec![];
-    for row in rows {let(kind,tool,error,created)=row?;if work_title(&tool).is_none(){continue;}
-        if kind=="tool_started" {actions+=1;if first==0 {first=created;}}
-        else {if error {failed+=1;} else {completed+=1;}
-            let label=match tool.as_str(){"local_read"=>"Read local file","local_list"=>"List local files","local_exec"=>"Run local command","guest_exec"|"command_start"=>"Run computer command","share_file"=>"Share file",_=>work_title(&tool).unwrap()};
+    for row in rows {let(kind,tool,error,created,call_id)=row?;if work_title(&tool).is_none(){continue;}
+        if kind=="tool_started" {actions+=1;pending.push((tool.clone(),call_id.clone()));if first==0 {first=created;}}
+        else {
+            let matching=pending.iter().position(|(name,id)|name==&tool&&id==&call_id)
+                .or_else(||call_id.as_ref().and_then(|_|pending.iter().position(|(name,id)|name==&tool&&id.is_none())));
+            if let Some(index)=matching {pending.remove(index);}
+            if error {failed+=1;} else {completed+=1;}
+            let label=activity_label(&tool).unwrap();
             if let Some(last)=recent.last_mut().filter(|last|last["label"]==label&&last["failed"]==error){last["count"]=json!(last["count"].as_u64().unwrap_or(1)+1);last["created"]=json!(created);}
             else {recent.push(json!({"label":label,"failed":error,"count":1,"created":created}));if recent.len()>4 {recent.remove(0);}}
         }
@@ -198,13 +222,21 @@ fn activity(c:&rusqlite::Connection,seq:i64,run:&str)->Result<Value> {
     let last:i64=c.query_row("SELECT COALESCE(MAX(created),0) FROM events WHERE run_id=? AND seq>? AND seq<=?",rusqlite::params![run,boundary,end],|r|r.get(0))?;
     use rusqlite::OptionalExtension;
     let phase:Option<String>=c.query_row("SELECT json_extract(body,'$.state') FROM events WHERE run_id=? AND seq>? AND seq<=? AND kind='model_progress' ORDER BY seq DESC LIMIT 1",rusqlite::params![run,boundary,end],|r|r.get(0)).optional()?;
-    Ok(json!({"actions":actions,"completed":completed,"failed":failed,"seconds":if first>0 {(last-first).max(0)}else{0},"recent":recent,"phase":phase,"last_at":last}))
+    let running:bool=c.query_row("SELECT status IN ('running','awaiting_approval') FROM runs WHERE id=?",[run],|r|r.get(0))?;
+    let current_label=if running&&end==i64::MAX {pending.last().and_then(|(tool,_)|activity_label(tool))}else{None};
+    Ok(json!({"current_label":current_label,"actions":actions,"completed":completed,"failed":failed,"seconds":if first>0 {(last-first).max(0)}else{0},"recent":recent,"phase":phase,"last_at":last}))
 }
 
 pub fn message(c:&rusqlite::Connection,seq:i64)->Result<Value> {
     use rusqlite::OptionalExtension;
     let mut value=c.query_row("SELECT p.run_id,p.mode,p.phase,p.group_id,COALESCE(p.task_title,r.task_title),p.work_qualified FROM message_progress p JOIN runs r ON r.id=p.run_id WHERE p.message_seq=?",[seq],|r|Ok(json!({"run_id":r.get::<_,String>(0)?,"mode":r.get::<_,String>(1)?,"phase":r.get::<_,String>(2)?,"group_id":r.get::<_,String>(3)?,"task_title":r.get::<_,String>(4)?,"work_qualified":r.get::<_,Option<bool>>(5)?}))).optional()?.unwrap_or(Value::Null);
-    if value["mode"]=="summaries" && value["phase"]=="commentary" {value["activity"]=activity(c,seq,value["run_id"].as_str().unwrap())?;}
+    if value["mode"]=="summaries" && value["phase"]=="commentary" {
+        let run=value["run_id"].as_str().unwrap().to_owned();
+        value["activity"]=activity(c,seq,&run)?;
+        let (start,end)=phase_range(c,seq,&run)?;
+        let hidden:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM routine_runs WHERE run_id=?1) OR EXISTS(SELECT 1 FROM routine_execution WHERE run_id=?1) OR EXISTS(SELECT 1 FROM events WHERE run_id=?1 AND kind='tool_result' AND json_extract(body,'$.tool')='finish_quietly' AND COALESCE(json_extract(body,'$.failed'),0)=0)",[&run],|r|r.get(0))?;
+        if !hidden&&!crate::initiative::is_run(c,&run)? {value["presentation"]=crate::task_presentation::presentation(c,&run,start,end)?;}
+    }
     Ok(value)
 }
 
@@ -212,6 +244,67 @@ pub fn message(c:&rusqlite::Connection,seq:i64)->Result<Value> {
 mod tests {
     use super::*;
     use crate::{conversation_updates, tests};
+
+    #[tokio::test]
+    async fn staged_presentation_is_display_only_and_phase_scoped() {
+        let app=tests::app();let bot=tests::bot(&app.db,"codex");
+        let id=app.db.queue(&bot.id,"Inspect and verify the report",0).unwrap();
+        let run=app.db.claim_bot(&bot.id).unwrap().unwrap();
+        app.db.event(&id,"assistant",json!({"phase":"commentary","text":"Checking the source report."})).unwrap();
+        let plan=json!({"plan":{"stages":["Inspect evidence","Verify report"]}});
+        let accepted=crate::runtime::call_tool(&app,&bot,&run,"task_progress",plan).await.unwrap();
+        assert_ne!(accepted["failed"],true);
+        // An activity anchor is independent of earlier written commentary.
+        app.db.event(&id,"tool_started",json!({"tool":"local_read"})).unwrap();
+        let rows=app.db.chat_messages(&run.chat_id).unwrap();
+        let marker=rows.iter().find(|m|m["kind"]=="task_progress").unwrap();
+        assert_eq!(marker["progress"]["presentation"]["mode"],"compact");
+        assert_eq!(marker["progress"]["activity"]["current_label"],"Read local file");
+        assert!(marker["seq"].as_i64().unwrap()>rows.iter().find(|m|m["text"]=="Checking the source report.").unwrap()["seq"].as_i64().unwrap());
+        app.db.event(&id,"tool_result",json!({"tool":"local_read","failed":false})).unwrap();
+        let advanced=crate::runtime::call_tool(&app,&bot,&run,"task_progress",json!({"stage":1})).await.unwrap();
+        assert_ne!(advanced["failed"],true);
+        let rows=app.db.chat_messages(&run.chat_id).unwrap();
+        let staged=rows.iter().find(|m|m["kind"]=="task_progress").unwrap();
+        assert_eq!(staged["progress"]["presentation"]["mode"],"staged");
+        assert_eq!(staged["progress"]["presentation"]["current_stage"],1);
+        assert_eq!(staged["progress"]["activity"]["current_label"],Value::Null);
+        assert_eq!(app.db.run(&id).unwrap().status,"running");
+        assert!(app.db.approvals().unwrap().is_empty());
+        app.db.event(&id,"assistant",json!({"phase":"final_answer","text":"Report verified."})).unwrap();
+        let frozen=app.db.chat_messages(&run.chat_id).unwrap().into_iter().find(|m|m["kind"]=="task_progress").unwrap();
+        app.db.event(&id,"tool_started",json!({"tool":"guest_exec"})).unwrap();
+        let rows=app.db.chat_messages(&run.chat_id).unwrap();
+        assert_eq!(rows.iter().find(|m|m["seq"]==frozen["seq"]).unwrap()["progress"],frozen["progress"]);
+        assert_eq!(rows.iter().rev().find(|m|m["kind"]=="task_progress").unwrap()["progress"]["presentation"]["mode"],"compact");
+    }
+
+    #[test]
+    fn compact_activity_tracks_overlapping_tools_without_exposing_content() {
+        let app=tests::app();let bot=tests::bot(&app.db,"codex");
+        let id=app.db.queue(&bot.id,"Read files",0).unwrap();let run=app.db.claim_bot(&bot.id).unwrap().unwrap();
+        for tool in ["local_read","guest_exec"] {app.db.event(&id,"tool_started",json!({"tool":tool,"args":{"secret":"private-content"}})).unwrap();}
+        app.db.event(&id,"tool_result",json!({"tool":"local_read","text":"private-content"})).unwrap();
+        let marker=app.db.chat_messages(&run.chat_id).unwrap().into_iter().find(|m|m["kind"]=="task_progress").unwrap();
+        assert_eq!(marker["progress"]["activity"]["current_label"],"Run computer command");
+        assert!(!marker["progress"].to_string().contains("private-content"));
+        app.db.finish(&id,"cancelled","","").unwrap();
+        let marker=app.db.chat_messages(&run.chat_id).unwrap().into_iter().find(|m|m["kind"]=="task_progress").unwrap();
+        assert_eq!(marker["progress"]["activity"]["current_label"],Value::Null);
+        assert_eq!(marker["progress"]["activity"]["completed"],1);
+    }
+
+    #[test]
+    fn declined_parallel_call_does_not_hide_another_active_call() {
+        let app=tests::app();let bot=tests::bot(&app.db,"claude-code");
+        let id=app.db.queue(&bot.id,"Read connected files",0).unwrap();let run=app.db.claim_bot(&bot.id).unwrap().unwrap();
+        app.db.event(&id,"tool_started",json!({"tool":"claude_connector","call_id":"active"})).unwrap();
+        app.db.event(&id,"tool_result",json!({"tool":"claude_connector","call_id":"declined","failed":true})).unwrap();
+        let activity=||app.db.chat_messages(&run.chat_id).unwrap().into_iter().find(|m|m["kind"]=="task_progress").unwrap()["progress"]["activity"].clone();
+        assert_eq!(activity()["current_label"],"Use connected service");
+        app.db.event(&id,"tool_result",json!({"tool":"claude_connector","call_id":"active","failed":false})).unwrap();
+        assert_eq!(activity()["current_label"],Value::Null);
+    }
 
     #[test]
     fn activity_distinguishes_slow_single_actions_and_bounds_each_phase() {
@@ -243,7 +336,9 @@ mod tests {
         let markers:Vec<_>=rows.iter().filter(|m|m["kind"]=="task_progress").collect();assert_eq!(markers.len(),1);
         let marker=markers[0];assert_eq!(marker["text"],"");assert_eq!(marker["progress"]["work_qualified"],true);assert_eq!(marker["progress"]["task_title"],"Review workspace scope");
         assert_eq!(app.db.attention().unwrap()["chats"],attention["chats"]);assert_eq!(app.db.chat(&run.chat_id).unwrap().last_message,last);
-        assert!(!crate::instructions::build(&app,&bot,&run,&[],Some(262144)).unwrap().contains("task_progress"));
+        let instructions=crate::instructions::build(&app,&bot,&run,&[],Some(262144)).unwrap();
+        let packet:Value=serde_json::from_str(instructions.rsplit_once('\n').unwrap().1).unwrap();
+        assert!(!packet["conversation"].to_string().contains("task_progress"),"Timeline markers are not conversation prose; the separate tool is documented in the guide");
         assert!(!app.db.bot_chat_read(&bot.id,&run.chat_id,0,30).unwrap()["messages"].as_array().unwrap().iter().any(|m|m["kind"]=="task_progress"));
         let connector=crate::connector_artifacts::create(&app.db,&run,&json!({"toolkit":"googledrive","tool_slug":"read_record","input":{}})).unwrap();
         let receipt=crate::connector_artifacts::record(&app.db.0.lock().unwrap(),&connector).unwrap();
@@ -300,7 +395,7 @@ mod tests {
             for _ in 0..2 {repair_task_markers(&app.db.0.lock().unwrap()).unwrap();}
             let rows=app.db.chat_messages(&run.chat_id).unwrap();
             let markers:Vec<_>=rows.iter().filter(|m|m["kind"]=="task_progress").collect();
-            assert_eq!(markers.len(),usize::from(new_work&&!narrated),"latest-phase work only; prior commentary must not exclude new silent work");
+            assert_eq!(markers.len(),usize::from(new_work),"latest-phase work owns a marker even with commentary; historical phases are unchanged");
             if let Some(marker)=markers.first() {
                 assert_eq!(marker["text"],"");assert_eq!(marker["progress"]["task_title"],"Latest task");
                 assert_ne!(marker["progress"]["group_id"],old.iter().find(|m|m["text"]=="Earlier written update").unwrap()["progress"]["group_id"]);

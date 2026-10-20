@@ -7,6 +7,7 @@ mod initiative_integration_tests;
 mod initiative_permission_tests;
 mod document_preview;
 mod progress_updates;
+mod task_presentation;
 mod primary_bot;
 mod work_rules;
 mod artifact_export;

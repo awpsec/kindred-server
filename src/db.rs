@@ -828,7 +828,7 @@ impl Db {
     /// Unassigned context reads stay quiet; assigned human work is already participation.
     pub fn group_activity_started(&self, run: &str) -> Result<bool> {
         Ok(self.0.lock().unwrap().query_row(
-            "SELECT EXISTS(SELECT 1 FROM events WHERE run_id=? AND (kind='recipient_selected' OR (kind='assistant' AND length(trim(COALESCE(json_extract(body,'$.text'),'')))>0) OR (kind='tool_started' AND COALESCE(json_extract(body,'$.tool'),'') NOT IN ('','set_task_title','finish_quietly','chat_read','chats_list','bots_list','bot_instructions_get','memory_search','memory_read','recall','remember','work_rules_read','work_rule_save','instructions_read','kindred_guide','skills_list'))))",
+            "SELECT EXISTS(SELECT 1 FROM events WHERE run_id=? AND (kind='recipient_selected' OR (kind='assistant' AND length(trim(COALESCE(json_extract(body,'$.text'),'')))>0) OR (kind='tool_started' AND COALESCE(json_extract(body,'$.tool'),'') NOT IN ('','set_task_title','task_progress','finish_quietly','chat_read','chats_list','bots_list','bot_instructions_get','memory_search','memory_read','recall','remember','work_rules_read','work_rule_save','instructions_read','kindred_guide','skills_list'))))",
             [run], |r| r.get(0))?)
     }
 
