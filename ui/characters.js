@@ -4,7 +4,7 @@ import {mountArtwork,reducedMotion} from './avatar-runtime/host.js';
 import {tributeIdentity,tributeState,createTribute,applyTributeState,startTributeReveal,renderTribute} from './tributes.js';
 export {appearance as avatarAppearance,selectAppearance,expressions,palettes};
 export const shapes=bodies;
-export const colors=palettes.map(p=>[p.label,p.id==='black'?'#ffffff':p.light]);
+export const colors=palettes.map(p=>[p.label,p.value,p.id]);
 export const defaultProfile={label:'',description:'',shape:'round',color:'#2475ff',eyes:'curious',animated:true,pinned:false,archived:false,notifications:true};
 export function newAvatarProfile(seed='') {const n=[...seed].reduce((a,c)=>(a*31+c.charCodeAt(0))>>>0,0);return selectAppearance({...defaultProfile},{body:seed?avatarCatalog.defaults[n%avatarCatalog.defaults.length]:'blob',expression:'neutral',palette:'blue',custom_color:null});}
 const NS='http://www.w3.org/2000/svg';
@@ -15,7 +15,7 @@ export function activityState(activity,now=Date.now()/1000,lastActive=0){
  const a=activity||{},busy=['queued','running','awaiting_user','awaiting_approval','cancelling'].includes(a.status);
  const timestamp=Math.max(+a.last_active_at||0,+a.completed_at||0,+a.finished_at||0,lastActive||0),online=busy||(timestamp>0&&now-timestamp<1800);
  let action='idle';
- if(['awaiting_user','awaiting_approval'].includes(a.status)||a.local?.phase==='awaiting_approval'||['user','approval'].includes(a.awaiting))action='blocked';
+ if(['awaiting_user','awaiting_approval'].includes(a.status)||(a.status==='running'&&(a.local?.phase==='awaiting_approval'||['user','approval'].includes(a.awaiting))))action='blocked';
  else if(a.stale||a.offline||a.reconnecting)action='idle';
  else if(a.status==='cancelling')action='powering-down';
  else if(a.status==='running')action=a.shape==='think'&&a.model_progress_state==='writing'?'streaming':actions[a.shape]||(['waiting','blocked'].includes(a.shape)?a.shape:'working');
@@ -26,11 +26,14 @@ export function activityState(activity,now=Date.now()/1000,lastActive=0){
  else action=online?'idle':'sleeping';
  return {action,label:a.label||(online?'Ready when you are':'Resting'),online,runId:a.run_id,settledAt:timestamp*1000};
 }
-const tributes=new Set();let tributeFrame=0,tributeObserver=null;
-function tributeTick(now){tributeFrame=0;for(const box of tributes){if(!box.isConnected){tributes.delete(box);tributeObserver?.unobserve(box);continue;}if(box._tributeVisible&&!document.hidden){renderTribute(box,Date.now(),reducedMotion());}}if(!document.hidden&&[...tributes].some(b=>b._tributeVisible&&b._character.p.animated!==false&&!reducedMotion()))tributeFrame=requestAnimationFrame(tributeTick);}
-function startTribute(box){if(!box.isConnected)return;if(!tributeObserver)tributeObserver=new IntersectionObserver(es=>{for(const e of es)e.target._tributeVisible=e.isIntersecting;queueTributes();});tributes.add(box);tributeObserver.observe(box);queueTributes();}
-function queueTributes(){if(!tributeFrame&&!document.hidden)tributeFrame=requestAnimationFrame(tributeTick);}
-document.addEventListener('visibilitychange',()=>{cancelAnimationFrame(tributeFrame);tributeFrame=0;if(!document.hidden)queueTributes();});
+const tributes=new Set();let tributeFrame=0,tributeObserver=null,tributeRemoval=null,tributeMotion=null;
+const tributePreference=matchMedia('(prefers-reduced-motion: reduce)');
+function releaseTribute(box){tributes.delete(box);tributeObserver?.unobserve(box);if(!tributes.size){cancelAnimationFrame(tributeFrame);tributeFrame=0;tributeObserver?.disconnect();tributeRemoval?.disconnect();tributeMotion?.disconnect();tributeObserver=tributeRemoval=tributeMotion=null;document.removeEventListener('visibilitychange',refreshTributes);tributePreference.removeEventListener('change',refreshTributes);}}
+function tributeTick(){tributeFrame=0;for(const box of tributes){if(!box.isConnected||!box._character?.tribute){releaseTribute(box);continue;}if(box._tributeVisible&&!document.hidden)renderTribute(box,Date.now(),reducedMotion());}queueTributes();}
+function queueTributes(){if(!tributeFrame&&!document.hidden&&!reducedMotion()&&[...tributes].some(b=>b._tributeVisible&&b._character?.p.animated!==false))tributeFrame=requestAnimationFrame(tributeTick);}
+function refreshTributes(){cancelAnimationFrame(tributeFrame);tributeFrame=0;for(const box of tributes){if(!box.isConnected||!box._character?.tribute){releaseTribute(box);continue;}if(box._tributeVisible&&!document.hidden)renderTribute(box,Date.now(),reducedMotion());}queueTributes();}
+function startTribute(box){if(!box.isConnected)return;if(!tributeObserver){tributeObserver=new IntersectionObserver(es=>{for(const e of es)e.target._tributeVisible=e.isIntersecting;refreshTributes();});tributeRemoval=new MutationObserver(()=>{for(const b of tributes)if(!b.isConnected||!b._character?.tribute)releaseTribute(b);});tributeRemoval.observe(document.documentElement,{childList:true,subtree:true});tributeMotion=new MutationObserver(refreshTributes);tributeMotion.observe(document.documentElement,{attributes:true,attributeFilter:['data-motion']});document.addEventListener('visibilitychange',refreshTributes);tributePreference.addEventListener('change',refreshTributes);}if(!tributes.has(box)){tributes.add(box);tributeObserver.observe(box);}queueTributes();}
+
 export function character(profile={},size=44,busy=false){
  const p={...defaultProfile,...profile},box=document.createElement('span');box.className='character artwork-character';box.setAttribute('aria-hidden','true');box.style.display='inline-block';box.style.position='relative';box.style.width=size+'px';box.style.height=size+'px';box.dataset.shape=p.avatar?.body||p.shape;
  if(p.bot_id)box.dataset.botId=p.bot_id;
@@ -47,7 +50,7 @@ export function setActivity(box,action='idle',options={}){
  let next=actions[action]||action,eventKey='';
  if(next==='finished'||next==='failed'){
    eventKey=options.runId?box.dataset.botId+'|'+options.runId:'';
-   if((eventKey&&seenTerminals.has(eventKey)&&c.terminal!==eventKey)||options.immediate||document.hidden||(options.settledAt&&Date.now()-options.settledAt>=8000))next='idle';
+   if((eventKey&&seenTerminals.has(eventKey)&&(c.terminal!==eventKey||c.action!==next))||options.immediate||document.hidden||(options.settledAt&&Date.now()-options.settledAt>=8000))next='idle';
    if(eventKey){seenTerminals.set(eventKey,Date.now());if(seenTerminals.size>2048)seenTerminals.delete(seenTerminals.keys().next().value);}
  }
  const newEvent=eventKey&&c.terminal!==eventKey;

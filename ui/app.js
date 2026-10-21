@@ -1858,6 +1858,7 @@ async function editBotText(id, key) {
 }
 function pickAvatar(value, save) {
   state.avatarDraft = { ...defaultProfile, ...value };
+  state.avatarBodySelected=false;
   state.avatarSave = save;
   renderAvatar();
   $("avatar-dialog").showModal();
@@ -1870,6 +1871,7 @@ function renderAvatar() {
     const b = button(
       "",
       () => {
+        state.avatarBodySelected=true;
         state.avatarDraft = selectAppearance(state.avatarDraft,{body:shape});
         state.avatarSave({...state.avatarDraft});
         renderAvatar();
@@ -1886,6 +1888,8 @@ function renderAvatar() {
   expressionOptions.replaceChildren(...expressions.map(expression=>{const b=button(expression,()=>{state.avatarDraft=selectAppearance(state.avatarDraft,{expression});state.avatarSave({...state.avatarDraft});renderAvatar();},'expression-option');b.setAttribute('aria-pressed',String(avatarAppearance(p).expression===expression));return b;}));
   let custom=$('avatar-custom-color');
   if(!custom){const label=node('label','avatar-custom-color','Custom color');custom=document.createElement('input');custom.type='color';custom.id='avatar-custom-color';label.append(custom);$('color-options').after(label);}
+  custom.parentElement.classList.toggle('selected',avatarAppearance(p).palette===null);
+  custom.parentElement.title=avatarAppearance(p).palette===null?'Custom (selected)':'Custom color';
   custom.value=p.color;custom.oninput=()=>{state.avatarDraft=selectAppearance(state.avatarDraft,{palette:null,custom_color:custom.value});state.avatarSave({...state.avatarDraft});renderAvatar();};
   $("color-options").replaceChildren();
   for (const [name, color] of colors) {
@@ -1896,9 +1900,9 @@ function renderAvatar() {
         state.avatarSave({...state.avatarDraft});
         renderAvatar();
       },
-      "color-option" + (p.color === color ? " selected" : ""),
+      "color-option" + (avatarAppearance(p).palette === palettes.find(p=>p.label===name).id ? " selected" : ""),
     );
-    b.style.backgroundColor = color === '#ffffff' ? 'var(--fg)' : color;
+    b.style.backgroundColor = color;
     b.title = name;
     b.setAttribute("aria-label", name);
     $("color-options").append(b);
@@ -4255,7 +4259,7 @@ $("prompt").onkeydown = (e) => {
 };
 $("new-avatar-button").onclick = () =>
   pickAvatar({...state.newProfile,name:$("bot-form").elements.name.value}, (p) => {
-    const {name:_,...appearance}=p;state.newProfile = appearance;state.newAvatarExplicit=true;
+    const {name:_,...appearance}=p;state.newProfile = appearance;state.newAvatarExplicit ||= state.avatarBodySelected;
     replaceCharacter($("new-avatar-button"),{...p,name:$("bot-form").elements.name.value},90);
   });
 $("bot-form").elements.name.addEventListener("change",()=>replaceCharacter($("new-avatar-button"),{...state.newProfile,name:$("bot-form").elements.name.value},90));
@@ -7682,8 +7686,8 @@ function avatarMenu(bot) {
   for(const [name,color] of colors) {
     const b=button('',()=>choose({avatarPatch:{palette:palettes.find(p=>p.label===name).id,custom_color:null}}),'color-option');
     b.onclick=()=>perform(()=>choose({avatarPatch:{palette:palettes.find(p=>p.label===name).id,custom_color:null}}));
-    b.dataset.color=color;
-    b.style.backgroundColor=color==='#ffffff'?'var(--fg)':color;b.title=name;b.setAttribute('aria-label',name);swatches.append(b);
+    b.dataset.color=color;b.dataset.palette=palettes.find(p=>p.label===name).id;
+    b.style.backgroundColor=color;b.title=name;b.setAttribute('aria-label',name);swatches.append(b);
   }
   wrap.updateProfile=updated=>{
     bot=updated;const p=portrait(bot);
@@ -7693,7 +7697,7 @@ function avatarMenu(bot) {
       b.replaceChildren(character({...selectAppearance(p,{body:b.dataset.shape}),name:'',animated:false},44));
     }
     for(const b of swatches.children) {
-      const selected=b.dataset.color===p.color;b.classList.toggle('selected',selected);b.setAttribute('aria-pressed',String(selected));
+      const selected=b.dataset.palette===avatarAppearance(p).palette;b.classList.toggle('selected',selected);b.setAttribute('aria-pressed',String(selected));
     }
   };
   wrap.updateProfile(bot);

@@ -419,6 +419,18 @@ mod api_tests {
             created["profile"]["avatar"],
             serde_json::to_value(default_for_id(id)).unwrap()
         );
+        let mut color_only = serde_json::to_value(&b).unwrap();
+        color_only["avatar_default"] = json!(true);
+        color_only["profile"]["avatar"] = json!({"version":1,"body":"blob","expression":"calm","palette":null,"custom_color":"#123456"});
+        let (s, custom) = call(app.clone(), "POST", "/api/bots", color_only).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(
+            custom["profile"]["avatar"]["body"],
+            default_for_id(custom["id"].as_str().unwrap()).body
+        );
+        assert_eq!(custom["profile"]["avatar"]["expression"], "calm");
+        assert_eq!(custom["profile"]["avatar"]["custom_color"], "#123456");
+        assert!(custom["profile"]["avatar"]["palette"].is_null());
         let mut v = serde_json::to_value(&b).unwrap();
         v["profile"]["avatar"] = json!({"version":1,"body":"capsule","expression":"calm","palette":"red","custom_color":null});
         let (s, created) = call(app, "POST", "/api/bots", v).await;
