@@ -298,7 +298,7 @@ pub fn dispatch(db: &Db, run: &Run, args: &Value) -> Result<()> {
     let c = db.0.lock().unwrap();
     let initiative = crate::initiative::is_run(&c, &run.id)?;
     if initiative {
-        ensure!(crate::initiative::active(&c, &run.id)?, "Initiative was turned off. This action was not executed.");
+        ensure!(crate::initiative::active(&c, &run.id)?, "Initiative was turned off or stopped, or its commitment or source changed. This action was not executed.");
         ensure!(crate::initiative::remaining_seconds(&c, &run.id, db::now())?.is_none_or(|seconds| seconds > 0),
             "This initiative check reached its 15-minute budget. This action was not executed.");
     }

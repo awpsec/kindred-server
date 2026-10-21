@@ -636,7 +636,9 @@ fn initiative_reliability_timezone_changes_cannot_reopen_spent_day() {
 
 #[test]
 fn initiative_reliability_clock_rollback_downtime_and_toggle_storm_keep_budget() {
-    let t = at(20, 14);
+    // save_bot uses the real clock when re-enabling. Keep the simulated checks
+    // ahead of it instead of letting this regression expire after October 20.
+    let t = (db::now() / 86400 + 1) * 86400 + 14 * 3600;
     let (db, mut b) = setup(t);
     initiative::tick(&db, t).unwrap();
     for _ in 0..32 {

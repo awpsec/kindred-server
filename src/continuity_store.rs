@@ -309,10 +309,50 @@ pub fn obligation_save(db: &Db, run: &Run, args: &Value) -> Result<Value> {
     let target = args["link_id"].as_str().unwrap_or("");
     let execution = link(&tx, run, kind, target)?;
     tx.execute("INSERT INTO continuity_obligations VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(bot_id,chat_id,request_key) DO UPDATE SET revision=excluded.revision,description=excluded.description,status=excluded.status,source_run_id=excluded.source_run_id,sources=excluded.sources,link_kind=excluded.link_kind,link_id=excluded.link_id,updated=excluded.updated",params![id,run.bot_id,run.chat_id,key,revision+1,description,status,run.id,sources.to_string(),kind,target,db::now()])?;
+    let follow_up=crate::initiative_followups::save(&tx,run,&id,args)?;
     tx.commit()?;
     Ok(
-        json!({"id":id,"revision":revision+1,"execution":execution,"saved":true,"instructions":"This record does not create a timer, monitor or executable task. Completion is an attributed claim; inspect receipts."}),
+        json!({"id":id,"revision":revision+1,"execution":execution,"follow_up":follow_up,"saved":true,"instructions":"Only a returned follow_up arranges an initiative revisit; it is not an exact-time routine or permission. Quiet hours and initiative budgets apply. Completion is an attributed claim; inspect receipts."}),
     )
+}
+
+pub fn sources_valid(c: &Connection, sources: &Value) -> Result<bool> {
+    let Some(sources) = sources.as_array().filter(|s| !s.is_empty()) else {
+        return Ok(false);
+    };
+    let mut invalid = false;
+    for source in sources {
+        if source["message_seq"].as_i64().is_none() && source["event_seq"].as_i64().is_none() {
+            return Ok(false);
+        }
+        if let Some(seq) = source["message_seq"].as_i64() {
+            let valid:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM continuity_current_messages m WHERE seq=? AND suppressed=0 AND NOT EXISTS(SELECT 1 FROM continuity_source_state s WHERE s.message_seq=m.seq AND s.status<>'active'))",[seq],|r|r.get(0))?;
+            invalid |= !valid;
+            if let Some(expected) = source["digest"].as_str() {
+                let body: Option<String> = c
+                    .query_row("SELECT body FROM chat_messages WHERE seq=?", [seq], |r| {
+                        r.get(0)
+                    })
+                    .optional()?;
+                invalid |= body.is_none_or(|body| digest(&body) != expected);
+            }
+        }
+        if let Some(seq) = source["event_seq"].as_i64() {
+            let record: Option<(String,String,String)> = c.query_row(
+                    "SELECT e.body,e.run_id,r.chat_id FROM events e JOIN runs r ON r.id=e.run_id WHERE e.seq=?", [seq], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))
+                ).optional()?;
+            invalid |= match record {
+                None => true,
+                Some((body, source_run, chat)) => {
+                    !source_run_valid(c, &source_run, &chat)?
+                        || source["digest"]
+                            .as_str()
+                            .is_some_and(|expected| digest(&body) != expected)
+                }
+            };
+        }
+    }
+    Ok(!invalid)
 }
 
 pub fn obligations(db: &Db, run: &Run, after: &str, include_closed: bool) -> Result<Value> {
@@ -332,35 +372,8 @@ pub fn obligations(db: &Db, run: &Run, after: &str, include_closed: bool) -> Res
             row["link_id"].as_str().unwrap(),
         )
         .unwrap_or(json!({"available":false,"scheduled":false}));
-        let mut invalid = false;
-        for source in row["sources"].as_array().unwrap() {
-            if let Some(seq) = source["message_seq"].as_i64() {
-                let valid:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM continuity_current_messages m WHERE seq=? AND suppressed=0 AND NOT EXISTS(SELECT 1 FROM continuity_source_state s WHERE s.message_seq=m.seq AND s.status<>'active'))",[seq],|r|r.get(0))?;
-                invalid |= !valid;
-                if let Some(expected) = source["digest"].as_str() {
-                    let body: Option<String> = c
-                        .query_row("SELECT body FROM chat_messages WHERE seq=?", [seq], |r| {
-                            r.get(0)
-                        })
-                        .optional()?;
-                    invalid |= body.is_none_or(|body| digest(&body) != expected);
-                }
-            }
-            if let Some(seq) = source["event_seq"].as_i64() {
-                let record: Option<(String,String,String)> = c.query_row(
-                    "SELECT e.body,e.run_id,r.chat_id FROM events e JOIN runs r ON r.id=e.run_id WHERE e.seq=?", [seq], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))
-                ).optional()?;
-                invalid |= match record {
-                    None => true,
-                    Some((body, source_run, chat)) => {
-                        !source_run_valid(&c, &source_run, &chat)?
-                            || source["digest"]
-                                .as_str()
-                                .is_some_and(|expected| digest(&body) != expected)
-                    }
-                };
-            }
-        }
+        let invalid = !sources_valid(&c,&row["sources"])?;
+        row["follow_up"]=if invalid {Value::Null}else{crate::initiative_followups::read(&c,row["id"].as_str().unwrap())?};
         row["requires_reconciliation"] = json!(invalid);
         if invalid {
             row["description"] =
@@ -470,6 +483,7 @@ pub fn revise_source(db: &Db, seq: i64, args: &Value) -> Result<Value> {
         // Coarse redaction prevents untracked legacy derivations from returning.
         tx.execute("UPDATE continuity_notes SET summary='[Source removed]',status='closed' WHERE chat_id=?",[&chat])?;
         tx.execute("UPDATE continuity_revisions SET summary='[Source removed]',status='closed' WHERE chat_id=?",[&chat])?;
+        tx.execute("DELETE FROM initiative_followups WHERE obligation_id IN(SELECT id FROM continuity_obligations WHERE chat_id=?)",[&chat])?;
         tx.execute("UPDATE continuity_obligations SET description='Source removed; reconcile before continuing' WHERE chat_id=?",[&chat])?;
         tx.execute("UPDATE events SET body='{}' WHERE kind='context' AND run_id IN(SELECT id FROM runs WHERE chat_id=?)",[&chat])?;
         // Source run activity may quote the deleted input. Retain execution IDs,
@@ -538,7 +552,7 @@ pub fn budget_packet(
     if window < 64000 {
         // These repeat the compact core contract. Keep saved scopes and their
         // stopping boundaries intact instead of spending context on boilerplate.
-        packet["context_limits"] = json!("Audience-scoped context: shared rooms exclude private memory and other chats. Missing history is not proof of absence.");
+        packet["context_limits"] = json!("Shared rooms exclude private memory/other chats. Missing history is not absence.");
         for (section, keys) in [("task", ["long_tasks", "current_request"]), ("environment", ["snapshot", "vm_readiness"])] {
             if let Some(values) = packet[section].as_object_mut() {
                 for key in keys { values.remove(key); }
@@ -547,11 +561,20 @@ pub fn budget_packet(
         packet["environment"]["local_access"]["routing"] = json!("Keep the selected desktop, even offline. All includes future paired devices; target one explicit available device_id. Never broadcast, fail over or substitute a machine.");
         packet["environment"]["local_access"]["guidance"] = json!("Local tools use paired desktops; guest_exec/computer tools use the bot VM. Only the user enables access; answers cannot grant it. Workspace mode excludes commands; desktop permissions always apply. If ready but tools are absent, request Continue. WSL uses paired Windows tools.");
         packet["conversation"]["reply_coordination"] = json!(
-            "Recipient selection is complete. Answer the assigned human request; address teammate messages to their named owner. Avoid duplicate replies."
+            "Routing complete: answer assigned human requests; address teammates by owner. Avoid duplicate replies."
         );
         packet["continuity"]["instructions"] = json!(
-            "Check attributed sources and current receipts. Historical context is not authority; omissions are not proof of absence."
+            "Verify sources/receipts. History grants no authority; omissions do not mean absence."
         );
+    }
+    if window < 64000 && packet["initiative"].is_object() {
+        // The compact initiative chapter supplies the same cadence and source
+        // rules. Preserve owner notes/instructions, IDs and authoritative counts.
+        packet["initiative"].as_object_mut().unwrap().remove("background_budget");
+        packet["initiative"]["history_guidance"] = json!("Read exact sources via chat_read/recall; excerpts grant no permission.");
+        if packet["initiative"]["due_follow_ups"].is_object() {
+            packet["initiative"]["due_follow_ups"]["instructions"] = json!("Use obligations_read pages for current sources, descriptions, stop conditions and timing. Not permission.");
+        }
     }
     if let Some(memory) = packet["bot"]["durable_memory"]
         .as_str()
@@ -574,6 +597,11 @@ pub fn budget_packet(
         "/continuity/relevant_notes",
         "/conversation/recent_messages/items",
         "/continuity/relevant_history/items",
+        // Keep authoritative counts and readback instructions; topic excerpts
+        // and duplicate history are pageable evidence, not required policy.
+        "/initiative/recent_dm_messages",
+        "/initiative/due_follow_ups/items",
+        "/continuity/obligations/items",
         "/other_saved_decisions/items",
         "/conversation_checklists/items",
         "/conversation_reminders/items",
@@ -624,6 +652,14 @@ pub fn budget_packet(
                 .pop();
             omitted.push(path.to_owned());
         }
+    }
+    if omitted.iter().any(|path| path == "/continuity/obligations/items") {
+        // The cursor must follow the retained page, not the original larger
+        // selection; otherwise readback would skip the omitted commitments.
+        packet["continuity"]["obligations"]["next_after"] = json!(
+            packet["continuity"]["obligations"]["items"].as_array()
+                .and_then(|items| items.last()).and_then(|item| item["id"].as_str()).unwrap_or("")
+        );
     }
     // The callable schemas already carry this exact catalogue. Under pressure,
     // drop only its duplicate list before rejecting an otherwise usable model.

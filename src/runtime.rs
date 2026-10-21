@@ -458,8 +458,8 @@ pub fn tool_specs() -> Vec<Value> {
         ),
         (
             "obligation_save",
-            "Record an unresolved commitment independently of summaries. Use stable key and expected_revision; include source message/event IDs. Saving DOES NOT schedule a timer, monitor or execution. For actionable follow-ups create the appropriate real routine, reminder or task and link its exact ID. Reminder links notify only. status is open, waiting, completed or cancelled; completion requires observed evidence. Always retain source references and reconcile stale revisions.",
-            json!({"key":{"type":"string"},"description":{"type":"string","maxLength":2000},"expected_revision":{"type":"integer"},"status":{"type":"string","enum":["open","waiting","completed","cancelled"]},"sources":{"type":"array","items":{"type":"object","properties":{"message_seq":{"type":"integer"},"event_seq":{"type":"integer"}}}},"link_kind":{"type":"string","enum":["","routine","reminder","run","command"]},"link_id":{"type":"string"}}),
+            "Retain sourced commitments with a stable key and expected_revision. Saving alone schedules nothing. With initiative enabled in your owner DM, follow_up arranges a best-effort revisit within quiet hours/budgets: next_check is Unix time, 5 minutes to 1 year ahead; stop_when is the completion condition. Omission preserves; null, closure or execution links remove it. Exact timing needs routines/reminders; reminders only notify. Reconcile stale revisions/sources; completion needs evidence.",
+            json!({"key":{"type":"string"},"description":{"type":"string","maxLength":2000},"expected_revision":{"type":"integer"},"status":{"type":"string","enum":["open","waiting","completed","cancelled"]},"sources":{"type":"array","items":{"type":"object","properties":{"message_seq":{"type":"integer"},"event_seq":{"type":"integer"}}}},"link_kind":{"type":"string","enum":["","routine","reminder","run","command"]},"link_id":{"type":"string"},"follow_up":{"type":["object","null"],"properties":{"next_check":{"type":"integer"},"stop_when":{"type":"string","maxLength":500}},"required":["next_check","stop_when"],"additionalProperties":false}}),
             vec!["key","description","expected_revision","status","sources"],
         ),
         (
@@ -689,7 +689,7 @@ pub async fn approve_required(
     args: &Value,
     force: bool,
 ) -> Result<bool> {
-    ensure!(crate::initiative::active(&app.db.0.lock().unwrap(), &run.id)?, "Initiative was turned off. This action was not executed.");
+    ensure!(crate::initiative::active(&app.db.0.lock().unwrap(), &run.id)?, "Initiative was turned off or stopped, or its commitment or source changed. This action was not executed.");
     ensure!(!app.db.pushed_followups_pending(&run.id)?, "The user pushed a new message. Finish this response now to receive it before starting another action. This call was not executed.");
     let force = force || (crate::connector_artifacts::email_send(args)
         && (crate::connector_artifacts::email_review_requested(&run.prompt) || crate::work_rules::coordinator_round(&app.db, run)?));
@@ -725,7 +725,7 @@ pub async fn approve_required(
     }
 }
 pub async fn call_tool(app: &App, bot: &Bot, run: &Run, name: &str, args: Value) -> Result<Value> {
-    ensure!(crate::initiative::active(&app.db.0.lock().unwrap(), &run.id)?, "Initiative was turned off. This action was not executed.");
+    ensure!(crate::initiative::active(&app.db.0.lock().unwrap(), &run.id)?, "Initiative was turned off or stopped, or its commitment or source changed. This action was not executed.");
     ensure!(!app.db.pushed_followups_pending(&run.id)?, "The user pushed a new message. Finish this response now to receive it before starting another action. This call was not executed.");
     ensure!(initiative_remaining(&app.db, &run.id, db::now())?.is_none_or(|remaining| !remaining.is_zero()),
         "This initiative check reached its 15-minute budget. Completed work is preserved.");
@@ -1637,7 +1637,7 @@ pub(crate) async fn drive_run<F: std::future::Future<Output = Result<String>>>(
         if app.account_disabled() {
             Some("This account was disabled by the server administrator.")
         } else if !crate::initiative::active(&app.db.0.lock().unwrap(), &run.id).unwrap_or(false) {
-            Some("Initiative was turned off. Completed actions are preserved.")
+            Some("Initiative was turned off or stopped, or its commitment or source changed. Completed actions are preserved.")
         } else if initiative_remaining(&app.db, &run.id, db::now()).ok().flatten().is_some_and(|remaining| remaining.is_zero()) {
             Some("This initiative check reached its 15-minute budget. Completed work is preserved; you can ask to continue it.")
         } else if app.db.cancelled(&run.id) {

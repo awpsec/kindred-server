@@ -275,6 +275,7 @@ impl Db {
         crate::conversation_updates::migrate(&c)?;
         crate::team_chats::migrate(&c)?;
         crate::continuity::migrate(&c)?;
+        crate::initiative_followups::init(&c)?;
         crate::memory_maintenance::migrate(&c)?;
         crate::work_rules::migrate(&c)?;
         crate::visual_panels::migrate(&c)?;

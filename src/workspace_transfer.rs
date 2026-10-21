@@ -74,6 +74,7 @@ const TABLES: &[&str] = &[
     "memory_snapshots",
     "memory_versions",
     "continuity_obligations",
+    "initiative_followups",
     "continuity_sessions",
     "continuity_dependencies",
     "standing_work_rules",
@@ -303,6 +304,7 @@ impl Db {
                     | "memory_overflow"
                     | "memory_snapshots"
                     | "continuity_obligations"
+                    | "initiative_followups"
                     | "continuity_sessions"
                     | "continuity_dependencies"
                     | "standing_work_rules"
@@ -346,6 +348,7 @@ impl Db {
                     | "memory_overflow"
                     | "memory_snapshots"
                     | "continuity_obligations"
+                    | "initiative_followups"
                     | "continuity_sessions"
                     | "continuity_dependencies"
                     | "standing_work_rules"

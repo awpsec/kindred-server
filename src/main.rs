@@ -1,4 +1,7 @@
 mod initiative;
+mod initiative_followups;
+#[cfg(test)]
+mod initiative_followup_tests;
 #[cfg(test)]
 mod initiative_tests;
 #[cfg(test)]

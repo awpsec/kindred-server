@@ -83,7 +83,7 @@ pub async fn start(app: &App, bot: &Bot, run: &Run, tool: &str, mut args: Value)
             |r| r.get(0),
         )?;
         ensure!(allowed, "Task stopped before command launch");
-        ensure!(crate::initiative::active(&tx, &run.id)?, "Initiative was turned off. This command was not started.");
+        ensure!(crate::initiative::active(&tx, &run.id)?, "Initiative was turned off or stopped, or its commitment or source changed. This command was not started.");
         if let Some(remaining) = crate::initiative::remaining_seconds(&tx, &run.id, db::now())? {
             ensure!(remaining > 0, "This initiative check reached its 15-minute budget. This command was not started.");
             args["max_seconds"] = json!(max.min(remaining as u64));

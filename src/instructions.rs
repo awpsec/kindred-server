@@ -7,7 +7,7 @@ use anyhow::{Result, bail};
 use rusqlite::OptionalExtension;
 use serde_json::{Value, json};
 
-pub const VERSION: &str = "42";
+pub const VERSION: &str = "43";
 pub const CORE: &str = include_str!("prompts/00-core.md");
 pub const BOUNDED_CORE: &str = include_str!("prompts/00-bounded-core.md");
 pub const CHAPTERS: &[(&str, &str)] = &[
@@ -355,7 +355,7 @@ pub fn build(
     ));
     if initiative["is_initiative"] == true {
         output.push_str("\n\n");
-        output.push_str(include_str!("prompts/09-initiative.md"));
+        output.push_str(if context_window.is_some_and(|n|n<64000) {include_str!("prompts/09-bounded-initiative.md")} else {include_str!("prompts/09-initiative.md")});
     }
     if is_routine {
         output.push_str("\nScheduled reporting: work quietly. Report only new information meeting notification criteria, real failures or needed input; do not repeat delivered updates. For a successful check with nothing new, call the actual finish_quietly tool directly, without preamble or final explanation. Otherwise use routine_complete(outcome=report, report=the finding), or outcome=error with an actionable reason. Successful terminal checks require one structured outcome; prose alone is insufficient. The tool ends the turn: no second final reply. Honor explicit requests to report every run. Never treat a failed or incomplete check as an all-clear.\n");

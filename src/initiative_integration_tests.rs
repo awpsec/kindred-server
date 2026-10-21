@@ -192,3 +192,67 @@ async fn initiative_background_command_launch_caps_actual_desktop_request_and_la
         assert_eq!(controls["commands"].as_array().unwrap().iter().find(|c|c["id"]==command).unwrap()["stop"],true);
     }
 }
+
+#[tokio::test]
+async fn initiative_real_sdk_saves_revisits_and_closes_a_topic_without_duplicate_notifications() {
+    let (app,bot,run,cursor)=setup("custom-11111111-1111-4111-8111-111111111111");
+    let source=app.db.0.lock().unwrap().query_row("SELECT max(seq) FROM chat_messages WHERE chat_id=? AND sender='user'",[&run.chat_id],|r|r.get::<_,i64>(0)).unwrap();
+    let due=Utc.timestamp_opt(db::now()+86400,0).single().unwrap().with_hour(12).unwrap().with_minute(0).unwrap().timestamp();
+    let obligation=json!({"key":"synthetic-draft","description":"Prepare an internal project draft when the source is ready","expected_revision":0,"status":"waiting","sources":[{"message_seq":source}],"follow_up":{"next_check":due,"stop_when":"Draft delivered or owner dismisses it"}});
+    let (url,script,server)=endpoint(vec![
+        action("save-topic","","obligation_save",obligation.clone()),
+        action("defer-general","","initiative_checkpoint",json!({"notes":"Draft source will be ready tomorrow","next_check":due+7*86400})),
+        action("quiet","","finish_quietly",json!({}))
+    ],false,false).await;
+    assert!(execute(&app,&bot,&run,&url).await.unwrap().is_empty());
+    assert!(app.db.notifications(Some(cursor)).unwrap()["items"].as_array().unwrap().is_empty());
+    assert!(script.requests.lock().unwrap()[1]["messages"].to_string().contains("next_check_not_before"));
+    server.abort();
+    crate::initiative::tick(&app.db,due-1).unwrap();
+    assert!(app.db.claim_bot(&bot.id).unwrap().is_none());
+    crate::initiative::tick(&app.db,due).unwrap();
+    let next=app.db.claim_bot(&bot.id).unwrap().expect("due topic wakes despite distant generic review");
+    assert_eq!(crate::initiative::context(&app.db,&next).unwrap()["due_follow_ups"]["total"],1);
+    let mut closed=obligation;
+    closed["expected_revision"]=json!(1);closed["status"]=json!("completed");closed["follow_up"]=Value::Null;
+    let (url,script,server)=endpoint(vec![
+        action("close-topic","","obligation_save",closed),
+        answer("Your synthetic project draft: review the current scope, gather supporting records, and confirm the next milestone. Nothing was sent externally.")
+    ],false,false).await;
+    let output=execute(&app,&bot,&next,&url).await.unwrap();
+    app.db.chat_complete(&next).unwrap();
+    assert!(output.starts_with("Your synthetic project draft:"));
+    assert_eq!(script.requests.lock().unwrap().len(),2);
+    assert_eq!(crate::initiative::context(&app.db,&next).unwrap()["due_follow_ups"]["total"],0);
+    assert_eq!(app.db.notifications(Some(cursor)).unwrap()["items"].as_array().unwrap().len(),1);
+    assert!(app.db.routines().unwrap().is_empty());
+    assert!(app.db.run_approvals(&next.id).unwrap().is_empty());
+    server.abort();
+}
+
+#[test]
+fn initiative_due_topic_context_fits_a_32k_model_with_production_tool_catalogue() {
+    let (app,bot,run,_)=setup("custom-11111111-1111-4111-8111-111111111111");
+    let source=app.db.0.lock().unwrap().query_row("SELECT max(seq) FROM chat_messages WHERE chat_id=? AND sender='user'",[&run.chat_id],|r|r.get::<_,i64>(0)).unwrap();
+    let due=db::now()+600;
+    for n in 0..4 {
+        crate::continuity::store::obligation_save(&app.db,&run,&json!({"key":format!("topic-{n}"),"description":"Pending task details ".repeat(90),"expected_revision":0,"status":"open","sources":[{"message_seq":source}],"follow_up":{"next_check":due,"stop_when":"Complete or dismissed ".repeat(20)}})).unwrap();
+    }
+    { let c=app.db.0.lock().unwrap();
+      let items=crate::initiative_followups::due(&c,&bot.id,due).unwrap();
+      crate::initiative_followups::claim(&c,&run.id,&items,due).unwrap();
+    }
+    let tools=runtime::tool_specs_for_run(&app,&bot,&run);
+    assert!(tools.iter().any(|tool|tool["name"]=="obligation_save"));
+    let text=crate::instructions::build(&app,&bot,&run,&tools,Some(32768)).unwrap();
+    assert!(text.contains("due_follow_ups"));
+    let packet:Value=serde_json::from_str(text.rsplit_once('\n').unwrap().1).unwrap();
+    assert_eq!(packet["initiative"]["due_follow_ups"]["total"],4);
+    assert!(packet["initiative"]["due_follow_ups"]["instructions"].as_str().unwrap().contains("obligations_read"));
+    if packet["initiative"]["due_follow_ups"]["items"].as_array().unwrap().len()<4 {
+        assert!(packet["context_selection"]["omitted_sections"]["/initiative/due_follow_ups/items"].as_u64().unwrap()>0);
+    }
+    assert!(crate::continuity::store::estimated_tokens(&text)
+        +crate::continuity::store::estimated_tokens(&json!(tools).to_string())
+        +crate::continuity::store::estimated_tokens(&run.prompt) <=32768-3276-1638);
+}

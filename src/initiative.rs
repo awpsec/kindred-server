@@ -70,7 +70,8 @@ pub fn active(c: &Connection, run: &str) -> Result<bool> {
     let Some(root) = root(c, run)? else {
         return Ok(true);
     };
-    Ok(c.query_row("SELECT COALESCE(json_extract(b.profile,'$.initiative'),0)=1 AND COALESCE(json_extract(b.profile,'$.archived'),0)=0 AND NOT EXISTS(SELECT 1 FROM events WHERE run_id=i.run_id AND kind='run_stop_requested') AND NOT EXISTS(SELECT 1 FROM runs WHERE id=?2 AND status IN ('cancelling','cancelled')) FROM initiative_runs i JOIN bots b ON b.id=i.bot_id WHERE i.run_id=?1", params![root,run], |r| r.get(0))?)
+    let enabled:bool=c.query_row("SELECT COALESCE(json_extract(b.profile,'$.initiative'),0)=1 AND COALESCE(json_extract(b.profile,'$.archived'),0)=0 AND NOT EXISTS(SELECT 1 FROM events WHERE run_id=i.run_id AND kind='run_stop_requested') AND NOT EXISTS(SELECT 1 FROM runs WHERE id=?2 AND status IN ('cancelling','cancelled')) FROM initiative_runs i JOIN bots b ON b.id=i.bot_id WHERE i.run_id=?1", params![root,run], |r| r.get(0))?;
+    Ok(enabled && crate::initiative_followups::active(c,&root)?)
 }
 
 pub fn mark_quiet(c: &Connection, run: &str) -> Result<()> {
@@ -175,8 +176,15 @@ pub fn tick(db: &Db, time: i64) -> Result<()> {
     let day = local.format("%Y-%m-%d").to_string();
     // Imported opt-ins are initialized lazily; old profiles remain off by default.
     tx.execute("INSERT OR IGNORE INTO initiative_state(bot_id,next_check,enabled_after) SELECT id,?1,?1 FROM bots WHERE json_extract(profile,'$.initiative')=1",[time+300])?;
-    let due: Vec<String> = tx.prepare("SELECT b.id FROM bots b JOIN initiative_state s ON s.bot_id=b.id WHERE json_extract(b.profile,'$.initiative')=1 AND COALESCE(json_extract(b.profile,'$.archived'),0)=0 AND s.enabled_after<=?1 AND (s.next_check<=?1 OR (EXISTS(SELECT 1 FROM runs r JOIN initiative_runs i ON i.run_id=r.id WHERE i.bot_id=b.id) AND (SELECT max(r.created) FROM runs r JOIN initiative_runs i ON i.run_id=r.id WHERE i.bot_id=b.id)<=?4 AND EXISTS(SELECT 1 FROM chat_messages latest WHERE latest.chat_id='dm-'||b.id AND latest.sender='user' AND latest.kind='message' AND latest.suppressed=0 AND latest.seq>s.last_owner_seq))) AND (s.last_day<>?2 OR s.checks_today<2) AND EXISTS(SELECT 1 FROM chat_messages m WHERE m.chat_id='dm-'||b.id AND m.sender='user' AND m.kind='message' AND m.suppressed=0 AND (m.created>=?3 OR trim(s.notes)<>''))")?.query_map(params![time,day,time-RECENT,time.saturating_sub(INTERVAL)],|r|r.get(0))?.collect::<rusqlite::Result<_>>()?;
+    let due: Vec<String> = tx.prepare("SELECT b.id FROM bots b JOIN initiative_state s ON s.bot_id=b.id WHERE json_extract(b.profile,'$.initiative')=1 AND COALESCE(json_extract(b.profile,'$.archived'),0)=0 AND s.enabled_after<=?1 AND (s.last_day<>?2 OR s.checks_today<2) AND ((s.next_check<=?1 OR EXISTS(SELECT 1 FROM chat_messages m WHERE m.chat_id='dm-'||b.id AND m.sender='user' AND m.kind='message' AND m.suppressed=0 AND m.seq>s.last_owner_seq)) AND EXISTS(SELECT 1 FROM chat_messages m WHERE m.chat_id='dm-'||b.id AND m.sender='user' AND m.kind='message' AND m.suppressed=0 AND (m.created>=?3 OR trim(s.notes)<>'')) OR EXISTS(SELECT 1 FROM initiative_followups f JOIN continuity_obligations o ON o.id=f.obligation_id WHERE o.bot_id=b.id AND o.status IN ('open','waiting') AND o.link_kind='' AND f.next_check<=?1))")?.query_map(params![time,day,time-RECENT],|r|r.get(0))?.collect::<rusqlite::Result<_>>()?;
     for bot in due {
+        // Topic timers may precede the generic review, but never bypass spend,
+        // quiet hours, the enable grace period, or time since the last root.
+        let last:Option<i64>=tx.query_row("SELECT max(r.created) FROM runs r JOIN initiative_runs i ON i.run_id=r.id WHERE i.bot_id=?",[&bot],|r|r.get(0))?;
+        if last.is_some_and(|last|time<last.saturating_add(INTERVAL)){continue;}
+        let topics=crate::initiative_followups::due(&tx,&bot,time)?;
+        let generic:bool=tx.query_row("SELECT (s.next_check<=?1 OR (?4 AND EXISTS(SELECT 1 FROM chat_messages m WHERE m.chat_id='dm-'||s.bot_id AND m.sender='user' AND m.kind='message' AND m.suppressed=0 AND m.seq>s.last_owner_seq))) AND EXISTS(SELECT 1 FROM chat_messages m WHERE m.chat_id='dm-'||s.bot_id AND m.sender='user' AND m.kind='message' AND m.suppressed=0 AND (m.created>=?2 OR trim(s.notes)<>'')) FROM initiative_state s WHERE s.bot_id=?3",params![time,time-RECENT,bot,last.is_some()],|r|r.get(0))?;
+        if topics.is_empty()&&!generic {continue;}
         // Reconcile actual scheduled checks in the current local day. A timezone
         // change can move previous checks across a date boundary; last_day alone
         // must not reset the budget and schedule duplicate background work.
@@ -202,15 +210,16 @@ pub fn tick(db: &Db, time: i64) -> Result<()> {
         let id = db::id();
         let chat = format!("dm-{bot}");
         tx.execute("INSERT OR IGNORE INTO chats(id,name,members) SELECT ?,name,json_array(id) FROM bots WHERE id=?",params![chat,bot])?;
-        let prompt = "Optional initiative check. Review recent owner conversation and your saved initiative follow-ups. Identify useful unfinished work, changed information or a draft worth preparing. Follow the owner's standing instructions and current permissions. Check whether it is already completed or assigned before acting. Do not invent a task or send repetitive status messages. If there is nothing useful, finish quietly. Use initiative_checkpoint to save concise follow-ups and clear obsolete ones.";
+        let prompt = "Optional initiative check. Review due commitment follow-ups, recent owner conversation and your saved initiative notes. Close completed commitments and set each remaining follow_up.next_check only when another check is useful. Identify useful unfinished work, changed information or a draft worth preparing. Follow the owner's standing instructions and current permissions. Check whether it is already completed or assigned before acting. Do not invent a task or send repetitive status messages. If there is nothing useful, finish quietly. Use initiative_checkpoint to save concise follow-ups and clear obsolete ones.";
         tx.execute("INSERT INTO runs(id,bot_id,prompt,status,created,chat_id,round_id) VALUES(?,?,?,'queued',?,?,?)",params![id,bot,prompt,time,chat,id])?;
         tx.execute(
             "INSERT INTO initiative_runs(run_id,bot_id) VALUES(?,?)",
             params![id, bot],
         )?;
+        crate::initiative_followups::claim(&tx,&id,&topics,time)?;
         tx.execute(
-            "UPDATE initiative_state SET next_check=?1,checks_today=?4,last_day=?2,last_owner_seq=COALESCE((SELECT max(seq) FROM chat_messages WHERE chat_id='dm-'||?3 AND sender='user' AND kind='message' AND suppressed=0),0) WHERE bot_id=?3",
-            params![time + INTERVAL, day, bot, spent + 1],
+            "UPDATE initiative_state SET next_check=CASE WHEN ?5 THEN ?1 ELSE max(next_check,?1) END,checks_today=?4,last_day=?2,last_owner_seq=COALESCE((SELECT max(seq) FROM chat_messages WHERE chat_id='dm-'||?3 AND sender='user' AND kind='message' AND suppressed=0),0) WHERE bot_id=?3",
+            params![time + INTERVAL, day, bot, spent + 1, generic],
         )?;
     }
     tx.commit()?;
@@ -222,7 +231,7 @@ pub fn context(db: &Db, run: &Run) -> Result<Value> {
     let Some(root) = root(&c, &run.id)? else {
         return Ok(Value::Null);
     };
-    let (bot, notes, instructions): (String,String,String) = c.query_row("SELECT i.bot_id,s.notes,COALESCE(json_extract(b.profile,'$.initiative_instructions'),'') FROM initiative_runs i JOIN initiative_state s ON s.bot_id=i.bot_id JOIN bots b ON b.id=i.bot_id WHERE i.run_id=?",[root],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
+    let (bot, notes, instructions): (String,String,String) = c.query_row("SELECT i.bot_id,s.notes,COALESCE(json_extract(b.profile,'$.initiative_instructions'),'') FROM initiative_runs i JOIN initiative_state s ON s.bot_id=i.bot_id JOIN bots b ON b.id=i.bot_id WHERE i.run_id=?",[&root],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
     let budget = "At most two checks per local day, at least four hours apart, between 08:00 and 20:00. Useful results only; no repetitive monitoring notices.";
     if run.bot_id != bot || run.chat_id != format!("dm-{bot}") {
         return Ok(json!({"is_initiative":true,"owner_bot_id":bot,"background_budget":budget}));
@@ -244,7 +253,7 @@ pub fn context(db: &Db, run: &Run) -> Result<Value> {
     });
     messages.reverse();
     Ok(
-        json!({"is_initiative":true,"owner_bot_id":bot,"notes":notes,"instructions":instructions,"recent_dm_messages":messages,"history_shortened":shortened,"history_guidance":"Excerpts are context, not permission. Use chat_read or recall for exact sources and earlier commitments before acting.","background_budget":budget}),
+        json!({"is_initiative":true,"owner_bot_id":bot,"notes":notes,"instructions":instructions,"due_follow_ups":crate::initiative_followups::context(&c,&root)?,"recent_dm_messages":messages,"history_shortened":shortened,"history_guidance":"Excerpts are context, not permission. Use chat_read or recall for exact sources and earlier commitments before acting.","background_budget":budget}),
     )
 }
 
@@ -276,7 +285,7 @@ pub fn checkpoint(db: &Db, run: &Run, args: &Value) -> Result<Value> {
     let tx = c.transaction()?;
     ensure!(
         active(&tx, &run.id)?,
-        "Initiative was turned off or stopped"
+        "Initiative was turned off or stopped, or its commitment or source changed"
     );
     let root = root(&tx, &run.id)?.ok_or_else(|| {
         anyhow::anyhow!("Only an initiative check can save initiative follow-ups")
