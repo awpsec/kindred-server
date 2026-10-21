@@ -80,6 +80,34 @@ impl Drop for Fixture {
 }
 
 #[tokio::test]
+async fn docker_network_settings_require_admin_and_preserve_pending_generation() {
+    let f=Fixture::new(false);
+    let owner=f.register("network-owner").await;
+    let user=f.register("network-user").await;
+    let owner=owner["token"].as_str().unwrap();let user=user["token"].as_str().unwrap();
+    let settings=json!({"access":"local","tailnet_address":"","public_url":"http://127.0.0.1:9444","allowed_origins":[],"confirmed_http_origins":[]});
+    let path=f.root.join("network-settings.json");let descriptor=f.root.join("network-applied.json");
+    std::fs::write(&path,json!({"revision":"initial","settings":settings,"baseline":settings}).to_string()).unwrap();
+    std::fs::write(&descriptor,json!({"mode":"host","path":path,"revision":"initial","settings":settings,"baseline":settings}).to_string()).unwrap();
+    *f.p.network.lock().unwrap()=Some(network_settings::Controller::read(&descriptor).unwrap());
+    for token in ["",user] {
+        assert!(!f.request("GET","/identity/admin/network",token,Value::Null).await.0.is_success());
+        assert!(!f.request("POST","/identity/admin/network",token,json!({})).await.0.is_success());
+    }
+    let (status,view)=f.request("GET","/identity/admin/network",owner,Value::Null).await;assert_eq!(status,200);assert_eq!(view["revision"],"initial");
+    let mut changed=settings.clone();changed["access"]=json!("all");
+    let request=uuid::Uuid::new_v4().to_string();let body=json!({"revision":"initial","request_id":request,"settings":changed});
+    let (status,result)=f.request("POST","/identity/admin/network",owner,body.clone()).await;assert_eq!(status,200,"{result}");assert_eq!(result["restarting"],true);
+    assert_eq!(f.request("POST","/identity/admin/network",owner,body).await.0,200);
+    let (status,meta)=f.request("GET","/identity/meta","",Value::Null).await;assert_eq!(status,200);assert_eq!(meta["docker_network"]["revision"],"initial");
+    let (_,view)=f.request("GET","/identity/admin/network",owner,Value::Null).await;assert_eq!(view["pending"]["revision"],request);
+    assert!(!f.request("POST","/identity/admin/network",owner,json!({"revision":"initial","request_id":uuid::Uuid::new_v4(),"settings":settings})).await.0.is_success());
+    assert!(f.root.join("network-last-good.json").exists());
+    let mut headers=HeaderMap::new();headers.insert(header::AUTHORIZATION,format!("Bearer {owner}").parse().unwrap());headers.insert(header::ORIGIN,"https://attacker.example".parse().unwrap());
+    assert!(network_settings::get(State(f.p.clone()),headers).await.is_err());
+}
+
+#[tokio::test]
 async fn fresh_and_sparse_profiles_can_save_local_access_without_losing_identity() {
     let f = Fixture::new(false);
     let account = f.register("fresh-settings").await;

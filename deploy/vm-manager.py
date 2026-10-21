@@ -26,6 +26,12 @@ CACHE = ROOT / '_images'
 DEBIAN = 'https://cloud.debian.org/images/cloud/trixie/latest/'
 IMAGE = 'debian-13-genericcloud-amd64.qcow2'
 
+def available_host_port(port):
+    # Host-network installations share ports with other host applications.
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        try: probe.bind(('127.0.0.1',port)); return True
+        except OSError: return False
+
 def run(args, **kwargs):
     return subprocess.run(list(map(str, args)), check=True, stdin=subprocess.DEVNULL,
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=600, **kwargs)
@@ -173,16 +179,16 @@ def reboot_process_exited(root, identity):
 def prepare(root, profile):
     metadata=root/'computer.json'
     if metadata.exists(): return json.loads(metadata.read_text())
+    resources=initial_resources(root)
+    validate_resource_capacity(resources)
     base=base_image()
     for name in ('ssh_client','ssh_host_ed25519_key'):
         if not (root/name).exists(): run(['ssh-keygen','-q','-t','ed25519','-N','','-f',root/name])
     with locked(ROOT/'allocation.lock'):
         used={json.loads(p.read_text())['port'] for p in ROOT.glob('*/computer/computer.json')}
-        port=next((p for p in range(22000,32000) if p not in used),None)
+        port=next((p for p in range(22000,32000) if p not in used and available_host_port(p)),None)
         if port is None: raise ValueError('Computer port capacity reached')
-        settings={'id':profile,'port':port,'cpus':number('KINDRED_VM_CPUS',2,1,32),
-                  'memory_mb':number('KINDRED_VM_MEMORY_MB',6144,1024,262144),
-                  'disk_gb':number('KINDRED_VM_DISK_GB',30,8,2048),'created_at':int(time.time())}
+        settings={'id':profile,'port':port,**resources,'created_at':int(time.time())}
         # Reserve the port before another profile can choose it.
         atomic(metadata,settings)
     return settings
@@ -280,6 +286,21 @@ def software_image():
             os.replace(temporary,image)
     return image
 
+def legacy_cgroups(controller, mount, membership):
+    roots={mount,mount/controller}
+    if controller=='cpu': roots.add(mount/'cpu,cpuacct')
+    entries=membership.read_text().splitlines() if membership.is_file() else []
+    relative=next((line.split(':',2)[2] for line in entries if len(line.split(':',2))==3 and controller in line.split(':',2)[1].split(',')),None)
+    groups=set(roots)
+    if relative is not None:
+        for root in roots:
+            group=(root/relative.lstrip('/')).resolve()
+            while group.is_relative_to(root):
+                groups.add(group)
+                if group==root:break
+                group=group.parent
+    return groups
+
 def memory_available(meminfo=Path('/proc/meminfo'), cgroup_root=Path('/sys/fs/cgroup'), membership=Path('/proc/self/cgroup')):
     available=next(int(line.split()[1])*1024 for line in meminfo.read_text().splitlines() if line.startswith('MemAvailable:'))
     cgroup_root=cgroup_root.resolve()
@@ -297,6 +318,10 @@ def memory_available(meminfo=Path('/proc/meminfo'), cgroup_root=Path('/sys/fs/cg
     for group in groups:
         limit=group/'memory.max';used=group/'memory.current'
         if limit.is_file() and used.is_file() and limit.read_text().strip()!='max':
+            available=min(available,int(limit.read_text())-int(used.read_text()))
+    for group in legacy_cgroups('memory',cgroup_root,membership):
+        limit=group/'memory.limit_in_bytes';used=group/'memory.usage_in_bytes'
+        if limit.is_file() and used.is_file():
             available=min(available,int(limit.read_text())-int(used.read_text()))
     return max(0,available)
 
@@ -341,6 +366,8 @@ def start(root, profile):
     if running(root):
         require_running(root)
         return settings
+    # Revalidate existing allocations too: host/container limits may have changed.
+    validate_resource_capacity(settings)
     software=seed(root,profile,settings)
     with locked(ROOT/'capacity.lock'):
         if running(root):
@@ -421,9 +448,56 @@ def connection_status(root):
 
 RESOURCE_LIMITS = {'cpus': (1, 32), 'memory_mb': (1024, 262144), 'disk_gb': (8, 2048)}
 
+def cpu_capacity(cgroup_root=Path('/sys/fs/cgroup'), membership=Path('/proc/self/cgroup')):
+    import math
+    count=len(os.sched_getaffinity(0)) if hasattr(os,'sched_getaffinity') else (os.cpu_count() or 1)
+    mount=cgroup_root.resolve();groups={mount}
+    if membership.is_file():
+        unified=next((line[3:] for line in membership.read_text().splitlines() if line.startswith('0::')),None)
+        if unified is not None:
+            group=(mount/unified.lstrip('/')).resolve()
+            while group.is_relative_to(mount):
+                groups.add(group)
+                if group==mount:break
+                group=group.parent
+    for group in groups:
+        quota=group/'cpu.max'
+        if quota.is_file():
+            maximum,period=quota.read_text().split()
+            if maximum!='max':count=min(count,max(1,math.ceil(int(maximum)/int(period))))
+    for group in legacy_cgroups('cpu',mount,membership):
+        quota=group/'cpu.cfs_quota_us';period=group/'cpu.cfs_period_us'
+        if quota.is_file() and period.is_file() and int(quota.read_text())>0:
+            count=min(count,max(1,math.ceil(int(quota.read_text())/int(period.read_text()))))
+    return max(1,count)
+
+def resource_capacity():
+    available=memory_available()//(1024*1024)
+    return {'cpus':min(32,cpu_capacity()),'memory_available_mb':available,
+            'memory_budget_mb':max(0,min(262144,available-512)),'reserved_memory_mb':512}
+
+def validate_resource_capacity(values):
+    capacity=resource_capacity()
+    if values['cpus']>capacity['cpus']:
+        raise ValueError(f"This server/container has {capacity['cpus']} CPUs available. Reduce the shared VM CPU count or increase the host/container CPU allocation.")
+    if values['memory_mb']>capacity['memory_budget_mb']:
+        raise ValueError(f"The shared VM requests {values['memory_mb']/1024:g} GB RAM, but only {capacity['memory_budget_mb']/1024:.1f} GB is available after reserving 0.5 GB for the server. Reduce shared VM RAM, stop another profile computer, or increase the service/container memory limit.")
+
+def initial_resources(root):
+    path=root/'resource-overrides.json'
+    values=json.loads(path.read_text()) if path.exists() else {
+        'cpus':number('KINDRED_VM_CPUS',2,1,32),'memory_mb':number('KINDRED_VM_MEMORY_MB',6144,1024,262144),
+        'disk_gb':number('KINDRED_VM_DISK_GB',30,8,2048)}
+    if not isinstance(values,dict) or set(values)!=set(RESOURCE_LIMITS):raise ValueError('Invalid initial VM resources')
+    for key,(low,high) in RESOURCE_LIMITS.items():
+        if type(values[key]) is not int or not low<=values[key]<=high:raise ValueError('Invalid initial VM resource '+key)
+    return values
+
 def resource_settings(root, profile):
+    capacity=resource_capacity()
+    limits={**RESOURCE_LIMITS,'cpus':(1,capacity['cpus']),'memory_mb':(1024,capacity['memory_budget_mb'])}
     if not (root/'computer.json').exists():
-        return {'state':'shut off','provisioned':False,'resources':{'cpus':number('KINDRED_VM_CPUS',2,1,32),'memory_mb':number('KINDRED_VM_MEMORY_MB',6144,1024,262144),'disk_gb':number('KINDRED_VM_DISK_GB',30,8,2048)},'limits':RESOURCE_LIMITS}
+        return {'state':'shut off','provisioned':False,'resources':initial_resources(root),'limits':limits,'capacity':capacity}
     settings = json.loads((root/'computer.json').read_text())
     disk = root/'disk.qcow2'
     if disk.exists() and not running(root):
@@ -435,7 +509,7 @@ def resource_settings(root, profile):
             atomic(root/'computer.json', settings)
     return {'state': 'running' if running(root) else 'shut off',
             'resources': {k: settings[k] for k in RESOURCE_LIMITS},
-            'limits': RESOURCE_LIMITS}
+            'limits': limits,'capacity':capacity}
 
 def resize_resources(root, profile, values):
     if not isinstance(values, dict) or set(values) != set(RESOURCE_LIMITS):
@@ -445,11 +519,13 @@ def resize_resources(root, profile, values):
             raise ValueError(f'{key} must be a whole number between {low} and {high}.')
     if running(root):
         raise ValueError('Shut down this computer before changing its resources.')
+    validate_resource_capacity(values)
+    if not (root/'computer.json').exists():
+        atomic(root/'resource-overrides.json',values)
+        return resource_settings(root,profile)
     current = resource_settings(root, profile)['resources']
     if values['disk_gb'] < current['disk_gb']:
         raise ValueError('Disk size can only be increased.')
-    if not (root/'computer.json').exists():
-        raise ValueError('Start the computer once before changing its resources.')
     settings = json.loads((root/'computer.json').read_text())
     disk = root/'disk.qcow2'
     if disk.exists() and values['disk_gb'] > current['disk_gb']:

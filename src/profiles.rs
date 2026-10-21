@@ -51,7 +51,11 @@ macro_rules! ensure {
 #[path = "account_management.rs"]
 mod account_management;
 
+#[path = "network_settings.rs"]
+mod network_settings;
+
 pub struct Profiles {
+    network: Mutex<Option<network_settings::Controller>>,
     self_ref: std::sync::OnceLock<std::sync::Weak<Profiles>>,
     config: Config,
     registry: Mutex<Connection>,
@@ -144,7 +148,9 @@ impl Profiles {
         mobile_pairing::migrate(&registry)?;
         let push = crate::mobile_push::Settings::from_env();
         let push_platforms = push.platforms();
+        let network=network_settings::Controller::from_env()?;
         let portal = Arc::new(Self {
+            network: Mutex::new(network),
             self_ref: Default::default(),
             config,
             registry: Mutex::new(registry),
@@ -422,6 +428,7 @@ pub fn router(portal: Portal) -> Router {
         .route("/identity/admin/password-resets", get(password_reset::list).post(password_reset::decide))
         .route("/identity/admin", get(admin).post(admin_update))
         .route("/identity/admin/remove", post(remove_account))
+        .route("/identity/admin/network", get(network_settings::get).post(network_settings::save))
         .route(
             "/identity/server-update",
             get(server_update_status).post(server_update_start),
@@ -470,8 +477,10 @@ async fn meta(State(p): State<Portal>) -> ApiResult {
     let first: bool = c.query_row("SELECT NOT EXISTS(SELECT 1 FROM accounts)", [], |r| {
         r.get(0)
     })?;
+    let registration=p.registration_open(&c)?;
+    drop(c);
     Ok(Json(
-        json!({"profiles":true,"server_chats":true,"mobile_pairing":true,"mobile_pairing_private_http":true,"connection_access":true,"connection_policy_digest":p.config.connection_policy_digest(),"deployment":if std::env::var("KINDRED_DEPLOYMENT").as_deref()==Ok("standalone"){"standalone"}else{"hosted"},"first_user":first,"legacy_claim":first&&p.legacy.is_some(),"registration":p.registration_open(&c)?,"version":env!("CARGO_PKG_VERSION")}),
+        json!({"docker_network":network_settings::meta(&p),"profiles":true,"server_chats":true,"mobile_pairing":true,"mobile_pairing_private_http":true,"connection_access":true,"connection_policy_digest":p.config.connection_policy_digest(),"deployment":if std::env::var("KINDRED_DEPLOYMENT").as_deref()==Ok("standalone"){"standalone"}else{"hosted"},"first_user":first,"legacy_claim":first&&p.legacy.is_some(),"registration":registration,"version":env!("CARGO_PKG_VERSION")}),
     ))
 }
 async fn register(State(p): State<Portal>, headers: HeaderMap, Json(v): Json<Value>) -> ApiResult {

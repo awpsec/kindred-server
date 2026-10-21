@@ -228,7 +228,11 @@ async fn main() -> Result<()> {
         Action::Serve => {
             let config = config::Config::load(&cli.config)?;
             let listen = config.listen;
-            let listener = tokio::net::TcpListener::bind(listen).await?;
+            let mut listeners = Vec::new();
+            for address in std::iter::once(listen).chain(config.additional_listen.iter().copied()) {
+                listeners.push(tokio::net::TcpListener::bind(address).await
+                    .with_context(|| format!("Could not listen on {address}"))?);
+            }
             let legacy = !config.profiles.enabled || config.profiles.import_legacy;
             let app = if legacy {
                 let token = std::env::var(&config.token_env)
@@ -257,11 +261,24 @@ async fn main() -> Result<()> {
                 env!("CARGO_PKG_VERSION"),
                 config.public_url
             );
-            axum::serve(listener, router.into_make_service_with_connect_info::<std::net::SocketAddr>())
-                .with_graceful_shutdown(async {
-                    let _ = tokio::signal::ctrl_c().await;
-                })
-                .await?;
+            let (shutdown, _) = tokio::sync::watch::channel(false);
+            let mut servers = tokio::task::JoinSet::new();
+            for listener in listeners {
+                let mut stopped = shutdown.subscribe();
+                let service = router.clone().into_make_service_with_connect_info::<std::net::SocketAddr>();
+                servers.spawn(async move {
+                    axum::serve(listener, service).with_graceful_shutdown(async move {
+                        let _ = stopped.changed().await;
+                    }).await
+                });
+            }
+            let first = tokio::select! {
+                _ = tokio::signal::ctrl_c() => None,
+                result = servers.join_next() => result,
+            };
+            let _ = shutdown.send(true);
+            while let Some(result) = servers.join_next().await { result??; }
+            if let Some(result) = first { result??; }
             if let Some(scheduler) = scheduler {
                 scheduler.abort();
             }

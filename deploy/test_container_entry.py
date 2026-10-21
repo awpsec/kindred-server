@@ -18,7 +18,7 @@ class PrivateDirectoryRestart(unittest.TestCase):
             root=Path(folder);data=root/'data';profiles=data/'profiles';profiles.mkdir(parents=True)
             for path in [data,profiles]:os.chown(path,1000,1000);path.chmod(0o700)
             try:
-                docker('run','--pull=never','-d','--name',name,'--network','none','--security-opt','no-new-privileges:true','--cap-drop','ALL','--cap-add','CHOWN','--cap-add','SETUID','--cap-add','SETGID','-e','KINDRED_ALLOWED_ORIGINS=["https://laptop.example.ts.net"]','-v',f'{data}:/data','-v',f'{Path(__file__).with_name("container-entry.py").resolve()}:/opt/kindred/source/deploy/container-entry.py:ro',image)
+                docker('run','--pull=never','-d','--name',name,'--network','none','--security-opt','no-new-privileges:true','--cap-drop','ALL','--cap-add','CHOWN','--cap-add','SETUID','--cap-add','SETGID','-e','KINDRED_ALLOWED_ORIGINS=["https://laptop.example.ts.net"]','-v',f'{data}:/data','-v',f'{Path(__file__).with_name("container-entry.py").resolve()}:/opt/kindred/source/deploy/container-entry.py:ro','-v',f'{Path(__file__).with_name("network_settings.py").resolve()}:/opt/kindred/source/deploy/network_settings.py:ro',image)
                 for attempt in range(2):
                     for _ in range(30):
                         try:

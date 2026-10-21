@@ -6,6 +6,7 @@ use std::{net::SocketAddr, path::Path};
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub listen: SocketAddr,
+    pub additional_listen: Vec<SocketAddr>,
     pub public_url: String,
     pub allowed_origins: Vec<String>,
     /// Exact HTTP origins approved by the managed Connection access Save flow.
@@ -134,6 +135,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             listen: "127.0.0.1:7340".parse().unwrap(),
+            additional_listen: Vec::new(),
             public_url: "http://127.0.0.1:7340".into(),
             allowed_origins: Vec::new(),
             confirmed_http_origins: Vec::new(),
@@ -217,6 +219,9 @@ impl Config {
         Ok(config)
     }
     pub fn validate(&self) -> Result<()> {
+        ensure!(self.additional_listen.len() <= 4, "At most four additional listeners are allowed");
+        let mut listeners=std::collections::HashSet::from([self.listen]);
+        for address in &self.additional_listen { ensure!(listeners.insert(*address), "Duplicate listening address"); }
         ensure!(self.decisions.api_key_env.len() <= 128 && !self.decisions.api_key_env.is_empty()
             && self.decisions.api_key_env.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'),
             "Decisions api_key_env must name a server environment variable");
@@ -329,7 +334,7 @@ impl Config {
             Some("localhost" | "127.0.0.1" | "[::1]" | "::1")
         );
         ensure!(
-            url.scheme() == "https" || (local && url.scheme() == "http"),
+            url.scheme() == "https" || ((local || private_network_host(url.host_str().unwrap_or(""))) && url.scheme() == "http"),
             "remote public_url requires HTTPS"
         );
         Ok(())

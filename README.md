@@ -34,27 +34,71 @@ Download the desktop app for **Windows x64**, **macOS Apple Silicon**, or **Linu
 Connect to a Kindred server, or choose **Standalone** with Docker running to host it on your device.
 Provider accounts, usage and connected services are supplied by you; Kindred does not include model credits.
 
-Prefer to self-host?
+Prefer to self-host on Linux?
 
-Download [compose.yaml](compose.yaml) into an empty folder. With Docker running,
-open a terminal in that folder and start Kindred:
+Save this as `compose.yml` on your Linux server:
 
-```sh
-docker compose up -d
+```yaml
+name: kindred
+services:
+  server:
+    image: ghcr.io/awpsec/kindred-server:latest
+    platform: linux/amd64
+    network_mode: host
+    # Older images without this entrypoint stop instead of exposing all interfaces.
+    entrypoint: [python3, /opt/kindred/source/deploy/linux-host-entry.py]
+    restart: unless-stopped
+    init: true
+    environment:
+      KINDRED_NETWORK_MODE: host
+      KINDRED_ACCESS: "local"
+      KINDRED_TAILNET_ADDRESS: ""
+      KINDRED_PUBLIC_URL: "http://127.0.0.1:9444"
+      KINDRED_ALLOWED_ORIGINS: '[]'
+      KINDRED_OPEN_REGISTRATION: "true"
+      # Resources for each profile's VM, shared by all bots in that profile.
+      KINDRED_VM_CPUS: "2"
+      KINDRED_VM_MEMORY_MB: "6144"
+      KINDRED_VM_DISK_GB: "30"
+      KINDRED_VM_ACCEL: "auto"
+    volumes:
+      - kindred-data:/data
+    cap_drop: [ALL]
+    cap_add: [CHOWN, SETUID, SETGID]
+    security_opt: [no-new-privileges:true]
+    stop_grace_period: 90s
+    healthcheck:
+      test: [CMD, python3, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9444/health',timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 6
+volumes:
+  kindred-data:
 ```
 
-Docker downloads the published server image automatically. To update to the
-latest published release, run these commands from the same folder:
+Run `docker compose up -d`, then open **http://127.0.0.1:9444** on the server
+(or through an SSH tunnel). Docker pulls the published image automatically.
+The first account is the server administrator. Create it before enabling remote access.
+
+In **Server admin → Networking**, choose localhost, localhost plus Tailscale,
+or all IPv4 interfaces, and set the server's URLs. You can also set these values
+in Compose. Web changes survive restarts; changing a Compose value overrides that
+saved field. Existing bridge deployments keep their port mappings in Compose.
+
+The VM CPU, memory and disk values configure **one shared computer per profile**.
+All bots in that profile share its resources; separate bot screens do not create
+separate VMs. Allow 6 GB RAM for each profile computer you intend to run, plus host
+overhead. Linux with KVM is recommended. Computer setup happens when needed.
+
+To update, run these commands from the same folder:
 
 ```sh
 docker compose pull
 docker compose up -d
 ```
 
-Open **http://127.0.0.1:9444**, create your account, connect a provider, and make your first bot.
-The first account is the server administrator. Computer setup happens when needed and can take several minutes.
-Allow **6 GB RAM per running profile computer**, plus host overhead; Linux with KVM is recommended.
-See [hosting and backups](docs/HOSTING.md) before exposing a server to others.
+Keep the same project name and data volume. See [hosting and backups](docs/HOSTING.md)
+for KVM, HTTPS, advanced multi-user limits and existing bridge deployments.
 
 ## Learn more
 

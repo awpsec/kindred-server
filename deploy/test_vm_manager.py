@@ -215,6 +215,9 @@ class RealQemuStartup(unittest.TestCase):
                 if manager.running(root):manager.qmp(root,'quit')
 
 class ResourcePersistence(unittest.TestCase):
+    def setUp(self):
+        capacity=patch.object(manager,'resource_capacity',return_value={'cpus':8,'memory_available_mb':32768,'memory_budget_mb':32256,'reserved_memory_mb':512})
+        capacity.start();self.addCleanup(capacity.stop)
     def test_existing_computer_keeps_allocation_when_service_defaults_change(self):
         with tempfile.TemporaryDirectory() as temporary:
             root=Path(temporary)
@@ -299,6 +302,22 @@ class ConnectionStatus(unittest.TestCase):
                 self.assertEqual(manager.connection_status(root),'runtime_failed')
 
 class MemoryCapacity(unittest.TestCase):
+    def test_cgroup_v1_memory_and_cpu_limits(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary);memory=root/'memory/service';cpu=root/'cpu,cpuacct/service';memory.mkdir(parents=True);cpu.mkdir(parents=True)
+            membership=root/'membership';membership.write_text('5:memory:/service\n4:cpu,cpuacct:/service\n')
+            meminfo=root/'meminfo';meminfo.write_text('MemAvailable: 33554432 kB\n')
+            (memory/'memory.limit_in_bytes').write_text(str(4*1024**3));(memory/'memory.usage_in_bytes').write_text(str(1024**3))
+            (cpu/'cpu.cfs_quota_us').write_text('100000');(cpu/'cpu.cfs_period_us').write_text('100000')
+            self.assertEqual(manager.memory_available(meminfo,root,membership),3*1024**3)
+            self.assertEqual(manager.cpu_capacity(root,membership),1)
+
+    def test_existing_vm_is_rejected_before_media_when_cpu_quota_shrinks(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary)
+            with patch.object(manager,'prepare',return_value={'cpus':4,'memory_mb':1024}),patch.object(manager,'running',return_value=False),patch.object(manager,'resource_capacity',return_value={'cpus':1,'memory_budget_mb':8192}),patch.object(manager,'seed') as seed:
+                with self.assertRaisesRegex(ValueError,'1 CPUs'):manager.start(root,'fixture')
+                seed.assert_not_called()
     def test_native_service_and_parent_limits_constrain_host_available_memory(self):
         with tempfile.TemporaryDirectory() as temporary:
             root=Path(temporary);mount=root/'cgroup';service=mount/'system.slice/kindred.service';service.mkdir(parents=True)
@@ -326,7 +345,7 @@ class MemoryCapacity(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root=Path(temporary)
             with patch.object(manager,'ROOT',root), \
-                 patch.object(manager,'prepare',return_value={'memory_mb':6144}), \
+                 patch.object(manager,'prepare',return_value={'cpus':2,'memory_mb':6144}), \
                  patch.object(manager,'seed'),patch.object(manager,'running',return_value=False), \
                  patch.object(manager,'memory_available',return_value=128*1024**2), \
                  patch.object(manager,'run') as launch:
@@ -359,6 +378,39 @@ class ProviderBridgeUpgrade(unittest.TestCase):
 
 
 class ResourceChanges(unittest.TestCase):
+    def setUp(self):
+        capacity=patch.object(manager,'resource_capacity',return_value={'cpus':8,'memory_available_mb':32768,'memory_budget_mb':32256,'reserved_memory_mb':512})
+        capacity.start();self.addCleanup(capacity.stop)
+
+    def test_initial_resources_can_be_saved_without_provisioning_or_downloads(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary);values={'cpus':2,'memory_mb':2048,'disk_gb':12}
+            with patch.object(manager,'running',return_value=False),patch.object(manager,'base_image') as image,patch.object(manager,'run') as command:
+                result=manager.resize_resources(root,'fixture',values)
+                self.assertFalse(result['provisioned']);self.assertEqual(result['resources'],values)
+                self.assertFalse((root/'computer.json').exists());image.assert_not_called();command.assert_not_called()
+            with patch.object(manager,'ROOT',root),patch.object(manager,'base_image',return_value=root/'base'),patch.object(manager,'run'):
+                prepared=manager.prepare(root,'fixture')
+                self.assertEqual({k:prepared[k] for k in values},values)
+
+    def test_impossible_allocation_is_rejected_before_save_and_first_download(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary)
+            capacity={'cpus':1,'memory_available_mb':2048,'memory_budget_mb':1536,'reserved_memory_mb':512}
+            with patch.object(manager,'resource_capacity',return_value=capacity),patch.object(manager,'running',return_value=False),patch.object(manager,'base_image') as image,patch.object(manager,'run') as command:
+                for values in [{'cpus':2,'memory_mb':1024,'disk_gb':30},{'cpus':1,'memory_mb':2048,'disk_gb':30}]:
+                    with self.assertRaises(ValueError):manager.resize_resources(root,'fixture',values)
+                    self.assertFalse((root/'resource-overrides.json').exists())
+                with self.assertRaises(ValueError):manager.prepare(root,'fixture')
+                image.assert_not_called();command.assert_not_called();self.assertFalse((root/'computer.json').exists())
+
+    def test_cpu_capacity_uses_affinity_and_nested_container_quota(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary);group=root/'service';group.mkdir();membership=root/'membership';membership.write_text('0::/service\n')
+            (root/'cpu.max').write_text('400000 100000');(group/'cpu.max').write_text('150000 100000')
+            with patch.object(manager.os,'sched_getaffinity',return_value=set(range(8))):
+                self.assertEqual(manager.cpu_capacity(root,membership),2)
+                (root/'cpu.max').write_text('100000 100000');self.assertEqual(manager.cpu_capacity(root,membership),1)
     @unittest.skipUnless(shutil.which('qemu-img'), 'qemu-img required')
     def test_real_disk_growth_and_integrity(self):
         with tempfile.TemporaryDirectory() as temporary:

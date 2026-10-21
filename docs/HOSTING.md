@@ -1,18 +1,47 @@
 # Hosting Kindred
 
-## Local server
+## Linux self-hosted server
 
-Use `docker compose up -d` at the repository root, then visit
-`http://127.0.0.1:9444`. The Compose default binds only to localhost. The first
-account is the administrator; sign up before exposing a fresh server to a team.
-Registration can then be closed and invitations issued from the profile menu.
+For a new manual installation, use the copyable `compose.yml` in the README or
+save `deploy/compose.linux.yaml` as `compose.yml`. This setup targets Linux hosts.
+It uses host networking and starts with Kindred listening on `127.0.0.1:9444`.
+There is no Docker `ports` mapping in this mode. The dedicated host entrypoint
+makes older images fail to start instead of accidentally exposing every interface.
+Desktop Standalone retains its existing platform-specific Docker networking.
 
-The server is Linux x86_64. Other host architectures use Docker's amd64 emulation.
-Docker Desktop must be running for standalone. Assign Docker enough memory for
-at least one 6 GB computer plus server overhead. QEMU uses KVM when available,
-otherwise TCG software emulation. On a Linux VPS, nested virtualization availability
-is controlled by the hosting provider. Enable `/dev/kvm` with `compose.kvm.yaml`
-and set `KINDRED_KVM_GID` to `stat -c %g /dev/kvm`.
+Create the administrator account locally (or through an SSH tunnel), then open
+**Server admin → Networking**. Choose this host only, localhost plus an existing
+Tailscale IP, or all IPv4 interfaces. Tailscale must already run on the Linux host;
+Kindred does not install it or change Tailscale Serve routes. Loopback remains
+available for health checks and host administration. Public deployments should use
+an HTTPS reverse proxy, which deliberately extends access beyond the local listener.
+Allowed URLs control browser origins, not the source networks allowed to connect.
+
+Save persists the settings and restarts the server process. Active tasks may be
+interrupted; the VM supervisor and running profile computers stay alive. The page
+reconnects and refreshes when its URL remains allowed. If that URL is removed, use
+the new-address link and sign in there. The previous configuration is restored if
+a saved web generation cannot start. Check container logs if a reconnect times out.
+
+Compose can also configure `KINDRED_ACCESS` (`local`, `tailnet`, `all`),
+`KINDRED_TAILNET_ADDRESS`, `KINDRED_PUBLIC_URL`, and `KINDRED_ALLOWED_ORIGINS` (a JSON
+array). Unchanged environment values preserve web overrides. Changing a value in
+Compose and recreating the container overrides only that saved field. The web
+page's **Reset to Compose settings** restores all the environment defaults.
+Settings and the last working generation live in the persistent data volume.
+Invalid Compose networking values stop startup without replacing saved settings;
+correct the environment and recreate the container.
+
+Existing installations using bridge-mode `compose.yaml` keep that topology.
+Their web page can change URLs but explains that Docker interface bindings remain
+in Compose. Do not silently replace a running bridge deployment with host mode:
+review reverse-proxy routing and host port usage first. VM SSH forwards use host
+loopback ports 22000–31999; new allocations skip occupied ports.
+
+The server image is Linux x86_64. Assign enough host memory for at least one 6 GB
+profile computer plus server overhead. QEMU uses KVM when available, otherwise TCG
+software emulation. On a Linux VPS, nested virtualization availability is controlled
+by the provider. Add `compose.kvm.yaml` and set `KINDRED_KVM_GID` to `stat -c %g /dev/kvm`.
 
 ## Team server with HTTPS
 
@@ -24,11 +53,16 @@ KINDRED_DOMAIN=kindred.example.com
 KINDRED_PUBLIC_URL=https://kindred.example.com
 ```
 
-Start the included HTTPS proxy with `docker compose --profile public up -d`.
+For existing bridge-mode installations, start the included HTTPS proxy with `docker compose --profile public up -d`.
 For KVM, also supply `-f compose.yaml -f compose.kvm.yaml`. Caddy obtains and renews
 the certificate. Keep the application port bound to localhost. Alternatively use
 an existing HTTPS reverse proxy with WebSocket support and set the matching public
 URL. Desktop clients accept HTTPS remote origins and loopback HTTP.
+
+For the Linux host-network template, configure a host HTTPS proxy to forward to
+`127.0.0.1:9444`. A proxy in its own bridged container cannot reach the server via
+`server:9444`; use host networking for that proxy or configure an explicit host
+route. Do not reuse the bridge-mode Caddy service unchanged.
 
 Every colleague installs the desktop app, enters that address and creates an account
 (or uses the administrator's invitation). They connect their own provider. No SSH
@@ -37,8 +71,16 @@ needed. Use the same account to restore profiles on another device.
 
 ## Limits and persistence
 
-`compose.yaml` exposes CPU, memory, disk, maximum-running-computer, user and profile
-limits. CPU/memory/disk defaults are captured when each computer is first created;
+CPU, memory and disk values size the VM shared by all bots in one profile.
+They do not allocate a VM per bot or limit the number of bot screens.
+The resource editor shows available host/container CPU and RAM and permits changes
+before first startup. Save and startup check those limits, including cgroup v1/v2
+CPU quotas and memory limits. Memory is not reserved by saving; capacity can change
+as other workloads run, so startup checks again. A Linux server that is itself a
+VM still needs adequate resources assigned by its hypervisor administrator.
+For multi-user hosting, `KINDRED_VM_MAX_RUNNING` (default 4) caps concurrently
+running **profile VMs across the server**. It is an advanced server capacity limit,
+not a limit on bots within a VM. User and profile limits are also configurable. CPU/memory/disk defaults are captured when each computer is first created;
 changing these values affects new computers. QEMU rejects starts that exceed the
 configured running-computer limit or available host/container memory. No other
 profile's computer is automatically evicted. Stop an idle computer from its controls.
