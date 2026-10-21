@@ -85,6 +85,14 @@ docker compose up -d
 
 Open **http://127.0.0.1:9444**, create your account, connect a provider, and make your first bot.
 The first account is the server administrator. Computer setup happens when needed and can take several minutes.
+
+This example is reachable only on the Docker host. `KINDRED_PUBLIC_URL` sets the
+address Kindred advertises; the `ports` mapping controls which host interfaces
+accept connections. For Tailscale HTTPS or access from other devices, follow
+[hosting and backups](docs/HOSTING.md). The desktop app's **Connection access**
+settings manage its own Standalone server; manually launched Compose deployments
+use their Compose and host network configuration.
+
 Allow **6 GB RAM per running profile computer**, plus host overhead; Linux with KVM is recommended.
 See [hosting and backups](docs/HOSTING.md) before exposing a server to others.
 
