@@ -87,7 +87,10 @@ saved field. Existing bridge deployments keep their port mappings in Compose.
 
 The VM CPU, memory and disk values configure **one shared computer per profile**.
 All bots in that profile share its resources; separate bot screens do not create
-separate VMs. Allow 6 GB RAM for each profile computer you intend to run, plus host
+separate VMs. These Compose resource values set defaults for new profile VMs;
+changing them does not resize an existing VM or increase the resources available
+to your Linux host or container. Budget for the combined use of multiple profiles.
+Allow 6 GB RAM for each profile computer you intend to run, plus host
 overhead. Linux with KVM is recommended. Computer setup happens when needed.
 
 To update, run these commands from the same folder:
