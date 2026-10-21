@@ -12,6 +12,7 @@ const vm=require('node:vm'),assert=require('node:assert/strict');
   for(const specifier of module.dependencySpecifiers){const target=new URL(specifier,address);assert.equal(target.origin,base.origin);pending.push(target.href);}
  }
  assert(visited.has(new URL('/standalone-access.js',base).href),'transitive standalone dependency must be checked');
+ assert(visited.has(new URL('/mobile-regions.js',base).href),'native region dependency must be served');
  assert(visited.size>=28,'nonempty actual module graph required');
  console.log(JSON.stringify({passed:true,nodes:visited.size,paths:[...visited].map(address=>new URL(address).pathname).sort()}));
 })().catch(error=>{console.error(error);process.exit(1);});
