@@ -985,6 +985,7 @@ fn pi_progress_reaches_activity_without_overriding_human_waits() {
         app.db.event(&id, "model_progress", json!({"state":state})).unwrap();
         let events = app.db.activity_events(&id).unwrap();
         assert_eq!(crate::runtime::activity("running", events.last()).1, label);
+        if state=="writing" {assert_eq!(crate::runtime::activity("running", events.last()).0,"think");}
         assert_eq!(crate::runtime::activity("awaiting_user", events.last()).1, "Waiting for you");
         assert_eq!(crate::runtime::activity("awaiting_approval", events.last()).1, "Waiting for your okay");
     }

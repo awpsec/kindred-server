@@ -69,6 +69,8 @@ pub struct Bot {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct BotProfile {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avatar: Option<crate::avatar_profiles::AvatarProfile>,
     pub label: String,
     pub description: String,
     pub shape: String,
@@ -87,6 +89,7 @@ pub struct BotProfile {
 impl Default for BotProfile {
     fn default() -> Self {
         Self {
+            avatar: None,
             label: String::new(),
             description: String::new(),
             shape: "round".into(),
@@ -151,8 +154,8 @@ impl Drop for DatabaseLock {
     }
 }
 
-pub(crate) fn bot_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Bot> {
-    Ok(Bot {
+pub(crate) fn bot_row(c: &Connection, r: &rusqlite::Row<'_>) -> rusqlite::Result<Bot> {
+    let mut bot = Bot {
         id: r.get(0)?,
         name: r.get(1)?,
         instructions: r.get(2)?,
@@ -163,7 +166,9 @@ pub(crate) fn bot_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Bot> {
         profile: serde_json::from_str(&r.get::<_, String>(7)?).unwrap_or_default(),
         reasoning_effort: r.get(8)?,
         approval_mode: r.get(9)?,
-    })
+    };
+    crate::avatar_profiles::read(c, &bot.id, &mut bot.profile)?;
+    Ok(bot)
 }
 pub(crate) fn run_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
     Ok(Run {
@@ -253,6 +258,7 @@ impl Db {
                 [],
             )?;
         }
+        crate::avatar_profiles::migrate(&c)?;
         crate::provider_accounts::migrate(&c)?;
         crate::connector_policy::migrate(&c)?;
         crate::local_access::migrate(&c)?;
@@ -314,20 +320,12 @@ impl Db {
         Ok(db)
     }
     pub fn bots(&self) -> Result<Vec<Bot>> {
-        Ok(self
-            .0
-            .lock()
-            .unwrap()
-            .prepare("SELECT * FROM bots ORDER BY name")?
-            .query_map([], bot_row)?
-            .collect::<rusqlite::Result<_>>()?)
+        let c=self.0.lock().unwrap();
+        Ok(c.prepare("SELECT * FROM bots ORDER BY name")?.query_map([], |r|bot_row(&c,r))?.collect::<rusqlite::Result<_>>()?)
     }
     pub fn bot(&self, id: &str) -> Result<Bot> {
-        Ok(self
-            .0
-            .lock()
-            .unwrap()
-            .query_row("SELECT * FROM bots WHERE id=?", [id], bot_row)?)
+        let c=self.0.lock().unwrap();
+        Ok(c.query_row("SELECT * FROM bots WHERE id=?", [id], |r|bot_row(&c,r))?)
     }
     #[cfg(test)]
     pub fn save_bot(&self, b: &Bot) -> Result<()> {
@@ -1055,6 +1053,9 @@ impl Db {
 }
 
 pub(crate) fn validate_bot(b: &Bot) -> Result<()> {
+    let mut normalized=b.clone();
+    normalized.profile=crate::avatar_profiles::legacy(&b.profile)?;
+    let b=&normalized;
     ensure!(
         b.approval_mode == "inherit" || valid_approval(&b.approval_mode),
         "invalid approval mode"
@@ -1126,6 +1127,7 @@ pub(crate) fn validate_bot(b: &Bot) -> Result<()> {
 }
 
 pub(crate) fn write_bot(c: &Connection, b: &Bot, preserve_text: bool) -> Result<()> {
+    let stored_profile=crate::avatar_profiles::legacy(&b.profile)?;
     // Preserve custom titles; only replace the exact old participant-generated name.
     let groups: Vec<(String,String,String)> = c.prepare("SELECT id,name,members FROM chats WHERE id NOT LIKE 'dm-%' AND id NOT LIKE 'server-%' AND EXISTS(SELECT 1 FROM json_each(members) WHERE value=?)")?
         .query_map([&b.id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?.collect::<rusqlite::Result<_>>()?;
@@ -1144,7 +1146,8 @@ pub(crate) fn write_bot(c: &Connection, b: &Bot, preserve_text: bool) -> Result<
             c.execute("UPDATE chats SET name=? WHERE id=?", params![new.join(", "),id])?;
         }
     }
-    c.execute("INSERT INTO bots(id,name,instructions,provider,model,memory,auto_approve,profile,reasoning_effort,approval_mode) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,instructions=CASE WHEN ?11 THEN bots.instructions ELSE excluded.instructions END,provider=excluded.provider,model=excluded.model,memory=CASE WHEN ?11 THEN bots.memory ELSE excluded.memory END,auto_approve=excluded.auto_approve,profile=excluded.profile,reasoning_effort=excluded.reasoning_effort,approval_mode=excluded.approval_mode", params![b.id,b.name,b.instructions,b.provider,b.model,b.memory,b.auto_approve,serde_json::to_string(&b.profile)?,b.reasoning_effort,b.approval_mode,preserve_text])?;
+    c.execute("INSERT INTO bots(id,name,instructions,provider,model,memory,auto_approve,profile,reasoning_effort,approval_mode) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,instructions=CASE WHEN ?11 THEN bots.instructions ELSE excluded.instructions END,provider=excluded.provider,model=excluded.model,memory=CASE WHEN ?11 THEN bots.memory ELSE excluded.memory END,auto_approve=excluded.auto_approve,profile=excluded.profile,reasoning_effort=excluded.reasoning_effort,approval_mode=excluded.approval_mode", params![b.id,b.name,b.instructions,b.provider,b.model,b.memory,b.auto_approve,serde_json::to_string(&stored_profile)?,b.reasoning_effort,b.approval_mode,preserve_text])?;
+    crate::avatar_profiles::write(c, &b.id, &b.profile, &stored_profile)?;
     Ok(())
 }
 

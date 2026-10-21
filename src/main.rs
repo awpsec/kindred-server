@@ -19,6 +19,7 @@ mod artifact_library;
 mod attachments;
 mod attention;
 mod avatars;
+mod avatar_profiles;
 #[cfg(test)]
 mod bot_archive_tests;
 mod bot_drafts;

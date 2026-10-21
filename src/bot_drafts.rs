@@ -30,7 +30,7 @@ impl Db {
             _ => chosen_color.trim(),
         }
         .to_string();
-        let bot = Bot {
+        let mut bot = Bot {
             id: String::new(),
             name: text("name")?,
             instructions: text("instructions")?,
@@ -48,6 +48,13 @@ impl Db {
                 ..Default::default()
             },
         };
+        if let Some(avatar)=args.get("avatar").filter(|v|!v.is_null()) {
+            let a:crate::avatar_profiles::AvatarProfile=serde_json::from_value(avatar.clone())?;
+            crate::avatar_profiles::validate(&a)?;
+            bot.profile.avatar=Some(a);
+            let fallback=crate::avatar_profiles::legacy(&bot.profile)?;
+            bot.profile.shape=fallback.shape;bot.profile.eyes=fallback.eyes;bot.profile.color=fallback.color;
+        }
         db::validate_bot(&bot)?;
         ensure!(
             !bot.instructions.trim().is_empty()
@@ -96,7 +103,7 @@ impl Db {
         let (payload,created,archived):(String,String,bool)=tx.query_row("SELECT d.payload,d.created_bot_id,c.archived FROM bot_drafts d JOIN chats c ON c.id=d.chat_id WHERE d.id=?",[id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
         // Retries from any client return the original creation, even after archiving.
         if !created.is_empty() {
-            let bot = tx.query_row("SELECT * FROM bots WHERE id=?", [created], db::bot_row)?;
+            let bot = tx.query_row("SELECT * FROM bots WHERE id=?", [created], |r| db::bot_row(&tx, r))?;
             return Ok(bot);
         }
         ensure!(

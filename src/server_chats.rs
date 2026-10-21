@@ -170,7 +170,7 @@ fn catalogue(p: &Profiles, id: &Identity) -> Result<Vec<Participant>> {
                 .unwrap_or_default();
             // Only public identity fields leave the owner's profile.
             let avatar = serde_json::to_value(&bot.profile)?;
-            let avatar = json!({"shape":avatar["shape"],"color":avatar["color"],"eyes":avatar["eyes"],"animated":avatar["animated"]});
+            let avatar = json!({"shape":avatar["shape"],"color":avatar["color"],"eyes":avatar["eyes"],"animated":avatar["animated"],"avatar":avatar["avatar"]});
             found.push(Participant {
                 inactive: false,
                 id: format!("bot:{profile}:{}", bot.id),
@@ -951,7 +951,7 @@ fn refresh_room_identities(p: &Profiles) -> Result<Vec<Room>> {
                 m.name = b.name.clone();
                 m.inactive = b.profile.archived;
                 let avatar = serde_json::to_value(&b.profile)?;
-                m.avatar = json!({"shape":avatar["shape"],"color":avatar["color"],"eyes":avatar["eyes"],"animated":avatar["animated"]});
+                m.avatar = json!({"shape":avatar["shape"],"color":avatar["color"],"eyes":avatar["eyes"],"animated":avatar["animated"],"avatar":avatar["avatar"]});
             }
         }
         // Permanently deleted bots must no longer be selected for group work.

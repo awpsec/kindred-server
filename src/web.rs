@@ -332,10 +332,12 @@ async fn status(
 async fn bots(State(app): State<Shared>) -> Result<Json<Vec<Bot>>> {
     Ok(Json(app.db.bots()?))
 }
-async fn save_bot(State(app): State<Shared>, Json(mut b): Json<Bot>) -> Result<Json<Bot>> {
+async fn save_bot(State(app): State<Shared>, Json(value): Json<Value>) -> Result<Json<Bot>> {
+    let mut b:Bot=serde_json::from_value(value.clone())?;
     b.id = db::id();
+    if value["avatar_default"]==true {b.profile.avatar=Some(crate::avatar_profiles::default_for_id(&b.id));}
     app.db.create_bot(&b)?;
-    Ok(Json(b))
+    Ok(Json(app.db.bot(&b.id)?))
 }
 async fn workspace_imports(State(app): State<Shared>) -> Result<Json<Vec<Value>>> {
     Ok(Json(crate::workspace_import::list(&app.db)?))
@@ -572,7 +574,7 @@ async fn activity(State(app): State<Shared>) -> Result<Json<Value>> {
                 if commands == 1 { "" } else { "s" }
             );
         }
-        result.insert(run.bot_id,json!({"commands":commands,"run_id":run.id,"status":run.status,"shape":shape,"label":label,"completed_at":completed_at,"started_at":started_at,"run_created_at":run.created,"server_time":db::now(),"local":local,"provider_retry":provider_retry,"last_active_at":completed_at.as_i64().unwrap_or(run.created)}));
+        result.insert(run.bot_id,json!({"commands":commands,"run_id":run.id,"status":run.status,"shape":shape,"label":label,"completed_at":completed_at,"started_at":started_at,"run_created_at":run.created,"server_time":db::now(),"model_progress_state":last.filter(|e|e["kind"]=="model_progress").map(|e|e["body"]["state"].clone()),"awaiting":if run.status=="awaiting_user" {"user"} else if run.status=="awaiting_approval" || local.as_ref().is_some_and(|v|v["phase"]=="awaiting_approval") {"approval"} else if local.as_ref().is_some_and(|v|v["phase"]!="running") {"device"} else {""},"local":local,"provider_retry":provider_retry,"last_active_at":completed_at.as_i64().unwrap_or(run.created)}));
     }
     Ok(Json(Value::Object(result)))
 }
@@ -1832,6 +1834,10 @@ fn static_assets<S: Clone + Send + Sync + 'static>() -> Router<S> {
                 )
             }),
         )
+        .route("/avatar-runtime/catalog.js", get(|| async { ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8")], include_str!("../ui/avatar-runtime/catalog.js")) }))
+        .route("/avatar-runtime/host.js", get(|| async { ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8")], include_str!("../ui/avatar-runtime/host.js")) }))
+        .route("/avatar-runtime/grok-avatar-engine.mjs", get(|| async { ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8")], include_str!("../ui/avatar-runtime/grok-avatar-engine.mjs")) }))
+        .route("/avatar-runtime/rolldown-runtime.mjs", get(|| async { ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8")], include_str!("../ui/avatar-runtime/rolldown-runtime.mjs")) }))
         .route(
             "/characters.js",
             get(|| async {

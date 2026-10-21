@@ -101,13 +101,8 @@ work and closes its computer viewers. See [account boundaries](PROFILES.md).
 - Rounded computer previews and a dark neutral desktop wallpaper with soft colour, with a native
   translucent Browser / Files / Terminal dock on every bot screen. The dock reserves its own
   desktop space and does not sit over application content.
-- Named bots with original animated SVG characters, eight shapes, colors,
-  labels, descriptions, pinning, role instructions, and editable persistent memory.
-  The first shape is a true circle; the second is a softly asymmetric pebble.
-  Eye placement, gaze and blinking adapt to each shape; avatar changes update
-  the welcome screen while you customize.
-  Eyes also ease into round wide looks, narrow squints and uneven questioning
-  expressions, with pauses between them and a calm pose for reduced motion.
+- Named bots with 25 regular artwork bodies, nine expressions, eleven palettes and custom colors, plus labels, descriptions, pinning, role instructions and editable persistent memory. Existing identities and tribute artwork are preserved. Reduced motion and each bot's animation preference apply live. Avatar motion decorates the adjacent task status; it does not measure task progress or audio.
+
 - Bots can draft a new teammate with a name, avatar, role, description and instructions.
   Review its chat card, choose **Details** to edit it, or **Create** to add it.
 - The composer **+** menu offers **Attach files** (up to five files, 8 MB each) and

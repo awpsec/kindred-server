@@ -115,7 +115,8 @@ impl Db {
             }
             if matches!(kind.as_str(),"user_action"|"approval") && c.query_row("SELECT COALESCE((SELECT bot_only OR archived FROM chats WHERE id=?),1)",[&chat_id],|r|r.get::<_,bool>(0))? {chat_id=format!("dm-{bot_id}");}
             if kind=="run_finished" && status=="completed" && c.query_row("SELECT COALESCE((SELECT bot_only FROM chats WHERE id=?),0)",[&chat_id],|r|r.get::<_,bool>(0))? {continue;}
-            let p: BotProfile = serde_json::from_str(&profile)?;
+            let mut p: BotProfile = serde_json::from_str(&profile)?;
+            crate::avatar_profiles::read(&c, &bot_id, &mut p)?;
             if !p.notifications || p.archived || muted(&mutes, &bot_id, &chat_id) {
                 continue;
             }

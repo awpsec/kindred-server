@@ -299,6 +299,7 @@ pub async fn run(app: &App, bot: &Bot, run: &Run) -> Result<String> {
 }
 
 pub fn migrate(c: &Connection) -> Result<()> {
+    crate::avatar_profiles::migrate(c)?;
     let transaction = c.unchecked_transaction()?;
     let c = &*transaction;
     c.execute_batch("CREATE TABLE IF NOT EXISTS provider_usage(run_id TEXT NOT NULL,request_id INTEGER NOT NULL,bot_id TEXT NOT NULL,provider TEXT NOT NULL,model TEXT NOT NULL,input_tokens INTEGER NOT NULL,output_tokens INTEGER NOT NULL,cached_tokens INTEGER NOT NULL,cost REAL,cost_source TEXT NOT NULL,created INTEGER NOT NULL,tokens_reported INTEGER NOT NULL DEFAULT 1,bot_name TEXT NOT NULL,bot_profile TEXT NOT NULL,PRIMARY KEY(run_id,request_id));")?;
@@ -315,19 +316,24 @@ pub fn migrate(c: &Connection) -> Result<()> {
             ALTER TABLE provider_usage_history_migration RENAME TO provider_usage;")?;
     }
     c.execute_batch("CREATE INDEX IF NOT EXISTS usage_provider ON provider_usage(provider,bot_id);
-        CREATE TRIGGER IF NOT EXISTS preserve_bot_usage_identity BEFORE DELETE ON bots BEGIN
-            UPDATE provider_usage SET bot_name=OLD.name,bot_profile=json_object('shape',COALESCE(json_extract(OLD.profile,'$.shape'),'round'),'color',COALESCE(json_extract(OLD.profile,'$.color'),'#d8d8d8'),'eyes',COALESCE(json_extract(OLD.profile,'$.eyes'),'curious'),'animated',json(CASE WHEN COALESCE(json_extract(OLD.profile,'$.animated'),1) THEN 'true' ELSE 'false' END)) WHERE bot_id=OLD.id;
+        DROP TRIGGER IF EXISTS preserve_bot_usage_identity;
+        CREATE TRIGGER preserve_bot_usage_identity BEFORE DELETE ON bots BEGIN
+            UPDATE provider_usage SET bot_name=OLD.name,bot_profile=json_patch(json_object('shape',COALESCE(json_extract(OLD.profile,'$.shape'),'round'),'color',COALESCE(json_extract(OLD.profile,'$.color'),'#d8d8d8'),'eyes',COALESCE(json_extract(OLD.profile,'$.eyes'),'curious'),'animated',json(CASE WHEN COALESCE(json_extract(OLD.profile,'$.animated'),1) THEN 'true' ELSE 'false' END)),COALESCE((SELECT json_object('avatar',json(artwork)) FROM bot_avatars WHERE bot_id=OLD.id AND fingerprint=json_extract(OLD.profile,'$.shape')||'|'||json_extract(OLD.profile,'$.eyes')||'|'||json_extract(OLD.profile,'$.color')),'{}')) WHERE bot_id=OLD.id;
         END;")?;
     transaction.commit()?;
     Ok(())
 }
 fn avatar_profile(profile: &Value) -> Value {
-    json!({
+    let mut safe = json!({
         "shape":profile["shape"].as_str().unwrap_or("round"),
         "color":profile["color"].as_str().unwrap_or("#d8d8d8"),
         "eyes":profile["eyes"].as_str().unwrap_or("curious"),
         "animated":profile["animated"].as_bool().unwrap_or(true),
-    })
+    });
+    if let Ok(a)=serde_json::from_value::<crate::avatar_profiles::AvatarProfile>(profile["avatar"].clone()) {
+        if crate::avatar_profiles::validate(&a).is_ok() { safe["avatar"]=serde_json::to_value(a).unwrap(); }
+    }
+    safe
 }
 pub fn record(app: &App, bot: &Bot, run: &Run, v: &Value) -> Result<()> {
     let request = v["request_id"]
@@ -391,7 +397,8 @@ pub async fn usage(
         FROM provider_usage u LEFT JOIN bots b ON b.id=u.bot_id JOIN latest l ON l.bot_id=u.bot_id AND l.position=1 WHERE u.provider=?1 GROUP BY u.bot_id ORDER BY COALESCE(b.name,l.bot_name) COLLATE NOCASE,u.bot_id")?;
     let rows = q.query_map([provider],|r| {
         let first_used_at = r.get::<_,i64>(9)?;
-        let profile: Value = serde_json::from_str(&r.get::<_,String>(14)?).unwrap_or(json!({}));
+        let mut profile: Value = serde_json::from_str(&r.get::<_,String>(14)?).unwrap_or(json!({}));
+        if let Ok(mut parsed)=serde_json::from_value::<crate::db::BotProfile>(profile.clone()) {crate::avatar_profiles::read(&c,&r.get::<_,String>(0)?,&mut parsed)?;if parsed.avatar.is_some(){profile=serde_json::to_value(parsed).unwrap();}}
         let status = r.get::<_,String>(15)?;
         Ok(json!({"bot_id":r.get::<_,String>(0)?,"name":r.get::<_,String>(1)?,"input_tokens":r.get::<_,i64>(2)?,"output_tokens":r.get::<_,i64>(3)?,"cached_tokens":r.get::<_,i64>(4)?,"reported_cost":r.get::<_,f64>(5)?,"estimated_cost":r.get::<_,f64>(6)?,"unpriced_requests":r.get::<_,i64>(7)?,"requests":r.get::<_,i64>(8)?,"since":first_used_at,"first_used_at":first_used_at,"last_used_at":r.get::<_,i64>(13)?,"unreported_tokens":r.get::<_,i64>(10)?,"reported_requests":r.get::<_,i64>(11)?,"estimated_requests":r.get::<_,i64>(12)?,"profile":avatar_profile(&profile),"deleted":status=="deleted","status":status}))
     })?.collect::<rusqlite::Result<Vec<_>>>()?;

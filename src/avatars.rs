@@ -54,36 +54,14 @@ pub fn png(profile: &BotProfile, name: &str) -> Result<Vec<u8>> {
             ));
         }
     }
-    let channels: Vec<u8> = [1, 3, 5]
-        .into_iter()
-        .map(|i| u8::from_str_radix(&color[i..i + 2], 16).unwrap())
-        .collect();
-    let ink = if channels.iter().map(|v| *v as u32).sum::<u32>() < 150 {
-        "#ffffff"
-    } else {
-        "#171b1d"
-    };
-    let f = &data["faces"][shape];
-    let x = f["x"].as_f64().unwrap();
-    let y = f["y"].as_f64().unwrap();
-    let spread = f["spread"].as_f64().unwrap();
-    let mut eyes = String::new();
-    for cx in [x - spread, x + spread] {
-        eyes.push_str(&match profile.eyes.as_str(){
-            "happy"=>format!("<path d='M{} {}q4 -6 8 0' fill='none' stroke='{ink}' stroke-width='4.5' stroke-linecap='round'/>",cx-4.,y+1.),
-            "sleepy"=>format!("<rect x='{}' y='{}' width='8' height='3.6' rx='1.8' fill='{ink}'/>",cx-4.,y-1.8),
-            _=>{let (rx,ry)=if profile.eyes=="wide"{(4.5,7.6)}else{(3.7,7.1)};format!("<ellipse cx='{cx}' cy='{y}' rx='{rx}' ry='{ry}' fill='{ink}'/>")}
-        });
-    }
-    let outline = if channels.iter().all(|v| *v >= 210) {
-        " stroke='#777f83' stroke-width='1'"
-    } else {
-        ""
-    };
-    let svg = format!(
-        "<svg xmlns='http://www.w3.org/2000/svg' width='128' height='128' viewBox='0 0 100 110'><path d='{}' fill='{color}'{outline}/>{eyes}</svg>",
-        data["paths"][shape].as_str().unwrap()
-    );
+    let a = crate::avatar_profiles::resolved(profile);
+    static PORTRAITS: OnceLock<Value> = OnceLock::new();
+    let portraits=PORTRAITS.get_or_init(||serde_json::from_str(include_str!("../ui/avatar-runtime/portraits.json")).expect("avatar portraits"));
+    let ink=if let Some(id)=&a.palette {
+        if id=="black" {"#ffffff"} else {crate::avatar_profiles::catalog()["palettes"].as_array().unwrap().iter().find(|p|p["id"]==*id).unwrap()["light"].as_str().unwrap()}
+    } else {a.custom_color.as_deref().unwrap_or("#2A92FE")};
+    let svg=portraits[&a.body][&a.expression].as_str().context("Missing avatar portrait")?;
+    let svg=if a.palette.as_deref()==Some("black") {svg.replace("fill=\"#ABCDEF\"", "fill=\"#ffffff\" stroke=\"#777f83\" stroke-width=\"1\"")} else {svg.replace("#ABCDEF",ink)};
     render(&svg)
 }
 
@@ -114,7 +92,7 @@ mod tests {
         profile.shape = "<script>".into();
         profile.color = "url(https://invalid.test)".into();
         assert!(png(&profile, "").is_ok());
-        assert_eq!(data()["paths"].as_object().unwrap().len(), 8);
+        assert_eq!(crate::avatar_profiles::catalog()["bodies"].as_array().unwrap().len(),25);
     }
 
     #[test]
@@ -148,4 +126,14 @@ mod tests {
             );
         }
     }
+}
+
+#[cfg(test)]
+mod artwork_tests {
+ use super::*;
+ #[test]
+ fn all_artwork_portraits_render_and_have_transparent_backgrounds() {
+  let c=crate::avatar_profiles::catalog();
+  for body in c["bodies"].as_array().unwrap(){for expression in c["expressions"].as_array().unwrap(){let mut p=BotProfile::default();p.avatar=Some(crate::avatar_profiles::AvatarProfile{version:1,body:body.as_str().unwrap().into(),expression:expression.as_str().unwrap().into(),palette:Some("blue".into()),custom_color:None});let image=png(&p,"").unwrap();assert!(image.starts_with(b"\x89PNG\r\n\x1a\n"));assert!(image.len()<32768);let decoded=resvg::tiny_skia::Pixmap::decode_png(&image).unwrap();assert_eq!(decoded.pixel(0,0).unwrap().alpha(),0);}}
+ }
 }

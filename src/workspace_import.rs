@@ -605,7 +605,7 @@ pub async fn prepare_local(
     }
     let id = db::id();
     let current = if sync {
-        let bot = tx.query_row("SELECT * FROM bots WHERE id=?", [&actor.id], db::bot_row)?;
+        let bot = tx.query_row("SELECT * FROM bots WHERE id=?", [&actor.id], |r| db::bot_row(&tx, r))?;
         baseline(&tx, &bot, &previous)?
     } else {
         Value::Null
@@ -744,7 +744,7 @@ fn conflicts(c: &Connection, v: &Value, draft: &Value) -> Result<Vec<String>> {
     let mut issues = Vec::new();
     let mut replacing = BTreeSet::new();
     if let Some(target) = v["target_id"].as_str().filter(|s| !s.is_empty()) {
-        let bot = c.query_row("SELECT * FROM bots WHERE id=?", [target], db::bot_row)?;
+        let bot = c.query_row("SELECT * FROM bots WHERE id=?", [target], |r| db::bot_row(&c, r))?;
         if bot.instructions != v["baseline"]["instructions"].as_str().unwrap_or("")
             || bot.memory != v["baseline"]["memory"].as_str().unwrap_or("")
         {
@@ -1020,7 +1020,7 @@ pub fn retry(db: &Db, id: &str) -> Result<Value> {
     let actor = tx.query_row(
         "SELECT * FROM bots WHERE id=?",
         [v["actor_id"].as_str().unwrap()],
-        db::bot_row,
+        |r| db::bot_row(&tx, r),
     )?;
     let sync = !v["target_id"].as_str().unwrap_or("").is_empty();
     ensure!(!actor.profile.archived, "Restore the converter bot first");

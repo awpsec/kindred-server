@@ -431,16 +431,9 @@ Sidebar rows retain the most recent message excerpt during work, approval waits
 and idle. Activity labels remain in the working conversation, while the top bar
 contains the selected name and avatar without a status subtitle.
 
-New bot appearances and new working-message avatars have a 1.15-second dot-to-body
-entrance. Its timestamp belongs to the cached avatar and is not restarted by polling,
-search, or selection changes. The silhouette and face settle before a tool morph begins.
-Generic thinking uses a shared RAF renderer: gentle squash and lean, followed by an
-occasional 0.72-second turn within an 18-second cycle. Face projection and clipping
-simulate the face passing behind a body that retains its shape and volume. A short
-gradient stroke follows the turn; no stars or dream decorations are added. The
-server activity timestamp keeps different sizes of the same bot in phase. The loop
-stops for disconnected or hidden avatars and respects reduced-motion changes while
-running. These are original SVG transformations; reference GIF frames are not bundled.
+Regular avatars use the supplied recovered Grok Bot renderer through `ui/characters.js` and a shared, visibility-aware 30fps scheduler. Body, held expression, semantic task state and reactions are independent. Stale, queued and cancelled work never imply active progress or success; explicit approval waits take precedence. Idle settles after 1.4 seconds. Hidden, offscreen, detached, static and reduced-motion slots stop frame work. Tribute artwork retains its separate identity path.
+
+Artwork metadata lives in `bot_avatars`, bound to legacy shape/eyes/color by a fingerprint. The legacy `bots.profile` JSON remains readable by older servers. Old-server visual edits invalidate stale artwork; unrelated preferences preserve it. No bulk profile rewrite is needed. See the pinned provenance record and third-party notices for incorporated artwork and code.
 
 Unread blue dots use persisted, monotonic per-chat read cursors. Public bot messages
 and questions can create unread activity; the user's own messages and private
