@@ -34,11 +34,10 @@ Download the desktop app for **Windows x64**, **macOS Apple Silicon**, or **Linu
 Connect to a Kindred server, or choose **Standalone** with Docker running to host it on your device.
 Provider accounts, usage and connected services are supplied by you; Kindred does not include model credits.
 
-Prefer to self-host?
+### Self-host on Linux
 
-With Docker installed and running, copy this into a file named **compose.yml**
-in an empty folder. Edit the environment values directly in the file as needed;
-no separate `.env` file is required.
+With Docker Compose installed on your Linux server, save the following as
+`compose.yml`. Edit the values directly in the file; no separate `.env` file is required.
 
 ```yaml
 name: kindred
@@ -54,10 +53,10 @@ services:
     environment:
       KINDRED_PUBLIC_URL: "http://127.0.0.1:9444"
       KINDRED_OPEN_REGISTRATION: "true" # Set to "false" to require invitations.
-      KINDRED_VM_CPUS: "2"             # CPU cores per bot computer.
-      KINDRED_VM_MEMORY_MB: "6144"     # RAM per bot computer, in MB.
-      KINDRED_VM_DISK_GB: "30"         # Disk capacity per bot computer, in GB.
-      KINDRED_VM_MAX_RUNNING: "4"      # Maximum simultaneous bot computers.
+      # One VM per profile, shared by all bots in that profile.
+      KINDRED_VM_CPUS: "2"
+      KINDRED_VM_MEMORY_MB: "6144"
+      KINDRED_VM_DISK_GB: "30"
     volumes:
       - kindred-data:/data
     cap_drop: [ALL]
@@ -83,7 +82,8 @@ docker compose pull
 docker compose up -d
 ```
 
-Open **http://127.0.0.1:9444**, create your account, connect a provider, and make your first bot.
+Open **http://127.0.0.1:9444** on the Linux server (or through an SSH tunnel),
+create your account, connect a provider, and make your first bot.
 The first account is the server administrator. Computer setup happens when needed and can take several minutes.
 
 This example is reachable only on the Docker host. `KINDRED_PUBLIC_URL` sets the
@@ -93,8 +93,15 @@ accept connections. For Tailscale HTTPS or access from other devices, follow
 settings manage its own Standalone server; manually launched Compose deployments
 use their Compose and host network configuration.
 
-Allow **6 GB RAM per running profile computer**, plus host overhead; Linux with KVM is recommended.
-See [hosting and backups](docs/HOSTING.md) before exposing a server to others.
+The CPU, memory and disk values above size **the shared VM itself**. All bots in
+one profile use that VM; separate bot screens do not allocate additional VMs.
+These values do not increase the resources available to your Linux host or container.
+
+The example allocates 2 virtual CPUs, 6 GB RAM and a 30 GB virtual disk to each
+profile VM. Choose values your server can support, leaving RAM for Kindred and
+the operating system. Multiple profiles can run separate VMs, so budget for their
+combined use. KVM acceleration is recommended; see [hosting and backups](docs/HOSTING.md)
+for setup and advanced capacity limits.
 
 ## Learn more
 
