@@ -36,9 +36,18 @@ Provider accounts, usage and connected services are supplied by you; Kindred doe
 
 Prefer to self-host?
 
+Download [compose.yaml](compose.yaml) into an empty folder. With Docker running,
+open a terminal in that folder and start Kindred:
+
 ```sh
-git clone https://github.com/awpsec/kindred-server.git
-cd kindred-server
+docker compose up -d
+```
+
+Docker downloads the published server image automatically. To update to the
+latest published release, run these commands from the same folder:
+
+```sh
+docker compose pull
 docker compose up -d
 ```
 
