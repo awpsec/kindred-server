@@ -53,7 +53,7 @@ services:
     environment:
       KINDRED_PUBLIC_URL: "http://127.0.0.1:9444"
       KINDRED_OPEN_REGISTRATION: "true" # Set to "false" to require invitations.
-      # One VM per profile, shared by all bots in that profile.
+      # Defaults for each new profile VM, shared by its bots.
       KINDRED_VM_CPUS: "2"
       KINDRED_VM_MEMORY_MB: "6144"
       KINDRED_VM_DISK_GB: "30"
@@ -93,9 +93,10 @@ accept connections. For Tailscale HTTPS or access from other devices, follow
 settings manage its own Standalone server; manually launched Compose deployments
 use their Compose and host network configuration.
 
-The CPU, memory and disk values above size **the shared VM itself**. All bots in
-one profile use that VM; separate bot screens do not allocate additional VMs.
-These values do not increase the resources available to your Linux host or container.
+The CPU, memory and disk values above set the defaults for **each new shared VM**.
+All bots in one profile use that VM; separate bot screens do not allocate additional VMs.
+Changing these Compose values does not resize an existing VM or increase the
+resources available to your Linux host or container.
 
 The example allocates 2 virtual CPUs, 6 GB RAM and a 30 GB virtual disk to each
 profile VM. Choose values your server can support, leaving RAM for Kindred and
