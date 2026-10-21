@@ -36,8 +36,40 @@ Provider accounts, usage and connected services are supplied by you; Kindred doe
 
 Prefer to self-host?
 
-Download [compose.yaml](compose.yaml) into an empty folder. With Docker running,
-open a terminal in that folder and start Kindred:
+With Docker installed and running, copy this into a file named **compose.yml**
+in an empty folder. Edit the environment values directly in the file as needed;
+no separate `.env` file is required.
+
+```yaml
+name: kindred
+
+services:
+  server:
+    image: ghcr.io/awpsec/kindred-server:latest
+    platform: linux/amd64
+    restart: unless-stopped
+    init: true
+    ports:
+      - "127.0.0.1:9444:9444"
+    environment:
+      KINDRED_PUBLIC_URL: "http://127.0.0.1:9444"
+      KINDRED_OPEN_REGISTRATION: "true" # Set to "false" to require invitations.
+      KINDRED_VM_CPUS: "2"             # CPU cores per bot computer.
+      KINDRED_VM_MEMORY_MB: "6144"     # RAM per bot computer, in MB.
+      KINDRED_VM_DISK_GB: "30"         # Disk capacity per bot computer, in GB.
+      KINDRED_VM_MAX_RUNNING: "4"      # Maximum simultaneous bot computers.
+    volumes:
+      - kindred-data:/data
+    cap_drop: [ALL]
+    cap_add: [CHOWN, SETUID, SETGID]
+    security_opt: [no-new-privileges:true]
+    stop_grace_period: 90s
+
+volumes:
+  kindred-data:
+```
+
+Open a terminal in that folder and run:
 
 ```sh
 docker compose up -d
