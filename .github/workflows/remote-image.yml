@@ -38,6 +38,8 @@ concurrency:
   cancel-in-progress: false
 jobs:
   image:
+    permissions:
+      contents: write
     if: ${{ inputs.approve }}
     runs-on: ubuntu-24.04
     timeout-minutes: 45
