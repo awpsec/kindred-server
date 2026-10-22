@@ -34,75 +34,74 @@ Download the desktop app for **Windows x64**, **macOS Apple Silicon**, or **Linu
 Connect to a Kindred server, or choose **Standalone** with Docker running to host it on your device.
 Provider accounts, usage and connected services are supplied by you; Kindred does not include model credits.
 
-### Self-host on Linux
+Prefer to self-host on Linux?
 
-With Docker Compose installed on your Linux server, save the following as
-`compose.yml`. Edit the values directly in the file; no separate `.env` file is required.
+Save this as `compose.yml` on your Linux server:
 
 ```yaml
 name: kindred
-
 services:
   server:
     image: ghcr.io/awpsec/kindred-server:latest
     platform: linux/amd64
+    network_mode: host
+    # Older images without this entrypoint stop instead of exposing all interfaces.
+    entrypoint: [python3, /opt/kindred/source/deploy/linux-host-entry.py]
     restart: unless-stopped
     init: true
-    ports:
-      - "127.0.0.1:9444:9444"
     environment:
+      KINDRED_NETWORK_MODE: host
+      KINDRED_ACCESS: "local"
+      KINDRED_TAILNET_ADDRESS: ""
       KINDRED_PUBLIC_URL: "http://127.0.0.1:9444"
-      KINDRED_OPEN_REGISTRATION: "true" # Set to "false" to require invitations.
-      # Defaults for each new profile VM, shared by its bots.
+      KINDRED_ALLOWED_ORIGINS: '[]'
+      KINDRED_OPEN_REGISTRATION: "true"
+      # Resources for each profile's VM, shared by all bots in that profile.
       KINDRED_VM_CPUS: "2"
       KINDRED_VM_MEMORY_MB: "6144"
       KINDRED_VM_DISK_GB: "30"
+      KINDRED_VM_ACCEL: "auto"
     volumes:
       - kindred-data:/data
     cap_drop: [ALL]
     cap_add: [CHOWN, SETUID, SETGID]
     security_opt: [no-new-privileges:true]
     stop_grace_period: 90s
-
+    healthcheck:
+      test: [CMD, python3, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9444/health',timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 6
 volumes:
   kindred-data:
 ```
 
-Open a terminal in that folder and run:
+Run `docker compose up -d`, then open **http://127.0.0.1:9444** on the server
+(or through an SSH tunnel). Docker pulls the published image automatically.
+The first account is the server administrator. Create it before enabling remote access.
 
-```sh
-docker compose up -d
-```
+In **Server admin → Networking**, choose localhost, localhost plus Tailscale,
+or all IPv4 interfaces, and set the server's URLs. You can also set these values
+in Compose. Web changes survive restarts; changing a Compose value overrides that
+saved field. Existing bridge deployments keep their port mappings in Compose.
 
-Docker downloads the published server image automatically. To update to the
-latest published release, run these commands from the same folder:
+The VM CPU, memory and disk values configure **one shared computer per profile**.
+All bots in that profile share its resources; separate bot screens do not create
+separate VMs. These Compose resource values set defaults for new profile VMs;
+changing them does not resize an existing VM or increase the resources available
+to your Linux host or container. Budget for the combined use of multiple profiles.
+Allow 6 GB RAM for each profile computer you intend to run, plus host
+overhead. Linux with KVM is recommended. Computer setup happens when needed.
+
+To update, run these commands from the same folder:
 
 ```sh
 docker compose pull
 docker compose up -d
 ```
 
-Open **http://127.0.0.1:9444** on the Linux server (or through an SSH tunnel),
-create your account, connect a provider, and make your first bot.
-The first account is the server administrator. Computer setup happens when needed and can take several minutes.
-
-This example is reachable only on the Docker host. `KINDRED_PUBLIC_URL` sets the
-address Kindred advertises; the `ports` mapping controls which host interfaces
-accept connections. For Tailscale HTTPS or access from other devices, follow
-[hosting and backups](docs/HOSTING.md). The desktop app's **Connection access**
-settings manage its own Standalone server; manually launched Compose deployments
-use their Compose and host network configuration.
-
-The CPU, memory and disk values above set the defaults for **each new shared VM**.
-All bots in one profile use that VM; separate bot screens do not allocate additional VMs.
-Changing these Compose values does not resize an existing VM or increase the
-resources available to your Linux host or container.
-
-The example allocates 2 virtual CPUs, 6 GB RAM and a 30 GB virtual disk to each
-profile VM. Choose values your server can support, leaving RAM for Kindred and
-the operating system. Multiple profiles can run separate VMs, so budget for their
-combined use. KVM acceleration is recommended; see [hosting and backups](docs/HOSTING.md)
-for setup and advanced capacity limits.
+Keep the same project name and data volume. See [hosting and backups](docs/HOSTING.md)
+for KVM, HTTPS, advanced multi-user limits and existing bridge deployments.
 
 ## Learn more
 
