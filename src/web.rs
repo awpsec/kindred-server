@@ -1602,6 +1602,7 @@ fn static_assets<S: Clone + Send + Sync + 'static>() -> Router<S> {
                 )
             }),
         )
+        .route("/transcript-attachments.js", get(|| async { ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8")], include_str!("../ui/transcript-attachments.js")) }))
         .route("/routine-flight.js", get(|| async { ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8")], include_str!("../ui/routine-flight.js")) }))
         .route("/group-activity.js", get(|| async { ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8")], include_str!("../ui/group-activity.js")) }))
         .route("/markup-cache.js", get(|| async { ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8")], include_str!("../ui/markup-cache.js")) }))
