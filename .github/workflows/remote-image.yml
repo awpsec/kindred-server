@@ -1,0 +1,77 @@
+name: Build and verify exact server image (manual only)
+run-name: remote-image-${{ inputs.nonce }}
+on:
+  workflow_dispatch:
+    inputs:
+      approve:
+        type: boolean
+        required: true
+        default: false
+      source:
+        type: string
+        required: true
+      tool:
+        type: string
+        required: true
+      version:
+        type: string
+        required: true
+      spec_id:
+        type: string
+        required: true
+      spec_release:
+        type: string
+        required: true
+      spec_sha:
+        type: string
+        required: true
+      spec_size:
+        type: string
+        required: true
+      nonce:
+        type: string
+        required: true
+permissions:
+  contents: read
+concurrency:
+  group: kindred-remote-image-build
+  cancel-in-progress: false
+jobs:
+  image:
+    if: ${{ inputs.approve }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      APPROVE: ${{ inputs.approve }}
+      SOURCE: ${{ inputs.source }}
+      TOOL: ${{ inputs.tool }}
+      VERSION: ${{ inputs.version }}
+      SPEC_ID: ${{ inputs.spec_id }}
+      SPEC_RELEASE: ${{ inputs.spec_release }}
+      SPEC_SHA: ${{ inputs.spec_sha }}
+      SPEC_SIZE: ${{ inputs.spec_size }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          path: tools
+          persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ inputs.source }}
+          path: product
+          persist-credentials: false
+      - name: Verify exact private inputs and final product/tool binding
+        run: python3 tools/scripts/release/remote-image/input.py
+      - name: Build and run the existing isolated image QA
+        shell: bash
+        run: bash tools/scripts/release/remote-image/run.sh
+      - name: Upload bounded verified archive and named receipts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: remote-image-${{ inputs.version }}-${{ github.run_id }}
+          path: export/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
