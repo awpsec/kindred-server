@@ -1661,6 +1661,51 @@ fn static_assets<S: Clone + Send + Sync + 'static>() -> Router<S> {
             }),
         )
         .route(
+            "/navigation-search.js",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+                    include_str!("../ui/navigation-search.js"),
+                )
+            }),
+        )
+        .route(
+            "/navigation-search.css",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+                    include_str!("../ui/navigation-search.css"),
+                )
+            }),
+        )
+        .route(
+            "/bot-center.js",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+                    include_str!("../ui/bot-center.js"),
+                )
+            }),
+        )
+        .route(
+            "/bot-center.css",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+                    include_str!("../ui/bot-center.css"),
+                )
+            }),
+        )
+        .route(
+            "/shell-polish.css",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+                    include_str!("../ui/shell-polish.css"),
+                )
+            }),
+        )
+        .route(
             "/select-menu.js",
             get(|| async {
                 (
