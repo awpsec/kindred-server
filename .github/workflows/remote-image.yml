@@ -77,3 +77,12 @@ jobs:
           if-no-files-found: error
           retention-days: 7
           compression-level: 0
+      - name: Preserve bounded failure-only phase and named log tails
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: remote-image-failure-${{ inputs.version }}-${{ github.run_id }}
+          path: failure/
+          if-no-files-found: warn
+          retention-days: 7
+          compression-level: 0
