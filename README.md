@@ -80,9 +80,11 @@ Run `docker compose up -d`, then open **http://127.0.0.1:9444** on the server
 (or through an SSH tunnel). Docker pulls the published image automatically.
 The first account is the server administrator. Create it before enabling remote access.
 
-In **Server admin → Networking**, choose localhost, localhost plus Tailscale,
-or all IPv4 interfaces, and set the server's URLs. You can also set these values
-in Compose. Web changes survive restarts; changing a Compose value overrides that
+In **Server admin → Networking**, follow **Set up access** for local use, private
+Tailscale HTTPS or public HTTPS. Configure the HTTPS service on the host, then check
+and save the address before sharing it. A saved URL does not enable TLS. Follow
+[the Tailscale setup steps](docs/HOSTING.md#private-team-server-with-tailscale-https)
+for a private team server. You can also set listener and URL values in Compose. Web changes survive restarts; changing a Compose value overrides that
 saved field. Existing bridge deployments keep their port mappings in Compose.
 
 The VM CPU, memory and disk values configure **one shared computer per profile**.
