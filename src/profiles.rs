@@ -429,6 +429,7 @@ pub fn router(portal: Portal) -> Router {
         .route("/identity/admin", get(admin).post(admin_update))
         .route("/identity/admin/remove", post(remove_account))
         .route("/identity/admin/network", get(network_settings::get).post(network_settings::save))
+        .route("/identity/admin/network/check", post(network_settings::check))
         .route(
             "/identity/server-update",
             get(server_update_status).post(server_update_start),

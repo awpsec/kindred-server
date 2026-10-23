@@ -93,6 +93,7 @@ async fn docker_network_settings_require_admin_and_preserve_pending_generation()
     for token in ["",user] {
         assert!(!f.request("GET","/identity/admin/network",token,Value::Null).await.0.is_success());
         assert!(!f.request("POST","/identity/admin/network",token,json!({})).await.0.is_success());
+        assert!(!f.request("POST","/identity/admin/network/check",token,json!({"url":"http://127.0.0.1:1"})).await.0.is_success());
     }
     let (status,view)=f.request("GET","/identity/admin/network",owner,Value::Null).await;assert_eq!(status,200);assert_eq!(view["revision"],"initial");
     let mut changed=settings.clone();changed["access"]=json!("all");
@@ -104,6 +105,7 @@ async fn docker_network_settings_require_admin_and_preserve_pending_generation()
     assert!(!f.request("POST","/identity/admin/network",owner,json!({"revision":"initial","request_id":uuid::Uuid::new_v4(),"settings":settings})).await.0.is_success());
     assert!(f.root.join("network-last-good.json").exists());
     let mut headers=HeaderMap::new();headers.insert(header::AUTHORIZATION,format!("Bearer {owner}").parse().unwrap());headers.insert(header::ORIGIN,"https://attacker.example".parse().unwrap());
+    assert!(network_settings::check(State(f.p.clone()),headers.clone(),Json(json!({"url":"http://127.0.0.1:1"}))).await.is_err());
     assert!(network_settings::get(State(f.p.clone()),headers).await.is_err());
 }
 
