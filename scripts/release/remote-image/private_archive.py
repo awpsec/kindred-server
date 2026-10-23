@@ -6,10 +6,18 @@ import stream_protocol as p
 
 def api(endpoint,method='GET',body=None,stdin=None):
  args=['gh','api',endpoint,'--method',method]
- if stdin is not None:args+=['--input','-','-H','Content-Type: application/gzip']
+ if stdin is not None:
+  size=os.fstat(stdin.fileno()).st_size
+  assert type(size)is int and 0<size<=p.MAX_ARCHIVE and stdin.tell()==0
+  args+=['--input','-','-H','Content-Type: application/gzip','-H','Content-Length: '+str(size)]
  elif body is not None:args+=['--input','-']
  result=subprocess.run(args,input=None if body is None else json.dumps(body).encode(),stdin=stdin,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=900)
- assert result.returncode==0,'Private upload API failed; no automatic retry'
+ if result.returncode!=0:
+  # Retain only numeric HTTP status and fixed operation identity; never raw stderr.
+  statuses=re.findall(rb'HTTP ([1-5][0-9]{2})',result.stderr[:65536])
+  diagnostic={'phase':'private_archive_api','operation':'archive_upload' if stdin is not None else 'release_metadata','returncode':result.returncode,'http_statuses':[int(x) for x in statuses[:4]],'stderr_bytes':len(result.stderr),'automatic_retry':False}
+  print(json.dumps(diagnostic,sort_keys=True),file=sys.stderr)
+  raise AssertionError('Private upload API failed; no automatic retry')
  assert len(result.stdout)<=8*1024**2
  return load(result.stdout)
 
