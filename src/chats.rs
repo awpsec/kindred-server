@@ -82,6 +82,9 @@ pub fn migrate(c: &Connection) -> Result<()> {
             }
         }
     }
+    // Page context resolves only persisted activity anchors, not every message
+    // by this bot. Keep lookup bounded to markers in this conversation.
+    c.execute_batch("CREATE INDEX IF NOT EXISTS chat_progress_marker ON chat_messages(chat_id,sender,created,seq) WHERE kind='task_progress' AND suppressed=0;")?;
     c.execute_batch("INSERT OR IGNORE INTO chats(id,name,members) SELECT 'dm-'||id,name,json_array(id) FROM bots;
       INSERT INTO chat_messages(chat_id,sender,body,kind,run_id,created) SELECT 'dm-'||bot_id,'user',prompt,'message','',created FROM runs WHERE chat_id='';
       INSERT INTO chat_messages(chat_id,sender,body,kind,run_id,created) SELECT 'dm-'||bot_id,bot_id,CASE WHEN error='' THEN output ELSE error END,'result',id,created FROM runs WHERE chat_id='' AND status IN ('completed','failed','interrupted','cancelled');

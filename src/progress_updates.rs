@@ -232,6 +232,14 @@ pub fn message(c:&rusqlite::Connection,seq:i64)->Result<Value> {
     let mut value=c.query_row("SELECT p.run_id,p.mode,p.phase,p.group_id,COALESCE(p.task_title,r.task_title),p.work_qualified FROM message_progress p JOIN runs r ON r.id=p.run_id WHERE p.message_seq=?",[seq],|r|Ok(json!({"run_id":r.get::<_,String>(0)?,"mode":r.get::<_,String>(1)?,"phase":r.get::<_,String>(2)?,"group_id":r.get::<_,String>(3)?,"task_title":r.get::<_,String>(4)?,"work_qualified":r.get::<_,Option<bool>>(5)?}))).optional()?.unwrap_or(Value::Null);
     if value["mode"]=="summaries" && value["phase"]=="commentary" {
         let run=value["run_id"].as_str().unwrap().to_owned();
+        // Pagination may omit the actual anchor. Expose only its persisted identity,
+        // never synthesize a task from commentary or change page rows/cursors.
+        let marker:Option<Value>=c.query_row(
+            "SELECT m.seq,m.created,m.run_id,m.sender,COALESCE(p.task_title,r.task_title) FROM chat_messages source JOIN chat_messages m ON m.chat_id=source.chat_id AND m.sender=source.sender JOIN message_progress p ON p.message_seq=m.seq AND p.run_id=m.run_id JOIN runs r ON r.id=m.run_id AND r.bot_id=m.sender AND r.chat_id=m.chat_id WHERE source.seq=?1 AND source.run_id=?2 AND source.suppressed=0 AND m.kind='task_progress' AND m.suppressed=0 AND p.group_id=?3 AND p.mode='summaries' AND p.phase='commentary' AND COALESCE(p.work_qualified,1)=1 ORDER BY m.created,m.seq LIMIT 1",
+            rusqlite::params![seq,run,value["group_id"].as_str().unwrap()],
+            |r|Ok(json!({"seq":r.get::<_,i64>(0)?,"created":r.get::<_,i64>(1)?,"run_id":r.get::<_,String>(2)?,"sender":r.get::<_,String>(3)?,"task_title":r.get::<_,String>(4)?})),
+        ).optional()?;
+        if let Some(marker)=marker {value["marker"]=marker;}
         value["activity"]=activity(c,seq,&run)?;
         let (start,end)=phase_range(c,seq,&run)?;
         let hidden:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM routine_runs WHERE run_id=?1) OR EXISTS(SELECT 1 FROM routine_execution WHERE run_id=?1) OR EXISTS(SELECT 1 FROM events WHERE run_id=?1 AND kind='tool_result' AND json_extract(body,'$.tool')='finish_quietly' AND COALESCE(json_extract(body,'$.failed'),0)=0)",[&run],|r|r.get(0))?;
@@ -244,6 +252,43 @@ pub fn message(c:&rusqlite::Connection,seq:i64)->Result<Value> {
 mod tests {
     use super::*;
     use crate::{conversation_updates, tests};
+
+    #[test]
+    fn paginated_commentary_carries_only_its_persisted_marker() {
+        let app=tests::app();let bot=tests::bot(&app.db,"codex");
+        let id=app.db.queue(&bot.id,"Read the report",0).unwrap();
+        let run=app.db.claim_bot(&bot.id).unwrap().unwrap();
+        app.db.event(&id,"tool_started",json!({"tool":"local_read"})).unwrap();
+        for n in 0..55 {
+            app.db.event(&id,"assistant",json!({"phase":"commentary","text":format!("Report update {n}")})).unwrap();
+        }
+        let all=app.db.chat_messages(&run.chat_id).unwrap();
+        let marker=all.iter().find(|m|m["kind"]=="task_progress").unwrap();
+        let marker_seq=marker["seq"].as_i64().unwrap();
+        let page=app.db.chat_message_page(&run.chat_id,None,None,50).unwrap();
+        let rows=page["messages"].as_array().unwrap();
+        assert_eq!(rows.len(),50);
+        assert_eq!(page["page"]["has_before"],true);
+        assert!(!rows.iter().any(|m|m["kind"]=="task_progress"));
+        for row in rows {
+            assert_eq!(row["progress"]["marker"]["seq"],marker["seq"]);
+            assert_eq!(row["progress"]["marker"]["run_id"],id);
+            assert_eq!(row["progress"]["marker"]["sender"],bot.id);
+        }
+        let source_seq=rows.last().unwrap()["seq"].as_i64().unwrap();
+        let other=tests::bot(&app.db,"codex");
+        let other_id=app.db.queue(&other.id,"Other task",0).unwrap();
+        let other_chat=app.db.run(&other_id).unwrap().chat_id;
+        let c=app.db.0.lock().unwrap();
+        c.execute("UPDATE chat_messages SET suppressed=1 WHERE seq=?",[marker_seq]).unwrap();
+        assert!(message(&c,source_seq).unwrap().get("marker").is_none(),"Suppressed anchors cannot return through page metadata");
+        c.execute("UPDATE chat_messages SET suppressed=0,sender='other-bot' WHERE seq=?",[marker_seq]).unwrap();
+        assert!(message(&c,source_seq).unwrap().get("marker").is_none(),"Same group does not establish another bot's ownership");
+        c.execute("UPDATE chat_messages SET sender=?1,chat_id=?2 WHERE seq=?3",rusqlite::params![bot.id,other_chat,marker_seq]).unwrap();
+        assert!(message(&c,source_seq).unwrap().get("marker").is_none(),"Same group cannot import another conversation's marker");
+        c.execute("UPDATE chat_messages SET chat_id=?1,kind='assistant' WHERE seq=?2",rusqlite::params![run.chat_id,marker_seq]).unwrap();
+        assert!(message(&c,source_seq).unwrap().get("marker").is_none(),"Legacy commentary never fabricates an anchor");
+    }
 
     #[tokio::test]
     async fn staged_presentation_is_display_only_and_phase_scoped() {
