@@ -250,13 +250,30 @@ async fn old_settings_clients_preserve_model_defaults_and_invalid_updates_do_not
     let url = format!("http://{}/api/settings", listener.local_addr().unwrap());
     let server = tokio::spawn(axum::serve(listener, web::router(app.clone())).into_future());
     let client = reqwest::Client::new();
+    let initial: Value = client.get(&url).bearer_auth(&app.token).send().await.unwrap().json().await.unwrap();
+    assert_eq!(initial["accent_color"], "monochrome");
+    app.db.save_setting("general", &json!({"name":"Existing","theme":"light"})).unwrap();
+    let migrated: Value = client.get(&url).bearer_auth(&app.token).send().await.unwrap().json().await.unwrap();
+    assert_eq!(migrated["accent_color"], "monochrome");
+    for accent in ["monochrome", "blue", "green", "orange", "purple", "pink"] {
+        let value = json!({"name":"You","theme":"dark","accent_color":accent});
+        let saved: Value = client.put(&url).bearer_auth(&app.token).json(&value).send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+        assert_eq!(saved["accent_color"], accent);
+        assert_eq!(app.db.setting("general").unwrap().unwrap()["accent_color"], accent);
+    }
     let defaults = json!({"codex":{"model":"chosen","reasoning_effort":"high"}});
-    let first = json!({"name":"You","theme":"dark","default_provider":"codex","model_defaults":defaults});
+    let first = json!({"name":"You","theme":"dark","accent_color":"blue","default_provider":"codex","model_defaults":defaults});
     assert!(client.put(&url).bearer_auth(&app.token).json(&first).send().await.unwrap().status().is_success());
     let prior_client = json!({"name":"Renamed","theme":"light"});
     let saved:Value = client.put(&url).bearer_auth(&app.token).json(&prior_client).send().await.unwrap().json().await.unwrap();
     assert_eq!(saved["model_defaults"],defaults);
     assert_eq!(saved["default_provider"],"codex");
+    assert_eq!(saved["accent_color"],"blue");
+    for invalid_accent in [json!("red"), json!(null), json!(true), json!(12)] {
+        let invalid = json!({"name":"Renamed","theme":"light","accent_color":invalid_accent});
+        assert!(client.put(&url).bearer_auth(&app.token).json(&invalid).send().await.unwrap().status().is_client_error());
+        assert_eq!(app.db.setting("general").unwrap().unwrap()["accent_color"], "blue");
+    }
     let invalid = json!({"name":"Renamed","theme":"light","model_defaults":{"unknown":{"model":"bad"}}});
     assert!(!client.put(&url).bearer_auth(&app.token).json(&invalid).send().await.unwrap().status().is_success());
     let saved:Value=client.get(&url).bearer_auth(&app.token).send().await.unwrap().json().await.unwrap();

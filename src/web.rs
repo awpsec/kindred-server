@@ -750,6 +750,15 @@ async fn save_settings(State(app): State<Shared>, Json(v): Json<Value>) -> Resul
         "identity",
     )?;
     let theme = runtime::string(&v, "theme")?;
+    // Older clients omit this preference. Preserve the saved accent in that case.
+    let accent_color = runtime::string(
+        if v.get("accent_color").is_some() { &v } else { &prior },
+        "accent_color",
+    )?;
+    require!(
+        matches!(accent_color, "monochrome" | "blue" | "green" | "orange" | "purple" | "pink"),
+        "Invalid accent color"
+    );
     require!(
         !name.trim().is_empty() && name.len() <= 80 && identity.len() <= 16000,
         "Identity name or preferences are invalid"
@@ -820,7 +829,7 @@ async fn save_settings(State(app): State<Shared>, Json(v): Json<Value>) -> Resul
         let effort = selection["reasoning_effort"].as_str().unwrap_or("");
         require!(model.len() <= 200 && !model.chars().any(char::is_control) && effort.len() <= 40 && effort.bytes().all(|b| b.is_ascii_lowercase() || b == b'_'), "Invalid default model selection");
     }
-    let settings = json!({"message_delivery":message_delivery,"progress_updates":progress_updates,"default_provider":default_provider,"model_defaults":model_defaults,"local_access":local_access,"approval_mode":approval,"name":name,"identity":identity,"theme":theme,"reduced_motion":v["reduced_motion"]==true,"notifications":notifications,"show_activity":show_activity,"separate_bot_chats":separate_bot_chats,"timezone":timezone,"timezone_mode":timezone_mode});
+    let settings = json!({"message_delivery":message_delivery,"progress_updates":progress_updates,"default_provider":default_provider,"model_defaults":model_defaults,"local_access":local_access,"approval_mode":approval,"name":name,"identity":identity,"theme":theme,"accent_color":accent_color,"reduced_motion":v["reduced_motion"]==true,"notifications":notifications,"show_activity":show_activity,"separate_bot_chats":separate_bot_chats,"timezone":timezone,"timezone_mode":timezone_mode});
     app.db.save_setting("general", &settings)?;
     let mut settings=settings;
     settings["primary_bot_id"]=json!(crate::primary_bot::get(&app.db)?);
