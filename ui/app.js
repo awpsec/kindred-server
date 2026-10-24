@@ -6120,7 +6120,10 @@ async function renderPreparedSharedChat(chat, force, mode='sync', signal) {
     const key=taskOwners.get(JSON.stringify([run.id,run.bot_id||run.participant])),tracker=key&&taskTrackers.get(key);
     return tracker?._progressRunId===run.id&&tracker.dataset.progressFinished==='false'?key:null;
   };
-  const projectedTrackers=new Map([...summaries].filter(([,items])=>items[0].projectedProgress).map(([key,items])=>[items.find(m=>!m.projectedProgress).seq,taskTrackers.get(key)]));
+  // Emit at the first owned transcript row, even when persisted commentary
+  // precedes its marker. Keep the marker identity and every message in order.
+  const trackerAnchors=new Map(),anchoredTasks=new Set();
+  for(const m of transcript){const key=m.progress?.group_id;if(!anchoredTasks.has(key)&&summaries.get(key)?.includes(m)){trackerAnchors.set(m.seq,taskTrackers.get(key));anchoredTasks.add(key);}}
   for(const m of data.messages)if(m.kind==='reminder_card'&&m.planning?.batch_id){const key=m.planning.batch_id,items=reminderGroups.get(key)||[];items.push(m);reminderGroups.set(key,items);}
   for (const m of transcript) {
     if(m.kind==='shared_attachment'){
@@ -6133,9 +6136,11 @@ async function renderPreparedSharedChat(chat, force, mode='sync', signal) {
       }
       renderAttachments(group,[file]);area.append(group);previousSender=null;continue;
     }
-    if(projectedTrackers.has(m.seq))area.append(projectedTrackers.get(m.seq));
-    if(stacked.has(m.seq)||m.kind==='continuation')continue;
-    if (!m.text?.trim()&&m.kind!=='task_progress') continue;
+    const anchoredTracker=trackerAnchors.get(m.seq);
+    if(stacked.has(m.seq)||m.kind==='continuation'||(!m.text?.trim()&&m.kind!=='task_progress')){
+      if(anchoredTracker){appendTranscriptTimestamp(m.created);area.append(anchoredTracker);}
+      continue;
+    }
     if(m.kind==='task_progress'&&!summaries.has(m.progress?.group_id))continue;
     if(hiddenCompletionMessage(m) && !runs.find(r=>r.id===m.run_id)?.error)continue;
     if(boundary&&!unreadInserted&&!['connector_artifact','task_progress'].includes(m.kind)&&(chat.shared?!m.mine:m.sender!=='user')&&m.sender!=='system'&&m.seq>boundary.after&&m.seq<=boundary.through){
@@ -6144,7 +6149,8 @@ async function renderPreparedSharedChat(chat, force, mode='sync', signal) {
       if(boundary.seenAt&&Date.now()-boundary.seenAt>8000)divider.classList.add('has-faded');
       area.append(divider);unreadObserver.observe(divider);
     }
-    if(m.kind==='task_progress'){const items=summaries.get(m.progress.group_id);if(items&&items.find(i=>i.kind==='task_progress').seq===m.seq){const tracker=taskTrackers.get(m.progress.group_id);if(tracker)area.append(tracker);}previousSender=null;continue;}
+    if(anchoredTracker){appendTranscriptTimestamp(m.created);area.append(anchoredTracker);}
+    if(m.kind==='task_progress'){previousSender=null;continue;}
     if(taskQuestionSeqs.has(m.seq)){const owner=runs.find(r=>r.id===m.question.run_id)||state.allRuns.find(r=>r.id===m.question.run_id)||state.details.get(m.question.run_id)?.run;area.append(attachTaskReview(taskQuestionReceipt(m,entry,m.question.task_group_id,owner?.progress_started||owner?.created||0),m.question.task_group_id,taskTrackers));previousSender=null;continue;}
     if(m.kind==='connection_card'&&validConnectionCard(m.text)){
       const group=node('article','message-group connection-message');group.dataset.message=String(m.seq);group.append(chatConnectionCard(m.text));area.append(group);previousSender=null;continue;
@@ -9060,7 +9066,7 @@ function renderAttachments(target, attachments) {
       if(state.token!==token)throw new Error('Connection changed');
       const response=await fetch('/api/deliverables/'+encodeURIComponent(id)+'/preview',{headers:{Authorization:'Bearer '+token},cache:'no-store',signal});
       if(!response.ok||!response.headers.get('Content-Type')?.startsWith('application/pdf'))throw new Error('Page preview unavailable');const blob=await response.blob();if(state.token!==token)throw new Error('Connection changed');if(blob.size>32*1024*1024)throw new Error('Preview exceeds limit');return blob;
-    },nativeSave,nativeReveal:window.__KINDRED_FILE_DELIVERY?receipt=>nativeInvoke('reveal_chat_file',{receipt}):null,notice,renderMarkdown:markdown}));
+    },nativeSave,nativeOpen:window.__KINDRED_MARKDOWN_OPEN?async receipt=>{if(state.token!==token)throw new Error('Connection changed');return nativeInvoke('open_chat_file',{receipt});}:null,nativeReveal:window.__KINDRED_FILE_DELIVERY?receipt=>nativeInvoke('reveal_chat_file',{receipt}):null,notice,renderMarkdown:markdown}));
   }
 }
 
@@ -9085,7 +9091,7 @@ document.addEventListener('click',event=>{
   if(!window.__KINDRED_EXTERNAL_LINKS||event.defaultPrevented||event.button!==0)return;
   const link=event.target.closest?.('a[href]');if(!link||link.hasAttribute('download'))return;
   let url;try{url=new URL(link.href);}catch{return;}
-  if(!['https:','http:'].includes(url.protocol)||(url.origin===location.origin&&link.target!=='_blank'))return;
+  if(!['https:','http:'].includes(url.protocol)||(url.origin===location.origin&&link.target!=='_blank'&&!(artifactLink&&(event.ctrlKey||event.metaKey))))return;
   // WKWebView may route a normal external click through its navigation policy
   // instead of its popup callback. Explicit IPC keeps sign-in outside the app.
   event.preventDefault();void perform(()=>nativeInvoke('open_external_url',{url:url.href}));
