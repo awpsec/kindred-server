@@ -27,9 +27,9 @@ if __name__=='__main__':
    assert not Path(i.filename).is_absolute() and '..' not in Path(i.filename).parts and chr(92) not in i.filename
    assert stat.S_IFMT(i.external_attr>>16) in (0,stat.S_IFREG,stat.S_IFDIR)
   assert z.testzip() is None;bm=load(z.read('bundle.json'));assert bm['version']==s['version'] and bm['source_commit']==s['source'];assert sha(z.read('kindred'))==m['server_sha256']
- Path('recipe/server/kindred-standalone-0.87.2.zip').write_bytes(bundle)
+ Path('recipe/server/kindred-standalone-0.87.3.zip').write_bytes(bundle)
  # Only explicit reviewed placeholders can vary; embedded code remains bound by recipe hashes.
- values={'@STAGE@':str(Path('recipe').resolve()),'@PRODUCT@':str(Path('product').resolve()),'@SOURCE@':s['source'],'@VERSION@':s['version'],'@IMAGE_TAG@':'0872-'+s['source'][:12],'@DOCKER_CONFIG@':str(Path('docker-config').resolve())}
+ values={'@STAGE@':str(Path('recipe').resolve()),'@PRODUCT@':str(Path('product').resolve()),'@SOURCE@':s['source'],'@VERSION@':s['version'],'@IMAGE_TAG@':'0873-'+s['source'][:12],'@DOCKER_CONFIG@':str(Path('docker-config').resolve())}
  Path('docker-config').mkdir(exist_ok=False)
  for n in SCRIPTS:
   p=Path('recipe')/n;text=p.read_text()

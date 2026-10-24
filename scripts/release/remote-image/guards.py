@@ -13,7 +13,7 @@ def load(b):
   return d
  return json.loads(b,object_pairs_hook=pairs,parse_constant=lambda _: (_ for _ in ()).throw(AssertionError('Nonfinite JSON')))
 def bound(s):
- assert s['bound'] is True and s['version']=='0.87.2' and s['repo']==REPO
+ assert s['bound'] is True and s['version']=='0.87.3' and s['repo']==REPO
  for key,n in [('source',40),('tool',40),('pin_sha256',64),('authority_sha256',64)]:assert re.fullmatch('[0-9a-f]{'+str(n)+'}',s[key])
  assert re.fullmatch(r'codex/[A-Za-z0-9._/-]+',s['tool_ref']) and '..' not in s['tool_ref']
  for key in ['recipe','bundle']:
