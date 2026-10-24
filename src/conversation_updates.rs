@@ -474,6 +474,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn router_normal_send_steers_despite_legacy_queue_setting() {
+        use std::future::IntoFuture;
+        let app=tests::app();let bot=tests::bot(&app.db,"codex");let chat=format!("dm-{}",bot.id);
+        app.db.queue(&bot.id,"Active task",0).unwrap();let run=app.db.claim_bot(&bot.id).unwrap().unwrap();
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let base=format!("http://{}/api",listener.local_addr().unwrap());
+        let server=tokio::spawn(axum::serve(listener,crate::web::router(app.clone())).into_future());let client=reqwest::Client::new();
+        let mut settings=crate::db::general_settings(None);settings["message_delivery"]=json!("queue");
+        assert!(client.put(format!("{base}/settings")).bearer_auth(&app.token).json(&settings).send().await.unwrap().status().is_success());
+        for (prompt,mode) in [("Normal",None),("Explicit queue",Some("queue"))] {
+            let mut body=json!({"prompt":prompt,"request_id":db::id()});if let Some(mode)=mode {body["delivery_mode"]=json!(mode);}
+            assert!(client.post(format!("{base}/chats/{chat}/messages")).bearer_auth(&app.token).json(&body).send().await.unwrap().status().is_success());
+        }
+        let c=app.db.0.lock().unwrap();
+        let steered:i64=c.query_row("SELECT COUNT(*) FROM steering_requests s JOIN runs r ON r.id=s.source_run_id WHERE s.run_id=? AND r.prompt='Normal'",[&run.id],|r|r.get(0)).unwrap();
+        let queued:i64=c.query_row("SELECT COUNT(*) FROM steering_requests s JOIN runs r ON r.id=s.source_run_id WHERE r.prompt='Explicit queue'",[],|r|r.get(0)).unwrap();
+        assert_eq!(steered,1);assert_eq!(queued,0);drop(c);server.abort();
+    }
+
+    #[tokio::test]
     async fn router_settings_queue_restore_and_request_receipts_are_authenticated_and_durable() {
         use std::future::IntoFuture;
         let app=tests::app();let bot=tests::bot(&app.db,"codex");let chat=format!("dm-{}",bot.id);

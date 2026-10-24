@@ -1306,7 +1306,7 @@ async fn chat_send(
     Json(v): Json<ChatMessage>,
 ) -> Result<Json<Value>> {
     Ok(Json(
-        json!({"runs":app.db.chat_send_request_mode(&id,&v.prompt,&v.mentions,&v.files,v.reply_to,v.request_id.as_deref(),v.delivery_mode.as_deref().unwrap_or("queue"))?}),
+        json!({"runs":app.db.chat_send_request_mode(&id,&v.prompt,&v.mentions,&v.files,v.reply_to,v.request_id.as_deref(),v.delivery_mode.as_deref().unwrap_or("steer"))?}),
     ))
 }
 async fn message_reaction(
