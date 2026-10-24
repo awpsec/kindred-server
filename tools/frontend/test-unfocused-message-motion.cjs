@@ -26,6 +26,6 @@ const result=await page.evaluate(async()=>{
  rows.forEach(row=>row.remove());return {foreground,settled,background,noReplay,stale};
 });
 assert.deepEqual(result,{foreground:true,settled:true,background:true,noReplay:true,stale:true});
-assert.deepEqual(errors,[]);console.log('Unfocused message motion: foreground fades, blur settlement, background suppression and no replay passed');
+assert.deepEqual(errors,[]);console.log('Unfocused message motion: foreground entrances, blur settlement, background suppression and no replay passed');
 }finally{await browser.close();server.closeAllConnections();server.close();}
 })().catch(e=>{console.error(e);process.exitCode=1;server.close();});
