@@ -1161,4 +1161,73 @@ for line in sys.stdin:
         assert!(!error.contains("private upstream"));
         server.abort();
     }
+    // Synthetic JSONL app-server only. No Codex binary, model, credentials, or VM.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_error_protocol_preserves_terminal_reason_and_retry_classification() {
+        let script = r#"
+import json,sys
+mode=sys.argv[1]
+def send(v):print(json.dumps(v),flush=True)
+for line in sys.stdin:
+ v=json.loads(line);m=v.get('method')
+ if m=='initialized':continue
+ if m=='initialize':result={}
+ elif m=='account/read':result={'account':{'type':'chatgpt'}}
+ elif m=='model/list':result={'data':[{'model':'test/model','isDefault':True,'defaultReasoningEffort':'medium','supportedReasoningEfforts':[{'reasoningEffort':'medium'}]}],'nextCursor':None}
+ elif m=='config/read':result={'config':{}}
+ elif m=='thread/start':result={'thread':{'id':'error-test-thread'}}
+ elif m=='app/installed':result={'apps':[]}
+ elif m=='mcpServerStatus/list':result={'data':[],'nextCursor':None}
+ elif m=='turn/start':
+  send({'id':v['id'],'result':{'turn':{'id':'error-test-turn'}}})
+  e={'message':'Synthetic terminal provider reason'}
+  if mode in ('notification_policy','completion_policy','retry_then_success'):e['codexErrorInfo']='cyberPolicy' if mode!='retry_then_success' else 'serverOverloaded'
+  elif mode=='notification_unknown':e['codexErrorInfo']='futureUnknownCode'
+  elif mode=='notification_transient':e['codexErrorInfo']={'responseStreamDisconnected':{'httpStatusCode':503}}
+  elif mode=='completion_auth':e['codexErrorInfo']={'httpConnectionFailed':{'httpStatusCode':401}}
+  elif mode=='notification_html':e={'message':'<html>PRIVATE_CHALLENGE_BODY</html>','codexErrorInfo':'other'}
+  if mode.startswith('completion_'):
+   send({'method':'turn/completed','params':{'threadId':'error-test-thread','turn':{'id':'error-test-turn','status':'failed','error':None if mode=='completion_no_error' else e}}})
+  else:
+   send({'method':'error','params':{'threadId':'error-test-thread','turnId':'error-test-turn','willRetry':mode=='retry_then_success','error':e}})
+  if mode=='retry_then_success':
+   send({'method':'item/completed','params':{'threadId':'error-test-thread','turnId':'error-test-turn','item':{'type':'agentMessage','phase':'final_answer','text':'Recovered inside provider'}}})
+   send({'method':'turn/completed','params':{'threadId':'error-test-thread','turn':{'id':'error-test-turn','status':'completed','error':None}}})
+  break
+ else:raise AssertionError('Unexpected request: '+str(v))
+ send({'id':v['id'],'result':result})
+"#;
+        for mode in ["notification_policy", "notification_unknown", "notification_uncoded", "notification_transient", "notification_html", "completion_policy", "completion_auth", "completion_no_error", "retry_then_success"] {
+            let app = crate::tests::app();
+            let bot = crate::tests::bot(&app.db, "codex");
+            app.db.queue(&bot.id, "Synthetic protocol error test", 0).unwrap();
+            let run = app.db.claim_bot(&bot.id).unwrap().unwrap();
+            let mut command = tokio::process::Command::new("python3");
+            command.args(["-u", "-c", script, mode]);
+            let mut rpc = Rpc::spawn(command).await.unwrap();
+            let result = tokio::time::timeout(Duration::from_secs(5), codex_rpc(&app, &bot, &run, &mut rpc)).await.expect(mode);
+            drop(rpc);
+            if mode == "retry_then_success" {
+                assert_eq!(result.unwrap(), "Recovered inside provider");
+                continue;
+            }
+            let error = result.unwrap_err();
+            if mode == "completion_no_error" {
+                assert!(error.downcast_ref::<crate::rpc::CodexTurnError>().is_none());
+                assert_eq!(error.to_string(), "Codex turn ended with status failed");
+            } else {
+                let typed = error.downcast_ref::<crate::rpc::CodexTurnError>().expect(mode);
+                assert_eq!(typed.retryable, mode == "notification_transient", "{mode}");
+                if mode == "notification_html" {
+                    assert!(!error.to_string().contains("PRIVATE_CHALLENGE_BODY"));
+                    assert!(error.to_string().contains("error page"));
+                } else {
+                    assert!(error.to_string().contains("Synthetic terminal provider reason"), "{mode}: {error}");
+                }
+            }
+            assert!(!error.to_string().contains(crate::provider_retry::EXHAUSTED));
+            assert!(!app.db.events(&run.id).unwrap().iter().any(|e| e["kind"] == "tool_requested"));
+        }
+    }
 }
