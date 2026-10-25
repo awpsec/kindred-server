@@ -53,7 +53,7 @@ jobs:
           assert re.fullmatch(r'\d+\.\d+\.\d+',os.environ['VERSION'])
           assert re.fullmatch(r'[0-9a-f]{40}',os.environ['SOURCE'])
           assert re.fullmatch(r'[0-9a-f]{64}',os.environ['IMAGE_SHA256'])
-          assert re.fullmatch(r'image-inputs-[0-9A-Za-z.-]+',os.environ['INPUT_RELEASE']) or os.environ['INPUT_RELEASE']=='image-private-0.87.3-40060349104-image0873_20261024T035620'
+          assert re.fullmatch(r'image-inputs-[0-9A-Za-z.-]+',os.environ['INPUT_RELEASE']) or os.environ['INPUT_RELEASE']=='image-private-0.87.6-40153268939-image0876_20261025T020727'
           assert json.loads(subprocess.check_output(['gh','release','view',os.environ['INPUT_RELEASE'],'--json','isDraft']))['isDraft']
           subprocess.run(['gh','release','download',os.environ['INPUT_RELEASE'],'--pattern','server-image.tar.gz'],check=True)
           with open('server-image.tar.gz','rb') as f: assert hashlib.file_digest(f,'sha256').hexdigest()==os.environ['IMAGE_SHA256']
