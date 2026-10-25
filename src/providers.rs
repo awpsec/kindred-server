@@ -391,6 +391,9 @@ async fn codex_rpc(app: &App, bot: &Bot, run: &Run, rpc: &mut Rpc) -> Result<Str
                     .pointer("/turn/status")
                     .and_then(Value::as_str)
                     .unwrap_or("unknown");
+                if status == "failed" && p["turn"]["error"].is_object() {
+                    return Err(crate::rpc::CodexTurnError::from_value(&p["turn"]["error"]).into());
+                }
                 ensure!(
                     status == "completed",
                     "Codex turn ended with status {status}"
@@ -439,12 +442,7 @@ async fn codex_rpc(app: &App, bot: &Bot, run: &Run, rpc: &mut Rpc) -> Result<Str
             }
             "error" => {
                 if p["willRetry"] != true {
-                    bail!(
-                        "Codex reported an error: {}",
-                        p.pointer("/error/message")
-                            .and_then(Value::as_str)
-                            .unwrap_or("unknown error")
-                    );
+                    return Err(crate::rpc::CodexTurnError::from_value(&p["error"]).into());
                 }
             }
             _ => {}
