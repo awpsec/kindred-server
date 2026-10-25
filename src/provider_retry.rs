@@ -8,6 +8,10 @@ pub const EXHAUSTED: &str = "Connection issue - 5 retries failed.";
 const DELAYS: [u64; 5] = [5, 10, 20, 40, 60];
 
 fn transient(error: &anyhow::Error) -> bool {
+    // This decision takes precedence over text in any wrapping context.
+    if let Some(error) = error.downcast_ref::<crate::rpc::CodexTurnError>() {
+        return error.retryable;
+    }
     error.chain().any(|e| {
         let text = e.to_string();
         text == "The subscription provider could not complete this task. Check its official CLI connection and quota; no alternate provider was used."
@@ -15,8 +19,6 @@ fn transient(error: &anyhow::Error) -> bool {
             || text == "Codex request timed out"
             || text == "Kindred could not keep an SSH connection to the bot computer. Check that the computer is running and its SSH configuration is valid, then retry sign-in."
             || text == "Codex stopped responding on the bot computer. Try Check connection or sign in again; if it repeats, ask the server administrator to check the guest's Codex installation."
-            || text == "Codex turn ended with status failed"
-            || text.starts_with("Codex reported an error:")
             || text == "Pi harness disconnected. Check the pinned Node runtime and harness installation; no alternate provider was used."
             || text.starts_with("OpenRouter connection failed")
             || text.starts_with("The custom provider connection failed")
@@ -408,15 +410,54 @@ mod tests {
             "OpenRouter returned HTTP 401. Check credentials",
             "Invalid provider tool request",
             "Run cancelled",
+            "Codex turn ended with status failed",
+            "Codex reported an error: This content was flagged for possible cybersecurity risk.",
         ] {
             assert!(!transient(&anyhow::anyhow!(message)));
         }
         for message in [
             "OpenRouter returned HTTP 503. Unavailable",
             "Codex request timed out",
-            "Codex turn ended with status failed",
         ] {
             assert!(transient(&anyhow::anyhow!(message)));
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_policy_failure_stops_once_and_preserves_the_chat_reason() {
+        let app = tests::app();
+        let bot = tests::bot(&app.db, "codex");
+        let id = app.db.queue(&bot.id, "Synthetic provider rejection", 0).unwrap();
+        let run = app.db.claim_bot(&bot.id).unwrap().unwrap();
+        let calls = Cell::new(0);
+        let result = retry(&app, &run, || {
+            calls.set(calls.get() + 1);
+            ready(Err(crate::rpc::CodexTurnError::from_value(&json!({
+                "codexErrorInfo":"cyberPolicy",
+                "message":"This content was flagged for possible cybersecurity risk."
+            })).into()))
+        }, &[Duration::ZERO; 5]).await.unwrap_err();
+        assert_eq!(calls.get(), 1);
+        assert!(result.to_string().contains("cybersecurity risk"));
+        assert!(!app.db.events(&id).unwrap().iter().any(|e| e["kind"] == "provider_retry"));
+        app.db.finish(&id, "failed", "", &result.to_string()).unwrap();
+        app.db.chat_complete(&run).unwrap();
+        let messages = app.db.chat_messages(&run.chat_id).unwrap();
+        let notice = messages.iter().find(|m| m["kind"] == "result").unwrap();
+        assert!(notice["status_notice"]["text"].as_str().unwrap().contains("cybersecurity risk"));
+        assert!(!notice.to_string().contains(EXHAUSTED));
+    }
+
+    #[test]
+    fn codex_terminal_error_classification_survives_wrapping() {
+        for code in ["cyberPolicy", "misalignmentPolicyViolation", "tooManyDenials", "unauthorized", "badRequest", "contextWindowExceeded", "sessionBudgetExceeded", "usageLimitExceeded", "sandboxError", "other", "futureUnknownCode"] {
+            let error = anyhow::Error::new(crate::rpc::CodexTurnError::from_value(&json!({"codexErrorInfo":code,"message":"Provider refused this request"})))
+                .context("Codex request timed out");
+            assert!(!transient(&error), "{code}");
+        }
+        for code in ["rateLimitExceeded", "flexUnavailable", "serverOverloaded", "internalServerError"] {
+            let error = anyhow::Error::new(crate::rpc::CodexTurnError::from_value(&json!({"codexErrorInfo":code,"message":"Please try again"}))).context("Provider failed");
+            assert!(transient(&error), "{code}");
         }
     }
 }

@@ -14,6 +14,38 @@ pub struct Rpc {
     queue: VecDeque<Value>,
     next_id: u64,
 }
+/// A terminal turn error is not necessarily a broken connection. Preserve the
+/// provider's classification so policy/auth/input failures cannot be replayed.
+#[derive(Debug)]
+pub(crate) struct CodexTurnError {
+    message: String,
+    pub(crate) retryable: bool,
+}
+impl CodexTurnError {
+    pub(crate) fn from_value(error: &Value) -> Self {
+        let info = &error["codexErrorInfo"];
+        let retryable = match info.as_str() {
+            Some("rateLimitExceeded" | "flexUnavailable" | "serverOverloaded" | "internalServerError") => true,
+            Some(_) => false,
+            None => ["httpConnectionFailed", "responseStreamConnectionFailed", "responseStreamDisconnected", "responseTooManyFailedAttempts"]
+                .iter().any(|kind| info.get(*kind).filter(|v| v.is_object()).is_some_and(|details| {
+                    let status = &details["httpStatusCode"];
+                    status.is_null() || status.as_u64().is_some_and(|n| n == 408 || n == 429 || (500..600).contains(&n))
+                })),
+        };
+        Self {
+            message: error_message(error["message"].as_str().unwrap_or("The provider did not supply an error description.")),
+            retryable,
+        }
+    }
+}
+impl std::fmt::Display for CodexTurnError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Codex reported an error: {}", self.message)
+    }
+}
+impl std::error::Error for CodexTurnError {}
+
 fn error_message(message: &str) -> String {
     // RPC error messages can contain an entire upstream HTML challenge page.
     // Never forward its scripts, cookies, or challenge tokens to chat/settings.
@@ -197,6 +229,30 @@ impl Rpc {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codex_turn_errors_retry_only_known_temporary_failures() {
+        for code in ["cyberPolicy", "misalignmentPolicyViolation", "unauthorized", "badRequest", "contextWindowExceeded", "sessionBudgetExceeded", "usageLimitExceeded", "other"] {
+            let error = CodexTurnError::from_value(&json!({"codexErrorInfo":code,"message":"Provider reason"}));
+            assert!(!error.retryable, "{code}");
+            assert!(error.to_string().contains("Provider reason"));
+        }
+        for code in ["rateLimitExceeded", "flexUnavailable", "serverOverloaded", "internalServerError"] {
+            assert!(CodexTurnError::from_value(&json!({"codexErrorInfo":code})).retryable);
+        }
+        for kind in ["httpConnectionFailed", "responseStreamConnectionFailed", "responseStreamDisconnected", "responseTooManyFailedAttempts"] {
+            for status in [Value::Null, json!(408), json!(429), json!(500), json!(503)] {
+                assert!(CodexTurnError::from_value(&json!({"codexErrorInfo":{kind:{"httpStatusCode":status}}})).retryable, "{kind} {status}");
+            }
+            for status in [json!(400), json!(401), json!(403), json!(404), json!(200), json!("503")] {
+                assert!(!CodexTurnError::from_value(&json!({"codexErrorInfo":{kind:{"httpStatusCode":status}}})).retryable, "{kind} {status}");
+            }
+        }
+        assert!(!CodexTurnError::from_value(&json!({"message":"Unknown failure"})).retryable);
+        assert!(!CodexTurnError::from_value(&json!({"codexErrorInfo":{"unknownFutureError":{}}})).retryable);
+        let error = CodexTurnError::from_value(&json!({"message":"<html>secret challenge</html>","codexErrorInfo":"other"}));
+        assert!(!error.to_string().contains("secret"));
+    }
 
     #[test]
     fn upstream_error_pages_are_not_forwarded_and_plain_errors_are_bounded() {
