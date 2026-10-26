@@ -171,7 +171,15 @@ pub async fn ticket(State(app): State<Shared>, Json(request): Json<DesktopReques
     // Recheck under the lock after ownership selection, for view and control alike.
     let start_lease = match screen_start_lease(&app, slot) {
         Ok(lease) => lease,
-        Err(error) => return (StatusCode::CONFLICT, Json(json!({"error":error.to_string()}))).into_response(),
+        Err(error) => {
+            // A bot can hold its action lease for an entire turn while its
+            // desktop is already ready. Passive observation needs no startup
+            // mutation and must not compete with that action lease.
+            if !request.control && passive_screen_ready(&app,slot).await.unwrap_or(false) {
+                return issue_ticket(&app,false,identity);
+            }
+            return (StatusCode::CONFLICT, Json(json!({"error":error.to_string()}))).into_response();
+        }
     };
     // Finish waking before issuing the short-lived WebSocket ticket. Startup
     // failures must reach the UI as an HTTP result, not an unexplained socket close.
@@ -183,9 +191,12 @@ pub async fn ticket(State(app): State<Shared>, Json(request): Json<DesktopReques
         return screen_failure();
     }
     drop(start_lease); // Tickets and passive streaming do not retain the startup lock.
-    match app.vnc.issue(request.control, identity) {
+    issue_ticket(&app,request.control,identity)
+}
+fn issue_ticket(app:&Shared,control:bool,identity:crate::screen_capacity::Identity)->Response {
+    match app.vnc.issue(control, identity) {
         Ok(ticket) => {
-            Json(json!({"ticket":ticket,"control":request.control,"expires_in":30})).into_response()
+            Json(json!({"ticket":ticket,"control":control,"expires_in":30})).into_response()
         }
         Err(e) => (
             StatusCode::TOO_MANY_REQUESTS,
@@ -254,6 +265,14 @@ impl Drop for SessionGuard {
     fn drop(&mut self) {
         self.0.vnc.sessions.fetch_sub(1, Ordering::SeqCst);
     }
+}
+async fn passive_screen_ready(app:&Shared,slot:i64)->anyhow::Result<bool> {
+    // Maintenance acquires integrations before every screen action lease.
+    // Holding this gate excludes both its pending admission and its active
+    // work while we observe readiness. Never run screen_ensure on this path.
+    let _maintenance=app.integrations.clone().try_lock_owned()?;
+    crate::vm_maintenance::available(&app.db)?;
+    Ok(guest_phase(&app.config.vm,slot).await?==ScreenPhase::Ready)
 }
 fn screen_start_lease(app:&Shared,slot:i64)->anyhow::Result<OwnedMutexGuard<()>> {
     let lease=app.screen_lock(slot).try_lock_owned().map_err(|_|anyhow::anyhow!("Computer startup is busy"))?;
@@ -486,11 +505,41 @@ print(json.dumps(({'error':'owned ensure failure'} if failure=='ensure' else {})
             // Real App slot17 and all-screen/integration lease admission.
             let f=Fixture::new(&root,&format!("{mode}-held"),control);
             let held=f.app.screen_lock(17).try_lock_owned().unwrap();
-            assert_eq!(f.call(control).await.status(),StatusCode::CONFLICT);
-            f.no_ticket_or_transport();drop(held);
+            assert_eq!(f.call(control).await.status(),if control {StatusCode::CONFLICT} else {StatusCode::OK});
+            assert!(!f.root.join("ensure.entered").exists(),"viewing a busy ready screen must not wake or modify it");
+            assert_eq!(f.app.vnc.tickets.lock().unwrap().len(),if control {0} else {1});
+            assert!(f.app.screen_lock(17).try_lock().is_err(),"viewer must not release the bot's lock");
+            drop(held);f.app.vnc.tickets.lock().unwrap().clear();
             let all=crate::vm_maintenance::leases(&f.app).unwrap();
             assert_eq!(f.call(control).await.status(),StatusCode::CONFLICT);
             f.no_ticket_or_transport();drop(all);
+
+            if !control {
+                for blocked in ["phase","integration","durable"] {
+                    let f=Fixture::new(&root,&format!("view-busy-{blocked}"),false);
+                    let _bot=f.app.screen_lock(17).try_lock_owned().unwrap();
+                    let integration=if blocked=="integration" {Some(f.app.integrations.clone().try_lock_owned().unwrap())} else {None};
+                    if blocked=="phase" {std::fs::write(f.root.join("failure"),"phase").unwrap();}
+                    if blocked=="durable" {f.app.db.0.lock().unwrap().execute("UPDATE vm_maintenance SET phase='checking' WHERE id=1",[]).unwrap();}
+                    assert_eq!(f.call(false).await.status(),StatusCode::CONFLICT,"{blocked} must not issue a passive ticket");
+                    f.no_ticket_or_transport();drop(integration);
+                }
+            }
+
+            if !control {
+                let f=Fixture::new(&root,"view-readiness-admission",false);
+                let bot_lease=f.app.screen_lock(17).try_lock_owned().unwrap();
+                std::fs::remove_file(f.root.join("phase.release")).unwrap();
+                let app=f.app.clone();let bot=f.bot.clone();
+                let task=tokio::spawn(async move {ticket(State(app),Json(DesktopRequest{control:false,bot_id:bot})).await});
+                f.reached("phase").await;
+                assert!(f.app.integrations.try_lock().is_err(),"passive readiness must exclude maintenance admission");
+                drop(bot_lease);
+                assert!(crate::vm_maintenance::leases(&f.app).is_err(),"maintenance must stay excluded if bot finishes during readiness");
+                f.permit("phase");assert_eq!(task.await.unwrap().status(),StatusCode::OK);
+                assert!(!f.root.join("ensure.entered").exists());
+                assert!(crate::vm_maintenance::leases(&f.app).is_ok(),"observation must release its admission gate");
+            }
 
             // Observe the first real maintenance SQL read, then change durable
             // state while ownership selection is blocked. No sleep-based race.
