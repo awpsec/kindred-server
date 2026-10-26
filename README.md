@@ -104,6 +104,9 @@ docker compose up -d
 
 Keep the same project name and data volume. See [hosting and backups](docs/HOSTING.md)
 for KVM, HTTPS, advanced multi-user limits and existing bridge deployments.
+Run `python3 scripts/server-setup.py doctor` from the existing Compose directory
+to check container connectivity, acceleration and version mismatches without
+changing the deployment. See [setup troubleshooting](docs/HOSTING-TROUBLESHOOTING.md).
 
 ## Learn more
 

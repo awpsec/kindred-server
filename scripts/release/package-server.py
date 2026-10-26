@@ -121,7 +121,9 @@ def package(binary, output, cua_driver=None, cua_driver_archive=None):
         raise ValueError(f"Wrong binary version: {actual}")
     tracked = git("ls-files", "-z").decode().split("\0")
     files = {name: ROOT / name for name in tracked if name.startswith("deploy/") or name.startswith("third-party/")}
-    for name in ["compose.yaml", "compose.kvm.yaml", "LICENSE", "THIRD_PARTY_NOTICES.md",
+    for name in ["compose.yaml", "compose.kvm.yaml", ".env.example", "scripts/server-setup.py",
+                 "docs/HOSTING.md", "docs/HOSTING-TROUBLESHOOTING.md", "docs/SETUP.md",
+                 "LICENSE", "THIRD_PARTY_NOTICES.md",
                  "harness/pi/package.json", "harness/pi/package-lock.json",
                  "harness/pi/worker.mjs", "harness/pi/session.mjs", "harness/pi/opencode-models.json",
                  "ui/fonts/LICENSE.txt", "ui/fonts/SOURCE.json",

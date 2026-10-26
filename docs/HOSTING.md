@@ -42,7 +42,40 @@ loopback ports 22000–31999; new allocations skip occupied ports.
 The server image is Linux x86_64. Assign enough host memory for at least one 6 GB
 profile computer plus server overhead. QEMU uses KVM when available, otherwise TCG
 software emulation. On a Linux VPS, nested virtualization availability is controlled
-by the provider. Add `compose.kvm.yaml` and set `KINDRED_KVM_GID` to `stat -c %g /dev/kvm`.
+by the provider. The Computers page reports startup acceleration and warns when
+the container falls back to slow software emulation.
+
+Keep `compose.kvm.yaml` in your existing Compose project. Configure KVM once from
+that directory, naming the **base file you already use**:
+
+```sh
+python3 scripts/server-setup.py configure-kvm --compose-file compose.yaml
+```
+
+If you saved the Linux host-network template as `compose.yml`, pass that filename
+instead. Repeat `--compose-file` for other existing overlays, in their existing
+order. If `.env` already defines `COMPOSE_FILE`, omit the flag; the helper preserves
+that list. It backs up `.env`, records the actual `/dev/kvm` group, and appends the
+KVM overlay. It does not change networking mode, start containers or enable host
+virtualization. Review its output before `docker compose up -d server`. Subsequent
+plain `docker compose pull` / `up -d` commands keep KVM because `.env` retains the
+overlay. An explicit `-f` argument or shell `COMPOSE_FILE` overrides that selection;
+include all overlays if you use those overrides. The overlay now refuses a missing
+group ID instead of guessing a distribution-specific number.
+
+For a read-only setup check, run:
+
+```sh
+python3 scripts/server-setup.py doctor
+```
+
+It checks host/container KVM access, available storage, container memory limits,
+running binary versus checkout version, and outbound HTTPS **from inside the
+running server container**. DNS alone does not verify HTTPS downloads. It does
+not print credentials or change firewall rules. Run it from the original Compose
+project directory, using the same shell/Compose selection as your deployment.
+See [hosting troubleshooting](HOSTING-TROUBLESHOOTING.md) for recovery and host
+administration checks.
 
 ## Private team server with Tailscale HTTPS
 
@@ -99,7 +132,7 @@ KINDRED_PUBLIC_URL=https://kindred.example.com
 ```
 
 For existing bridge-mode installations, start the included HTTPS proxy with `docker compose --profile public up -d`.
-For KVM, also supply `-f compose.yaml -f compose.kvm.yaml`. Caddy obtains and renews
+Keep the persisted KVM overlay configured as above. Caddy obtains and renews
 the certificate. Keep the application port bound to localhost. Alternatively use
 an existing HTTPS reverse proxy with WebSocket support and set the matching public
 URL. Desktop clients accept HTTPS remote origins and loopback HTTP.
@@ -197,7 +230,24 @@ In **Server administration → Computers**, administrators can change
 CPU count, RAM and disk capacity for their current workspace. Shut down the
 computer there, save the resources, then start it again. Stop active bot work and
 return any controlled screens first. Existing disks and sign-ins are retained;
-disks can grow but cannot shrink. The managed Debian guest uses
+disks can grow but cannot shrink. For a fresh, smaller disk, shut down the computer
+and choose **Recreate computer…**. Specify the new resources and type `RECREATE`.
+Active/queued work, controlled screens, sign-in operations and maintenance block
+recreation. This is a separate operation from saving resources: it archives the
+old guest, including its files, installed apps and guest sign-ins, and leaves a
+fresh, stopped computer. Workspace chats, bots, provider settings and account
+credentials outside the guest remain. Start the fresh computer to provision it.
+
+Archives stay in the data volume under
+`profiles/_computer-backups/<profile-id>/<archive-id>/computer`, with a receipt.
+They contain sensitive guest data and are not automatically pruned. They retain
+the original image backing files, so keep the image cache too. Archive moves stay
+on the same filesystem and require no second copy of a large disk. A failed switch
+restores the old directory. A host administrator must restore an archive while
+the server and that computer are stopped, checking its saved port is still free;
+do not overwrite a running guest or combine files from different computers.
+
+The managed Debian guest uses
 [cloud-init growth modules](https://docs.cloud-init.io/en/latest/reference/modules.html)
 to expand its root filesystem on boot.
 

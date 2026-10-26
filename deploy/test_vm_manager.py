@@ -440,7 +440,7 @@ class ResourceChanges(unittest.TestCase):
                     with self.assertRaises(ValueError): manager.resize_resources(root,'fixture',invalid)
                 # An interrupted metadata write must never allow a disk shrink.
                 size=45
-                with self.assertRaisesRegex(ValueError,'only be increased'): manager.resize_resources(root,'fixture',{'cpus':4,'memory_mb':8192,'disk_gb':40})
+                with self.assertRaisesRegex(ValueError,'cannot shrink.*Recreate computer'): manager.resize_resources(root,'fixture',{'cpus':4,'memory_mb':8192,'disk_gb':40})
                 self.assertEqual(json.loads((root/'computer.json').read_text())['disk_gb'],45)
             with patch.object(manager,'running',return_value=True),patch.object(manager,'run') as run:
                 with self.assertRaisesRegex(ValueError,'Shut down'):manager.resize_resources(root,'fixture',{'cpus':4,'memory_mb':8192,'disk_gb':50})

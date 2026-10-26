@@ -974,6 +974,59 @@ async fn computer_resource_controls_require_admin_and_use_current_profile() {
 }
 
 #[tokio::test]
+async fn computer_recreation_requires_admin_confirmation_and_current_profile() {
+    let f = Fixture::new(false);
+    let owner = f.register("recreate-owner").await;
+    let member = f.register("recreate-member").await;
+    let token = owner["token"].as_str().unwrap();
+    let profile = f.p.identity(token).unwrap().profile;
+    let record = f.root.join("recreation-invoked.json");
+    std::fs::write(f.root.join("fixture-manager.py"),format!("import json,sys,pathlib\npayload=json.load(sys.stdin)\nvalue={{'action':sys.argv[1],'profile':sys.argv[2],'payload':payload,'archive_id':'fixture'}}\npathlib.Path({}).write_text(json.dumps(value))\nprint(json.dumps(value))\n",serde_json::to_string(&record.to_string_lossy()).unwrap())).unwrap();
+    let body = json!({"confirmation":"RECREATE","resources":{"cpus":2,"memory_mb":2048,"disk_gb":12}});
+    for denied in ["", member["token"].as_str().unwrap()] {
+        assert!(!f.request("POST","/identity/computer-settings/recreate",denied,body.clone()).await.0.is_success());
+    }
+    let mut incorrect = body.clone(); incorrect["confirmation"] = json!("yes");
+    assert!(!f.request("POST","/identity/computer-settings/recreate",token,incorrect).await.0.is_success());
+    let mut headers=HeaderMap::new();
+    headers.insert(header::AUTHORIZATION,format!("Bearer {token}").parse().unwrap());
+    headers.insert(header::ORIGIN,"https://untrusted.example".parse().unwrap());
+    assert!(recreate_computer(State(f.p.clone()),headers,Json(body.clone())).await.is_err());
+    assert!(!record.exists());
+    let (status,value)=f.request("POST","/identity/computer-settings/recreate",token,body.clone()).await;
+    assert_eq!(status,StatusCode::OK,"{value}");
+    assert_eq!(value["profile"],profile);
+    assert_eq!(value["action"],"recreate");
+    assert_eq!(value["payload"],body);
+}
+
+#[tokio::test]
+async fn computer_recreation_refuses_queued_work_maintenance_and_held_leases() {
+    let f = Fixture::new(false);
+    let owner = f.register("recreate-busy").await;
+    let token = owner["token"].as_str().unwrap();
+    let app = f.p.app(&f.p.identity(token).unwrap().profile).unwrap();
+    let record = f.root.join("recreation-invoked.json");
+    std::fs::write(f.root.join("fixture-manager.py"),format!("import pathlib\npathlib.Path({}).touch()\nprint('{{}}')\n",serde_json::to_string(&record.to_string_lossy()).unwrap())).unwrap();
+    let body = json!({"confirmation":"RECREATE","resources":{"cpus":2,"memory_mb":2048,"disk_gb":12}});
+    let integrations = app.integrations.clone().try_lock_owned().unwrap();
+    assert!(!f.request("POST","/identity/computer-settings/recreate",token,body.clone()).await.0.is_success());
+    drop(integrations);
+    let screen = app.screen_lock(17).try_lock_owned().unwrap();
+    assert!(!f.request("POST","/identity/computer-settings/recreate",token,body.clone()).await.0.is_success());
+    drop(screen);
+    app.db.0.lock().unwrap().execute("UPDATE vm_maintenance SET phase='starting' WHERE id=1",[]).unwrap();
+    assert!(!f.request("POST","/identity/computer-settings/recreate",token,body.clone()).await.0.is_success());
+    app.db.0.lock().unwrap().execute("UPDATE vm_maintenance SET phase='idle' WHERE id=1",[]).unwrap();
+    let bot = crate::tests::bot(&app.db,"codex");
+    app.db.queue(&bot.id,"Do not reset my computer",0).unwrap();
+    let (status,value)=f.request("POST","/identity/computer-settings/recreate",token,body).await;
+    assert!(!status.is_success(),"{value}");
+    assert!(value.to_string().contains("queued"),"{value}");
+    assert!(!record.exists());
+}
+
+#[tokio::test]
 async fn server_update_requires_administrator_and_valid_release() {
     let f=Fixture::new(false);
     let owner=f.register("update-owner").await;

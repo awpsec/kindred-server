@@ -438,6 +438,7 @@ pub fn router(portal: Portal) -> Router {
             "/identity/computer-settings",
             get(computer_settings).post(save_computer_settings),
         )
+        .route("/identity/computer-settings/recreate", post(recreate_computer))
         .route("/device/claim", post(claim_device))
         .route("/api/devices/link", post(link_device))
         .route(
@@ -1008,6 +1009,28 @@ async fn save_computer_settings(
         );
     }
     Ok(Json(crate::vm::resize_resources(&app.config.vm, v).await?))
+}
+
+async fn recreate_computer(
+    State(p): State<Portal>, headers: HeaderMap, Json(v): Json<Value>,
+) -> ApiResult {
+    p.origin(&headers)?;
+    let id = p.identity(bearer(&headers))?;
+    ensure!(id.admin, "Administrator access required");
+    ensure!(v["confirmation"] == "RECREATE", "Type RECREATE to confirm a fresh computer.");
+    let app = p.app(&id.profile)?;
+    let _leases = crate::vm_maintenance::leases(&app)
+        .map_err(|_| anyhow::anyhow!("The computer is in use. Stop active tasks and sign-in operations first."))?;
+    web::computer_ready(&app)?;
+    {
+        let c = app.db.0.lock().unwrap();
+        ensure!(!crate::workspace_transfer::frozen(&c)?, "Finish the workspace transfer first.");
+        let pending: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM runs WHERE status IN ('queued','running','awaiting_user','awaiting_approval','cancelling')) OR EXISTS(SELECT 1 FROM command_jobs WHERE status IN ('starting','running'))", [], |r| r.get(0))?;
+        ensure!(!pending, "Stop active and queued bot work before recreating the computer.");
+    }
+    let receipt = crate::vm::recreate_computer(&app.config.vm, v).await?;
+    app.vnc.close_all();
+    Ok(Json(receipt))
 }
 
 async fn server_update_status(State(p): State<Portal>, headers: HeaderMap) -> ApiResult {

@@ -44,7 +44,7 @@ class DriverPayload(unittest.TestCase):
             # Use real tracked distribution resources, but synthetic ELF payloads.
             resources = packager.git("ls-files", "-z").decode().split("\0")
             for name in resources:
-                if name and (name.startswith(("deploy/", "third-party/", "harness/pi/", "ui/fonts/", "docs/PROVIDER_MARKS")) or name in {"Cargo.toml", "compose.yaml", "compose.kvm.yaml", "LICENSE", "THIRD_PARTY_NOTICES.md", "ui/artifact-vendor.js.LEGAL.txt"}):
+                if name and (name.startswith(("deploy/", "third-party/", "harness/pi/", "ui/fonts/", "docs/PROVIDER_MARKS")) or name in {"Cargo.toml", "compose.yaml", "compose.kvm.yaml", ".env.example", "scripts/server-setup.py", "docs/HOSTING.md", "docs/HOSTING-TROUBLESHOOTING.md", "docs/SETUP.md", "LICENSE", "THIRD_PARTY_NOTICES.md", "ui/artifact-vendor.js.LEGAL.txt"}):
                     destination = root / name
                     destination.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copyfile(original / name, destination)
@@ -74,6 +74,8 @@ class DriverPayload(unittest.TestCase):
                 self.assertEqual((archive.getinfo(manifest["packaged_path"]).external_attr >> 16) & 0o777, 0o755)
                 self.assertEqual(json.loads(archive.read("bundle.json"))["cua_driver"], manifest)
                 self.assertEqual(archive.read("kindred"), data)
+                for name in ("scripts/server-setup.py", ".env.example", "docs/HOSTING.md", "docs/HOSTING-TROUBLESHOOTING.md"):
+                    self.assertEqual(archive.read(name),(root/name).read_bytes())
             self.assertEqual(json.loads((output / "SOURCE.json").read_text())["cua_driver"], manifest)
 
     def test_derivative_provenance_rejects_missing_or_changed_inputs(self):

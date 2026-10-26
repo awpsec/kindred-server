@@ -1,7 +1,9 @@
-# Optional Linux acceleration: set KINDRED_KVM_GID to `stat -c %g /dev/kvm`.
+# Optional Linux acceleration. Persist the actual host device group with:
+# python3 scripts/server-setup.py configure-kvm --compose-file compose.yaml
+# The helper only updates .env; review it before recreating the server container.
 services:
   server:
     devices: [/dev/kvm:/dev/kvm]
-    group_add: ["${KINDRED_KVM_GID:-108}"]
+    group_add: ["${KINDRED_KVM_GID:?Run scripts/server-setup.py configure-kvm with your base Compose file first}"]
     environment:
       KINDRED_VM_ACCEL: kvm

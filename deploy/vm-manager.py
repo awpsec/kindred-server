@@ -18,6 +18,7 @@ import subprocess
 import sys
 import time
 import urllib.request
+import urllib.error
 import uuid
 
 ROOT = Path(os.environ.get('KINDRED_PROFILES_DIR', '/data/profiles')).resolve()
@@ -44,10 +45,11 @@ def atomic(path, data):
     os.replace(temp, path)
 
 @contextlib.contextmanager
-def locked(path):
+def locked(path, wait=True):
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     with path.open('a') as stream:
-        fcntl.flock(stream, fcntl.LOCK_EX)
+        try:fcntl.flock(stream, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
+        except BlockingIOError as error:raise ValueError('The computer is starting or another computer operation is in progress. Wait for it to finish before recreating.') from error
         yield
 
 def identifier(value):
@@ -56,8 +58,8 @@ def identifier(value):
 
 def directory(value):
     value = identifier(value)
-    root = (ROOT / value / 'computer').resolve()
-    if root.parent.parent != ROOT: raise ValueError('Invalid computer directory')
+    root = ROOT / value / 'computer'
+    if root.resolve() != root: raise ValueError('Invalid computer directory')
     with locked(ROOT/'_lifecycle'/value):
         if (ROOT/'_retired'/value).exists(): raise ValueError('This computer belongs to a removed account')
         root.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -77,12 +79,18 @@ def base_image():
     image = CACHE / IMAGE
     with locked(CACHE / 'download.lock'):
         if image.exists(): return image
-        sums = urllib.request.urlopen(DEBIAN + 'SHA512SUMS', timeout=60).read(128*1024).decode()
-        matches = [line.split()[0] for line in sums.splitlines() if line.split()[-1].lstrip('*') == IMAGE]
+        try:
+            with urllib.request.urlopen(DEBIAN + 'SHA512SUMS', timeout=60) as response:
+                sums = response.read(128*1024).decode()
+        except (OSError, urllib.error.URLError) as error:
+            raise ValueError('Computer setup could not fetch Debian image checksums over HTTPS. Check outbound TCP/443 from the server container and firewall return traffic; DNS alone is not a connectivity check. Existing computers were not changed.') from error
+        matches = [line.split()[0] for line in sums.splitlines() if line.split() and line.split()[-1].lstrip('*') == IMAGE]
         if len(matches) != 1 or len(matches[0]) != 128: raise ValueError('Debian image checksum unavailable')
         temporary = CACHE / (uuid.uuid4().hex + '.download')
         try:
-            download(DEBIAN + IMAGE, temporary, 1024*1024*1024)
+            try: download(DEBIAN + IMAGE, temporary, 1024*1024*1024)
+            except (OSError, urllib.error.URLError) as error:
+                raise ValueError('Computer setup could not download the Debian image. Check free storage and outbound HTTPS from the server container, then retry. The incomplete download is discarded; existing disks are preserved.') from error
             with temporary.open('rb') as stream: actual = hashlib.file_digest(stream, 'sha512').hexdigest()
             if actual != matches[0]: raise ValueError('Debian image checksum mismatch; retry setup')
             os.replace(temporary, image)
@@ -360,6 +368,10 @@ def launch(root, args):
     (root/'startup-error.log').unlink(missing_ok=True)
 
 def start(root, profile):
+    # Refuse an explicitly requested but unavailable KVM device before downloads.
+    if not running(root):
+        accel=acceleration()
+        if accel['effective'] is None: raise ValueError(accel['message'])
     settings=prepare(root,profile)
     # Existing running computers must not depend on downloading or repackaging
     # installation media after a server update.
@@ -376,9 +388,8 @@ def start(root, profile):
         active=sum(running(p.parent) for p in ROOT.glob('*/computer/computer.json'))
         if active>=number('KINDRED_VM_MAX_RUNNING',4,1,128): raise ValueError('All computer slots are in use. Stop an idle profile computer or ask the administrator to raise the limit.')
         if memory_available()<(settings['memory_mb']+512)*1024*1024: raise ValueError('Not enough memory to start this computer. Stop an idle computer or increase the Kindred service/container memory limit to cover the VM and server together.')
-        accel=os.environ.get('KINDRED_VM_ACCEL','auto')
-        if accel not in ('auto','kvm','tcg'): raise ValueError('Invalid computer accelerator')
-        if accel=='auto': accel='kvm' if os.access('/dev/kvm',os.R_OK|os.W_OK) else 'tcg'
+        accel=acceleration()['effective']
+        if accel is None: raise ValueError(acceleration()['message'])
         args=['qemu-system-x86_64','-name','kindred-'+profile,'-machine','q35,accel='+accel,'-cpu','host' if accel=='kvm' else 'max',
               '-smp',settings['cpus'],'-m',settings['memory_mb'],'-display','none','-nodefaults','-device','VGA','-device','virtio-rng-pci',
               '-drive',f'file={root}/disk.qcow2,if=virtio,format=qcow2',
@@ -493,11 +504,37 @@ def initial_resources(root):
         if type(values[key]) is not int or not low<=values[key]<=high:raise ValueError('Invalid initial VM resource '+key)
     return values
 
+def acceleration(device=Path('/dev/kvm')):
+    requested=os.environ.get('KINDRED_VM_ACCEL','auto')
+    if requested not in ('auto','kvm','tcg'): raise ValueError('Invalid computer accelerator')
+    available=False
+    try:
+        descriptor=os.open(device,os.O_RDWR|os.O_CLOEXEC)
+        os.close(descriptor);available=True
+        reason=''
+    except FileNotFoundError:
+        reason='KVM is not exposed to the server container. Enable virtualization on the host and persist the KVM Compose overlay.'
+    except OSError:
+        reason='The server cannot open /dev/kvm. Match KINDRED_KVM_GID to the host device group and recreate the container with the KVM overlay.'
+    effective='tcg' if requested=='tcg' else 'kvm' if available else 'tcg' if requested=='auto' else None
+    message=reason if effective is None else ('Software emulation (TCG) is enabled. First startup and bot computers can be very slow. '+reason if effective=='tcg' else 'Hardware acceleration (KVM) is available.')
+    return {'requested':requested,'effective':effective,'kvm_available':available,'message':message.strip()}
+
+def computer_diagnostics(root, resources):
+    accel=acceleration();warnings=[]
+    if accel['effective']!='kvm':warnings.append(accel['message'])
+    free=shutil.disk_usage(root).free//(1024*1024)
+    if free<2048:warnings.append('Less than 2 GB storage remains in the profiles volume. Free space before installing or expanding a computer.')
+    if not running(root) and resources['memory_mb']>resource_capacity()['memory_budget_mb']:
+        warnings.append('The selected RAM exceeds currently available capacity. Stop another computer or lower RAM before starting. Leave headroom for the server and guest applications.')
+    return {'acceleration':accel,'storage_free_mb':free,'warnings':warnings}
+
 def resource_settings(root, profile):
     capacity=resource_capacity()
     limits={**RESOURCE_LIMITS,'cpus':(1,capacity['cpus']),'memory_mb':(1024,capacity['memory_budget_mb'])}
     if not (root/'computer.json').exists():
-        return {'state':'shut off','provisioned':False,'resources':initial_resources(root),'limits':limits,'capacity':capacity}
+        values=initial_resources(root)
+        return {'state':'shut off','provisioned':False,'recreation_supported':True,'resources':values,'limits':limits,'capacity':capacity,'diagnostics':computer_diagnostics(root,values)}
     settings = json.loads((root/'computer.json').read_text())
     disk = root/'disk.qcow2'
     if disk.exists() and not running(root):
@@ -508,6 +545,7 @@ def resource_settings(root, profile):
             settings['disk_gb'] = size
             atomic(root/'computer.json', settings)
     return {'state': 'running' if running(root) else 'shut off',
+            'provisioned':disk.is_file(),'recreation_supported':True,'diagnostics':computer_diagnostics(root,settings),
             'resources': {k: settings[k] for k in RESOURCE_LIMITS},
             'limits': limits,'capacity':capacity}
 
@@ -524,15 +562,62 @@ def resize_resources(root, profile, values):
         atomic(root/'resource-overrides.json',values)
         return resource_settings(root,profile)
     current = resource_settings(root, profile)['resources']
-    if values['disk_gb'] < current['disk_gb']:
-        raise ValueError('Disk size can only be increased.')
-    settings = json.loads((root/'computer.json').read_text())
     disk = root/'disk.qcow2'
+    if disk.exists() and values['disk_gb'] < current['disk_gb']:
+        raise ValueError('An existing disk cannot shrink. Keep its current size or use Recreate computer for a fresh, smaller disk. Recreation archives the old computer and removes installed apps and guest sign-ins from the new one.')
+    settings = json.loads((root/'computer.json').read_text())
     if disk.exists() and values['disk_gb'] > current['disk_gb']:
         run(['qemu-img', 'resize', disk, str(values['disk_gb'])+'G'])
     settings.update(values)
     atomic(root/'computer.json', settings)
     return resource_settings(root, profile)
+
+def recreate_computer(root, profile, payload):
+    """Archive a stopped guest atomically. Never delete a disk or profile data."""
+    if not isinstance(payload,dict) or set(payload)!={'confirmation','resources'} or payload['confirmation']!='RECREATE':
+        raise ValueError('Type RECREATE to confirm a fresh computer.')
+    values=payload['resources']
+    if not isinstance(values,dict) or set(values)!=set(RESOURCE_LIMITS):raise ValueError('Specify CPU count, memory and disk size.')
+    for key,(low,high) in RESOURCE_LIMITS.items():
+        if type(values[key]) is not int or not low<=values[key]<=high:raise ValueError('Invalid computer resource '+key)
+    validate_resource_capacity(values)
+    with locked(ROOT/'_lifecycle'/profile):
+        if root!=ROOT/profile/'computer' or root.resolve()!=root or (ROOT/'_retired'/profile).exists():
+            raise ValueError('Invalid computer directory')
+        if running(root):raise ValueError('Shut down the computer before recreating it.')
+        for name in ('computer.json','disk.qcow2'):
+            path=root/name
+            if path.is_symlink() or not path.is_file():raise ValueError('Only an existing, provisioned computer can be recreated.')
+        if json.loads((root/'computer.json').read_text()).get('id')!=profile:raise ValueError('Computer identity does not match this workspace.')
+        pidfile=root/'qemu.pid'
+        if pidfile.is_symlink():raise ValueError('Cannot verify computer process; recreation was not started.')
+        if pidfile.exists():
+            pid=int(pidfile.read_text().strip())
+            if pid<=1 or Path(f'/proc/{pid}').exists():raise ValueError('The computer process has not exited. Retry after shutdown finishes.')
+        # Also catch a live QEMU whose PID record was removed or became stale.
+        for command in Path('/proc').glob('[0-9]*/cmdline'):
+            try:
+                args=command.read_bytes().split(b'\0')
+                if args and args[0].rsplit(b'/',1)[-1]==b'qemu-system-x86_64' and any(str(root/'disk.qcow2').encode() in arg for arg in args):
+                    raise ValueError('The computer process has not exited. Retry after shutdown finishes.')
+            except (FileNotFoundError,PermissionError,ProcessLookupError):pass
+        archive_base=ROOT/'_computer-backups'/profile
+        if archive_base.resolve()!=archive_base:raise ValueError('Invalid computer archive directory')
+        archive_base.mkdir(parents=True,exist_ok=True,mode=0o700)
+        receipt_id=time.strftime('%Y%m%dT%H%M%SZ',time.gmtime())+'-'+uuid.uuid4().hex
+        backup=archive_base/receipt_id;backup.mkdir(mode=0o700)
+        # Prepare everything that can fail before moving the old computer.
+        fresh=backup/'fresh';fresh.mkdir(mode=0o700)
+        atomic(fresh/'resource-overrides.json',values)
+        atomic(fresh/'power-intent.json',{'running':False})
+        atomic(backup/'receipt.json',{'profile':profile,'created_at':int(time.time()),'resources':values,'archive_id':receipt_id})
+        os.rename(root,backup/'computer')
+        try:
+            os.rename(fresh,root)
+        except BaseException:
+            os.rename(backup/'computer',root)
+            raise
+        return {'state':'shut off','provisioned':False,'resources':values,'archive_id':receipt_id}
 
 def restore_computers():
     """Restore provisioned computers without blocking HTTP startup or creating new disks."""
@@ -565,12 +650,12 @@ def main():
     if action=='retire' and (ROOT/'_retired'/profile).exists():
         root=ROOT/profile/'computer'
     else: root=directory(profile)
-    if action not in ('ensure','start','domstate','connection-status','shutdown','reboot','resource-settings','resize-resources','retire'): raise ValueError('Unknown computer action')
+    if action not in ('ensure','start','domstate','connection-status','shutdown','reboot','resource-settings','resize-resources','recreate','retire'): raise ValueError('Unknown computer action')
     if action=='connection-status':
         print(json.dumps({'setup':connection_status(root)}));return
     if action=='domstate':
         print(json.dumps({'state':'running' if running(root) else 'shut off','provisioned':(root/'computer.json').exists()}));return
-    with locked(ROOT/'_operations'/profile):
+    with locked(ROOT/'_operations'/profile,wait=action!='recreate'):
         if action=='retire':
             with locked(ROOT/'_lifecycle'/profile):
                 (ROOT/'_retired').mkdir(exist_ok=True,mode=0o700)
@@ -596,6 +681,8 @@ def main():
             print(json.dumps(resource_settings(root, profile)));return
         if action == 'resize-resources':
             print(json.dumps(resize_resources(root, profile, json.loads(sys.stdin.read(4096)))));return
+        if action == 'recreate':
+            print(json.dumps(recreate_computer(root,profile,json.loads(sys.stdin.read(4096)))));return
         if action in ('ensure','start'):
             settings=start(root,profile)
             atomic(root/'power-intent.json',{'running':True})

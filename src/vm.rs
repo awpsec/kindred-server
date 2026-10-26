@@ -204,12 +204,20 @@ pub async fn managed(config: &Vm, action: &str, timeout: u64) -> Result<Value> {
 }
 
 pub async fn resize_resources(config: &Vm, values: Value) -> Result<Value> {
+    managed_resources(config, "resize-resources", values).await
+}
+
+pub async fn recreate_computer(config: &Vm, values: Value) -> Result<Value> {
+    managed_resources(config, "recreate", values).await
+}
+
+async fn managed_resources(config: &Vm, action: &str, values: Value) -> Result<Value> {
     ensure!(
         uuid::Uuid::parse_str(&config.managed_id).is_ok(),
         "This computer is managed outside Kindred"
     );
     let mut command = Command::new("python3");
-    command.args([&config.manager, "resize-resources", &config.managed_id]);
+    command.args([&config.manager, action, &config.managed_id]);
     let bytes = capture(command, Some(serde_json::to_vec(&values)?), 60, 65536).await?;
     Ok(serde_json::from_slice(&bytes)?)
 }
