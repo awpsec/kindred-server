@@ -66,5 +66,13 @@ class ServerSetup(unittest.TestCase):
             result=setup.doctor(self.root)
         self.assertNotIn('secret',json.dumps(result).lower())
 
+    def test_multiline_environment_is_never_rewritten_or_exposed(self):
+        original="SECRET='private first line\nCOMPOSE_FILE=private-value\nlast line'\n"
+        (self.root/'.env').write_text(original)
+        with self.assertRaisesRegex(ValueError,'Multiline') as error:setup.configure_kvm(self.root,['compose.yaml'],self.device)
+        self.assertEqual((self.root/'.env').read_text(),original)
+        self.assertNotIn('private',str(error.exception))
+        self.assertEqual(list(self.root.glob('.env.kindred*')),[])
+
 
 if __name__=='__main__':unittest.main()

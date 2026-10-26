@@ -20,6 +20,10 @@ def read_environment(path):
     values = {}
     for line in text.splitlines():
         match = re.match(r'^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$', line)
+        if match and match[2].startswith(('"', "'")):
+            try:shlex.split(match[2], comments=True)
+            except ValueError:
+                raise ValueError('Multiline or incomplete quoted .env values require manual KVM configuration. No file was changed.') from None
         if match and match[1] in ('COMPOSE_FILE', 'COMPOSE_PATH_SEPARATOR', 'KINDRED_KVM_GID'):
             parts = shlex.split(match[2], comments=True)
             if len(parts) > 1:
