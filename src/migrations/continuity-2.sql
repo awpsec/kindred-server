@@ -38,6 +38,7 @@ AND NOT (
   AND EXISTS(SELECT 1 FROM run_message_sources s JOIN runs r ON r.id=s.run_id WHERE s.message_seq=old.seq)
   AND NOT EXISTS(SELECT 1 FROM run_message_sources s LEFT JOIN runs r ON r.id=s.run_id
     WHERE s.message_seq=old.seq AND (r.id IS NULL OR r.status NOT IN ('queued','withdrawn')
+      OR EXISTS(SELECT 1 FROM continuity_sessions cs WHERE cs.run_id=r.id)
       OR EXISTS(SELECT 1 FROM events e WHERE e.run_id=r.id AND e.kind IN ('run_started','context','tool_requested','assistant'))))
   AND NOT EXISTS(SELECT 1 FROM run_message_sources s JOIN followup_offer_sources f ON f.source_run_id=s.run_id
     LEFT JOIN followup_offers o ON o.id=f.offer_id WHERE s.message_seq=old.seq AND (o.id IS NULL OR o.state<>'offered'))

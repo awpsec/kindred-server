@@ -87,13 +87,14 @@ class ContinuityInvalidation(unittest.TestCase):
         self.assertEqual(c.execute('SELECT count(*) FROM continuity_epochs').fetchone()[0],0)
 
     def test_started_handed_off_unknown_and_partially_delivered_messages_remain_protected(self):
-        for scenario in ['running','old-start','transported','missing-run','other-recipient']:
+        for scenario in ['running','old-start','context-built','transported','missing-run','other-recipient']:
             with self.subTest(scenario=scenario):
                 c=fixture();c.execute("UPDATE runs SET status='queued'")
                 c.execute("INSERT INTO chat_messages VALUES(1,'room','user','Original rule','message','',0)")
                 c.execute("INSERT INTO run_message_sources VALUES('run',1)")
                 if scenario=='running':c.execute("UPDATE runs SET status='running'")
                 if scenario=='old-start':c.execute("INSERT INTO events VALUES(1,'run','run_started','{}')")
+                if scenario=='context-built':c.execute("INSERT INTO continuity_sessions VALUES('run','bot','room',0,1,'fixture','fixture',1)")
                 if scenario=='transported':
                     c.execute("INSERT INTO followup_offers VALUES('offer','parent','transported')")
                     c.execute("INSERT INTO followup_offer_sources VALUES('run','offer')")
@@ -102,7 +103,9 @@ class ContinuityInvalidation(unittest.TestCase):
                     c.execute("INSERT INTO runs VALUES('other','another-bot','room','completed')")
                     c.execute("INSERT INTO run_message_sources VALUES('other',1)")
                 c.execute("UPDATE chat_messages SET body='Corrected rule' WHERE seq=1")
-                self.assertEqual(c.execute('SELECT invalidated FROM continuity_memory_guard').fetchone()[0],1)
+                guard=c.execute('SELECT invalidated FROM continuity_memory_guard').fetchone()
+                self.assertIsNotNone(guard,'Consumed or uncertain sources must remain protected')
+                self.assertEqual(guard[0],1)
 
 
 if __name__=='__main__':unittest.main()
