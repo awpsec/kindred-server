@@ -25,8 +25,13 @@ CREATE TRIGGER IF NOT EXISTS continuity_search_update AFTER UPDATE OF body ON ch
 END;
 -- Coarse invalidation deliberately covers legacy notes without source edges too.
 -- Raw source records remain available; stale derived prose is excluded on read.
-CREATE TRIGGER IF NOT EXISTS continuity_source_changed AFTER UPDATE OF body,suppressed ON chat_messages
-WHEN old.body<>new.body OR (old.suppressed<>new.suppressed AND old.kind NOT IN ('assistant','result')) BEGIN
+-- Reinstall on upgrade: IF NOT EXISTS would retain the faulty older trigger.
+-- Hiding an activity marker leaves its canonical task-work event intact.
+-- Checklist/artifact cards may be hidden as part of canonical source edits;
+-- keep those and all user edits conservative, even for queued recipients.
+DROP TRIGGER IF EXISTS continuity_source_changed;
+CREATE TRIGGER continuity_source_changed AFTER UPDATE OF body,suppressed ON chat_messages
+WHEN old.body<>new.body OR (old.suppressed<>new.suppressed AND old.kind NOT IN ('assistant','result','task_progress')) BEGIN
   INSERT INTO continuity_epochs VALUES(old.chat_id,1) ON CONFLICT(chat_id) DO UPDATE SET epoch=epoch+1;
   INSERT INTO continuity_memory_guard SELECT value,1 FROM json_each((SELECT members FROM chats WHERE id=old.chat_id)) WHERE value IN(SELECT id FROM bots) ON CONFLICT(bot_id) DO UPDATE SET invalidated=1;
 END;
