@@ -881,7 +881,7 @@ dependencies = [
 
 [[package]]
 name = "kindred"
-version = "0.87.9"
+version = "0.87.10"
 dependencies = [
  "anyhow",
  "axum",
