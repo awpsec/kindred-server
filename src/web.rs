@@ -236,6 +236,7 @@ pub fn router(app: Shared) -> Router {
         .route("/vm/{action}", post(vm_action))
         .route("/computer", get(screenshot).post(computer))
         .route("/computer/session", post(crate::vnc::ticket))
+        .route("/computer/observe-session", post(crate::vnc::observe_ticket))
         .route("/computer/screen-state", get(crate::vnc::screen_state))
         .route("/takeover", post(takeover))
         .route("/codex/{action}", post(codex))

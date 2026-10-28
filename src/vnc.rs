@@ -138,7 +138,23 @@ pub struct DesktopRequest {
     #[serde(default)]
     bot_id: String,
 }
+pub async fn observe_ticket(state: State<Shared>, request: Json<DesktopRequest>) -> Response {
+    ticket_mode(state.0, request.0, true).await
+}
 pub async fn ticket(State(app): State<Shared>, Json(request): Json<DesktopRequest>) -> Response {
+    ticket_mode(app, request, false).await
+}
+fn observation_identity(app: &Shared, bot_id: &str) -> anyhow::Result<Option<crate::screen_capacity::Identity>> {
+    anyhow::ensure!(!app.db.bot(bot_id)?.profile.archived, "Restore this bot before viewing its computer");
+    app.db.existing_screen(bot_id)?.map(|slot| app.db.screen_identity(bot_id, slot)).transpose()
+}
+fn observation_unavailable() -> Response {
+    (StatusCode::CONFLICT, Json(json!({"screen_state":"unavailable","error":"The screen is not ready for viewing. Open the computer to check it."}))).into_response()
+}
+async fn ticket_mode(app: Shared, request: DesktopRequest, observe_only: bool) -> Response {
+    if observe_only && request.control {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error":"An observation session cannot take control."}))).into_response();
+    }
     if let Ok(power) = crate::vm::control(&app.config.vm, "domstate").await {
         if let Some(phase) = power_phase(&power) {
             return (StatusCode::CONFLICT, Json(json!({"screen_state":phase,"error":if phase==ScreenPhase::Off {"Computer is off. Start it in Bot Computer settings."} else {"Computer is paused. Resume it before waking the screen."}}))).into_response();
@@ -147,8 +163,14 @@ pub async fn ticket(State(app): State<Shared>, Json(request): Json<DesktopReques
     if crate::vm_maintenance::available(&app.db).is_err() {
         return (StatusCode::CONFLICT, Json(json!({"error":"The computer is updating. Its screen will be available when updates finish."}))).into_response();
     }
-    let identity = match crate::web::screen_selection(&app, &request.bot_id).await {
-        Ok(s) => s,
+    let selection = if observe_only {
+        observation_identity(&app, &request.bot_id)
+    } else {
+        crate::web::screen_selection(&app, &request.bot_id).await.map(Some)
+    };
+    let identity = match selection {
+        Ok(Some(s)) => s,
+        Ok(None) => return observation_unavailable(),
         Err(e) => {
             return (
                 StatusCode::BAD_REQUEST,
@@ -167,6 +189,13 @@ pub async fn ticket(State(app): State<Shared>, Json(request): Json<DesktopReques
     }
     let _ownership=app.screen_ownership_lock(slot).read_owned().await;
     if app.db.screen_identity(&identity.owner,slot).ok().as_ref()!=Some(&identity) {return StatusCode::CONFLICT.into_response()};
+    // Background observation has no startup capability, even if readiness
+    // changed after the client's preflight or the bot's action lease is free.
+    if observe_only {
+        return if passive_screen_ready(&app,slot).await.unwrap_or(false) {
+            issue_ticket(&app,false,identity)
+        } else { observation_unavailable() };
+    }
     // Maintenance takes these same screen locks before its durable reservation.
     // Recheck under the lock after ownership selection, for view and control alike.
     let start_lease = match screen_start_lease(&app, slot) {
@@ -483,10 +512,10 @@ while not (p/(stage+'.release')).exists():
     assert time.monotonic()<deadline,'owned fixture gate timeout'
     time.sleep(.005)
 failure=(p/'failure').read_text() if (p/'failure').exists() else ''
-print(json.dumps(({'error':'owned ensure failure'} if failure=='ensure' else {}) if stage=='ensure' else {'state':'failed' if failure=='phase' else 'ready'}))
+print(json.dumps(({'error':'owned ensure failure'} if failure=='ensure' else {}) if stage=='ensure' else {'state':(p/'phase').read_text() if (p/'phase').exists() else ('failed' if failure=='phase' else 'ready')}))
 "#).unwrap();std::fs::set_permissions(&ssh,std::fs::Permissions::from_mode(0o700)).unwrap();
             let mut failures=Vec::new();
-            for mode in ["view","control"] {
+            for mode in ["view","control","observe"] {
                 let owned=root.join(mode);std::fs::create_dir(&owned).unwrap();
                 let output=std::process::Command::new(std::env::current_exe().unwrap())
                     .args(["--exact","vnc::composition_tests::ticket_startup_and_readiness_share_runtime_admission_for_both_modes","--nocapture","--test-threads=1"])
@@ -499,6 +528,48 @@ print(json.dumps(({'error':'owned ensure failure'} if failure=='ensure' else {})
             return;
         };
         let root=PathBuf::from(root);
+        if std::env::var("KINDRED_VNC_COMPOSITION_MODE").unwrap()=="observe" {
+            // Preflight can be stale by ticket admission. The observation
+            // endpoint must never enter startup, even with a free action lease.
+            let f=Fixture::new(&root,"observe-ready-to-asleep",false);
+            assert_eq!(guest_phase(&f.app.config.vm,17).await.unwrap(),ScreenPhase::Ready);
+            std::fs::write(f.root.join("phase"),"asleep").unwrap();
+            let response=observe_ticket(State(f.app.clone()),Json(DesktopRequest{control:false,bot_id:f.bot.clone()})).await;
+            f.no_ticket_or_transport();
+            assert_eq!(response.status(),StatusCode::CONFLICT);
+            assert!(f.app.screen_lock(17).try_lock().is_ok());
+            for busy in [false,true] {
+                let f=Fixture::new(&root,if busy {"observe-ready-busy"}else{"observe-ready-idle"},false);
+                let lease=if busy {Some(f.app.screen_lock(17).try_lock_owned().unwrap())}else{None};
+                let response=observe_ticket(State(f.app.clone()),Json(DesktopRequest{control:false,bot_id:f.bot.clone()})).await;
+                assert_eq!(response.status(),StatusCode::OK);
+                assert!(!f.root.join("ensure.entered").exists());
+                let ticket=f.app.vnc.tickets.lock().unwrap().values().next().unwrap().clone();
+                assert!(!ticket.1,"An observation ticket cannot grant control");
+                assert_eq!(ticket.2.owner,f.bot);
+                drop(lease);
+            }
+            for phase in ["waking","sleeping","failed"] {
+                let f=Fixture::new(&root,&format!("observe-{phase}"),false);
+                std::fs::write(f.root.join("phase"),phase).unwrap();
+                assert_eq!(observe_ticket(State(f.app.clone()),Json(DesktopRequest{control:false,bot_id:f.bot.clone()})).await.status(),StatusCode::CONFLICT);
+                f.no_ticket_or_transport();
+            }
+            let f=Fixture::new(&root,"observe-unallocated",false);
+            let other=crate::tests::bot(&f.app.db,"codex").id;
+            assert_eq!(observe_ticket(State(f.app.clone()),Json(DesktopRequest{control:false,bot_id:other.clone()})).await.status(),StatusCode::CONFLICT);
+            assert_eq!(f.app.db.existing_screen(&other).unwrap(),None);
+            f.no_ticket_or_transport();
+            assert!(!f.root.join("phase.entered").exists());
+            let f=Fixture::new(&root,"observe-interactive-rejected",true);
+            assert_eq!(observe_ticket(State(f.app.clone()),Json(DesktopRequest{control:true,bot_id:f.bot.clone()})).await.status(),StatusCode::BAD_REQUEST);
+            f.no_ticket_or_transport();
+            let f=Fixture::new(&root,"observe-maintenance",false);
+            let held=f.app.integrations.clone().try_lock_owned().unwrap();
+            assert_eq!(observe_ticket(State(f.app.clone()),Json(DesktopRequest{control:false,bot_id:f.bot.clone()})).await.status(),StatusCode::CONFLICT);
+            f.no_ticket_or_transport();drop(held);
+            return;
+        }
         for control in [false,true] {
             let mode=if control {"control"} else {"view"};
             if std::env::var("KINDRED_VNC_COMPOSITION_MODE").unwrap()!=mode {continue;}
