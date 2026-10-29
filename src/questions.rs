@@ -13,6 +13,13 @@ pub struct QuestionInput {
     pub context: String,
     pub options: Vec<String>,
 }
+impl QuestionInput {
+    pub fn validate_details(&self) -> Result<()> {
+        ensure!(!self.context.trim().is_empty() && self.context.chars().count() <= 1200 && self.context.split_whitespace().count() <= 120,
+            "Keep card details within 120 words and 1200 characters. Include only decision-relevant facts and verified links; keep longer background in chat.");
+        Ok(())
+    }
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Question {
     pub id: String,
@@ -145,7 +152,7 @@ impl Db {
         );
         ensure!(
             !input.context.trim().is_empty() && input.context.len() <= 8000,
-            "Include a concise factual summary and enough context to continue later"
+            "Provide decision details within 8 KB"
         );
         ensure!(
             (2..=6).contains(&input.options.len()),
@@ -356,6 +363,15 @@ impl Db {
 #[cfg(test)]
 mod context_tests {
     use super::visible_context;
+
+    #[test]
+    fn generated_details_are_brief_without_destroying_verified_links() {
+        let mut input=super::QuestionInput{topic_key:"choice".into(),question:"Which route?".into(),context:"The river route adds ten minutes. [Route details](https://example.com/routes?start=home&end=river)".into(),options:vec!["River".into(),"Direct".into()]};
+        assert!(input.validate_details().is_ok());
+        input.context="word ".repeat(121);assert!(input.validate_details().is_err());
+        input.context="字".repeat(1201);assert!(input.validate_details().is_err());
+        input.context=" ".into();assert!(input.validate_details().is_err());
+    }
 
     #[test]
     fn legacy_routing_is_hidden_without_removing_factual_context() {

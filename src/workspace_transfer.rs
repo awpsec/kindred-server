@@ -23,6 +23,7 @@ const TABLES: &[&str] = &[
     "deliverables",
     "chat_messages",
     "voice_calls",
+    "voice_delegations",
     "message_reactions",
     "chat_completion_receipts",
     "chat_completion_pending",

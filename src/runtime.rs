@@ -139,8 +139,8 @@ pub fn tool_specs() -> Vec<Value> {
         ),
         (
             "ask_question",
-            "Ask the user to choose what happens next. Group questions for the owner are delivered to your private chat; include the source group and enough context. Shows a persistent choice card with two to six options and a custom response. Include a concise factual summary, relevant verified links, and enough context to resume later. Use a stable topic_key for the same issue (for example service-trial-expiry-date), so future checks reuse the saved decision rather than asking again. Check decisions_list first. A pending card ends this turn and releases the computer; the answer queues a continuation for you in the owner DM, retaining the source group context when applicable. Do not include a custom/Other choice yourself. Never ask for passwords, codes or card details here.",
-            json!({"topic_key":{"type":"string","maxLength":160},"question":{"type":"string","maxLength":240},"context":{"type":"string","maxLength":8000},"options":{"type":"array","minItems":2,"maxItems":6,"items":{"type":"string","maxLength":160}}}),
+            "Ask the user to choose what happens next. Group questions for the owner are delivered to your private chat; include the source group and enough context. Shows a persistent choice card with two to six options and a custom response. Keep the question to one short line. Details must be at most 120 words and 1200 characters: two or three short sentences or bullets with only decision-relevant facts and verified links. Put longer background in chat, not the card. Use plain text or Markdown, not HTML-escaped entities. Use a stable topic_key for the same issue (for example service-trial-expiry-date), so future checks reuse the saved decision rather than asking again. Check decisions_list first. A pending card ends this turn and releases the computer; the answer queues a continuation for you in the owner DM, retaining the source group context when applicable. Do not include a custom/Other choice yourself. Never ask for passwords, codes or card details here.",
+            json!({"topic_key":{"type":"string","maxLength":160},"question":{"type":"string","maxLength":240},"context":{"type":"string","maxLength":1200},"options":{"type":"array","minItems":2,"maxItems":6,"items":{"type":"string","maxLength":160}}}),
             vec!["topic_key", "question", "context", "options"],
         ),
         (
@@ -867,7 +867,11 @@ async fn call_tool_inner(
             result
         },
         "kindred_guide" => crate::instructions::chapter(args["topic"].as_str().unwrap_or(""))?,
-        "ask_question" => app.db.ask_question(run, serde_json::from_value(args)?)?,
+        "ask_question" => {
+            let input: crate::questions::QuestionInput = serde_json::from_value(args)?;
+            input.validate_details()?;
+            app.db.ask_question(run, input)?
+        },
         "decisions_list" => {
             json!({"text":serde_json::to_string(&app.db.decisions_for_run(run,args["topic_key"].as_str())?)?})
         }
