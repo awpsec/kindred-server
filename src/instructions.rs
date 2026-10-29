@@ -239,6 +239,7 @@ pub fn build(
             members = app.db.server_chat_participants(&run.chat_id)?;
         }
         let mut messages = app.db.chat_messages(&run.chat_id)?;
+        crate::voice::restore_context(&app.db, &mut messages)?;
         messages.retain(|message|message["kind"]!="task_progress");
         let candidates:Vec<i64>=messages.iter().filter_map(|m|m["seq"].as_i64()).collect();
         let hidden=crate::continuity::store::hidden_sources(&app.db,&run.chat_id,&candidates)?;

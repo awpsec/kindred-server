@@ -1378,7 +1378,7 @@ async fn dispatch(State(p): State<Portal>, mut request: Request<Body>) -> Respon
                     .into_response();
             }
         }
-    } else if path == "/vnc" {
+    } else if path == "/vnc" || path == "/voice" {
         let ticket = reqwest::Url::parse(&format!("http://localhost{}", request.uri()))
             .ok()
             .and_then(|u| {
@@ -1392,7 +1392,7 @@ async fn dispatch(State(p): State<Portal>, mut request: Request<Body>) -> Respon
             .lock()
             .unwrap()
             .values()
-            .find(|app| app.vnc.has_ticket(&ticket))
+            .find(|app| if path == "/voice" { app.voice.has_ticket(&ticket) } else { app.vnc.has_ticket(&ticket) })
             .cloned();
         match app {
             Some(app) => app,

@@ -205,6 +205,8 @@ pub fn router(app: Shared) -> Router {
         .route("/dictation/openrouter/models", get(crate::dictation::models))
         .route("/dictation/openrouter/transcribe", post(crate::dictation::transcribe)
             .layer(DefaultBodyLimit::max(crate::dictation::REQUEST_BYTES)))
+        .route("/voice/settings", get(crate::voice::settings).put(crate::voice::save_settings))
+        .route("/voice/start", post(crate::voice::start))
         .route("/connections/decisions", get(decisions_status).post(save_decisions).delete(remove_decisions))
         .route("/opencode/{id}/key", post(crate::opencode::save_key))
         .route("/opencode/{id}/models", get(crate::opencode::models))
@@ -253,6 +255,7 @@ pub fn router(app: Shared) -> Router {
         .nest("/api", api)
         .route("/device/claim", post(crate::pairing::claim))
         .route("/vnc", get(crate::vnc::upgrade))
+        .route("/voice", get(crate::voice::upgrade))
         .merge(static_assets())
         .layer(DefaultBodyLimit::max(128 * 1024))
         .layer(middleware::from_fn(headers))
@@ -1747,6 +1750,8 @@ fn static_assets<S: Clone + Send + Sync + 'static>() -> Router<S> {
                 )
             }),
         )
+        .route("/voice.js", get(|| async { ([(header::CONTENT_TYPE,"text/javascript; charset=utf-8")],include_str!("../ui/voice.js")) }))
+        .route("/voice-audio-worklet.js", get(|| async { ([(header::CONTENT_TYPE,"text/javascript; charset=utf-8")],include_str!("../ui/voice-audio-worklet.js")) }))
         .route(
             "/dictation.js",
             get(|| async {

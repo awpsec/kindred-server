@@ -22,6 +22,7 @@ const TABLES: &[&str] = &[
     "attachments",
     "deliverables",
     "chat_messages",
+    "voice_calls",
     "message_reactions",
     "chat_completion_receipts",
     "chat_completion_pending",
@@ -172,6 +173,7 @@ impl Db {
             !active,
             "Finish or cancel active tasks before moving this profile"
         );
+        ensure!(!tx.query_row("SELECT EXISTS(SELECT 1 FROM voice_calls WHERE finished=0)", [], |r| r.get::<_,bool>(0))?, "End the voice call and wait for its conversation to be saved before moving this profile");
         ensure!(
             !crate::vm_maintenance::busy(&tx)?,
             "Wait for computer updates before moving this profile"

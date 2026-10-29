@@ -130,6 +130,7 @@ mod user_tasks;
 mod vm;
 mod vm_maintenance;
 mod vnc;
+mod voice;
 mod web;
 mod release_github;
 mod server_update;

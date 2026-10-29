@@ -252,6 +252,7 @@ pub fn app() -> Shared {
         maintenance_leases: Default::default(),
         pairing: Default::default(),
         vnc: crate::vnc::VncState::default(),
+        voice: Default::default(),
         catalogues: Default::default(),
     })
 }

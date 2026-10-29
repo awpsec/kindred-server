@@ -29,6 +29,7 @@ pub struct App {
     pub maintenance_leases: std::sync::Mutex<Option<crate::vm_maintenance::Leases>>,
     pub pairing: crate::pairing::Pairing,
     pub vnc: crate::vnc::VncState,
+    pub voice: crate::voice::Calls,
     pub catalogues: crate::provider_catalog::CatalogState,
 }
 pub type Shared = Arc<App>;
@@ -62,11 +63,14 @@ impl App {
             maintenance_leases: Default::default(),
             pairing: Default::default(),
             vnc: Default::default(),
+            voice: Default::default(),
             catalogues: Default::default(),
         });
         if crate::vm_maintenance::busy(&app.db.0.lock().unwrap())? {
             *app.maintenance_leases.lock().unwrap() = Some(crate::vm_maintenance::leases(&app)?);
         }
+        // Retain a failed handoff for recovery; it must not prevent server startup.
+        let _ = crate::voice::recover(&app.db);
         Ok(app)
     }
     pub fn screen_ownership_lock(&self,slot:i64)->Arc<tokio::sync::RwLock<()>> {
@@ -1502,6 +1506,7 @@ pub async fn scheduler(app: Shared) {
     let _maintenance_worker = AbortWorker(tokio::spawn(crate::vm_maintenance::worker(app.clone())));
     let _command_worker = AbortWorker(tokio::spawn(crate::command_jobs::worker(app.clone())));
     let _continuity_worker = AbortWorker(tokio::spawn(crate::continuity::store::worker(app.clone())));
+    let _voice_worker = AbortWorker(tokio::spawn(crate::voice::worker(app.clone())));
     let _mail_worker = AbortWorker(tokio::spawn(crate::mail_watch::worker(app.clone())));
     let capacity = Arc::new(tokio::sync::Semaphore::new(app.config.max_parallel_runs));
     loop {
