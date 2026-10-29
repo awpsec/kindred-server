@@ -202,6 +202,9 @@ pub fn router(app: Shared) -> Router {
             post(crate::local_access::poll).layer(DefaultBodyLimit::max(12 * 1024 * 1024)),
         )
         .route("/connections/openrouter", post(save_openrouter))
+        .route("/dictation/openrouter/models", get(crate::dictation::models))
+        .route("/dictation/openrouter/transcribe", post(crate::dictation::transcribe)
+            .layer(DefaultBodyLimit::max(crate::dictation::REQUEST_BYTES)))
         .route("/connections/decisions", get(decisions_status).post(save_decisions).delete(remove_decisions))
         .route("/opencode/{id}/key", post(crate::opencode::save_key))
         .route("/opencode/{id}/models", get(crate::opencode::models))

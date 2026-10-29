@@ -86,6 +86,7 @@ mod provider_catalog;
 mod provider_inbox;
 mod provider_retry;
 mod providers;
+mod dictation;
 mod questions;
 mod quiet_output;
 #[cfg(test)]
