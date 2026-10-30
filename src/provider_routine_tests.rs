@@ -79,9 +79,10 @@ elif mode=='decision':
  tool('ask_question',{'topic_key':'synthetic-routine-choice','question':'Continue this check?',
       'context':'Synthetic check needs your choice.','options':['Continue','Leave it']},True)
 elif mode=='empty':empty()
-elif mode=='provider_notice':
+elif mode in ('provider_notice','provider_notice_html'):
  assert provider=='claude-code'
- send({'type':'assistant','is_error':True,'text':'Synthetic Claude connector access was denied.'})
+ text='Synthetic Claude connector access was denied.' if mode=='provider_notice' else '<html><script>window._cf_chl_token="PRIVATE_PROVIDER_DIAGNOSTIC"</script>Upstream challenge</html>'
+ send({'type':'assistant','is_error':True,'text':text})
  quiet=tool('finish_quietly',{})
  assert quiet['failed'] and 'report it instead' in quiet['text']
  empty()
@@ -171,7 +172,7 @@ async fn routine_provider_protocols_failed_tool_keeps_original_reason_after_refu
         assert_eq!(saved.status, "failed");
         assert_eq!(saved.error, error);
         let messages = app.db.chat_messages(&run.chat_id).unwrap();
-        assert_eq!(messages.iter().filter(|m| m["kind"] == "result" && m["text"] == error).count(), 1);
+        assert_eq!(messages.iter().filter(|m| m["kind"] == "result" && m["text"] == format!("failed: {error}")).count(), 1);
         assert_eq!(app.db.notifications(Some(cursor)).unwrap()["items"].as_array().unwrap().len(), 1);
         let c = app.db.0.lock().unwrap();
         assert_eq!(c.query_row("SELECT count(*) FROM routine_completion WHERE run_id=?", [&run.id], |r| r.get::<_,i64>(0)).unwrap(), 0);
@@ -238,15 +239,29 @@ async fn routine_provider_protocols_pending_choices_remain_visible() {
 
 #[tokio::test]
 async fn routine_provider_protocols_claude_error_notice_cannot_finish_quietly() {
-    let app = tests::app();
-    let (bot, run) = scheduled(&app, "claude-code");
-    let result = protocol(&app, &bot, &run, "provider_notice").await;
-    assert!(result.as_ref().unwrap_err().to_string().contains("Synthetic Claude connector access was denied."));
-    finish(&app, &run, result);
-    assert_eq!(app.db.run(&run.id).unwrap().status, "failed");
-    assert_eq!(app.db.chat_messages(&run.chat_id).unwrap().iter().filter(|m| m["kind"] == "result").count(), 1);
-    let c = app.db.0.lock().unwrap();
-    assert_eq!(c.query_row("SELECT count(*) FROM routine_completion WHERE run_id=?", [&run.id], |r| r.get::<_,i64>(0)).unwrap(), 0);
+    for mode in ["provider_notice", "provider_notice_html"] {
+        let app = tests::app();
+        let (bot, run) = scheduled(&app, "claude-code");
+        let cursor = app.db.notifications(None).unwrap()["cursor"].as_i64().unwrap();
+        let result = protocol(&app, &bot, &run, mode).await;
+        assert!(result.as_ref().unwrap_err().to_string().contains("the provider reported an error"));
+        finish(&app, &run, result);
+        let saved = app.db.run(&run.id).unwrap();
+        assert_eq!(saved.status, "failed");
+        let messages = app.db.chat_messages(&run.chat_id).unwrap();
+        assert_eq!(messages.iter().filter(|m| m["kind"] == "result").count(), 1);
+        let notifications = app.db.notifications(Some(cursor)).unwrap();
+        assert_eq!(notifications["items"].as_array().unwrap().len(), 1);
+        let public = format!("{} {messages:?} {notifications}", saved.error);
+        for private in ["PRIVATE_PROVIDER_DIAGNOSTIC", "<html>", "<script>", "_cf_chl_token", "Synthetic Claude connector access"] {
+            assert!(!public.contains(private), "Raw provider diagnostics escaped into public output: {mode}");
+        }
+        if mode == "provider_notice_html" {
+            assert!(app.db.events(&run.id).unwrap().iter().any(|event| event["kind"] == "provider_diagnostic" && event["body"]["text"].as_str().unwrap().contains("PRIVATE_PROVIDER_DIAGNOSTIC")), "Raw diagnostics remain available in Activity");
+        }
+        let c = app.db.0.lock().unwrap();
+        assert_eq!(c.query_row("SELECT count(*) FROM routine_completion WHERE run_id=?", [&run.id], |r| r.get::<_,i64>(0)).unwrap(), 0);
+    }
 }
 
 #[test]

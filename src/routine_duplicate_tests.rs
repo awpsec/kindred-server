@@ -94,26 +94,39 @@ fn routine_result_duplicates_remain_physical_but_only_one_is_visible_per_run() {
     check_legacy_results(false);
 }
 
+fn legacy_routine_run(db: &Db, routine: &Routine) -> String {
+    // Historical routines predate mandatory structured completion. The current
+    // scheduler registers that policy, so construct the old persisted shape
+    // explicitly instead of misclassifying a new occurrence as legacy data.
+    let id = db.queue(&routine.bot_id, &routine.prompt, 0).unwrap();
+    let c = db.0.lock().unwrap();
+    c.execute("INSERT INTO routine_runs(run_id,routine_id,quiet) VALUES(?,?,0)", params![id, routine.id]).unwrap();
+    assert!(crate::routine_completion::root(&c, &id).unwrap().is_none());
+    id
+}
+
 fn check_legacy_results(with_events: bool) {
     let path = std::env::temp_dir().join(format!("kindred-routine-result-{}", db::id()));
     let (first, second, chat, duplicate_seq) = {
         let db = Db::open(path.to_str().unwrap()).unwrap();
         let bot = crate::tests::bot(&db, "codex");
         let saved = routine(&db, &bot, None);
-        let first = db.run_routine_now(&saved.id).unwrap();
+        let first = legacy_routine_run(&db, &saved);
         let text = "Routine final report";
         if with_events {
             db.event(&first, "assistant", serde_json::json!({"text": text}))
                 .unwrap();
         }
         db.finish(&first, "completed", text, "").unwrap();
+        assert_eq!(db.run(&first).unwrap().status, "completed");
         db.chat_complete(&db.run(&first).unwrap()).unwrap();
-        let second = db.run_routine_now(&saved.id).unwrap();
+        let second = legacy_routine_run(&db, &saved);
         if with_events {
             db.event(&second, "assistant", serde_json::json!({"text": text}))
                 .unwrap();
         }
         db.finish(&second, "completed", text, "").unwrap();
+        assert_eq!(db.run(&second).unwrap().status, "completed");
         db.chat_complete(&db.run(&second).unwrap()).unwrap();
         let chat = format!("dm-{}", bot.id);
         db.0

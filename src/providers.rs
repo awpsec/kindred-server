@@ -19,17 +19,25 @@ fn codex_tool_result(result: &Value) -> Value {
 // changes a provider error, successful tool completion, or deferred decision.
 pub(crate) fn routine_empty_error(app: &App, run: &Run) -> Result<Option<String>> {
     use rusqlite::OptionalExtension;
-    let failure: Option<(String, String)> = app.db.0.lock().unwrap().query_row(
-        "SELECT substr(CASE WHEN e.kind='tool_result' THEN COALESCE(json_extract(e.body,'$.tool'),'tool') ELSE 'the provider' END,1,128), substr(json_extract(e.body,'$.text'),1,2048)
+    let failure: Option<(String, String, bool)> = app.db.0.lock().unwrap().query_row(
+        "SELECT substr(CASE WHEN e.kind='tool_result' THEN COALESCE(json_extract(e.body,'$.tool'),'tool') ELSE 'the provider' END,1,128),
+             CASE WHEN e.kind='tool_result' THEN substr(json_extract(e.body,'$.text'),1,2048) ELSE '' END, e.kind!='tool_result'
          FROM events e WHERE e.run_id=?1 AND ((e.kind='tool_result' AND json_extract(e.body,'$.failed')=1)
              OR (e.kind IN ('assistant','provider_diagnostic') AND json_extract(e.body,'$.status_notice')='provider_error'))
          AND json_type(e.body,'$.text')='text' AND length(trim(json_extract(e.body,'$.text')))>0
          AND EXISTS(SELECT 1 FROM routine_runs WHERE run_id=?1)
          AND NOT EXISTS(SELECT 1 FROM routine_completion WHERE run_id=?1)
          ORDER BY CASE WHEN json_extract(e.body,'$.tool') IN ('finish_quietly','routine_complete') THEN 1 ELSE 0 END, e.seq DESC LIMIT 1",
-        [&run.id], |row| Ok((row.get(0)?, row.get(1)?)),
+        [&run.id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     ).optional()?;
-    Ok(failure.and_then(|(tool, text)| {
+    Ok(failure.and_then(|(tool, text, provider_notice)| {
+        if provider_notice {
+            // CLI notices can contain complete upstream HTML, challenge tokens
+            // or other private diagnostics. Leave them in Activity; the public
+            // routine result uses the same safe connection/quota guidance as
+            // terminal subscription errors, without changing retry policy.
+            return Some("This routine ended without a result after the provider reported an error. Check its connection and quota; review Activity for details.".into());
+        }
         let tool = runtime::bounded(tool.trim(), 128);
         let text = runtime::bounded(text.trim(), 2048);
         (!text.is_empty()).then(|| format!(
