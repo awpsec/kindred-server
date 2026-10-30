@@ -34,6 +34,7 @@ macro_rules! require {
         }
     };
 }
+pub mod preview;
 
 const ENDPOINT: &str = "wss://api.openai.com/v1/live/sessions";
 const MAX_TEXT: usize = 54_000;
@@ -90,6 +91,7 @@ pub async fn save_settings(
     );
     app.db
         .save_setting("voice", &serde_json::to_value(prefs)?)?;
+    app.voice.preview.cancel();
     settings(State(app)).await
 }
 #[derive(Clone)]
@@ -103,6 +105,7 @@ struct Ticket {
 pub struct Calls {
     tickets: Mutex<HashMap<String, Ticket>>,
     active: Mutex<Option<String>>,
+    preview: preview::State,
 }
 impl Calls {
     pub fn has_ticket(&self, key: &str) -> bool {
@@ -214,6 +217,7 @@ pub async fn upgrade(
         let mut active = app.voice.active.lock().unwrap();
         require!(active.is_none(), "Finish the current call first.");
         *active = Some(ticket.id.clone());
+        app.voice.preview.cancel();
     }
     let lease = Lease {
         app: app.clone(),
@@ -225,7 +229,47 @@ pub async fn upgrade(
 }
 pub fn migrate(c: &rusqlite::Connection) -> Result<()> {
     c.execute_batch("CREATE TABLE IF NOT EXISTS voice_calls(id TEXT PRIMARY KEY, chat_id TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE, started INTEGER NOT NULL, seconds INTEGER NOT NULL DEFAULT 0, transcript TEXT NOT NULL DEFAULT '[]', finished INTEGER NOT NULL DEFAULT 0, confirmed INTEGER NOT NULL DEFAULT 0, message_seq INTEGER, handoff_run TEXT); CREATE INDEX IF NOT EXISTS voice_pending ON voice_calls(id) WHERE finished=0;")?;
+    // Transport counters only: never retain microphone samples or provider errors.
+    c.execute_batch("CREATE TABLE IF NOT EXISTS voice_call_health(call_id TEXT PRIMARY KEY REFERENCES voice_calls(id) ON DELETE CASCADE, counters TEXT NOT NULL, error_code TEXT);")?;
     work::migrate(c)
+}
+
+#[derive(Default, Serialize)]
+struct AudioHealth {
+    input_frames: u64,
+    input_bytes: u64,
+    input_active_frames: u64,
+    output_frames: u64,
+    output_bytes: u64,
+    input_transcript_events: u64,
+    output_transcript_events: u64,
+}
+impl AudioHealth {
+    fn save(&self, db: &Db, id: &str, error: Option<&str>) -> Result<()> {
+        db.0.lock().unwrap().execute(
+            "INSERT INTO voice_call_health(call_id,counters,error_code) SELECT id,?,? FROM voice_calls WHERE id=? ON CONFLICT(call_id) DO UPDATE SET counters=excluded.counters,error_code=excluded.error_code",
+            params![serde_json::to_string(self)?, error, id],
+        )?;
+        Ok(())
+    }
+}
+#[derive(Debug)]
+struct MissingAudio;
+impl std::fmt::Display for MissingAudio {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Microphone audio stopped reaching the call.")
+    }
+}
+impl std::error::Error for MissingAudio {}
+fn audio_overdue(last: Instant, muted: bool) -> bool {
+    !muted && last.elapsed() >= Duration::from_secs(8)
+}
+fn audio_bytes(value: &Value, limit: usize) -> Result<Vec<u8>> {
+    let data = value.as_str().context("Invalid audio.")?;
+    ensure!(data.len() <= limit.div_ceil(3) * 4, "Invalid audio frame.");
+    let bytes = STANDARD.decode(data)?;
+    ensure!(!bytes.is_empty() && bytes.len() <= limit && bytes.len() % 2 == 0, "Invalid audio frame.");
+    Ok(bytes)
 }
 #[derive(Default, Serialize, Deserialize)]
 struct Transcript {
@@ -440,9 +484,20 @@ fn elapsed(start: Instant, closing: Option<Instant>) -> u64 {
         .as_secs()
 }
 async fn call(app: Shared, ticket: Ticket, mut client: WebSocket, _lease: Lease) {
-    let result = relay(&app, &ticket, &mut client).await;
-    if result.is_err() {
-        let _=send(&mut client,json!({"type":"error","message":"The voice connection ended. Check your OpenAI API key, credits, and GPT-Live access. Your conversation so far is being saved."})).await;
+    let mut health = AudioHealth::default();
+    let result = relay(&app, &ticket, &mut client, &mut health).await;
+    finish_call(&app, &ticket, &mut client, result, &health).await;
+}
+async fn finish_call(app: &Shared, ticket: &Ticket, client: &mut WebSocket, result: Result<bool>, health: &AudioHealth) {
+    let error_code = result.as_ref().err().map(|e| if e.is::<MissingAudio>() { "microphone_audio_missing" } else { "voice_connection_failed" });
+    let _ = health.save(&app.db, &ticket.id, error_code);
+    if let Some(code) = error_code {
+        let message = if code == "microphone_audio_missing" {
+            "Your microphone audio stopped reaching the call. Check your microphone and try again. Your conversation so far is being saved."
+        } else {
+            "The voice connection ended. Check your connection and OpenAI Voice settings, then try again. Your conversation so far is being saved."
+        };
+        let _=send(client,json!({"type":"error","code":code,"message":message})).await;
     }
     // Failures are intentionally not logged with provider bodies, keys, or transcripts.
     let exists = app
@@ -458,13 +513,13 @@ async fn call(app: Shared, ticket: Ticket, mut client: WebSocket, _lease: Lease)
         .unwrap_or(false);
     let saved = !exists || finish(&app.db, &ticket.id, result.unwrap_or(false)).is_ok();
     let _ = send(
-        &mut client,
+        client,
         json!({"type":"ended","id":ticket.id,"saved":saved}),
     )
     .await;
     let _ = tokio::time::timeout(Duration::from_secs(2), client.close()).await;
 }
-async fn relay(app: &Shared, ticket: &Ticket, client: &mut WebSocket) -> Result<bool> {
+async fn relay(app: &Shared, ticket: &Ticket, client: &mut WebSocket, health: &mut AudioHealth) -> Result<bool> {
     let key = crate::connections::decisions_key(app).context("Connect OpenAI in Settings.")?;
     ensure!(preferences(&app.db).enabled, "Voice is disabled.");
     let chat = app.db.chat(&ticket.chat)?;
@@ -480,7 +535,7 @@ async fn relay(app: &Shared, ticket: &Ticket, client: &mut WebSocket) -> Result<
     )
     .await
     .context("Voice connection timed out.")??;
-    relay_connected(app, ticket, client, upstream, &key).await
+    relay_connected(app, ticket, client, upstream, &key, health).await
 }
 // The same relay is exercised against a local provider fixture; no production
 // endpoint override or test-only authentication bypass exists.
@@ -490,6 +545,7 @@ async fn relay_connected<S>(
     client: &mut WebSocket,
     mut upstream: tokio_tungstenite::WebSocketStream<S>,
     key: &str,
+    health: &mut AudioHealth,
 ) -> Result<bool>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -510,16 +566,18 @@ where
     let mut last_client = Instant::now();
     let mut connected = Instant::now();
     let mut confirmed = false;
+    let mut last_audio = Instant::now();
+    let mut muted = false;
     loop {
         tokio::select! {
             incoming=upstream.next()=>{
                 let event=match incoming {Some(Ok(UpstreamMessage::Text(text)))=>serde_json::from_str::<Value>(&text)?,Some(Ok(UpstreamMessage::Ping(bytes)))=>{upstream.send(UpstreamMessage::Pong(bytes)).await?;continue;},Some(Ok(_))=>continue,_=>break};
                 match event["type"].as_str().unwrap_or("") {
-                    "session.started"=>{ensure!(started.is_none(),"Duplicate start.");started=Some(Instant::now());connected=Instant::now();
+                    "session.started"=>{ensure!(started.is_none(),"Duplicate start.");started=Some(Instant::now());connected=Instant::now();last_audio=Instant::now();
                         {let c=app.db.0.lock().unwrap();ensure!(!crate::workspace_transfer::frozen(&c)?,"This workspace is moving.");c.execute("INSERT INTO voice_calls(id,chat_id,started,transcript) VALUES(?,?,?,?)",params![ticket.id,ticket.chat,db::now(),serde_json::to_string(&transcript)?])?;}
                         send(client,json!({"type":"started","id":ticket.id,"started_ms":db::now()*1000})).await?;},
-                    "session.input_transcript.delta"|"session.output_transcript.delta"=>{transcript.append(&event)?;if event["type"]=="session.input_transcript.delta" {last_transcript=Instant::now();}if let Some(start)=started {checkpoint(&app.db,&ticket.id,&transcript,elapsed(start,closing))?;}},
-                    "session.output_audio.delta"=>{if closing.is_none(){send(client,json!({"type":"audio","data":event["delta"]})).await?;}},
+                    "session.input_transcript.delta"|"session.output_transcript.delta"=>{transcript.append(&event)?;if event["type"]=="session.input_transcript.delta" {last_transcript=Instant::now();health.input_transcript_events+=1;}else{health.output_transcript_events+=1;}if let Some(start)=started {checkpoint(&app.db,&ticket.id,&transcript,elapsed(start,closing))?;}},
+                    "session.output_audio.delta"=>{if closing.is_none(){let bytes=audio_bytes(&event["delta"],96000)?;health.output_frames+=1;health.output_bytes+=bytes.len() as u64;send(client,json!({"type":"audio","data":event["delta"]})).await?;}},
                     "session.delegation.created"=>{
                         ensure!(started.is_some(),"Call has not started.");
                         let id=event["delegation"]["id"].as_str().context("Missing delegation ID.")?;
@@ -539,8 +597,8 @@ where
                 let event=match incoming {Some(Ok(Message::Text(text)))=>serde_json::from_str::<Value>(&text)?,Some(Ok(Message::Pong(_)))=>{last_client=Instant::now();continue;},Some(Ok(Message::Ping(bytes)))=>{client.send(Message::Pong(bytes)).await?;last_client=Instant::now();continue;},_=>json!({"type":"end"})};
                 last_client=Instant::now();
                 let command=match event["type"].as_str().unwrap_or("") {
-                    "audio"=>{ensure!(started.is_some(),"Call has not started.");let data=event["data"].as_str().context("Invalid audio.")?;let bytes=STANDARD.decode(data)?;ensure!(!bytes.is_empty()&&bytes.len()<=48000&&bytes.len()%2==0,"Invalid audio frame.");json!({"type":"session.input_audio.append","audio":data})},
-                    "mute"=>json!({"type":if event["muted"]==true{"session.input_audio.mute"}else{"session.input_audio.unmute"},"event_id":uuid::Uuid::new_v4().to_string()}),
+                    "audio"=>{ensure!(started.is_some(),"Call has not started.");let bytes=audio_bytes(&event["data"],48000)?;last_audio=Instant::now();health.input_frames+=1;health.input_bytes+=bytes.len() as u64;if bytes.chunks_exact(2).any(|s|i16::from_le_bytes([s[0],s[1]]).unsigned_abs()>128){health.input_active_frames+=1;}json!({"type":"session.input_audio.append","audio":event["data"]})},
+                    "mute"=>{muted=event["muted"]==true;last_audio=Instant::now();json!({"type":if muted{"session.input_audio.mute"}else{"session.input_audio.unmute"},"event_id":uuid::Uuid::new_v4().to_string()})},
                     "end"=>{closing=Some(Instant::now());json!({"type":"session.close"})},
                     "ping"=>{send(client,json!({"type":"pong"})).await?;continue;},
                     _=>anyhow::bail!("Unsupported voice command.")
@@ -548,7 +606,11 @@ where
                 send_upstream(&mut upstream,command).await?;
             },
             _=heartbeat.tick()=>{
-                if let Some(start)=started {checkpoint(&app.db,&ticket.id,&transcript,elapsed(start,closing))?;}
+                if let Some(start)=started {checkpoint(&app.db,&ticket.id,&transcript,elapsed(start,closing))?;health.save(&app.db,&ticket.id,None)?;}
+                if started.is_some() && closing.is_none() && audio_overdue(last_audio,muted) {
+                    let _ = send_upstream(&mut upstream,json!({"type":"session.close"})).await;
+                    return Err(MissingAudio.into());
+                }
                 if started.is_some() && closing.is_none() && !app.account_disabled() {
                     let ready:Vec<String>=delegations.iter().filter(|(_,at)|at.elapsed()>=Duration::from_millis(1500)&&last_transcript.elapsed()>=Duration::from_millis(700)).map(|(id,_)|id.clone()).collect();
                     for id in ready {
@@ -614,6 +676,32 @@ mod tests {
             )
             .unwrap();
         id
+    }
+    #[test]
+    fn missing_audio_watchdog_distinguishes_silence_mute_and_stalled_transport() {
+        let old = Instant::now() - Duration::from_secs(9);
+        assert!(audio_overdue(old, false));
+        assert!(!audio_overdue(old, true));
+        assert!(!audio_overdue(Instant::now(), false));
+        assert_eq!(audio_bytes(&json!("AAAAAA=="),48000).unwrap(),vec![0;4]);
+        for data in [json!(""),json!("AA=="),json!("not base64"),Value::Null] {
+            assert!(audio_bytes(&data,48000).is_err());
+        }
+        assert!(audio_bytes(&json!(STANDARD.encode(vec![0;48002])),48000).is_err());
+    }
+    #[test]
+    fn audio_diagnostics_keep_only_transport_counts_and_a_fixed_error_code() {
+        let app=crate::tests::app();let bot=test_bot(&app.db,"codex");
+        let id=record(&app.db,&format!("dm-{}",bot.id),&Transcript::default());
+        let mut health=AudioHealth::default();health.input_frames=25;health.input_bytes=48000;
+        health.save(&app.db,&id,None).unwrap();
+        health.output_frames=2;health.save(&app.db,&id,Some("microphone_audio_missing")).unwrap();
+        let c=app.db.0.lock().unwrap();
+        let (raw,code):(String,String)=c.query_row("SELECT counters,error_code FROM voice_call_health WHERE call_id=?",[id],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+        let counters:Value=serde_json::from_str(&raw).unwrap();
+        assert!(counters.as_object().unwrap().values().all(|v|v.is_u64()));
+        assert_eq!(counters["input_frames"],25);assert_eq!(counters["output_frames"],2);
+        assert_eq!(code,"microphone_audio_missing");
     }
     #[test]
     fn live_work_uses_bot_provider_and_closing_never_repeats_dispatched_work() {
@@ -995,9 +1083,14 @@ mod tests {
                 async move {
                     upgrade.on_upgrade(move |mut client| async move {
                         let (provider, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+                        let mut health=AudioHealth::default();
                         let result =
-                            relay_connected(&app, &ticket, &mut client, provider, key).await;
+                            relay_connected(&app, &ticket, &mut client, provider, key, &mut health).await;
                         let confirmed = result.unwrap();
+                        assert_eq!(health.input_frames,1);
+                        assert_eq!(health.input_bytes,4);
+                        assert_eq!(health.output_frames,1);
+                        health.save(&app.db,&ticket.id,None).unwrap();
                         finish(&app.db, &ticket.id, confirmed).unwrap();
                         let _ = send(&mut client, json!({"type":"ended"})).await;
                         tx.lock().unwrap().take().unwrap().send(confirmed).unwrap();
@@ -1056,5 +1149,80 @@ mod tests {
         assert_eq!(prompt.matches("the plan.").count(), 1);
         server.abort();
         std::fs::remove_dir_all(root).unwrap();
+    }
+    #[tokio::test]
+    async fn a_live_socket_without_microphone_frames_ends_with_a_saved_receipt_and_releases_the_call() {
+        use std::{future::IntoFuture,sync::Arc};
+        let root=std::env::temp_dir().join(format!("kindred-voice-stall-{}",db::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut app=crate::tests::app();
+        Arc::get_mut(&mut app).unwrap().config.database=root.join("state.db").to_string_lossy().into_owned();
+        let key="sk-proj-voice-fixture-not-a-real-credential";
+        crate::connections::save_decisions(&app,Some(key)).unwrap();
+        let bot=test_bot(&app.db,"openrouter");
+        let ticket=Ticket{id:db::id(),chat:format!("dm-{}",bot.id),voice:"marin".into(),expires:db::now()+60};
+        let provider=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let provider_url=format!("ws://{}",provider.local_addr().unwrap());
+        let provider_task=tokio::spawn(async move {
+            let (stream,_)=provider.accept().await.unwrap();
+            let mut ws=tokio_tungstenite::accept_async(stream).await.unwrap();
+            ws.next().await.unwrap().unwrap();
+            send_upstream(&mut ws,json!({"type":"session.started"})).await.unwrap();
+            while let Some(Ok(UpstreamMessage::Text(text)))=ws.next().await {
+                let event:Value=serde_json::from_str(&text).unwrap();
+                if event["type"]=="session.close" {return;}
+            }
+            panic!("Stalled call did not close the provider session");
+        });
+        let (done_tx,done_rx)=tokio::sync::oneshot::channel();
+        let done_tx=Arc::new(Mutex::new(Some(done_tx)));
+        let a=app.clone();let t=ticket.clone();
+        let router=axum::Router::new().route("/",axum::routing::get(move |upgrade:WebSocketUpgrade| {
+            let app=a.clone();let ticket=t.clone();let url=provider_url.clone();let tx=done_tx.clone();
+            async move {upgrade.on_upgrade(move |mut client| async move {
+                *app.voice.active.lock().unwrap()=Some(ticket.id.clone());
+                let lease=Lease{app:app.clone(),id:ticket.id.clone()};
+                let (provider,_)=tokio_tungstenite::connect_async(url).await.unwrap();
+                let mut health=AudioHealth::default();
+                let result=relay_connected(&app,&ticket,&mut client,provider,key,&mut health).await;
+                assert!(result.as_ref().unwrap_err().is::<MissingAudio>());
+                finish_call(&app,&ticket,&mut client,result,&health).await;
+                drop(lease);tx.lock().unwrap().take().unwrap().send(()).unwrap();
+            })}
+        }));
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url=format!("ws://{}",listener.local_addr().unwrap());
+        let server=tokio::spawn(axum::serve(listener,router).into_future());
+        let (mut client,_)=tokio_tungstenite::connect_async(url).await.unwrap();
+        let started:Value=serde_json::from_str(client.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+        assert_eq!(started["type"],"started");
+        // A live connection and healthy silent input are not speech; both must
+        // remain valid. Then keep the socket alive while capture stops entirely.
+        send_upstream(&mut client,json!({"type":"mute","muted":true})).await.unwrap();
+        send_upstream(&mut client,json!({"type":"audio","data":"AAAAAA=="})).await.unwrap();
+        send_upstream(&mut client,json!({"type":"mute","muted":false})).await.unwrap();
+        let mut ping=tokio::time::interval(Duration::from_secs(1));
+        let mut error_seen=false;let mut ended=false;
+        tokio::time::timeout(Duration::from_secs(12),async {
+            while !ended {
+                tokio::select! {
+                    _=ping.tick()=>send_upstream(&mut client,json!({"type":"ping"})).await.unwrap(),
+                    event=client.next()=>{
+                        let event=event.unwrap().unwrap();
+                        if !event.is_text(){continue;}
+                        let value:Value=serde_json::from_str(event.to_text().unwrap()).unwrap();
+                        if value["type"]=="error" {assert_eq!(value["code"],"microphone_audio_missing");error_seen=true;}
+                        if value["type"]=="ended" {assert_eq!(value["saved"],true);ended=true;}
+                    }
+                }
+            }
+        }).await.unwrap();
+        assert!(error_seen);done_rx.await.unwrap();provider_task.await.unwrap();
+        assert!(app.voice.active.lock().unwrap().is_none());
+        assert_eq!(app.db.chat_messages(&ticket.chat).unwrap().len(),1);
+        let c=app.db.0.lock().unwrap();
+        assert_eq!(c.query_row("SELECT count(*) FROM runs",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+        assert_eq!(c.query_row("SELECT error_code FROM voice_call_health WHERE call_id=?",[ticket.id],|r|r.get::<_,String>(0)).unwrap(),"microphone_audio_missing");
+        drop(c);server.abort();std::fs::remove_dir_all(root).unwrap();
     }
 }

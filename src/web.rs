@@ -213,6 +213,7 @@ pub fn router(app: Shared) -> Router {
             .layer(DefaultBodyLimit::max(crate::dictation::REQUEST_BYTES)))
         .route("/voice/settings", get(crate::voice::settings).put(crate::voice::save_settings))
         .route("/voice/start", post(crate::voice::start))
+        .route("/voice/preview", post(crate::voice::preview::render))
         .route("/connections/decisions", get(decisions_status).post(save_decisions).delete(remove_decisions))
         .route("/opencode/{id}/key", post(crate::opencode::save_key))
         .route("/opencode/{id}/models", get(crate::opencode::models))
