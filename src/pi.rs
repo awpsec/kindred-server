@@ -292,17 +292,20 @@ async fn run_worker(
                     frame["output"].as_str().unwrap_or("").trim_end() == result.trim_end(),
                     "Pi completion did not match its emitted result"
                 );
-                ensure!(
-                    !result.trim().is_empty()
-                        || app
+                if result.trim().is_empty() {
+                    if let Some(error) = crate::providers::routine_empty_error(app, run)? {
+                        bail!(error);
+                    }
+                    ensure!(app
                             .db
                             .events(&run.id)?
                             .iter()
                             .any(|e| e["kind"] == "tool_result"
                                 && e["body"]["tool"] == "react_to_message"
                                 && e["body"]["failed"] != true),
-                    "Model completed without a result"
-                );
+                        "Model completed without a result"
+                    );
+                }
                 let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
                     .await
                     .context("Pi harness did not exit after completion")??;
@@ -351,6 +354,22 @@ pub fn sse_response(value: Value) -> axum::response::Response {
         chunk(json!({}), value["choices"][0]["finish_reason"].clone())
     );
     ([("content-type", "text/event-stream")], body).into_response()
+}
+
+#[cfg(all(test, unix))]
+pub(crate) async fn routine_protocol_fixture(app: &App, bot: &Bot, run: &Run, script: &str) -> Result<String> {
+    let path = std::env::temp_dir().join(format!("kindred-routine-protocol-{}.py", crate::db::id()));
+    std::fs::write(&path, script)?;
+    let config = crate::config::Pi {
+        node_binary: "/usr/bin/python3".into(),
+        worker_script: path.to_string_lossy().into_owned(),
+    };
+    let result = tokio::time::timeout(Duration::from_secs(5), run_worker(
+        app, bot, run, "fixture-key", json!({"context_window":128000}),
+        "http://127.0.0.1:9", true, &config,
+    )).await;
+    let _ = std::fs::remove_file(path);
+    result.context("Routine Pi fixture timed out")?
 }
 
 #[cfg(test)]

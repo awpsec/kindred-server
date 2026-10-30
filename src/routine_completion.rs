@@ -124,7 +124,7 @@ pub fn complete(c: &Connection, run: &str, args: &Value) -> Result<Value> {
         "This routine is no longer running"
     );
     if outcome == "quiet" {
-        ensure!(!c.query_row("SELECT EXISTS(SELECT 1 FROM events WHERE run_id=?1 AND ((kind='tool_result' AND json_extract(body,'$.failed')=1) OR (kind='assistant' AND json_extract(body,'$.status_notice')='provider_error'))) OR EXISTS(SELECT 1 FROM attachments WHERE run_id=?1) OR EXISTS(SELECT 1 FROM deliverables WHERE run_id=?1) OR EXISTS(SELECT 1 FROM approvals WHERE run_id=?1 AND status='pending') OR EXISTS(SELECT 1 FROM user_tasks WHERE run_id=?1 AND status IN ('pending','ready')) OR EXISTS(SELECT 1 FROM questions WHERE run_id=?1 AND status='pending')",[run],|r|r.get::<_,bool>(0))?,"This routine has an error, files or a pending decision; report it instead of finishing quietly");
+        ensure!(!c.query_row("SELECT EXISTS(SELECT 1 FROM events WHERE run_id=?1 AND ((kind='tool_result' AND json_extract(body,'$.failed')=1) OR (kind IN ('assistant','provider_diagnostic') AND json_extract(body,'$.status_notice')='provider_error'))) OR EXISTS(SELECT 1 FROM attachments WHERE run_id=?1) OR EXISTS(SELECT 1 FROM deliverables WHERE run_id=?1) OR EXISTS(SELECT 1 FROM approvals WHERE run_id=?1 AND status='pending') OR EXISTS(SELECT 1 FROM user_tasks WHERE run_id=?1 AND status IN ('pending','ready')) OR EXISTS(SELECT 1 FROM questions WHERE run_id=?1 AND status='pending')",[run],|r|r.get::<_,bool>(0))?,"This routine has an error, files or a pending decision; report it instead of finishing quietly");
     }
     let previous: Option<(String, String)> = c
         .query_row(

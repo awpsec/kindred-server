@@ -430,6 +430,11 @@ async fn run_child(app:&App,bot:&Bot,run:&Run,mut child:tokio::process::Child)->
                     frame["output"].as_str() == Some(text.as_str()),
                     "Provider completion did not match its output"
                 );
+                if text.trim().is_empty() {
+                    if let Some(error) = crate::providers::routine_empty_error(app, run)? {
+                        bail!(error);
+                    }
+                }
                 ensure!(
                     !text.trim().is_empty() || !calls.is_empty(),
                     "Provider completed without a result"
@@ -449,6 +454,15 @@ async fn run_child(app:&App,bot:&Bot,run:&Run,mut child:tokio::process::Child)->
             _ => bail!("Unexpected subscription provider frame"),
         }
     }
+}
+
+#[cfg(all(test, unix))]
+pub(crate) async fn routine_protocol_fixture(app: &App, bot: &Bot, run: &Run, script: &str) -> Result<String> {
+    let child = tokio::process::Command::new("python3")
+        .args(["-u", "-c", script])
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit())
+        .kill_on_drop(true).spawn()?;
+    run_child(app, bot, run, child).await
 }
 
 #[cfg(test)]

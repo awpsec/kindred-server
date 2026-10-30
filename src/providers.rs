@@ -13,6 +13,32 @@ fn codex_tool_result(result: &Value) -> Value {
     json!({"contentItems":items,"success":result["failed"]!=true})
 }
 
+// Empty provider output is not a quiet-completion receipt. Keep the underlying
+// scheduled-check failure useful, especially when finish_quietly was refused
+// afterwards. This only supplies diagnostics; it never records an outcome or
+// changes a provider error, successful tool completion, or deferred decision.
+pub(crate) fn routine_empty_error(app: &App, run: &Run) -> Result<Option<String>> {
+    use rusqlite::OptionalExtension;
+    let failure: Option<(String, String)> = app.db.0.lock().unwrap().query_row(
+        "SELECT substr(CASE WHEN e.kind='tool_result' THEN COALESCE(json_extract(e.body,'$.tool'),'tool') ELSE 'the provider' END,1,128), substr(json_extract(e.body,'$.text'),1,2048)
+         FROM events e WHERE e.run_id=?1 AND ((e.kind='tool_result' AND json_extract(e.body,'$.failed')=1)
+             OR (e.kind IN ('assistant','provider_diagnostic') AND json_extract(e.body,'$.status_notice')='provider_error'))
+         AND json_type(e.body,'$.text')='text' AND length(trim(json_extract(e.body,'$.text')))>0
+         AND EXISTS(SELECT 1 FROM routine_runs WHERE run_id=?1)
+         AND NOT EXISTS(SELECT 1 FROM routine_completion WHERE run_id=?1)
+         ORDER BY CASE WHEN json_extract(e.body,'$.tool') IN ('finish_quietly','routine_complete') THEN 1 ELSE 0 END, e.seq DESC LIMIT 1",
+        [&run.id], |row| Ok((row.get(0)?, row.get(1)?)),
+    ).optional()?;
+    Ok(failure.and_then(|(tool, text)| {
+        let tool = runtime::bounded(tool.trim(), 128);
+        let text = runtime::bounded(text.trim(), 2048);
+        (!text.is_empty()).then(|| format!(
+            "This routine ended without a result after {} failed: {text}",
+            if tool.is_empty() { "a tool" } else { tool },
+        ))
+    }))
+}
+
 pub async fn codex_models(rpc: &mut Rpc) -> Result<Vec<Value>> {
     let mut models = Vec::new();
     let mut cursor = Value::Null;
@@ -427,17 +453,20 @@ async fn codex_rpc(app: &App, bot: &Bot, run: &Run, rpc: &mut Rpc) -> Result<Str
                     rpc.request("turn/start",json!({"threadId":thread_id,"effort":effort,"input":[{"type":"text","text":format!("The human subtask has returned control. Respect its tool result: a skipped step is incomplete and must never be treated as successful. Your previous reply did not inspect the resulting page. Continue this same task by taking a fresh computer_screenshot, then continue the unfinished original task. Do not repeat form submission, verification clicks, account creation, or other completed actions. If the screenshot cannot be obtained, state that verification is incomplete. {}",crate::user_tasks::continuation_context(run))}]})).await?;
                     continue;
                 }
-                ensure!(
-                    !output.trim().is_empty()
-                        || app
+                if output.trim().is_empty() {
+                    if let Some(error) = routine_empty_error(app, run)? {
+                        bail!(error);
+                    }
+                    ensure!(app
                             .db
                             .events(&run.id)?
                             .iter()
                             .any(|e| e["kind"] == "tool_result"
                                 && e["body"]["tool"] == "react_to_message"
                                 && e["body"]["failed"] != true),
-                    "Codex completed without a result"
-                );
+                        "Codex completed without a result"
+                    );
+                }
                 return Ok(output);
             }
             "error" => {
@@ -453,6 +482,10 @@ async fn codex_rpc(app: &App, bot: &Bot, run: &Run, rpc: &mut Rpc) -> Result<Str
 #[cfg(all(test, unix))]
 #[path = "memory_contract_tests.rs"]
 mod memory_contract_tests;
+
+#[cfg(all(test, unix))]
+#[path = "provider_routine_tests.rs"]
+mod routine_protocol_tests;
 
 #[cfg(test)]
 mod tests {
