@@ -77,7 +77,7 @@ pub fn specs(app: &App) -> Vec<Value> {
     let specs = [
         (
             "slack_monitors_list",
-            "List this bot's Slack monitors and workspace identities. No connection: Settings > Routines > Slack; never request tokens in chat. ChatGPT Slack is separate. Events use no polling model or new reply permissions.",
+            "List this bot's Slack monitors and workspace identities. No connection: Settings > Slack monitoring; never request tokens in chat. ChatGPT Slack is separate. Events use no polling model or new reply permissions.",
             json!({}),
             vec![],
         ),
@@ -147,13 +147,13 @@ fn credential_path(app: &App) -> PathBuf {
 }
 fn credentials(app: &App, id: &str) -> Result<Credentials> {
     let bytes =
-        std::fs::read(credential_path(app)).context("Reconnect Slack in Settings → Routines")?;
+        std::fs::read(credential_path(app)).context("Reconnect Slack in Settings → Slack monitoring")?;
     let store: Value =
         serde_json::from_slice(&bytes).context("Slack credential store unavailable")?;
     serde_json::from_str(
         store[format!("slack:{id}")]
             .as_str()
-            .context("Reconnect Slack in Settings → Routines")?,
+            .context("Reconnect Slack in Settings → Slack monitoring")?,
     )
     .context("Slack credentials unavailable")
 }
@@ -180,7 +180,7 @@ pub fn view(app: &App, bot: Option<&str>) -> Result<Value> {
         items.push(item);
     }
     Ok(
-        json!({"connections":connections,"items":items,"delivery":"Slack Events API · Socket Mode","setup":"Settings → Routines → Slack → Connect Slack","scope_note":"All channels means channels available to this Slack identity and the app's event subscriptions. DMs belong to this connected identity. New messages only; reconnecting does not scan history."}),
+        json!({"connections":connections,"items":items,"delivery":"Slack Events API · Socket Mode","setup":"Settings → Slack monitoring → Connect Slack","scope_note":"All channels means channels available to this Slack identity and the app's event subscriptions. DMs belong to this connected identity. New messages only; reconnecting does not scan history."}),
     )
 }
 pub async fn list(State(app): State<Shared>) -> Result<Json<Value>, crate::web::Error> {

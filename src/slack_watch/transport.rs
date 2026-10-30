@@ -7,7 +7,7 @@ use tokio_tungstenite::tungstenite::{Message, protocol::WebSocketConfig};
 // contain credentials and are never exposed in status, logs or tool results.
 fn api_error(code: &str) -> String {
     match code {
-        "invalid_auth"|"token_revoked"|"account_inactive"|"not_authed"=>"Slack rejected this token. Reconnect the account in Settings → Routines.".into(),
+        "invalid_auth"|"token_revoked"|"account_inactive"|"not_authed"=>"Slack rejected this token. Reconnect the account in Settings → Slack monitoring.".into(),
         "missing_scope"=>"The Slack app is missing a required permission. Update its scopes and reinstall it.".into(),
         "not_allowed_token_type"=>"Use the Slack app's app-level token for events and its user or bot OAuth token for the account.".into(),
         "channel_not_found"|"not_in_channel"=>"This Slack account cannot access that channel. Join it or select an accessible channel.".into(),
