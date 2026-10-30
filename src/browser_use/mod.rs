@@ -1,4 +1,4 @@
-//! Codex browser worker. Kindred owns candidates and action arguments; the
+//! GPT browser worker. Kindred owns candidates and action arguments; the
 //! official Decisions transport selects only a grounded current choice.
 mod driver;
 #[cfg(test)]
@@ -121,7 +121,7 @@ impl Observation {
             "Browser left the requested origin"
         );
         ensure!(
-            (2..=256).contains(&self.candidates.len()),
+            (2..=255).contains(&self.candidates.len()),
             "Invalid browser candidate count"
         );
         let mut ids = std::collections::HashSet::new();
@@ -192,6 +192,8 @@ struct Outcome {
     reason: String,
     actions: Vec<Value>,
     uncertain: bool,
+    selection_attempts: usize,
+    selections_received: usize,
     #[serde(skip)]
     observation: Option<Observation>,
 }
@@ -202,6 +204,8 @@ impl Outcome {
             reason: reason.into(),
             actions: vec![],
             uncertain: false,
+            selection_attempts: 0,
+            selections_received: 0,
             observation: None,
         }
     }
@@ -293,13 +297,14 @@ async fn drive_until<D: Decisions + ?Sized, B: Browser, G: Guard>(
             observation,
             previous_actions: outcome.actions.clone(),
         };
+        outcome.selection_attempts += 1;
         let choice = match tokio::time::timeout_at(
             deadline.min(tokio::time::Instant::now() + Duration::from_secs(15)),
             selector.choose(&input),
         )
         .await
         {
-            Ok(Ok(choice)) => choice,
+            Ok(Ok(choice)) => { outcome.selections_received += 1; choice },
             Ok(Err(error)) => {
                 outcome.reason = format!(
                     "Decisions unavailable: {error}. Continue from the observed state; no new input was dispatched"
@@ -330,7 +335,7 @@ async fn drive_until<D: Decisions + ?Sized, B: Browser, G: Guard>(
             outcome.reason = if candidate.kind == "finish" {
                 "The selector reports the goal satisfied; verify the final observed result. No independent success confirmation was made"
             } else {
-                "Browser needs Codex planning or human assistance"
+                "Browser needs the bot to plan the next step or request human assistance"
             }
             .into();
             break;
@@ -453,8 +458,8 @@ impl Guard for RuntimeGuard<'_> {
             "Run cancelled"
         );
         ensure!(
-            self.app.db.bot(&self.bot.id)?.provider == "codex",
-            "Bot provider changed"
+            self.app.db.bot(&self.bot.id).is_ok_and(|b| supports(&b) && b.provider == self.bot.provider && b.model == self.bot.model),
+            "Bot provider or model changed"
         );
         ensure!(
             !self.app.db.turn_deferred(&self.run.id)?,
@@ -492,8 +497,14 @@ impl Guard for RuntimeGuard<'_> {
     }
 }
 
+fn supports(bot: &Bot) -> bool {
+    // The selection model uses its own explicitly saved OpenAI key. GPT chat
+    // models routed through API providers need the same helper as Codex bots.
+    bot.provider == "codex" || ((bot.provider == "openrouter" || bot.provider.starts_with("custom-"))
+        && (bot.model.starts_with("gpt-") || bot.model.starts_with("openai/gpt-")))
+}
 pub fn preferred(app: &App, bot: &Bot) -> bool {
-    bot.provider == "codex"
+    supports(bot)
         && (app.decisions.is_some() || crate::connections::decisions_key(app).is_some())
 }
 pub fn prepare_open(app: &App, bot: &Bot, args: &mut Value) {
@@ -507,7 +518,7 @@ pub fn prepare_open(app: &App, bot: &Bot, args: &mut Value) {
 }
 pub fn spec() -> Value {
     json!({"type":"function","name":"computer_browser_task",
-        "description":"Preferred browser worker for Codex bots with an explicitly configured OpenAI Decisions API-key connection. Uses your existing VM browser profile and focused tab; first open the site with normal computer tools. Supply an exact origin, goal and named exact form values. Selects grounded page actions, uses Kindred approvals and verifies fields. Never supply secrets. On fallback inspect current state and preserve completed/uncertain receipts with ordinary computer tools; never replay them or bypass denial. A finish selection is not independent proof of remote success.",
+        "description":"Preferred browser worker for GPT bots with an explicitly configured OpenAI API key. Uses the Decisions API with your existing VM browser profile and focused tab; first open the site with normal computer tools. Supply an exact origin, goal and named exact form values. Selects grounded page actions, uses Kindred approvals and verifies fields. Never supply secrets. Native file dialogs, visible embedded frames and sign-in may require ordinary computer tools. On fallback inspect current state and preserve completed/uncertain receipts; never replay them or bypass denial. After the unsupported step, resume this worker on the observed origin. A finish selection is not independent proof of remote success.",
         "inputSchema":{"type":"object","properties":{
             "goal":{"type":"string","maxLength":8000},
             "origin":{"type":"string","description":"Exact HTTP(S) origin without a path or credentials"},
@@ -516,27 +527,28 @@ pub fn spec() -> Value {
             "required":["goal","origin"],"additionalProperties":false}})
 }
 pub fn instructions(app: &App, bot: &Bot) -> &'static str {
-    if bot.provider != "codex" {
+    if !supports(bot) {
         return "";
     }
     if preferred(app, bot) {
-        "\nBrowser execution: prefer computer_browser_task on your existing Bot Computer for browser work. Supply the exact origin, goal and named values. On fallback, continue from current observations and completed action receipts with normal computer tools; never replay completed or uncertain actions or bypass a denial.\n"
+        "\nBrowser execution: prefer computer_browser_task on your existing Bot Computer for supported browser work. It uses the saved OpenAI API key independently of your chat provider. Open the site first; supply the actual current origin, goal and named values. On fallback, handle only the unsupported step with normal computer tools, then resume the browser worker from the current page and completed receipts. Never replay completed or uncertain actions or bypass a denial. Native file dialogs and sign-in are not API connection failures.\n"
     } else {
         "\nBrowser execution: Decisions is preferred when a supported connection is available. This runtime has no configured OpenAI Decisions API-key connection; use your existing computer tools. Subscription OAuth and ordinary Luna access do not establish Decisions API access.\n"
     }
 }
 pub async fn call(app: &App, bot: &Bot, run: &Run, args: Value) -> Result<Value> {
     ensure!(
-        bot.provider == "codex" && app.db.bot(&bot.id)?.provider == "codex",
-        "This browser worker is only available to Codex bots"
+        supports(bot) && supports(&app.db.bot(&bot.id)?),
+        "This browser worker is available to GPT bots with an OpenAI API key"
     );
     let task: Task = serde_json::from_value(args)?;
     task.validate()?;
     if !preferred(app, bot) {
-        return Ok(Outcome::new("unavailable", "OpenAI Decisions is not configured. Save an API key under Settings → Connections → Codex → Browser helper; Kindred supports the documented API-key route and does not use subscription OAuth for Decisions. Use the existing computer tools; no browser action was attempted.").result());
+        return Ok(Outcome::new("unavailable", "OpenAI Decisions is not configured. Save an OpenAI API key in Settings → Connections. Subscription OAuth does not authorize Decisions. Use the existing computer tools; no browser action was attempted.").result());
     }
     let configured = ConfiguredDecisions {
         app,
+        run,
         last_key: Default::default(),
     };
     let selector: &dyn Decisions = app.decisions.as_deref().unwrap_or(&configured);
@@ -560,14 +572,20 @@ pub async fn call(app: &App, bot: &Bot, run: &Run, args: Value) -> Result<Value>
         .await
     {
         Ok(browser) => browser,
-        Err(_) => {
+        Err(error) => {
             drop(session);
             app.desktop_sessions.release(&run.id);
-            return Ok(Outcome::new("unavailable", "Existing browser has no supported observation connection. Continue with ordinary computer tools; no action attempted.").result());
+            let outcome=Outcome::new("unavailable", format!("Browser observation connection unavailable: {error}. No Decisions request or browser action was attempted."));
+            app.db.event(&run.id,"browser_worker_finished",json!({"status":outcome.status,"reason":outcome.reason,"selection_attempts":0,"selections_received":0,"actions":0}))?;
+            return Ok(outcome.result());
         }
     };
     let outcome = session
-        .rpc(async { Ok(drive(selector, &mut browser, &guard, &task).await.result()) })
+        .rpc(async {
+            let outcome=drive(selector, &mut browser, &guard, &task).await;
+            app.db.event(&run.id,"browser_worker_finished",json!({"status":outcome.status,"reason":outcome.reason,"selection_attempts":outcome.selection_attempts,"selections_received":outcome.selections_received,"actions":outcome.actions.len()}))?;
+            Ok(outcome.result())
+        })
         .await;
     drop(browser);
     drop(session);
@@ -577,6 +595,7 @@ pub async fn call(app: &App, bot: &Bot, run: &Run, args: Value) -> Result<Value>
 
 struct ConfiguredDecisions<'a> {
     app: &'a App,
+    run: &'a Run,
     last_key: std::sync::Mutex<Option<Vec<u8>>>,
 }
 impl Decisions for ConfiguredDecisions<'_> {
@@ -590,9 +609,13 @@ impl Decisions for ConfiguredDecisions<'_> {
                     .as_ref()
                     .to_vec(),
             );
-            let result = transport::OpenAiDecisions::new(key)?.choose(input).await;
-            let _=self.app.db.save_setting("decisions_last_use",&json!({"fingerprint":self.last_key.lock().unwrap().clone(),"error":result.as_ref().err().map(|e|e.to_string())}));
-            result
+            let result = transport::OpenAiDecisions::new(key)?.request(input).await;
+            let receipt=json!({"checked_at":db::now(),"model":"gpt-6-luna","request_id":result.as_ref().ok().and_then(|v|v.request_id.as_deref()),"error":result.as_ref().err().map(|e|e.to_string())});
+            let _=self.app.db.event(&self.run.id,"browser_decisions_request",receipt.clone());
+            let mut saved=receipt;
+            saved["fingerprint"]=json!(self.last_key.lock().unwrap().clone());
+            let _=self.app.db.save_setting("decisions_last_use",&saved);
+            result.map(|v|v.choice)
         })
     }
 }

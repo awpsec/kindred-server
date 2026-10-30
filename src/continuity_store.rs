@@ -533,6 +533,22 @@ pub fn estimated_tokens(text: &str) -> usize {
     ascii.div_ceil(3) + (text.len() - ascii)
 }
 
+// Small models do not need empty optional containers and empty text fields.
+// Keep false/zero policy values and every nonempty instruction,
+// count, source identity and readback reference. This never truncates evidence.
+fn compact_empty_context(value: &mut Value) {
+    match value {
+        Value::Object(values) => {
+            for child in values.values_mut() { compact_empty_context(child); }
+            values.retain(|key,v|!(key == "omitted_items_from_loaded_window" && v == 0)
+                && !v.is_null() && !v.as_str().is_some_and(str::is_empty)
+                && !v.as_array().is_some_and(Vec::is_empty) && !v.as_object().is_some_and(serde_json::Map::is_empty));
+        }
+        Value::Array(values) => { for child in values { compact_empty_context(child); } }
+        _ => {}
+    }
+}
+
 pub fn budget_packet(
     db: &Db,
     run: &Run,
@@ -591,11 +607,9 @@ pub fn budget_packet(
         "/recent_shared_conversations/items",
         "/teammates/items",
         "/available_conversations/items",
-        "/continuity/recent_task_journal",
         "/continuity/last_harness_summary",
         "/continuity/notes/items",
         "/continuity/relevant_notes",
-        "/conversation/recent_messages/items",
         "/continuity/relevant_history/items",
         // Keep authoritative counts and readback instructions; topic excerpts
         // and duplicate history are pageable evidence, not required policy.
@@ -607,6 +621,10 @@ pub fn budget_packet(
         "/conversation_reminders/items",
         "/referenced_commands/items",
         "/bot/durable_memory",
+        // Recent corrections and completion records outrank recalled history.
+        // Role instructions and the compact memory prefix are never trimmed.
+        "/continuity/recent_task_journal",
+        "/conversation/recent_messages/items",
     ] {
         if fixed + estimated_tokens(&packet.to_string()) <= ceiling.saturating_sub(256) {
             break;
@@ -653,6 +671,10 @@ pub fn budget_packet(
             omitted.push(path.to_owned());
         }
     }
+    if omitted.iter().any(|path| path == "/bot/durable_memory") {
+        packet["bot"]["memory_shortened"] = json!(true);
+        packet["bot"]["memory_read_next_offset"] = json!(0);
+    }
     if omitted.iter().any(|path| path == "/continuity/obligations/items") {
         // The cursor must follow the retained page, not the original larger
         // selection; otherwise readback would skip the omitted commitments.
@@ -691,6 +713,9 @@ pub fn budget_packet(
             packet["bot"]["memory_read_next_offset"] = json!(offset);
         }
     }
+    if fixed + estimated_tokens(&packet.to_string()) > ceiling.saturating_sub(256) {
+        compact_empty_context(packet);
+    }
     let mut omitted_sections = std::collections::BTreeMap::new();
     for path in &omitted {
         *omitted_sections.entry(path).or_insert(0usize) += 1;
@@ -702,7 +727,7 @@ pub fn budget_packet(
         "Selected model context is too small for the current request, tools and required instructions; use a larger-context model or shorten the request. No required instructions were silently discarded (estimated {used}, fixed {fixed}, ceiling {ceiling}, window {window})"
     );
     // No text, queries, embeddings, credentials or source excerpts in diagnostics.
-    db.event(&run.id,"context_selection",json!({"version":2,"window_tokens":window,"estimated_input_tokens":used,"reserved_output_tokens":reserve,"omitted_items":omitted.len(),"budget_us":start.elapsed().as_micros().min(u64::MAX as u128) as u64,"private_memory_included":packet["bot"]["durable_memory"].is_string(),"history_items":packet["continuity"]["relevant_history"]["items"].as_array().map(Vec::len).unwrap_or(0),"open_obligations":packet["continuity"]["obligations"]["total"]}))?;
+    db.event(&run.id,"context_selection",json!({"version":3,"window_tokens":window,"estimated_input_tokens":used,"reserved_output_tokens":reserve,"omitted_items":omitted.len(),"omitted_sections":omitted_sections,"recent_message_items":packet["conversation"]["recent_messages"]["items"].as_array().map(Vec::len).unwrap_or(0),"budget_us":start.elapsed().as_micros().min(u64::MAX as u128) as u64,"private_memory_included":packet["bot"]["durable_memory"].is_string(),"history_items":packet["continuity"]["relevant_history"]["items"].as_array().map(Vec::len).unwrap_or(0),"open_obligations":packet["continuity"]["obligations"]["total"]}))?;
     Ok(())
 }
 

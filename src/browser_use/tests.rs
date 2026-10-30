@@ -164,6 +164,8 @@ async fn successful_actions_are_observed_and_preserved_when_decisions_becomes_un
     assert_eq!(outcome.status, "fallback");
     assert_eq!(browser.actions, 1);
     assert_eq!(browser.observations, 2);
+    assert_eq!(outcome.selection_attempts, 2);
+    assert_eq!(outcome.selections_received, 1);
     assert_eq!(outcome.actions[0]["applied"], true);
     assert!(!outcome.uncertain);
     assert_eq!(*guard.receipts.lock().unwrap(), vec![false]);
@@ -349,6 +351,7 @@ async fn runtime_guard_preserves_real_approval_receipts_and_budget() {
     bot.approval_mode = "auto".into();
     app.db.save_bot(&bot).unwrap();
     app.db.queue(&bot.id, "Configure an assessment", 0).unwrap();
+    app.db.screen(&bot.id).unwrap();
     let run = app.db.claim_bot(&bot.id).unwrap().unwrap();
     let guard = RuntimeGuard {
         app: &app,
@@ -582,6 +585,7 @@ async fn human_return_requires_desktop_observation_before_browser_lease() {
     Arc::get_mut(&mut app).unwrap().decisions = Some(Arc::new(Selector::new(&[])));
     let bot = crate::tests::bot(&app.db, "codex");
     app.db.queue(&bot.id, "Continue after sign-in", 0).unwrap();
+    app.db.screen(&bot.id).unwrap();
     let run = app.db.claim_bot(&bot.id).unwrap().unwrap();
     app.db
         .event(&run.id, "user_action_done", json!({"outcome":"done"}))
@@ -611,6 +615,7 @@ fn saved_credential_change_revokes_selected_action_before_input() {
         root.join("fixture.db").to_string_lossy().into_owned();
     let bot = crate::tests::bot(&app.db, "codex");
     app.db.queue(&bot.id, "Fixture", 0).unwrap();
+    app.db.screen(&bot.id).unwrap();
     let run = app.db.claim_bot(&bot.id).unwrap().unwrap();
     let key = "sk-synthetic-revoke-123456789";
     crate::connections::save_decisions(&app, Some(key)).unwrap();
@@ -637,6 +642,50 @@ fn saved_credential_change_revokes_selected_action_before_input() {
     crate::connections::save_decisions(&app, None).unwrap();
     assert!(guard.check().is_err());
     assert!(app.db.approvals().unwrap().is_empty());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn saved_openai_key_exposes_worker_to_gpt_api_models_only() {
+    let mut app=crate::tests::app();
+    let root=std::env::temp_dir().join(format!("kindred-gpt-decisions-{}",db::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    Arc::get_mut(&mut app).unwrap().config.database=root.join("fixture.db").to_string_lossy().into_owned();
+    for (provider, model, supported) in [
+        ("codex","gpt-daybreak-blue-latest",true),
+        ("custom-11111111-1111-4111-8111-111111111111","gpt-6.1",true),
+        ("openrouter","openai/gpt-6.1",true),
+        ("openrouter","anthropic/claude-opus-5",false),
+        ("claude-code","gpt-6.1",false),
+    ] {
+        let mut bot=crate::tests::bot(&app.db,provider);bot.model=model.into();
+        crate::connections::save_decisions(&app,None).unwrap();
+        assert!(!preferred(&app,&bot));
+        crate::connections::save_decisions(&app,Some("sk-synthetic-api-model-key-12345")).unwrap();
+        assert_eq!(preferred(&app,&bot),supported);
+        assert_eq!(crate::runtime::tool_specs_for(&app,&bot).iter().any(|s|s["name"]=="computer_browser_task"),supported);
+        let mut args=json!({"url":"https://example.test","_decisions_observation":true});prepare_open(&app,&bot,&mut args);
+        assert_eq!(args.get("_decisions_observation").is_some(),supported);
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn api_verification_receipt_is_for_current_key_and_has_no_credentials() {
+    let mut app=crate::tests::app();
+    let root=std::env::temp_dir().join(format!("kindred-decisions-receipt-{}",db::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    Arc::get_mut(&mut app).unwrap().config.database=root.join("fixture.db").to_string_lossy().into_owned();
+    let key="sk-synthetic-receipt-key-12345";
+    crate::connections::save_decisions(&app,Some(key)).unwrap();
+    assert_eq!(crate::connections::decisions_status(&app)["access_verified"],false);
+    app.db.save_setting("decisions_last_use",&json!({"fingerprint":ring::digest::digest(&ring::digest::SHA256,key.as_bytes()).as_ref(),"checked_at":db::now(),"request_id":"req_fixture","error":null})).unwrap();
+    let receipt=crate::connections::decisions_status(&app);
+    assert_eq!(receipt["access_verified"],true);assert_eq!(receipt["last_request_id"],"req_fixture");
+    assert!(!receipt.to_string().contains(key));assert!(receipt.get("fingerprint").is_none());
+    crate::connections::save_decisions(&app,Some("sk-synthetic-replacement-12345")).unwrap();
+    let receipt=crate::connections::decisions_status(&app);
+    assert_eq!(receipt["access_verified"],false);assert!(receipt["last_request_id"].is_null());
     std::fs::remove_dir_all(root).unwrap();
 }
 

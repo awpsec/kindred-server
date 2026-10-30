@@ -201,7 +201,49 @@ class BrowserTests(unittest.TestCase):
             result = subprocess.run(['python3', str(ROOT / 'deploy/browser-driver.py'), absent], input=request,
                 text=True, capture_output=True, timeout=15, check=True)
             self.assertIn('error', json.loads(result.stdout))
+            self.assertEqual(json.loads(result.stdout)['code'], 'endpoint_unavailable')
             self.assertEqual(result.stderr, '')
+
+    def test_large_scrolling_page_keeps_visible_controls_and_terminal_choices(self):
+        # Real dashboards have many controls/frames below the viewport. They
+        # must not make the current page unusable before an API request.
+        self.driver.evaluate('document.body.insertAdjacentHTML("beforeend", `<div style="position:absolute;top:10000px">${"<button>Offscreen</button>".repeat(500)}<iframe src="about:blank"></iframe></div>`)')
+        observation=self.driver.observe(self.origin,{})
+        self.assertFalse(any('Offscreen' in c['label'] for c in observation['candidates']))
+        self.assertTrue(self.action(observation,'Set checkbox \u201cSafe checks\u201d')['applied'])
+        # Many overlapping visible fields and supplied values used to exceed
+        # the candidate ceiling, aborting the whole worker.
+        self.driver.evaluate('document.body.insertAdjacentHTML("beforeend", `<div style="position:fixed;top:400px">${"<input aria-label=Fixture>".repeat(180)}</div>`)')
+        observation=self.driver.observe(self.origin,{f'v{i}':str(i) for i in range(16)})
+        self.assertEqual(len(observation['candidates']),255)
+        self.assertEqual(observation['candidates'][-2]['id'],'finish')
+        self.assertEqual(observation['candidates'][-1]['id'],'escalate')
+        self.assertEqual(len({c['id'] for c in observation['candidates']}),255)
+        self.assertTrue(any(c['kind']=='scroll' for c in observation['candidates']))
+
+    def test_observation_waits_for_navigation_without_replaying_actions(self):
+        from unittest.mock import patch
+        original=self.driver.observe_once
+        attempts=[]
+        def navigating(origin, values):
+            attempts.append(1)
+            if len(attempts)<3: raise module.BrowserUnavailable('navigation')
+            return original(origin,values)
+        with patch.object(self.driver,'observe_once',side_effect=navigating), patch.object(self.driver,'act',side_effect=AssertionError('No action retry')):
+            observation=self.driver.observe(self.origin,{})
+        self.assertEqual(len(attempts),3)
+        self.assertTrue(observation['snapshot_id'])
+
+    def test_browser_errors_are_actionable_without_leaking_page_or_key(self):
+        error=module.wire_error(RuntimeError('private URL sk-secret-token page text'))
+        self.assertEqual(error['code'],'unavailable')
+        self.assertNotIn('secret',json.dumps(error))
+        self.driver.evaluate('document.body.insertAdjacentHTML("beforeend", `<iframe src="about:blank"></iframe>`)')
+        with self.assertRaises(module.BrowserUnavailable) as caught:
+            self.driver.observe(self.origin,{})
+        self.assertEqual(caught.exception.code,'unsupported_frame')
+        self.assertIn('ordinary computer tools',module.wire_error(caught.exception)['error'])
+        self.assertIsNone(self.driver.snapshot)
 
     def test_authentication_views_do_not_produce_model_observations(self):
         observation = self.driver.observe(self.origin, {})
@@ -214,13 +256,15 @@ class BrowserTests(unittest.TestCase):
         self.assertIsNone(self.driver.snapshot)
 
 
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--chrome', required=True)
     parser.add_argument('--node', default='node')
     parser.add_argument('--playwright-module', default='playwright')
+    parser.add_argument('--test', action='append', default=[])
     args = parser.parse_args()
     CHROME = args.chrome
     NODE = args.node
     PLAYWRIGHT_MODULE = args.playwright_module
-    unittest.main(argv=[__file__], verbosity=2)
+    unittest.main(argv=[__file__, *args.test], verbosity=2)

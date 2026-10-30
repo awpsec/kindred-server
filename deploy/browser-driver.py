@@ -19,6 +19,30 @@ from urllib.parse import urlsplit
 
 LIMIT = 8 * 1024 * 1024
 
+# Only these Kindred-owned messages cross the wire. Never forward arbitrary CDP
+# exception descriptions, page contents, URLs, credentials or supplied values.
+ERRORS = {
+    'not_focused': 'No focused tab at the requested origin. A native dialog, browser chrome or another tab may need ordinary computer tools.',
+    'navigation': 'The browser is still navigating or its page context changed. Inspect the current page before continuing.',
+    'authentication': 'Sign-in or verification requires the normal human-interaction flow; no page observation was sent to Decisions.',
+    'unsupported_frame': 'A visible embedded frame needs ordinary computer tools; no page observation was sent to Decisions.',
+    'origin_changed': 'The page left the requested origin. Inspect the current page before choosing another origin.',
+    'identity_changed': 'The selected browser profile, process or display changed; no further input was attempted.',
+    'endpoint_unavailable': 'This browser profile has no usable observation connection. Open it with Kindred computer tools.',
+    'unavailable': 'Existing browser connection or observation unavailable',
+}
+
+
+class BrowserUnavailable(RuntimeError):
+    def __init__(self, code):
+        self.code = code if code in ERRORS else 'unavailable'
+        super().__init__(ERRORS[self.code])
+
+
+def wire_error(error):
+    code = error.code if isinstance(error, BrowserUnavailable) else 'unavailable'
+    return {'error': ERRORS[code], 'code': code}
+
 
 class WebSocket:
     def __init__(self, url):
@@ -144,7 +168,10 @@ def bound_browser(profile, display, port):
 
 class Driver:
     def __init__(self, profile, observer, display=None):
-        lines = (Path(profile) / 'DevToolsActivePort').read_text().splitlines()
+        try:
+            lines = (Path(profile) / 'DevToolsActivePort').read_text().splitlines()
+        except OSError:
+            raise BrowserUnavailable('endpoint_unavailable') from None
         if len(lines) != 2 or not lines[0].isdigit() or not lines[1].startswith('/devtools/browser/'):
             raise ValueError('No supported debugging connection for this browser profile')
         port = int(lines[0])
@@ -173,7 +200,7 @@ class Driver:
             if response.get('id') != request_id:
                 continue
             if 'error' in response:
-                raise RuntimeError('Browser protocol request failed')
+                raise BrowserUnavailable('navigation')
             return response['result']
         raise TimeoutError('Browser protocol timed out')
 
@@ -183,7 +210,11 @@ class Driver:
             params['contextId'] = context
         result = self.call('Runtime.evaluate', params, session or self.session)
         if result.get('exceptionDetails'):
-            raise RuntimeError('Browser observation or element operation failed')
+            description = result['exceptionDetails'].get('exception', {}).get('description', '')
+            for code in ERRORS:
+                if description.splitlines()[0:1] == ['Error: kindred:' + code]:
+                    raise BrowserUnavailable(code)
+            raise BrowserUnavailable('navigation')
         return result['result'].get('value')
 
     def binding_current(self):
@@ -191,9 +222,21 @@ class Driver:
                 and bound_browser(self.profile, self.display, self.port) == self.binding)
 
     def observe(self, origin, values):
+        # Reading a page immediately after open/click used to fail during normal
+        # navigation. Retry observations only, never a dispatched action.
+        deadline = time.monotonic() + 2
+        while True:
+            try:
+                return self.observe_once(origin, values)
+            except BrowserUnavailable as error:
+                if error.code not in ('navigation', 'not_focused') or time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.1)
+
+    def observe_once(self, origin, values):
         self.snapshot = None
         if not self.binding_current():
-            raise RuntimeError('Browser identity changed')
+            raise BrowserUnavailable('identity_changed')
         # Identify the focused visible tab from this browser profile. Never
         # switch tabs or select another bot's browser to obtain an observation.
         tabs = self.call('Target.getTargets')['targetInfos']
@@ -202,18 +245,28 @@ class Driver:
             if tab['type'] != 'page' or not tab['url'].startswith(origin + '/'):
                 continue
             session = self.call('Target.attachToTarget', {'targetId': tab['targetId'], 'flatten': True})['sessionId']
-            self.call('Page.enable', session=session)
-            self.call('Runtime.enable', session=session)
-            frame = self.call('Page.getFrameTree', session=session)['frameTree']['frame']['id']
-            context = self.call('Page.createIsolatedWorld', {'frameId': frame, 'worldName': 'kindred-browser-worker'}, session)['executionContextId']
-            if self.evaluate('document.visibilityState === "visible" && document.hasFocus()', context, session):
-                visible.append((session, context))
-            else:
-                self.call('Target.detachFromTarget', {'sessionId': session})
+            keep = False
+            try:
+                self.call('Page.enable', session=session)
+                self.call('Runtime.enable', session=session)
+                frame = self.call('Page.getFrameTree', session=session)['frameTree']['frame']['id']
+                context = self.call('Page.createIsolatedWorld', {'frameId': frame, 'worldName': 'kindred-browser-worker'}, session)['executionContextId']
+                if self.evaluate('document.visibilityState === "visible" && document.hasFocus()', context, session):
+                    visible.append((session, context))
+                    keep = True
+            except BrowserUnavailable:
+                # An inactive tab navigating must not block the focused tab.
+                pass
+            finally:
+                if not keep:
+                    try:
+                        self.call('Target.detachFromTarget', {'sessionId': session})
+                    except Exception:
+                        pass
         if len(visible) != 1:
             for session, _ in visible:
                 self.call('Target.detachFromTarget', {'sessionId': session})
-            raise RuntimeError('Need exactly one focused browser tab at the requested origin')
+            raise BrowserUnavailable('not_focused')
         if self.session:
             try:
                 self.call('Target.detachFromTarget', {'sessionId': self.session})
@@ -223,14 +276,16 @@ class Driver:
         self.origin = origin
         self.evaluate('globalThis.kindredBrowser = ' + self.observer, self.context)
         result = self.evaluate('kindredBrowser.observe(' + json.dumps(values) + ',' + json.dumps(secrets.token_hex(24)) + ')', self.context)
-        capture_check = 'kindredBrowser.safeToCapture(' + json.dumps(origin) + ')'
-        if not self.evaluate(capture_check, self.context):
-            raise RuntimeError('Browser changed or authentication view requires human input')
+        capture_check = 'kindredBrowser.captureStatus(' + json.dumps(origin) + ')'
+        status = self.evaluate(capture_check, self.context)
+        if status != 'ready':
+            raise BrowserUnavailable(status)
         image = self.call('Page.captureScreenshot', {'format': 'png', 'captureBeyondViewport': False}, self.session)['data']
-        if not self.evaluate(capture_check, self.context):
-            raise RuntimeError('Browser changed while capturing its observation')
+        status = self.evaluate(capture_check, self.context)
+        if status != 'ready':
+            raise BrowserUnavailable(status)
         if not self.binding_current():
-            raise RuntimeError('Browser identity changed during observation')
+            raise BrowserUnavailable('identity_changed')
         result['image'] = 'data:image/png;base64,' + image
         self.snapshot = result['snapshot_id']
         return result
@@ -292,10 +347,10 @@ def serve(profile, display=None):
                 response = driver.act(request['snapshot_id'], request['choice_id'])
             else:
                 raise ValueError('Unsupported browser request')
-        except Exception:
+        except Exception as error:
             # Never include page HTML, supplied text, credentials or protocol
             # response bodies in an error. Runtime records action uncertainty.
-            response = {'error': 'Existing browser connection or observation unavailable'}
+            response = wire_error(error)
         data = json.dumps(response, ensure_ascii=False).encode()
         if len(data) > LIMIT:
             data = b'{"error":"Browser response exceeds its limit"}'

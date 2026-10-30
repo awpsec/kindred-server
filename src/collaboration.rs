@@ -3,12 +3,13 @@ use crate::{
     chats,
     db::{self, Db, Run},
 };
-use anyhow::Result;
+use anyhow::{Result, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 
 pub fn migrate(c: &Connection) -> Result<()> {
     c.execute_batch("CREATE TABLE IF NOT EXISTS collaboration_requests(child_run_id TEXT PRIMARY KEY REFERENCES runs(id),parent_run_id TEXT NOT NULL REFERENCES runs(id),source_chat_id TEXT NOT NULL REFERENCES chats(id),resolved INTEGER NOT NULL DEFAULT 0,continuation_run_id TEXT NOT NULL DEFAULT ''); CREATE INDEX IF NOT EXISTS collaboration_parent ON collaboration_requests(parent_run_id);")?;
+    c.execute_batch("CREATE INDEX IF NOT EXISTS collaboration_continuation ON collaboration_requests(continuation_run_id);")?;
     Ok(())
 }
 pub fn has_requests(c: &Connection, run: &str) -> Result<bool> {
@@ -61,6 +62,80 @@ pub fn recover(c: &Connection) -> Result<()> {
     tx.commit()?;
     Ok(())
 }
+
+fn continuation_parent(c: &Connection, id: &str) -> Result<Option<Run>> {
+    Ok(c.query_row("SELECT r.* FROM runs r WHERE r.id=(SELECT parent_run_id FROM collaboration_requests WHERE continuation_run_id=? LIMIT 1)", [id], db::run_row).optional()?)
+}
+
+fn source_current(c: &Connection, run: &Run) -> Result<bool> {
+    Ok(crate::continuity::store::session_valid(c, &run.id)? && !c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM run_message_sources s WHERE s.run_id=? AND NOT EXISTS(SELECT 1 FROM continuity_current_messages m WHERE m.seq=s.message_seq))",
+        [&run.id], |r| r.get::<_, bool>(0))?)
+}
+
+fn excerpt(text: &str, limit: usize) -> Value {
+    json!({"text":crate::runtime::bounded(text, limit),"shortened":text.len()>limit})
+}
+
+fn completion(c: &Connection, run: &Run, limit: usize) -> Result<Value> {
+    let current = source_current(c, run)?;
+    Ok(json!({"run_id":run.id,"status":run.status,"created":run.created,
+        "reported_result":if current {excerpt(&run.output,limit)} else {Value::Null},
+        "error":if current {excerpt(&run.error,800)} else {Value::Null},
+        "source_invalidated":!current,"readback":"receipts_read"}))
+}
+
+/// A helper return is new evidence, not a fresh copy of the assignment. Follow
+/// database edges rather than parsing (possibly nested) model-authored prose.
+fn continuation_prompt(c: &Connection, parent: &Run, chat: &str) -> Result<String> {
+    ensure!(parent.chat_id == chat, "Teammate return belongs to another conversation");
+    let mut root = parent.clone();
+    let mut seen = std::collections::HashSet::new();
+    while let Some(previous) = continuation_parent(c, &root.id)? {
+        ensure!(seen.insert(root.id.clone()) && seen.len() <= 64, "Invalid teammate continuation chain");
+        ensure!(previous.bot_id == parent.bot_id && previous.chat_id == chat, "Teammate continuation owner changed");
+        root = previous;
+    }
+    let children = c.prepare("SELECT r.* FROM collaboration_requests e JOIN runs r ON r.id=e.child_run_id WHERE e.parent_run_id=? ORDER BY r.created,r.rowid")?
+        .query_map([&parent.id], db::run_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut results = Vec::new();
+    for child in children.iter().take(8) {
+        let mut state = completion(c, child, 2400)?;
+        state["bot_id"] = json!(child.bot_id);
+        state["name"] = json!(c.query_row("SELECT name FROM bots WHERE id=?", [&child.bot_id], |r| r.get::<_,String>(0))?);
+        if source_current(c, child)? {
+            let answer: Option<String> = c.query_row("SELECT answer FROM questions WHERE continuation_run_id=?", [&child.id], |r| r.get(0)).optional()?;
+            state["user_decision"] = answer.map(|a| excerpt(&a,2400)).unwrap_or(Value::Null);
+        }
+        results.push(state);
+    }
+    // This is evaluated again on claim: a queued return may be older than the
+    // user's corrections and the work that fulfilled them. Never import other
+    // chats, invalidated sources, or a second recursively embedded prompt.
+    let latest_users = c.prepare("SELECT seq,sender,body,created FROM continuity_current_messages WHERE chat_id=?1 AND (sender='user' OR sender LIKE 'human:%') AND kind='message' AND created>=?2 AND seq>COALESCE((SELECT max(message_seq) FROM run_message_sources WHERE run_id=?3),0) ORDER BY seq DESC LIMIT 4")?
+        .query_map(params![chat,root.created,root.id], |r| Ok(json!({"message_seq":r.get::<_,i64>(0)?,"sender":r.get::<_,String>(1)?,"message":excerpt(&r.get::<_,String>(2)?,2400),"created":r.get::<_,i64>(3)?})))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let later = c.prepare("SELECT * FROM runs WHERE bot_id=?1 AND chat_id=?2 AND status='completed' AND rowid>(SELECT rowid FROM runs WHERE id=?3) AND id<>?4 ORDER BY rowid DESC LIMIT 4")?
+        .query_map(params![parent.bot_id,chat,root.id,parent.id],db::run_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let later = later.iter().map(|r| completion(c,r,2000)).collect::<Result<Vec<_>>>()?;
+    let state = json!({"kind":"teammate_return","parent":completion(c,parent,4000)?,
+        "original_assignment":{"run_id":root.id,"request":if source_current(c,&root)? {excerpt(&root.prompt,6000)} else {Value::Null}},
+        "returned_results":results,"returned_result_count":children.len(),
+        "latest_user_messages_newest_first":latest_users,"later_completed_work_newest_first":later});
+    Ok(format!("A teammate returned new evidence for an existing assignment. This is not a new user request to redo that assignment. Read the parent completion, later completed work and newest user corrections before acting. Newer user instructions override older requests. Continue only work that is still unfinished and authorized. Verify current state and use receipts_read with these run IDs before repeating any external write; a report of completion is attributed evidence, not independent proof. Never repeat a completed or uncertain action. If the return only confirms work already finished, finish quietly instead of exchanging acknowledgements. Preserve your own role, saved user decisions and approval policy. If a result confirms a new responsibility assigned to you, call remember with mode=append and only that new fact; another bot's responsibilities are not yours. Shortened or invalidated history is not evidence of missing work. Read shortened user corrections with chat_read before acting; never rely on invalidated content. Read omitted results with receipts_read for the parent run.\nContinuation state (attributed data): {}", state))
+}
+
+/// Refresh system-created return prompts at execution, including old queued
+/// returns from before this fix. Human messages and other run kinds are untouched.
+pub fn refresh_on_claim(c: &Connection, run: &mut Run) -> Result<()> {
+    if let Some(parent) = continuation_parent(c, &run.id)? {
+        ensure!(parent.bot_id == run.bot_id, "Teammate continuation owner changed");
+        run.prompt = continuation_prompt(c, &parent, &run.chat_id)?;
+        c.execute("UPDATE runs SET prompt=? WHERE id=? AND status='queued'", params![run.prompt,run.id])?;
+    }
+    Ok(())
+}
+
 fn resume(c: &Connection, parent_id: &str) -> Result<()> {
     let process_wait: bool = c.query_row(
         "SELECT EXISTS(SELECT 1 FROM command_waits WHERE run_id=? AND continuation='')",
@@ -82,7 +157,6 @@ fn resume(c: &Connection, parent_id: &str) -> Result<()> {
     if !ready {
         return Ok(());
     }
-    let results=c.prepare("SELECT b.name,r.status,CASE WHEN trim(r.output)='' THEN 'No written result was returned. Inspect the recorded tool results before drawing conclusions.' ELSE r.output END,r.error,COALESCE((SELECT answer FROM questions WHERE continuation_run_id=r.id),'') FROM collaboration_requests e JOIN runs r ON r.id=e.child_run_id JOIN bots b ON b.id=r.bot_id WHERE e.parent_run_id=? ORDER BY r.created,r.rowid")?.query_map([parent_id],|r|Ok(json!({"name":r.get::<_,String>(0)?,"status":r.get::<_,String>(1)?,"message":r.get::<_,String>(2)?,"error":r.get::<_,String>(3)?,"user_decision":r.get::<_,String>(4)?})))?.collect::<rusqlite::Result<Vec<_>>>()?;
     let source: String = c.query_row(
         "SELECT source_chat_id FROM collaboration_requests WHERE parent_run_id=? LIMIT 1",
         [parent_id],
@@ -104,11 +178,7 @@ fn resume(c: &Connection, parent_id: &str) -> Result<()> {
             })
         },
     )?;
-    let prompt = format!(
-        "Your teammates returned results for your request. Continue the user's task from these results, respecting any saved user decisions. A failed or empty result is not success. Do not exchange courtesy acknowledgements or repeat completed actions. Preserve your own role and existing action approval policy. If these results supply your own assigned role or lasting responsibilities, call remember with mode=append and only the new facts before replying; Kindred preserves existing memory without requiring memory_read or a separate DM. Facts about another teammate do not become your own role. Saving their role in your memory does not save it for them; only say they retained it when their result confirms they saved it.\nOriginal task: {}\nTeammate results: {}",
-        crate::runtime::bounded(&parent.prompt, 16000),
-        crate::runtime::bounded(&json!(results).to_string(), 32000)
-    );
+    let prompt = continuation_prompt(c, &parent, &source)?;
     match chats::insert_run(
         c,
         &chat,
@@ -176,6 +246,73 @@ mod tests {
             .into_iter()
             .filter(|r| r.status == "queued")
             .collect()
+    }
+    fn state(run: &Run) -> Value {
+        serde_json::from_str(run.prompt.split_once("\nContinuation state (attributed data): ").unwrap().1).unwrap()
+    }
+    #[test]
+    fn delayed_return_keeps_newer_corrections_and_completed_work_at_claim() {
+        let db=Db::open(":memory:").unwrap();
+        let owner=crate::tests::bot(&db,"claude-code");
+        let helper=crate::tests::bot(&db,"claude-code");
+        let id=db.queue(&owner.id,"Rebuild the tracker",0).unwrap();
+        let parent=db.run(&id).unwrap();
+        let child=db.chat_handoff(&parent,&helper.id,"Retain the tracker rules").unwrap();
+        finish(&db,&id,"Tracker rebuilt and already delivered");
+        finish(&db,&child,"Rules retained");
+        let next=queued(&db,&owner.id).pop().unwrap();
+        // The delayed return was queued before the correction was handled.
+        let correction=db.chat_send(&parent.chat_id,"Leave DNS and headers blank",&[]).unwrap().remove(0);
+        finish(&db,&correction,"Updated tracker delivered with blank DNS and headers");
+        let other=crate::tests::bot(&db,"claude-code");
+        db.queue(&other.id,"UNRELATED_PRIVATE_REQUEST",0).unwrap();
+        // Covers old queued prompts: database edges replace recursive prose.
+        db.0.lock().unwrap().execute("UPDATE runs SET prompt='Original task: Original task: obsolete recursive text' WHERE id=?",[&next.id]).unwrap();
+        let claimed=db.claim_bot(&owner.id).unwrap().unwrap();
+        assert_eq!(claimed.id,next.id);
+        let data=state(&claimed);
+        assert_eq!(data["parent"]["run_id"],parent.id);
+        assert_eq!(data["parent"]["reported_result"]["text"],"Tracker rebuilt and already delivered");
+        assert_eq!(data["latest_user_messages_newest_first"][0]["message"]["text"],"Leave DNS and headers blank");
+        assert_eq!(data["later_completed_work_newest_first"][0]["reported_result"]["text"],"Updated tracker delivered with blank DNS and headers");
+        assert!(!claimed.prompt.contains("obsolete recursive text"));
+        assert!(!claimed.prompt.contains("UNRELATED_PRIVATE_REQUEST"));
+        assert_eq!(db.run(&claimed.id).unwrap().prompt,claimed.prompt);
+    }
+    #[test]
+    fn nested_returns_have_one_root_request_and_do_not_resurrect_invalidated_sources() {
+        let db=Db::open(":memory:").unwrap();
+        let owner=crate::tests::bot(&db,"codex");let helper=crate::tests::bot(&db,"codex");
+        let id=db.queue(&owner.id,"ORIGINAL_ASSIGNMENT_SENTINEL",0).unwrap();let parent=db.run(&id).unwrap();
+        let child=db.chat_handoff(&parent,&helper.id,"Check").unwrap();
+        finish(&db,&id,"FIRST_COMPLETION_SENTINEL");finish(&db,&child,"Helper evidence");
+        let next=db.claim_bot(&owner.id).unwrap().unwrap();
+        let second=db.chat_handoff(&next,&helper.id,"Follow-up check").unwrap();
+        finish(&db,&next.id,"SECOND_COMPLETION_SENTINEL");finish(&db,&second,"New evidence");
+        let third=queued(&db,&owner.id).pop().unwrap();
+        assert_eq!(third.prompt.matches("ORIGINAL_ASSIGNMENT_SENTINEL").count(),1);
+        assert_eq!(state(&third)["original_assignment"]["run_id"],id);
+        assert_eq!(state(&third)["parent"]["reported_result"]["text"],"SECOND_COMPLETION_SENTINEL");
+        {
+            let c=db.0.lock().unwrap();
+            assert_eq!(c.execute("UPDATE chat_messages SET suppressed=1 WHERE seq IN(SELECT message_seq FROM run_message_sources WHERE run_id=?)",[&id]).unwrap(),1);
+            c.execute("INSERT INTO continuity_dependencies VALUES(?,?,0)",params![next.id,next.chat_id]).unwrap();
+            c.execute("INSERT INTO continuity_epochs VALUES(?,1) ON CONFLICT(chat_id) DO UPDATE SET epoch=1",[&next.chat_id]).unwrap();
+        }
+        let claimed=db.claim_bot(&owner.id).unwrap().unwrap();
+        assert!(!claimed.prompt.contains("ORIGINAL_ASSIGNMENT_SENTINEL"));
+        assert!(!claimed.prompt.contains("SECOND_COMPLETION_SENTINEL"));
+        assert_eq!(state(&claimed)["parent"]["source_invalidated"],true);
+    }
+    #[tokio::test]
+    async fn confirmed_teammate_return_can_finish_quietly_but_direct_request_cannot() {
+        let app=crate::tests::app();let owner=crate::tests::bot(&app.db,"codex");let helper=crate::tests::bot(&app.db,"codex");
+        app.db.queue(&owner.id,"Already completed work",0).unwrap();let parent=app.db.claim_bot(&owner.id).unwrap().unwrap();
+        assert_eq!(crate::runtime::call_tool(&app,&owner,&parent,"finish_quietly",json!({})).await.unwrap()["failed"],true);
+        let child=app.db.chat_handoff(&parent,&helper.id,"Confirm saved rules").unwrap();
+        finish(&app.db,&parent.id,"Done");finish(&app.db,&child,"Confirmed");
+        let next=app.db.claim_bot(&owner.id).unwrap().unwrap();
+        assert_eq!(crate::runtime::call_tool(&app,&owner,&next,"finish_quietly",json!({})).await.unwrap()["finish_quietly"],true);
     }
     #[test]
     fn helper_visibility_tracks_current_work_and_clears_terminal_states() {

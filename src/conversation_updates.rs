@@ -12,6 +12,7 @@ pub fn migrate(c: &Connection) -> Result<()> {
     c.execute_batch("CREATE TABLE IF NOT EXISTS run_steering(source_run_id TEXT PRIMARY KEY REFERENCES runs(id),run_id TEXT NOT NULL REFERENCES runs(id),created INTEGER NOT NULL);CREATE INDEX IF NOT EXISTS steering_owner ON run_steering(run_id);")?;
     c.execute_batch("CREATE TABLE IF NOT EXISTS queue_push_requests(source_run_id TEXT PRIMARY KEY REFERENCES runs(id),run_id TEXT NOT NULL REFERENCES runs(id),created INTEGER NOT NULL);CREATE INDEX IF NOT EXISTS queue_push_owner ON queue_push_requests(run_id);")?;
     c.execute_batch("CREATE TABLE IF NOT EXISTS steering_requests(source_run_id TEXT PRIMARY KEY REFERENCES runs(id),run_id TEXT NOT NULL REFERENCES runs(id),created INTEGER NOT NULL);")?;
+    c.execute_batch("CREATE INDEX IF NOT EXISTS steering_requests_owner ON steering_requests(run_id);")?;
     c.execute_batch("CREATE TABLE IF NOT EXISTS message_send_modes(message_seq INTEGER PRIMARY KEY REFERENCES chat_messages(seq),mode TEXT NOT NULL);CREATE TABLE IF NOT EXISTS queued_message_claims(request_id TEXT PRIMARY KEY,chat_id TEXT NOT NULL,message_seq INTEGER NOT NULL,payload TEXT NOT NULL);")?;
     c.execute_batch("CREATE TABLE IF NOT EXISTS message_progress(message_seq INTEGER PRIMARY KEY REFERENCES chat_messages(seq),run_id TEXT NOT NULL REFERENCES runs(id),mode TEXT NOT NULL,phase TEXT NOT NULL,group_id TEXT NOT NULL);")?;
     let columns:Vec<String>=c.prepare("PRAGMA table_info(message_progress)")?.query_map([],|r|r.get(1))?.collect::<rusqlite::Result<_>>()?;
@@ -45,6 +46,15 @@ pub fn repair_completed_followup_parents(c: &rusqlite::Connection) -> Result<()>
 }
 
 impl Db {
+    /// CLI transports accept the user's text at a verified turn boundary. Stop
+    /// starting further tools while that boundary is pending; do not consume the
+    /// message in a tool result or replay the provider session to deliver it.
+    pub fn user_turn_waiting(&self, run: &Run) -> Result<bool> {
+        let c = self.0.lock().unwrap();
+        if crate::initiative::is_run(&c, &run.id)? { return Ok(false); }
+        Ok(c.query_row("SELECT EXISTS(SELECT 1 FROM runs r JOIN steering_requests s ON s.source_run_id=r.id JOIN run_message_sources src ON src.run_id=r.id JOIN continuity_current_messages m ON m.seq=src.message_seq JOIN runs active ON active.id=s.run_id WHERE s.run_id=?1 AND active.status='running' AND active.bot_id=?2 AND active.chat_id=?3 AND r.bot_id=?2 AND r.chat_id=?3 AND r.status='queued' AND r.rowid>active.rowid AND r.depth=0 AND r.reply_to='' AND m.sender='user' AND m.kind IN ('message','voice_call') AND NOT EXISTS(SELECT 1 FROM followup_offer_sources f WHERE f.source_run_id=r.id) AND NOT EXISTS(SELECT 1 FROM run_commands cmd WHERE cmd.run_id=r.id) AND NOT EXISTS(SELECT 1 FROM routine_runs rr WHERE rr.run_id=r.id) AND NOT EXISTS(SELECT 1 FROM questions q WHERE q.continuation_run_id=r.id))", params![run.id,run.bot_id,run.chat_id], |r| r.get(0))?)
+    }
+
     pub fn edit_queued_message(&self, chat: &str, seq: i64, expected: &str, text: &str) -> Result<()> {
         ensure!(!text.trim().is_empty() && text.len() <= 64000, "Message must be 1..64000 bytes");
         let mut c=self.0.lock().unwrap();let tx=c.transaction()?;
@@ -249,7 +259,7 @@ impl Db {
         }
         // Only actual user sends are eligible. Commands retain their immutable
         // invocation snapshot; routine/teammate/question continuations stay queued.
-        let candidates:Vec<(String,String,i64)>=tx.prepare("SELECT r.id,r.prompt,s.message_seq FROM runs r JOIN steering_requests wanted ON wanted.source_run_id=r.id AND wanted.run_id=?3 JOIN run_message_sources s ON s.run_id=r.id JOIN chat_messages m ON m.seq=s.message_seq WHERE r.bot_id=?1 AND r.chat_id=?2 AND r.status='queued' AND NOT EXISTS(SELECT 1 FROM followup_offer_sources offered WHERE offered.source_run_id=r.id) AND r.rowid>(SELECT rowid FROM runs WHERE id=?3) AND r.depth=0 AND r.reply_to='' AND m.sender='user' AND m.kind IN ('message','voice_call') AND NOT EXISTS(SELECT 1 FROM run_commands WHERE run_id=r.id) AND NOT EXISTS(SELECT 1 FROM routine_runs WHERE run_id=r.id) AND NOT EXISTS(SELECT 1 FROM questions WHERE continuation_run_id=r.id) ORDER BY r.rowid LIMIT 4")?
+        let candidates:Vec<(String,String,i64)>=tx.prepare("SELECT r.id,r.prompt,s.message_seq FROM runs r JOIN steering_requests wanted ON wanted.source_run_id=r.id AND wanted.run_id=?3 JOIN run_message_sources s ON s.run_id=r.id JOIN continuity_current_messages m ON m.seq=s.message_seq WHERE r.bot_id=?1 AND r.chat_id=?2 AND r.status='queued' AND NOT EXISTS(SELECT 1 FROM followup_offer_sources offered WHERE offered.source_run_id=r.id) AND r.rowid>(SELECT rowid FROM runs WHERE id=?3) AND r.depth=0 AND r.reply_to='' AND m.sender='user' AND m.kind IN ('message','voice_call') AND NOT EXISTS(SELECT 1 FROM run_commands WHERE run_id=r.id) AND NOT EXISTS(SELECT 1 FROM routine_runs WHERE run_id=r.id) AND NOT EXISTS(SELECT 1 FROM questions WHERE continuation_run_id=r.id) ORDER BY r.rowid LIMIT 4")?
             .query_map(params![run.bot_id,run.chat_id,run.id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?.collect::<rusqlite::Result<_>>()?;
         let mut updates = vec![];
         let mut bytes = 0;

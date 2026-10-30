@@ -400,6 +400,23 @@ fn dormant_obligations_are_paged_without_search_and_require_real_execution_links
 }
 
 #[test]
+fn newest_corrections_and_completion_receipts_outlive_recalled_history() {
+    let db=Db::open(":memory:").unwrap();let (_,run)=setup(&db);
+    let mut context=json!({"bot":{"durable_memory":""},"task":{},"environment":{},
+        "conversation":{"recent_messages":{"items":[{"text":"LATEST_CORRECTION_SENTINEL"}]}},
+        "continuity":{"recent_task_journal":[{"output":"LATEST_COMPLETION_SENTINEL"}],
+            "relevant_history":{"items":(0..100).map(|i|json!({"text":format!("OLD_TOPIC_{i} {}","x".repeat(1000))})).collect::<Vec<_>>()}}});
+    store::budget_packet(&db,&run,&mut context,"",&[],Some(8192)).unwrap();
+    assert_eq!(context["conversation"]["recent_messages"]["items"].as_array().unwrap().len(),1);
+    assert_eq!(context["continuity"]["recent_task_journal"].as_array().unwrap().len(),1);
+    assert!(context["continuity"]["relevant_history"]["items"].as_array().unwrap().len()<100);
+    let events=db.events(&run.id).unwrap();let log=&events.last().unwrap()["body"];
+    assert!(log["omitted_sections"]["/continuity/relevant_history/items"].as_u64().unwrap()>0);
+    assert_eq!(log["recent_message_items"],1);
+    assert!(!log.to_string().contains("SENTINEL"));
+}
+
+#[test]
 fn bounded_context_model_budgets_and_diagnostics_do_not_log_content() {
     let app = app();
     let (b, run) = setup(&app.db);

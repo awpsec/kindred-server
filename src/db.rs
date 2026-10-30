@@ -600,6 +600,7 @@ impl Db {
                 tx.commit()?;
                 return Ok(None);
             }
+            crate::collaboration::refresh_on_claim(&tx, r)?;
             crate::progress_updates::start(&tx, r)?;
             tx.execute("UPDATE runs SET status='running' WHERE id=?", [&r.id])?;
         }
@@ -618,6 +619,7 @@ impl Db {
             )
             .optional()?;
         if let Some(r) = &mut run {
+            crate::collaboration::refresh_on_claim(&tx, r)?;
             crate::progress_updates::start(&tx, r)?;
             tx.execute("UPDATE runs SET status='running' WHERE id=?", [&r.id])?;
         }

@@ -380,15 +380,25 @@ async fn run_child(app:&App,bot:&Bot,run:&Run,mut child:tokio::process::Child)->
                     "Invalid provider tool request"
                 );
                 crate::provider_retry::check_tool_budget(app, run)?;
-                let result = runtime::call_tool(app, bot, run, name, frame["args"].clone())
-                    .await
-                    .unwrap_or_else(|e| json!({"text":e.to_string(),"failed":true}));
+                let mut result = if name != "set_task_title" && app.db.user_turn_waiting(run)? {
+                    app.db.event(&run.id,"user_update_boundary",json!({"tool":name,"call_id":id,"action_started":false}))?;
+                    json!({"failed":true,"text":"This tool was not executed: the user sent a new message. End this conversational turn now without further tools or a completion claim. Kindred will deliver the exact message as the next user turn in this same session. Preserve completed actions and continue only work consistent with that message."})
+                } else {
+                    runtime::call_tool(app, bot, run, name, frame["args"].clone())
+                        .await
+                        .unwrap_or_else(|e| json!({"text":e.to_string(),"failed":true}))
+                };
                 if result["deferred_question"] == true
                     || result["finish_quietly"] == true || result["routine_complete"] == true
                     || result["deferred_process"] == true
                 {
                     if let Some(offer)=followup_offer.take(){app.db.defer_followup(run,&offer)?;}
                     return Ok(String::new());
+                }
+                // A send may arrive while the tool is executing. Preserve its
+                // actual result, then ask for the safe boundary immediately.
+                if app.db.user_turn_waiting(run)? {
+                    result["kindred_turn_control"] = json!({"yield_for_user_message":true,"instruction":"End this conversational turn now. A user update will follow through the user channel; do not start more tools or repeat the completed tool."});
                 }
                 crate::pi::send(
                     &mut input,
@@ -444,6 +454,39 @@ async fn run_child(app:&App,bot:&Bot,run:&Run,mut child:tokio::process::Child)->
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn waiting_correction_stops_new_tools_and_is_delivered_once_in_same_session() {
+        for provider in ["claude-code","kimi-code"] {
+            let app=crate::tests::app();let bot=crate::tests::bot(&app.db,provider);
+            app.db.queue(&bot.id,"Old assignment",0).unwrap();let run=app.db.claim_bot(&bot.id).unwrap().unwrap();
+            let source=app.db.chat_send(&run.chat_id,"Corrected assignment",&[]).unwrap().remove(0);
+            app.db.request_steering(&source,&run.id).unwrap();
+            let script=r#"import sys,json
+def read():return json.loads(sys.stdin.readline())
+def send(v):print(json.dumps(v),flush=True)
+s=read();send({'type':'ready','protocol':1,'provider':s['provider'],'model':s['model'],'reasoning_effort':s['reasoning_effort']})
+send({'type':'tool_call','id':'stale-action','name':'memory_read','args':{}})
+r=read();assert r['result']['failed'] and r['result']['kindred_turn_control']['yield_for_user_message']
+assert 'Corrected assignment' not in json.dumps(r)
+send({'type':'turn_complete','input_id':'initial'})
+d=read();assert 'Corrected assignment' in d['prompt'] and 'Old assignment' not in d['prompt']
+send({'type':'tool_call','id':'current-action','name':'memory_read','args':{}})
+r=read();assert 'kindred_turn_control' not in r['result']
+send({'type':'assistant','text':'Correction handled'})
+send({'type':'turn_complete','input_id':d['offer_id']})
+assert read()['finish']
+send({'type':'complete','output':'Correction handled'})
+"#;
+            let child=tokio::process::Command::new("python3").args(["-u","-c",script]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit()).kill_on_drop(true).spawn().unwrap();
+            assert_eq!(run_child(&app,&bot,&run,child).await.unwrap(),"Correction handled");
+            assert_eq!(app.db.run(&source).unwrap().status,"steered");
+            assert!(!app.db.user_turn_waiting(&run).unwrap());
+            let events=app.db.events(&run.id).unwrap();
+            assert_eq!(events.iter().filter(|e|e["kind"]=="user_followups").count(),1);
+            assert_eq!(events.iter().filter(|e|e["kind"]=="tool_started" && e["body"]["tool"]=="memory_read").count(),1);
+            assert_eq!(events.iter().filter(|e|e["kind"]=="user_update_boundary").count(),1);
+        }
+    }
     #[tokio::test]
     async fn classification_subscription_turn_boundary_preserves_each_phase() {
         for provider in ["claude-code","kimi-code"] {for first_work in [false,true] {

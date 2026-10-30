@@ -1,12 +1,12 @@
 # Decisions browser worker
 
-The OpenAI Decisions API selects a current action from Kindred's observed browser choices. Kindred supplies the action arguments and executes them through its existing browser profile and approvals. The bot's selected parent model and subscription sign-in stay unchanged. Only Codex bots use this optional worker; other providers retain their tools.
+The OpenAI Decisions API selects a current action from Kindred's observed browser choices. Kindred supplies the action arguments and executes them through its existing browser profile and approvals. The bot's selected parent model and subscription sign-in stay unchanged. Codex bots and GPT chat models configured through OpenAI-compatible API providers or OpenRouter can use this optional worker when the account has an OpenAI API key. Other models retain their existing tools.
 
-## API key in Codex Connectors
+## OpenAI API key
 
-Open Settings → Connections → Codex → Browser helper. Paste an OpenAI API key and choose Save key. Saving explicitly enables this API-billed helper for your account’s workspaces without changing Codex subscription sign-in or its parent model. Blank Save does not delete a key; Disconnect requires confirmation. Save/replace takes effect on the next choice, and changing/removing the key revokes any action selected with the previous key before input. Failed saves preserve the previous credential.
+Open Settings → Connections → OpenAI API. Paste an OpenAI API key and choose Save key. Saving explicitly enables this API-billed helper for your account’s workspaces without changing Codex subscription sign-in or its parent model. Blank Save does not delete a key; Disconnect requires confirmation. Save/replace takes effect on the next choice, and changing/removing the key revokes any action selected with the previous key before input. Failed saves preserve the previous credential.
 
-Kindred stores the key using its existing private atomic credential-file convention (0600 on Unix), with the account derived from the authenticated workspace. Status never returns key bytes. No key goes in browser storage, logs or source. “Key saved” does not prove API access; status reports a plain last-use failure when available. A failed API call selects no new input and preserves earlier receipts.
+Kindred stores the key using its existing private atomic credential-file convention (0600 on Unix), with the account derived from the authenticated workspace. Status never returns key bytes. No key goes in browser storage, logs or source. “Key saved” does not prove API access. Status includes the last API check time and request ID or failure, scoped to the currently saved key. Browser-worker receipts separately report selection attempts, received choices and the reason for a fallback. A failed API call selects no new input and preserves earlier receipts.
 
 ## Legacy server environment
 
@@ -23,6 +23,8 @@ The current supported Kindred Decisions integration uses an OpenAI API key. The 
 Managed browser restoration and new URL launches enable a random-port debugging endpoint on guest loopback for the existing per-display profile. Restoration requires installation of the updated guest start-desktop script (new provisioning includes it); the runtime-binary updater does not install that script. This applies when a browser process starts using that installed script; upgrading the guest runtime or saving a key does not add an endpoint to an already-running browser. Kindred does not kill, restart or migrate that browser to obtain attachment. It continues with ordinary computer tools until the matching launch script is installed and a deliberate normal browser restart occurs. API authentication and browser attachment are separate requirements.
 
 Open the desired site with ordinary computer tools first. The observer attaches only to the exact managed profile, browser parent and its owned loopback socket on the selected X11 display. It never starts/restarts the browser. Existing browsers without a supported endpoint remain on ordinary tools. Copied endpoint metadata, different profiles/displays, stale snapshots, covered elements, unsupported frames and visible password/OTP views refuse safely.
+
+The observer waits briefly through navigation without repeating actions, considers controls in the visible viewport, and reserves exit/scroll choices within the API limit of 255 choices. Large pages and offscreen frames do not disable the entire worker. Visible embedded frames, sign-in and native file dialogs can still require ordinary computer tools. Once that step is complete, the bot can resume the worker on the current origin.
 
 The official request contains text evidence and an inline PNG data URL, plus one named choice question. Responses must bind the question name/type, selected ID and complete finite probability distribution to this observation. The API does not generate arbitrary tool arguments. Page evidence is untrusted. Supplied values and screenshots are sent to OpenAI only on this enabled path; never supply secrets.
 

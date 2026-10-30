@@ -8,6 +8,11 @@ const ENDPOINT: &str = "https://api.openai.com/v1/decisions";
 const QUESTION: &str = "next_browser_action";
 const MAX_RESPONSE: usize = 128 * 1024;
 
+pub(super) struct DecisionReceipt {
+    pub choice: String,
+    pub request_id: Option<String>,
+}
+
 pub struct OpenAiDecisions {
     client: reqwest::Client,
     key: String,
@@ -60,7 +65,7 @@ impl OpenAiDecisions {
         value.endpoint = endpoint;
         Ok(value)
     }
-    async fn request(&self, input: &DecisionInput) -> Result<String> {
+    pub(super) async fn request(&self, input: &DecisionInput) -> Result<DecisionReceipt> {
         let body = request_body(input)?;
         let mut response = self
             .client
@@ -99,17 +104,19 @@ impl OpenAiDecisions {
         }
         let value: Value = serde_json::from_slice(&bytes)
             .map_err(|_| anyhow::anyhow!("Decisions returned invalid JSON"))?;
-        validate_answer(input, &value)
+        let request_id=response.headers().get("x-request-id").and_then(|v|v.to_str().ok())
+            .filter(|v|v.len()<=128 && v.bytes().all(|b|b.is_ascii_alphanumeric() || b"_-".contains(&b))).map(str::to_owned);
+        Ok(DecisionReceipt {choice:validate_answer(input, &value)?,request_id})
     }
 }
 impl Decisions for OpenAiDecisions {
     fn choose<'a>(&'a self, input: &'a DecisionInput) -> Work<'a, String> {
-        Box::pin(self.request(input))
+        Box::pin(async move {self.request(input).await.map(|v|v.choice)})
     }
 }
 fn request_body(input: &DecisionInput) -> Result<Value> {
     ensure!(
-        !input.observation.candidates.is_empty() && input.observation.candidates.len() <= 256,
+        (2..=255).contains(&input.observation.candidates.len()),
         "Invalid Decisions candidate set"
     );
     ensure!(
@@ -230,6 +237,14 @@ mod tests {
         "probabilities":[{"value":"a0","probability":0.8},{"value":"finish","probability":0.2}]}]})
     }
     #[test]
+    fn documented_choice_bounds_are_enforced_before_request() {
+        for (count,valid) in [(1,false),(2,true),(255,true),(256,false)] {
+            let mut value=input();
+            value.observation.candidates=(0..count).map(|i|Candidate{id:format!("a{i}"),label:format!("Choice {i}"),kind:"click".into(),value_key:None}).collect();
+            assert_eq!(request_body(&value).is_ok(),valid,"{count} choices");
+        }
+    }
+    #[test]
     fn official_schema_and_strict_question_choice_distribution_binding() {
         let input = input();
         let request = request_body(&input).unwrap();
@@ -324,7 +339,7 @@ mod tests {
                         if slow {
                             tokio::time::sleep(Duration::from_millis(1000)).await;
                         }
-                        axum::Json(answer())
+                        ([("x-request-id", "req_synthetic_local")],axum::Json(answer()))
                     }
                 }),
             );
@@ -339,11 +354,13 @@ mod tests {
                 .timeout(Duration::from_millis(if slow { 300 } else { 3000 }))
                 .build()
                 .unwrap();
-            let result = transport.choose(&input()).await;
+            let result = transport.request(&input()).await;
             if slow {
                 assert!(result.is_err())
             } else {
-                assert_eq!(result.unwrap(), "a0")
+                let receipt=result.unwrap();
+                assert_eq!(receipt.choice, "a0");
+                assert_eq!(receipt.request_id.as_deref(),Some("req_synthetic_local"));
             }
             assert_eq!(count.load(Ordering::SeqCst), 1);
             server.abort();

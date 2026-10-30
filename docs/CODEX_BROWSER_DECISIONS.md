@@ -1,4 +1,6 @@
-# Codex browser worker and Decisions integration status
+# Historical Codex browser worker notes (September 30, 2026)
+
+These notes describe the initial preview implementation. For the current public API integration, GPT model support and saved-key setup, see [Decisions browser worker](DECISIONS.md).
 
 Owner preference: Codex-powered bots should prefer OpenAI Decisions for browser
 execution when supported access is available. Their existing computer tools are

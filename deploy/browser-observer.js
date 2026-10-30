@@ -1,11 +1,11 @@
 // Runs in a CDP isolated world. Page content cannot access the action map.
 // This is Kindred's browser protocol, not an OpenAI Decisions request schema.
 (() => {
-  const MAX_CHOICES = 256, MAX_ELEMENTS = 160;
+  const MAX_CHOICES = 255, MAX_ELEMENTS = 160;
   let snapshot = null;
   const visible = element => {
     const rect = element.getBoundingClientRect(), style = element.ownerDocument.defaultView.getComputedStyle(element);
-    return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+    return rect.width > 0 && rect.height > 0 && rect.bottom > 0 && rect.right > 0 && rect.top < innerHeight && rect.left < innerWidth && style.visibility !== 'hidden' && style.display !== 'none';
   };
   const editable = element => element instanceof HTMLTextAreaElement ||
     (element instanceof HTMLInputElement && ['text', 'search', 'url', 'email', 'tel', 'number'].includes(element.type));
@@ -19,7 +19,9 @@
   }
   // An isolated world's security origin may be null. Resolve the actual page
   // URL rather than treating the isolated world as the page's origin.
-  const safeToCapture = origin => new URL(location.href).origin === origin && document.visibilityState === 'visible' && document.hasFocus() && !authenticationVisible();
+  const captureStatus = origin => new URL(location.href).origin !== origin ? 'origin_changed' :
+    document.visibilityState !== 'visible' || !document.hasFocus() ? 'not_focused' : authenticationVisible() ? 'authentication' : 'ready';
+  const safeToCapture = origin => captureStatus(origin) === 'ready';
   const labelText = label => {
     const clone = label.cloneNode(true);
     for (const control of clone.querySelectorAll('input,textarea,select,button')) control.remove();
@@ -40,11 +42,12 @@
         if (element.shadowRoot) visit(element.shadowRoot);
         // Frames need their own coordinate/context mapping. Explicitly fall back
         // instead of guessing that a frame's coordinates refer to this page.
-        if (element.tagName === 'IFRAME' && visible(element)) throw new Error('Frame requires ordinary computer tools');
+        if (element.tagName === 'IFRAME' && visible(element)) throw new Error('kindred:unsupported_frame');
         if (!visible(element) || forbidden(element)) continue;
         if (element.matches('button,a[href],input,textarea,select,[role="button"],[role="checkbox"],[role="radio"],[role="switch"]')) {
-          found.push(element);
-          if (found.length > MAX_ELEMENTS) throw new Error('Page exceeds browser element limit');
+          // A large page can still use the visible, grounded subset. Keep
+          // scanning for frames/authentication even after the control budget.
+          if (found.length < MAX_ELEMENTS) found.push(element);
         }
       }
     }
@@ -62,10 +65,12 @@
   }
   function observe(values, snapshotId) {
     snapshot = null;
-    if (!safeToCapture(new URL(location.href).origin)) throw new Error('Authentication view needs the normal human-interaction flow');
+    const status = captureStatus(new URL(location.href).origin);
+    if (status !== 'ready') throw new Error('kindred:' + status);
     const list = elements(), actions = new Map(), candidates = [];
     const add = (kind, label, data = {}, value_key = undefined) => {
-      if (candidates.length >= MAX_CHOICES - 4) throw new Error('Page exceeds browser choice limit');
+      // Reserve five choices for scrolling, waiting and both terminal actions.
+      if (candidates.length >= MAX_CHOICES - 5) return;
       const id = 'a' + candidates.length;
       actions.set(id, {kind, ...data});
       candidates.push({id, kind, label, value_key});
@@ -86,11 +91,13 @@
         add('click', `Click “${label}”${suffix}`, {element});
       }
     }
-    for (const [direction, amount] of [['down', 600], ['up', -600]]) add('scroll', `Scroll ${direction}`, {amount});
-    add('wait', 'Wait briefly for the page');
+    for (const [kind, label, data] of [['scroll', 'Scroll down', {amount:600}], ['scroll', 'Scroll up', {amount:-600}], ['wait', 'Wait briefly for the page', {}]]) {
+      const id = 'a' + candidates.length;
+      actions.set(id, {kind, ...data}); candidates.push({id, kind, label});
+    }
     // Terminal choices are mandatory even on pages with no actionable elements.
     candidates.push({id: 'finish', kind: 'finish', label: 'Finish: the observed goal appears satisfied'});
-    candidates.push({id: 'escalate', kind: 'escalate', label: 'Return to Codex: need planning, sign-in, unsupported controls or clarification'});
+    candidates.push({id: 'escalate', kind: 'escalate', label: 'Return to the bot: need planning, sign-in, unsupported controls or clarification'});
     snapshot = {id: snapshotId, origin: new URL(location.href).origin, signature: signature(list), list, actions};
     const states = list.map((element, index) => ({control: index, name: name(element), type: element.getAttribute('role') || element.type || element.tagName.toLowerCase(),
       disabled: Boolean(element.disabled || element.getAttribute('aria-disabled') === 'true'),
@@ -144,5 +151,5 @@
     if (action.kind === 'check') return action.element.isConnected && checked(action.element) === action.checked;
     return true; // Click dispatch is recorded; the next observation checks its result.
   }
-  return {observe, prepare, fill, select, verify, safeToCapture};
+  return {observe, prepare, fill, select, verify, safeToCapture, captureStatus};
 })()

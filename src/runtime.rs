@@ -157,7 +157,7 @@ pub fn tool_specs() -> Vec<Value> {
         ),
         (
             "finish_quietly",
-            "Finish without another chat bubble or completion notification. Use after a routine check with nothing new, or in the assigned continuation when the user chose to defer, wait, decline, or get back to you and their saved choice card is sufficient acknowledgment. Do not add a preamble about how you interpreted their answer. Never hide an error, an important change, a requested action, or needed user input. This ends the turn immediately; initiative checks, routine runs, shared conversations with nothing useful to add, and assigned question continuations may use it. In a group, call this tool directly rather than posting \"No reply needed\", an acknowledgement analysis, or a restatement of unchanged status.",
+            "Finish without another chat bubble or completion notification. Use after a routine check with nothing new, or in the assigned continuation when the user chose to defer, wait, decline, or get back to you and their saved choice card is sufficient acknowledgment. Do not add a preamble about how you interpreted their answer. Never hide an error, an important change, a requested action, or needed user input. This ends the turn immediately; initiative checks, routine runs, shared conversations with nothing useful to add, and assigned question or teammate-return continuations may use it. In a group, call this tool directly rather than posting \"No reply needed\", an acknowledgement analysis, or a restatement of unchanged status.",
             json!({}),
             vec![],
         ),
@@ -908,9 +908,10 @@ async fn call_tool_inner(
             if initiative { crate::initiative::mark_quiet(&c, &run.id)?; }
             let decision:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM questions WHERE continuation_run_id=?1 AND bot_id=?2 AND (chat_id=?3 OR delivery_chat_id=?3) AND status='answered')",rusqlite::params![run.id,bot.id,run.chat_id],|r|r.get(0))?;
             let shared:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM chats WHERE id=?1 AND id NOT LIKE 'dm-%' AND EXISTS(SELECT 1 FROM json_each(members) WHERE value=?2))",rusqlite::params![run.chat_id,bot.id],|r|r.get(0))?;
+            let teammate_return:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM collaboration_requests e JOIN runs parent ON parent.id=e.parent_run_id WHERE e.continuation_run_id=?1 AND parent.bot_id=?2 AND e.source_chat_id=?3)",rusqlite::params![run.id,bot.id,run.chat_id],|r|r.get(0))?;
             ensure!(
-                routine || initiative || decision || shared,
-                "Only an initiative check, routine, shared conversation or assigned question continuation can finish quietly"
+                routine || initiative || decision || shared || teammate_return,
+                "Only an initiative check, routine, shared conversation or assigned question/teammate continuation can finish quietly"
             );
             c.execute("UPDATE chat_messages SET suppressed=1 WHERE run_id=? AND kind='task_progress'",[&run.id])?;
             c.commit()?;

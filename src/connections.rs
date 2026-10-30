@@ -158,13 +158,14 @@ pub fn decisions_status(app: &App) -> Value {
                 .to_vec()
         )
     });
-    let last_error = app
+    let last_use = app
         .db
         .setting("decisions_last_use")
         .ok()
         .flatten()
-        .filter(|v| fingerprint.as_ref() == Some(&v["fingerprint"]))
-        .and_then(|v| v["error"].as_str().map(str::to_string));
+        .filter(|v| fingerprint.as_ref() == Some(&v["fingerprint"]));
+    let last_error=last_use.as_ref().and_then(|v|v["error"].as_str());
+    let checked_at=last_use.as_ref().and_then(|v|v["checked_at"].as_i64());
     let account = app
         .profile_portal
         .get()
@@ -173,7 +174,7 @@ pub fn decisions_status(app: &App) -> Value {
             p.upgrade()
                 .is_some_and(|p| p.account_credential_path(id).is_ok())
         });
-    json!({"configured":credential.is_some(),"source":credential.as_ref().map(|(_,source)|*source).unwrap_or("none"),"scope":if account {"account"}else{"workspace"},"access_verified":false,"last_error":last_error})
+    json!({"configured":credential.is_some(),"source":credential.as_ref().map(|(_,source)|*source).unwrap_or("none"),"scope":if account {"account"}else{"workspace"},"access_verified":checked_at.is_some() && last_error.is_none(),"last_checked_at":checked_at,"last_request_id":last_use.as_ref().and_then(|v|v["request_id"].as_str()),"last_error":last_error})
 }
 pub fn save_decisions(app: &App, key: Option<&str>) -> Result<()> {
     if let Some(key) = key {
