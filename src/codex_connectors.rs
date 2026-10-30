@@ -543,7 +543,7 @@ async fn execute_rpc(
         Ok(value) => {
             let failed = value["isError"] == true;
             connector_artifacts::complete(&app.db, &id, &value, failed)?;
-            Ok(json!({"text":runtime::bounded(&value.to_string(),60_000),"failed":failed}))
+            crate::connector_results::response(&app.db, run, &value, failed)
         }
         Err(e) => {
             let value = json!({"text":e.to_string(),"failed":true});

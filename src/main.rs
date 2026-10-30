@@ -46,6 +46,7 @@ mod connector_edits;
 mod email_contacts;
 mod connector_policy;
 mod connector_records;
+mod connector_results;
 mod continuity;
 mod memory_maintenance;
 #[cfg(test)]

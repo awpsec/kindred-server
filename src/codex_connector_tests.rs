@@ -256,6 +256,7 @@ for line in sys.stdin:
    send({'id':'native-approval','method':'item/tool/requestUserInput','params':{'questions':[]}}); continue
   if mode=='disconnect': break
   result={'content':[{'type':'text','text':'fixture receipt'}],'isError':mode=='error','structuredContent':{'id':'fixture-receipt'}}
+  if mode=='verified-large': result={'content':[{'type':'text','text':json.dumps({'emails':[{'body':'Synthetic mail body. '*9000},{'subject':'Final unread message'}]})}],'isError':False}
  elif v.get('id')=='native-approval':
   assert 'error' in v; break
  else: raise AssertionError('Forbidden or unexpected method: '+str(m))
@@ -615,6 +616,39 @@ async fn verified_codex_calls_follow_full_access_but_preserve_review_boundaries(
         );
         std::fs::remove_file(log).unwrap();
     }
+}
+
+#[tokio::test]
+async fn codex_large_read_returns_every_message_without_calling_the_provider_again() {
+    let app = crate::tests::app();
+    let mut bot = crate::tests::bot(&app.db, "codex");
+    bot.approval_mode = "full".into();
+    app.db.save_bot(&bot).unwrap();
+    let id = app.db.queue(&bot.id, "Read synthetic mail", 0).unwrap();
+    app.db.claim().unwrap();
+    let run = app.db.run(&id).unwrap();
+    let log = std::env::temp_dir().join(format!("kindred-codex-{}.jsonl", crate::db::id()));
+    let mut rpc = peer("verified-large", &log).await;
+    let mut input = args();
+    input["tool_name"] = json!("gmail.get_profile");
+    input["arguments"] = json!({});
+    let mut result = execute_rpc(&app, &bot, &run, &input, &mut rpc).await.unwrap();
+    let mut reconstructed = String::new();
+    loop {
+        assert_eq!(result["failed"], false);
+        let page:Value = serde_json::from_str(result["text"].as_str().unwrap()).unwrap();
+        reconstructed.push_str(page["content"].as_str().unwrap());
+        if page["has_more"] == false { break; }
+        result = runtime::call_tool(&app, &bot, &run, "connector_result_read",
+            json!({"result_id":page["result_id"],"cursor":page["next_cursor"]})).await.unwrap();
+    }
+    let response:Value = serde_json::from_str(&reconstructed).unwrap();
+    let mail:Value = serde_json::from_str(response["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(mail["emails"][0]["body"].as_str().unwrap(), "Synthetic mail body. ".repeat(9000));
+    assert_eq!(mail["emails"][1]["subject"], "Final unread message");
+    assert_eq!(frames(&log).iter().filter(|v| v["method"] == "mcpServer/tool/call").count(), 1);
+    assert!(app.db.approvals().unwrap().is_empty());
+    std::fs::remove_file(log).unwrap();
 }
 
 #[test]
