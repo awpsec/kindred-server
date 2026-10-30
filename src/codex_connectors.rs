@@ -356,6 +356,8 @@ pub async fn tools(app: &App, bot: &Bot, args: &Value) -> Result<Value> {
     tool_page(&crate::connector_policy::inventory(app, bot)?, args)
 }
 fn tool_page(inv: &Value, args: &Value) -> Result<Value> {
+    const PAGE_BYTES: usize = 48_000;
+    const LARGE_SCHEMA_BYTES: usize = 256_000;
     let app_id = runtime::string(args, "app_id")?;
     let query = args["query"].as_str().unwrap_or("").trim().to_lowercase();
     let cursor = args["cursor"].as_str().unwrap_or("");
@@ -382,13 +384,19 @@ fn tool_page(inv: &Value, args: &Value) -> Result<Value> {
         .context("ChatGPT app schemas unavailable")?
         .iter()
         .map(|v| {
+            let name = v["name"].as_str().unwrap_or("").to_lowercase();
             let haystack = format!(
                 "{} {}",
                 v["name"].as_str().unwrap_or(""),
                 v["description"].as_str().unwrap_or("")
             )
             .to_lowercase();
-            (terms.iter().filter(|t| haystack.contains(**t)).count(), v)
+            // A tool mentioned in another action's prose is a weaker match
+            // than the action's own name (for example read_thread vs edit_message).
+            let score = terms.iter().map(|term| {
+                if name.contains(*term) { 3 } else if haystack.contains(*term) { 1 } else { 0 }
+            }).sum::<usize>();
+            (score, v)
         })
         .filter(|(score, _)| terms.is_empty() || *score > 0)
         .collect::<Vec<_>>();
@@ -423,22 +431,30 @@ fn tool_page(inv: &Value, args: &Value) -> Result<Value> {
     };
     ensure!(offset <= all.len(), "Invalid ChatGPT tool cursor");
     let mut selected = Vec::new();
+    let mut unavailable = Vec::new();
     let mut bytes = 0;
+    let mut next = offset;
     for (_, value) in all.iter().skip(offset).take(4) {
         let size = value.to_string().len();
-        ensure!(
-            !selected.is_empty() || size <= 48000,
-            "This tool's schema exceeds the discovery limit; choose another supported action"
-        );
-        if bytes + size > 48000 {
+        // Never let one large schema poison every subsequent page. Return a
+        // complete supported schema alone; never truncate its required fields,
+        // enums or constraints. Execution still validates against the live copy.
+        if size > LARGE_SCHEMA_BYTES {
+            unavailable.push(json!({"name":value["name"],"schema_bytes":size,
+                "reason":"This schema is too large to expose in one discovery response. Its arguments were not returned; do not guess them. Other actions remain available."}));
+            next += 1;
+            continue;
+        }
+        if !selected.is_empty() && bytes + size > PAGE_BYTES {
             break;
         }
         bytes += size;
         selected.push(*value);
+        next += 1;
+        if bytes > PAGE_BYTES { break; }
     }
-    let next = offset + selected.len();
     Ok(
-        json!({"app_id":app_id,"server":row["server"],"account_key":inv["provider_account_key"],"connection":row["display_name"],"requires_approval":row["requires_approval"],"permission_persistence_available":row["permission_persistence_available"],"execution_available":true,"tools":selected,"matched_tools":all.len(),"next_cursor":if next<all.len(){Some(format!("{fingerprint}:{next}"))}else{None},"execute_with":"codex_connector","note":"Use exact returned names and inputSchema. Discovery does not grant action permission."}),
+        json!({"app_id":app_id,"server":row["server"],"account_key":inv["provider_account_key"],"connection":row["display_name"],"requires_approval":row["requires_approval"],"permission_persistence_available":row["permission_persistence_available"],"execution_available":true,"tools":selected,"unavailable_tools":unavailable,"matched_tools":all.len(),"next_cursor":if next<all.len(){Some(format!("{fingerprint}:{next}"))}else{None},"execute_with":"codex_connector","note":"Use exact returned names and complete inputSchema from tools. unavailable_tools contain no usable schema. Follow next_cursor to continue; discovery does not grant action permission."}),
     )
 }
 fn binding(inv: &Value, args: &Value) -> Result<Value> {

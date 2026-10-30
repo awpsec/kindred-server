@@ -53,6 +53,135 @@ fn focused_discovery_returns_complete_schemas_and_invalidates_changed_account_cu
     inv["provider_connections"][0]["execution_available"] = json!(false);
     assert!(tool_page(&inv, &json!({"app_id":"slack-app"})).is_err());
 }
+
+fn discovery_fixture(tools: Vec<Value>) -> Value {
+    json!({"provider_account_key":"account-bound","provider_connections":[{
+        "app_id":"slack-app","server":"codex_apps","display_name":"Slack",
+        "execution_available":true,"requires_approval":true,
+        "permission_persistence_available":false,"tool_schemas":tools
+    }]})
+}
+
+#[test]
+fn discovery_large_schema_has_its_own_complete_page_without_blocking_later_tools() {
+    // Slack's rich edit-message input is larger than the ordinary page budget,
+    // while the read-thread input is small. Neither schema may be lost.
+    let large = json!({"name":"slack.b_edit_message","description":"Edit a message",
+        "inputSchema":{"type":"object","properties":{"message":{"type":"object",
+            "properties":{"blocks":{"type":"array","items":{"oneOf":(0..500).map(|i|
+                json!({"type":"object","properties":{"type":{"const":format!("block_{i}")},
+                    "text":{"type":"string","maxLength":3000}},"required":["type","text"],
+                    "additionalProperties":false})).collect::<Vec<_>>()}}}},"channel":{"type":"string"}},
+            "required":["message","channel"],"additionalProperties":false},"read_only":false});
+    assert!((48_001..256_000).contains(&large.to_string().len()));
+    let small = |name: &str| json!({"name":name,"inputSchema":{"type":"object","properties":{},"additionalProperties":false}});
+    let tools = vec![small("slack.a_profile"),large.clone(),small("slack.c_read_thread")];
+    let inv = discovery_fixture(tools.clone());
+    let mut cursor=Value::Null;
+    let mut seen=Vec::new();
+    let mut pages=0;
+    loop {
+        let page=tool_page(&inv,&json!({"app_id":"slack-app","cursor":cursor})).unwrap();
+        assert_eq!(page["requires_approval"],true);
+        assert_eq!(page["permission_persistence_available"],false);
+        assert_eq!(page["unavailable_tools"],json!([]));
+        let entries=page["tools"].as_array().unwrap();
+        assert!(!entries.is_empty());
+        if entries.contains(&large) { assert_eq!(entries,&vec![large.clone()]); }
+        seen.extend(entries.iter().cloned());
+        cursor=page["next_cursor"].clone();pages+=1;
+        assert!(pages<=3,"Discovery cursor did not advance");
+        if cursor.is_null(){break;}
+    }
+    assert_eq!(pages,3);
+    assert_eq!(seen,tools);
+    assert_eq!(inv["provider_connections"][0]["tool_schemas"][1],large);
+}
+
+#[test]
+fn discovery_ranks_thread_reader_above_an_editor_that_mentions_threads() {
+    let inv=discovery_fixture(vec![
+        json!({"name":"slack.slack_edit_message","description":"Edit a message in a thread; read it first","inputSchema":{"type":"object","description":"x".repeat(65000)}}),
+        json!({"name":"slack.slack_read_thread","description":"Read thread replies","inputSchema":{"type":"object","properties":{"channel_id":{"type":"string"},"message_ts":{"type":"string"}},"required":["channel_id","message_ts"]}})
+    ]);
+    let page=tool_page(&inv,&json!({"app_id":"slack-app","query":"read thread"})).unwrap();
+    assert_eq!(page["tools"][0]["name"],"slack.slack_read_thread");
+    assert_eq!(page["tools"][0]["inputSchema"]["required"],json!(["channel_id","message_ts"]));
+    assert_eq!(page["tools"].as_array().unwrap().len(),1);
+    assert!(page["next_cursor"].is_string());
+}
+
+#[test]
+fn discovery_schema_byte_boundaries_and_mixed_cursor_accounting() {
+    let sized=|name:&str,bytes:usize| {
+        let mut value=json!({"name":name,"inputSchema":{"type":"object","description":""}});
+        value["inputSchema"]["description"]=json!("x".repeat(bytes-value.to_string().len()));
+        assert_eq!(value.to_string().len(),bytes);value
+    };
+    for size in [48_000,48_001,256_000,256_001] {
+        let schema=sized("slack.tool",size);
+        let page=tool_page(&discovery_fixture(vec![schema.clone()]),&json!({"app_id":"slack-app"})).unwrap();
+        assert!(page["next_cursor"].is_null());
+        if size<=256_000 { assert_eq!(page["tools"],json!([schema])); }
+        else { assert_eq!(page["tools"],json!([]));assert_eq!(page["unavailable_tools"][0]["schema_bytes"],size); }
+    }
+    let inv=discovery_fixture(vec![sized("slack.a",200),sized("slack.b",256_001),sized("slack.c",48_001),sized("slack.d",200)]);
+    let first=tool_page(&inv,&json!({"app_id":"slack-app"})).unwrap();
+    assert_eq!(first["tools"][0]["name"],"slack.a");
+    assert_eq!(first["unavailable_tools"][0]["name"],"slack.b");
+    let second=tool_page(&inv,&json!({"app_id":"slack-app","cursor":first["next_cursor"]})).unwrap();
+    assert_eq!(second["tools"].as_array().unwrap().len(),1);
+    assert_eq!(second["tools"][0]["name"],"slack.c");
+    let third=tool_page(&inv,&json!({"app_id":"slack-app","cursor":second["next_cursor"]})).unwrap();
+    assert_eq!(third["tools"][0]["name"],"slack.d");
+    assert!(third["next_cursor"].is_null());
+}
+
+#[test]
+fn discovery_unsupported_schema_is_explicit_and_cannot_poison_pagination() {
+    let huge=|i|json!({"name":format!("slack.a_huge_{i}"),"inputSchema":{"type":"object","description":"x".repeat(256001)}});
+    let mut tools=(0..5).map(huge).collect::<Vec<_>>();
+    tools.push(json!({"name":"slack.z_read_thread","inputSchema":{"type":"object","properties":{}}}));
+    let inv=discovery_fixture(tools);
+    let first=tool_page(&inv,&json!({"app_id":"slack-app"})).unwrap();
+    assert_eq!(first["tools"],json!([]));
+    assert_eq!(first["unavailable_tools"].as_array().unwrap().len(),4);
+    assert!(first.to_string().len()<4000);
+    let second=tool_page(&inv,&json!({"app_id":"slack-app","cursor":first["next_cursor"]})).unwrap();
+    assert_eq!(second["tools"][0]["name"],"slack.z_read_thread");
+    assert_eq!(second["unavailable_tools"].as_array().unwrap().len(),1);
+    assert!(second["next_cursor"].is_null());
+    assert!(second["unavailable_tools"][0].get("inputSchema").is_none());
+}
+
+#[test]
+#[ignore = "Requires an explicitly supplied, sanitized connector schema inventory; no live calls"]
+fn codex_discovery_recorded_slack_inventory() {
+    let path=std::env::var("KINDRED_CODEX_SCHEMA_FIXTURE").expect("Explicit sanitized schema fixture path");
+    let inv:Value=serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    let mut queries=vec![String::new()];
+    queries.extend(inv["reproduction_queries"].as_array().unwrap().iter().map(|q|q.as_str().unwrap().to_owned()));
+    let mut total_pages=0;
+    for query in queries {
+        let mut cursor=Value::Null;
+        let mut seen=HashSet::new();
+        let mut pages=0;
+        loop {
+            let page=tool_page(&inv,&json!({"app_id":"slack-app","query":query,"cursor":cursor})).unwrap();
+            assert_eq!(page["unavailable_tools"],json!([]));
+            for tool in page["tools"].as_array().unwrap() {
+                assert!(seen.insert(tool["name"].as_str().unwrap().to_owned()));
+                assert!(inv["provider_connections"][0]["tool_schemas"].as_array().unwrap().contains(tool));
+            }
+            pages+=1;assert!(pages<100);
+            cursor=page["next_cursor"].clone();
+            if cursor.is_null(){assert_eq!(seen.len(),page["matched_tools"].as_u64().unwrap() as usize);break;}
+        }
+        if query.is_empty() || query.contains("thread") { assert!(seen.contains("slack.slack_read_thread")); }
+        total_pages+=pages;
+    }
+    println!("Sanitized Slack inventory and original queries: {total_pages} complete discovery pages verified");
+}
 #[test]
 fn luna_and_sol_expose_the_same_chatgpt_discovery_path() {
     let app = crate::tests::app();
