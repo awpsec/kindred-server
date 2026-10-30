@@ -278,6 +278,7 @@ impl Db {
         crate::artifact_library::migrate(&c)?;
         crate::connector_artifacts::migrate(&c)?;
         crate::mail_watch::migrate(&c)?;
+        crate::slack_watch::migrate(&c)?;
         crate::conversation_updates::migrate(&c)?;
         crate::team_chats::migrate(&c)?;
         crate::continuity::migrate(&c)?;

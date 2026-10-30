@@ -241,6 +241,7 @@ pub fn app() -> Shared {
         desktop_sessions: Default::default(),
         profile_portal: Default::default(),
         mail_lock: Mutex::new(()),
+        slack_lock: Mutex::new(()),
         config: Config::default(),
         db: Db::open(":memory:").unwrap(),
         token: "integration-test-token-32-characters".into(),

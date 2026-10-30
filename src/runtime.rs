@@ -18,6 +18,7 @@ pub struct App {
     pub desktop_sessions: crate::desktop_sessions::Sessions,
     pub profile_portal: std::sync::OnceLock<(std::sync::Weak<crate::profiles::Profiles>, String)>,
     pub mail_lock: Mutex<()>,
+    pub slack_lock: Mutex<()>,
     pub config: Config,
     pub db: Db,
     pub token: String,
@@ -53,6 +54,7 @@ impl App {
             desktop_sessions: Default::default(),
             profile_portal: Default::default(),
             mail_lock: Mutex::new(()),
+            slack_lock: Mutex::new(()),
             config,
             db,
             token,
@@ -93,6 +95,7 @@ pub fn tool_specs_for(app: &App, bot: &Bot) -> Vec<Value> { tool_specs_scoped(ap
 pub fn tool_specs_for_run(app: &App, bot: &Bot, run: &Run) -> Vec<Value> { tool_specs_scoped(app,bot,Some(&run.id)) }
 fn tool_specs_scoped(app: &App, bot: &Bot, run_id: Option<&str>) -> Vec<Value> {
     let mut specs = tool_specs();
+    specs.extend(crate::slack_watch::specs(app));
     let scheduled=app.db.0.lock().unwrap().query_row("SELECT EXISTS(SELECT 1 FROM runs r WHERE r.bot_id=?1 AND (?2 IS NULL OR r.id=?2) AND r.status IN ('queued','running','awaiting_user','awaiting_approval') AND (EXISTS(SELECT 1 FROM routine_runs WHERE run_id=r.id) OR EXISTS(SELECT 1 FROM routine_execution WHERE run_id=r.id)))",rusqlite::params![bot.id,run_id],|r|r.get::<_,bool>(0)).unwrap_or(false);
     if !scheduled { specs.retain(|s|s["name"]!="routine_complete"); }
     let initiative = run_id.is_some_and(|id| crate::initiative::is_run(&app.db.0.lock().unwrap(),id).unwrap_or(false));
@@ -104,7 +107,7 @@ fn tool_specs_scoped(app: &App, bot: &Bot, run_id: Option<&str>) -> Vec<Value> {
         specs.push(crate::browser_use::spec());
     }
     if bot.provider != "codex" {
-        specs.retain(|s| s["name"] != "codex_connector");
+        specs.retain(|s| s["name"] != "codex_connector" && s["name"] != "codex_connector_tools");
     }
     if crate::local_access::enabled(app, bot) {
         specs.extend(crate::local_access::specs());
@@ -193,7 +196,7 @@ pub fn tool_specs() -> Vec<Value> {
         ),
         (
             "connectors_list",
-            "List actual Kindred accounts and this bot's provider connections (Codex or Claude), duplicate services, saved source preference and permissions. Prefer provider follows provider_source for this bot. Kindred remains available alongside provider connections or alone. For duplicate services follow preferred_source unless the user explicitly names another source; ask when unconfigured or ask. Never switch sources after denial or authorization failure. execution_available=false forbids execution. Connections are separate from browser bookmarks.",
+            "Find connected accounts/source preferences. provider_connections=ChatGPT/Claude; apps/kindred_configured=Kindred. For ChatGPT use codex_connector_tools(app_id). Follow preferred_source; ask if unset. Never switch after denial or call execution_available=false.",
             json!({}),
             vec![],
         ),
@@ -211,13 +214,19 @@ pub fn tool_specs() -> Vec<Value> {
         ),
         (
             "codex_connector",
-            "Call an imported Codex subscription connector using exact app_id, server, tool_name and account_key from connectors_list. Use the discovered input schema. Available only for Codex bots and connections with execution_available=true. Follow requires_approval and permission_persistence_available from discovery. Kindred revalidates the connection, permissions and tool before dispatch; provider restrictions and email-send review still apply. Never retry an uncertain write or switch sources after denial. If sign-in is required, let the person reconnect in Settings.",
+            "Call a ChatGPT app with exact identifiers/schema from codex_connector_tools. Available to every Codex model. Rechecks account/tools/permissions; email-send reviews remain. Never retry uncertain writes or switch after denial. Reconnect in Settings if needed.",
             json!({"app_id":{"type":"string"},"server":{"type":"string"},"tool_name":{"type":"string"},"account_key":{"type":"string"},"arguments":{"type":"object"}}),
             vec!["app_id", "server", "tool_name", "account_key", "arguments"],
         ),
         (
+            "codex_connector_tools",
+            "Search a ChatGPT app_id from connectors_list. Query task words or omit to browse; follow next_cursor. Returns names, complete schemas and identity for codex_connector. Read-only, no model turn. Supports Luna and all Codex models.",
+            json!({"app_id":{"type":"string"},"query":{"type":"string","maxLength":300},"cursor":{"type":"string"}}),
+            vec!["app_id"],
+        ),
+        (
             "connector_tools",
-            "Discover connected app tools, exact versions and input schemas. Follow next_cursor for more results.",
+            "Discover Kindred app tools using toolkit/account_id from apps; follow next_cursor. For ChatGPT provider_connections use codex_connector_tools.",
             json!({"toolkit":{"type":"string","maxLength":160},"account_id":{"type":"string","description":"Exact account id from connectors_list"},"query":{"type":"string"},"cursor":{"type":"string"}}),
             vec!["toolkit", "account_id", "query"],
         ),
@@ -675,7 +684,7 @@ pub fn needs_approval(app: &App, bot: &Bot, tool: &str, args: &Value) -> Result<
 
 // Opting into initiative does not authorize reconfiguring independent automations.
 fn initiative_management_tool(name: &str) -> bool {
-    matches!(name, "routine_create" | "routine_update" | "routine_control" | "inbox_monitor_save" | "inbox_monitor_setup" | "work_rule_save" | "connector_configure" | "show_connector")
+    matches!(name, "routine_create" | "routine_update" | "routine_control" | "inbox_monitor_save" | "inbox_monitor_setup" | "slack_monitor_save" | "slack_monitor_control" | "work_rule_save" | "connector_configure" | "show_connector")
 }
 fn initiative_remaining(db: &Db, run: &str, time: i64) -> Result<Option<Duration>> {
     let c = db.0.lock().unwrap();
@@ -788,6 +797,7 @@ async fn call_tool_inner(
         matches!(name, "computer_browser_task" | "initiative_checkpoint") || tool_specs()
             .into_iter()
             .chain(crate::local_access::specs())
+            .chain(crate::slack_watch::specs(app))
             .any(|t| t["name"] == name),
         "unknown tool: {name}"
     );
@@ -833,6 +843,8 @@ async fn call_tool_inner(
             | "routine_update"
             | "routine_control"
             | "inbox_monitor_save"
+            | "slack_monitor_save"
+            | "slack_monitor_control"
             | "share_file"
     ) && !approve(app, bot, run, name, &args).await?
     {
@@ -1050,13 +1062,21 @@ async fn call_tool_inner(
             if let Some(error) = refresh_error {
                 inv["provider_refresh_error"] = json!(error);
             }
-            json!({"text":serde_json::to_string(&inv)?})
+            json!({"text":serde_json::to_string(&crate::codex_connectors::discovery_view(inv))?})
         }
         "show_connector" => {
             crate::composio::request_connection_card(app, run, string(&args, "toolkit")?, args["account_name"].as_str().unwrap_or(""))?
         }
         "connector_configure" => crate::connector_policy::configure(app, bot, run, &args).await?,
         "codex_connector" => crate::codex_connectors::execute(app, bot, run, &args).await?,
+        "codex_connector_tools" => json!({"text":crate::codex_connectors::tools(app,bot,&args).await?.to_string()}),
+        "slack_monitors_list" => json!({"text":crate::slack_watch::view(app,Some(&bot.id))?.to_string()}),
+        "slack_channels" => json!({"text":crate::slack_watch::channels(app,string(&args,"account_id")?,args["cursor"].as_str().unwrap_or("")).await?.to_string()}),
+        "slack_monitor_save" => {
+            let mut input=args.clone();input["bot_id"]=json!(bot.id);
+            json!({"text":crate::slack_watch::save_watch(app,serde_json::from_value(input)?,Some(&bot.id)).await?.to_string()})
+        },
+        "slack_monitor_control" => json!({"text":crate::slack_watch::control(app,Some(&bot.id),string(&args,"id")?,string(&args,"action")?).await?.to_string()}),
         "connector_tools" => {
             let data = crate::composio::catalog_account(
                 app,
@@ -1513,6 +1533,7 @@ pub async fn scheduler(app: Shared) {
     let _continuity_worker = AbortWorker(tokio::spawn(crate::continuity::store::worker(app.clone())));
     let _voice_worker = AbortWorker(tokio::spawn(crate::voice::worker(app.clone())));
     let _mail_worker = AbortWorker(tokio::spawn(crate::mail_watch::worker(app.clone())));
+    let _slack_worker = AbortWorker(tokio::spawn(crate::slack_watch::worker(app.clone())));
     let capacity = Arc::new(tokio::sync::Semaphore::new(app.config.max_parallel_runs));
     loop {
         if app.account_disabled() {

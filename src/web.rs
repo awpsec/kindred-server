@@ -167,6 +167,12 @@ pub fn router(app: Shared) -> Router {
             get(crate::mail_watch::list).post(crate::mail_watch::save),
         )
         .route("/inbox-monitors/{id}/pause", post(crate::mail_watch::pause))
+        .route("/slack-monitoring", get(crate::slack_watch::list))
+        .route("/slack-connections", post(crate::slack_watch::connect))
+        .route("/slack-connections/{id}", axum::routing::delete(crate::slack_watch::disconnect))
+        .route("/slack-connections/{id}/channels", get(crate::slack_watch::channels_route))
+        .route("/slack-monitors", post(crate::slack_watch::save))
+        .route("/slack-monitors/{id}/control", post(crate::slack_watch::control_route))
         .route("/inbox-monitors/{id}/check", post(crate::mail_watch::check))
         .route(
             "/inbox-monitors/{id}",
@@ -1751,6 +1757,7 @@ fn static_assets<S: Clone + Send + Sync + 'static>() -> Router<S> {
                 )
             }),
         )
+        .route("/slack-monitoring.js", get(|| async { ([(header::CONTENT_TYPE,"text/javascript; charset=utf-8")],include_str!("../ui/slack-monitoring.js")) }))
         .route("/voice.js", get(|| async { ([(header::CONTENT_TYPE,"text/javascript; charset=utf-8")],include_str!("../ui/voice.js")) }))
         .route("/voice-audio-worklet.js", get(|| async { ([(header::CONTENT_TYPE,"text/javascript; charset=utf-8")],include_str!("../ui/voice-audio-worklet.js")) }))
         .route(

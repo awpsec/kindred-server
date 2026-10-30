@@ -318,6 +318,129 @@ pub async fn refresh(app: &App) -> Result<Value> {
     )?;
     Ok(value)
 }
+/// Model-facing discovery is an app directory, not every app's full schema.
+/// Keep the settings inventory unchanged and retain every permission/source gate.
+pub fn discovery_view(mut value: Value) -> Value {
+    if value["provider_source"] != "codex" {
+        return value;
+    }
+    value["kindred_configured"] = value["configured"].clone();
+    value.as_object_mut().unwrap().remove("configured");
+    value["chatgpt_connected"] = json!(
+        !value["provider_account_key"]
+            .as_str()
+            .unwrap_or("")
+            .is_empty()
+    );
+    if let Some(rows) = value["provider_connections"].as_array_mut() {
+        for row in rows {
+            let count = row["tool_schemas"].as_array().map(Vec::len).unwrap_or(0);
+            row.as_object_mut().unwrap().remove("tool_schemas");
+            row.as_object_mut().unwrap().remove("tools");
+            row["tool_count"] = json!(count);
+            row["discover_tools"] =
+                json!({"tool":"codex_connector_tools","arguments":{"app_id":row["app_id"]}});
+        }
+    }
+    value["discovery_instruction"] = json!(
+        "provider_connections lists ChatGPT apps; apps lists separate Kindred connections. An empty apps list or kindred_configured=false does not mean ChatGPT apps are missing. Use codex_connector_tools for a ChatGPT app, then codex_connector with its returned exact schema and identifiers. All Codex models, including Luna, use this route."
+    );
+    value
+}
+pub async fn tools(app: &App, bot: &Bot, args: &Value) -> Result<Value> {
+    ensure!(
+        bot.provider == "codex" && app.db.bot(&bot.id)?.provider == "codex",
+        "ChatGPT app discovery requires a Codex subscription bot"
+    );
+    refresh(app).await?;
+    tool_page(&crate::connector_policy::inventory(app, bot)?, args)
+}
+fn tool_page(inv: &Value, args: &Value) -> Result<Value> {
+    let app_id = runtime::string(args, "app_id")?;
+    let query = args["query"].as_str().unwrap_or("").trim().to_lowercase();
+    let cursor = args["cursor"].as_str().unwrap_or("");
+    ensure!(
+        app_id.len() <= 256 && query.len() <= 300 && cursor.len() <= 128,
+        "Invalid ChatGPT tool search"
+    );
+    let row = inv["provider_connections"]
+        .as_array()
+        .context("Refresh ChatGPT connections first")?
+        .iter()
+        .find(|v| v["app_id"] == app_id)
+        .context("Choose an app_id from connectors_list → provider_connections")?;
+    ensure!(
+        row["execution_available"] == true,
+        "This ChatGPT app has no verified callable tools. Check its connection in Settings."
+    );
+    let terms = query
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|s| s.len() > 1)
+        .collect::<Vec<_>>();
+    let mut all = row["tool_schemas"]
+        .as_array()
+        .context("ChatGPT app schemas unavailable")?
+        .iter()
+        .map(|v| {
+            let haystack = format!(
+                "{} {}",
+                v["name"].as_str().unwrap_or(""),
+                v["description"].as_str().unwrap_or("")
+            )
+            .to_lowercase();
+            (terms.iter().filter(|t| haystack.contains(**t)).count(), v)
+        })
+        .filter(|(score, _)| terms.is_empty() || *score > 0)
+        .collect::<Vec<_>>();
+    all.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| a.1["name"].as_str().cmp(&b.1["name"].as_str()))
+    });
+    let binding = json!([
+        inv["provider_account_key"],
+        app_id,
+        query,
+        all.iter().map(|(_, v)| v).collect::<Vec<_>>()
+    ]);
+    let fingerprint = digest(&SHA256, binding.to_string().as_bytes())
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    let offset = if cursor.is_empty() {
+        0
+    } else {
+        let (prefix, index) = cursor
+            .split_once(':')
+            .context("Invalid ChatGPT tool cursor")?;
+        ensure!(
+            prefix == fingerprint,
+            "ChatGPT tools or account changed. Search again without the old cursor."
+        );
+        index
+            .parse::<usize>()
+            .context("Invalid ChatGPT tool cursor")?
+    };
+    ensure!(offset <= all.len(), "Invalid ChatGPT tool cursor");
+    let mut selected = Vec::new();
+    let mut bytes = 0;
+    for (_, value) in all.iter().skip(offset).take(4) {
+        let size = value.to_string().len();
+        ensure!(
+            !selected.is_empty() || size <= 48000,
+            "This tool's schema exceeds the discovery limit; choose another supported action"
+        );
+        if bytes + size > 48000 {
+            break;
+        }
+        bytes += size;
+        selected.push(*value);
+    }
+    let next = offset + selected.len();
+    Ok(
+        json!({"app_id":app_id,"server":row["server"],"account_key":inv["provider_account_key"],"connection":row["display_name"],"requires_approval":row["requires_approval"],"permission_persistence_available":row["permission_persistence_available"],"execution_available":true,"tools":selected,"matched_tools":all.len(),"next_cursor":if next<all.len(){Some(format!("{fingerprint}:{next}"))}else{None},"execute_with":"codex_connector","note":"Use exact returned names and inputSchema. Discovery does not grant action permission."}),
+    )
+}
 fn binding(inv: &Value, args: &Value) -> Result<Value> {
     ensure!(
         inv["account_key"] == args["account_key"],

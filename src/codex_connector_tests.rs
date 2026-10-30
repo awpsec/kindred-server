@@ -1,6 +1,80 @@
 use super::*;
 use std::time::Duration;
 
+#[test]
+fn compact_discovery_preserves_chatgpt_apps_without_kindred_accounts() {
+    let inv = json!({"provider_source":"codex","provider_account_key":"account-bound","configured":false,"apps":[],"provider_connections":[{"app_id":"slack-app","server":"codex_apps","display_name":"Slack","execution_available":true,"requires_approval":true,"tools":["slack.search"],"tool_schemas":[{"name":"slack.search","inputSchema":{"type":"object","description":"x".repeat(100000)}}]}]});
+    let compact = discovery_view(inv.clone());
+    assert_eq!(compact["chatgpt_connected"], true);
+    assert!(compact.get("configured").is_none());
+    assert_eq!(compact["kindred_configured"], false);
+    assert_eq!(compact["provider_connections"][0]["tool_count"], 1);
+    assert!(compact.to_string().len() < 2000);
+    assert_eq!(
+        inv["provider_connections"][0]["tool_schemas"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+#[test]
+fn focused_discovery_returns_complete_schemas_and_invalidates_changed_account_cursors() {
+    let tools=(0..11).map(|i|json!({"name":format!("slack.search_{i:02}"),"description":"Search messages","inputSchema":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}})).collect::<Vec<_>>();
+    let mut inv = json!({"provider_account_key":"account-bound","provider_connections":[{"app_id":"slack-app","server":"codex_apps","display_name":"Slack","execution_available":true,"requires_approval":true,"tool_schemas":tools}]});
+    let mut cursor = Value::Null;
+    let mut names = std::collections::HashSet::new();
+    loop {
+        let page = tool_page(
+            &inv,
+            &json!({"app_id":"slack-app","query":"search messages","cursor":cursor}),
+        )
+        .unwrap();
+        assert_eq!(page["account_key"], "account-bound");
+        for tool in page["tools"].as_array().unwrap() {
+            assert_eq!(tool["inputSchema"]["required"], json!(["query"]));
+            assert!(names.insert(tool["name"].as_str().unwrap().to_owned()));
+        }
+        cursor = page["next_cursor"].clone();
+        if cursor.is_null() {
+            break;
+        }
+    }
+    assert_eq!(names.len(), 11);
+    let page = tool_page(&inv, &json!({"app_id":"slack-app"})).unwrap();
+    inv["provider_account_key"] = json!("replaced");
+    assert!(
+        tool_page(
+            &inv,
+            &json!({"app_id":"slack-app","cursor":page["next_cursor"]})
+        )
+        .is_err()
+    );
+    inv["provider_connections"][0]["execution_available"] = json!(false);
+    assert!(tool_page(&inv, &json!({"app_id":"slack-app"})).is_err());
+}
+#[test]
+fn luna_and_sol_expose_the_same_chatgpt_discovery_path() {
+    let app = crate::tests::app();
+    let mut bot = crate::tests::bot(&app.db, "codex");
+    for model in ["gpt-6-luna", "gpt-6.1-sol"] {
+        bot.model = model.into();
+        let specs = runtime::tool_specs_for(&app, &bot);
+        for name in [
+            "connectors_list",
+            "codex_connector_tools",
+            "codex_connector",
+        ] {
+            assert!(specs.iter().any(|v| v["name"] == name));
+        }
+    }
+    bot.provider = "openrouter".into();
+    assert!(
+        !runtime::tool_specs_for(&app, &bot)
+            .iter()
+            .any(|v| v["name"] == "codex_connector_tools")
+    );
+}
 async fn peer(mode: &str, log: &std::path::Path) -> Rpc {
     let script = r#"
 import sys,json

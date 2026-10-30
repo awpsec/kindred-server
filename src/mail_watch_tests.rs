@@ -369,6 +369,8 @@ async fn empty_checks_do_not_run_ai_new_mail_deduplicates_and_busy_bot_batches()
     let next = app.db.claim_bot(&bot.id).unwrap().unwrap();
     assert!(next.prompt.contains("\"message_id\":\"c\""));
     assert!(!next.prompt.contains("\"message_id\":\"b\""));
+    // New scheduled executions classify the report before publishing it.
+    crate::runtime::call_tool(&app,&bot,&next,"routine_complete",json!({"outcome":"report","report":"A client needs your reply"})).await.unwrap();
     app.db
         .finish(&next.id, "completed", "A client needs your reply", "")
         .unwrap();

@@ -65,6 +65,7 @@ mod guest;
 mod instructions;
 mod local_access;
 mod mail_watch;
+mod slack_watch;
 mod mobile_push;
 mod managed_process;
 mod message_actions;
