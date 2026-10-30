@@ -494,6 +494,29 @@ async fn routine_editor_roundtrip_manual_run_and_quiet_checks_preserve_notificat
     app.db
         .finish(&run.id, "failed", "", "A real error")
         .unwrap();
+    // A late finish cannot overwrite a completed quiet routine. Verify real
+    // failures using a new check instead of mutating that terminal outcome.
+    assert_eq!(app.db.run(&run.id).unwrap().status, "completed");
+    assert!(app.db.notifications(Some(0)).unwrap()["items"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    app.db.finish(&normal.id, "completed", "", "").unwrap();
+    let response: serde_json::Value = client
+        .post(&url)
+        .bearer_auth(&app.token)
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let failed = app.db.claim().unwrap().unwrap();
+    assert_eq!(failed.id, response["run_id"]);
+    assert_ne!(failed.id, run.id);
+    app.db.finish(&failed.id, "failed", "", "A real error").unwrap();
+    app.db.event(&failed.id, "run_finished", json!({})).unwrap();
     assert_eq!(
         app.db.notifications(Some(0)).unwrap()["items"]
             .as_array()

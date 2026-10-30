@@ -311,7 +311,7 @@ impl Db {
             let c=self.0.lock().unwrap();
             let dispatch:Option<i64>=c.query_row("SELECT e.seq FROM events e JOIN followup_offers o ON o.id=json_extract(e.body,'$.offer_id') AND o.run_id=e.run_id WHERE o.id=? AND o.run_id=? AND o.state='transported' AND e.kind='followup_dispatch' ORDER BY e.seq DESC LIMIT 1",params![offer,run.id],|r|r.get(0)).optional()?;
             let dispatch=dispatch.ok_or_else(||anyhow::anyhow!("Follow-up has no matching dispatch receipt"))?;
-            let question:Option<String>=c.query_row("SELECT q.id FROM questions q JOIN events e ON e.run_id=q.run_id AND e.kind='question_wait' AND json_extract(e.body,'$.id')=q.id WHERE q.run_id=? AND q.bot_id=? AND q.chat_id=? AND q.status IN ('pending','answered','skipped','cancelled') AND e.seq>?4 ORDER BY e.seq DESC LIMIT 1",params![run.id,run.bot_id,run.chat_id,dispatch],|r|r.get(0)).optional()?;
+            let question:Option<String>=c.query_row("SELECT q.id FROM questions q JOIN events e ON e.run_id=q.run_id AND e.kind='question_wait' AND json_extract(e.body,'$.id')=q.id WHERE q.run_id=? AND q.bot_id=? AND q.chat_id=? AND q.status IN ('pending','answered','dismissed','skipped','cancelled') AND e.seq>?4 ORDER BY e.seq DESC LIMIT 1",params![run.id,run.bot_id,run.chat_id,dispatch],|r|r.get(0)).optional()?;
             if let Some(id)=question {json!({"kind":"question","question_id":id})}
             else if let Some(ids)=c.query_row("SELECT w.ids FROM command_waits w JOIN events e ON e.run_id=w.run_id AND e.kind='process_wait' AND json_extract(e.body,'$.ids')=w.ids WHERE w.run_id=? AND e.seq>? ORDER BY e.seq DESC LIMIT 1",params![run.id,dispatch],|r|r.get::<_,String>(0)).optional()? {json!({"kind":"process_wait","command_ids":serde_json::from_str::<Value>(&ids)?})}
             else {
@@ -1133,6 +1133,45 @@ mod tests {
     async fn followup_question_handoff_owns_continuation_without_recovery_error() {
         let app=tests::app();let bot=tests::bot(&app.db,"codex");app.db.queue(&bot.id,"Root",0).unwrap();let run=app.db.claim_bot(&bot.id).unwrap().unwrap();let source=app.db.chat_send(&run.chat_id,"Question followup",&[]).unwrap()[0].clone();app.db.request_steering(&source,&run.id).unwrap();let offer=app.db.offer_followups(&run).unwrap().unwrap();let id=offer["id"].as_str().unwrap();app.db.dispatch_followup(&run,id).unwrap();app.db.followup_transported(&run,id).unwrap();assert!(app.db.defer_followup(&run,id).is_err());
         let result=runtime::call_tool(&app,&bot,&run,"ask_question",json!({"topic_key":"synthetic-followup","question":"Which source?","context":"Synthetic followup source choice","options":["A","B"]})).await.unwrap();assert_eq!(result["deferred_question"],true);app.db.defer_followup(&run,id).unwrap();app.db.finish(&run.id,"completed","","").unwrap();app.db.deliver_pending_completions().unwrap();assert_eq!(app.db.run(&source).unwrap().status,"steered");assert!(!app.db.chat_messages(&run.chat_id).unwrap().iter().any(|m|m["run_id"]==source&&m["kind"]=="result"));let events=app.db.events(&run.id).unwrap();let receipt=events.iter().find(|e|e["kind"]=="user_followups").unwrap();assert_eq!(receipt["body"]["delivery"],"managed_handoff");assert_eq!(receipt["body"]["handoff"]["kind"],"question");
+    }
+
+    #[tokio::test]
+    async fn dismissed_followup_question_settles_without_recovery_or_continuation() {
+        for provider in ["codex", "claude-code"] {
+            let app = tests::app();
+            let bot = tests::bot(&app.db, provider);
+            app.db.queue(&bot.id, "Original task", 0).unwrap();
+            let run = app.db.claim_bot(&bot.id).unwrap().unwrap();
+            let source = app.db.chat_send(&run.chat_id, "Follow-up needing a choice", &[]).unwrap()[0].clone();
+            app.db.request_steering(&source, &run.id).unwrap();
+            let offer = app.db.offer_followups(&run).unwrap().unwrap();
+            let id = offer["id"].as_str().unwrap();
+            app.db.dispatch_followup(&run, id).unwrap();
+            app.db.followup_transported(&run, id).unwrap();
+            let result = runtime::call_tool(&app, &bot, &run, "ask_question", json!({
+                "topic_key":"dismissed-followup", "question":"Which source?",
+                "context":"Synthetic follow-up source choice", "options":["A", "B"]
+            })).await.unwrap();
+            assert_eq!(result["deferred_question"], true);
+            let question = app.db.chat_messages(&run.chat_id).unwrap().into_iter()
+                .find(|m| m["kind"] == "question").unwrap()["question"].clone();
+            let saved = app.db.dismiss_question(question["id"].as_str().unwrap()).unwrap();
+            assert_eq!(saved.status, "dismissed");
+            assert!(saved.answer.is_empty() && saved.selected.is_none() && saved.continuation_run_id.is_empty());
+            // Dismiss can win the race with the provider's end-of-turn receipt.
+            app.db.defer_followup(&run, id).unwrap();
+            app.db.finish(&run.id, "completed", "", "").unwrap();
+            app.db.deliver_pending_completions().unwrap();
+            assert_eq!(app.db.run(&source).unwrap().status, "steered");
+            assert!(app.db.claim_bot(&bot.id).unwrap().is_none());
+            assert!(!app.db.chat_messages(&run.chat_id).unwrap().iter()
+                .any(|m| (m["run_id"] == source || m["run_id"] == run.id) && m["kind"] == "result"));
+            let events = app.db.events(&run.id).unwrap();
+            let receipt = events.iter().find(|e| e["kind"] == "user_followups").unwrap();
+            assert_eq!(receipt["body"]["delivery"], "managed_handoff");
+            assert_eq!(receipt["body"]["handoff"]["question_id"], question["id"]);
+            assert_eq!(events.iter().filter(|e| e["kind"] == "question_dismissed").count(), 1);
+        }
     }
 
     #[tokio::test]
