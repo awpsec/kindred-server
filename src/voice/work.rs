@@ -295,7 +295,7 @@ mod tests {
     #[test]
     fn failed_provider_details_are_not_spoken_as_results() {
         let app = crate::tests::app();
-        let bot = crate::tests::bot(&app.db, "codex");
+        let bot = test_bot(&app.db, "codex");
         let chat = format!("dm-{}", bot.id);
         let call = db::id();
         let mut transcript = Transcript::default();
@@ -348,7 +348,7 @@ mod tests {
     #[test]
     fn recent_chat_context_includes_calls_but_excludes_suppressed_history() {
         let app = crate::tests::app();
-        let bot = crate::tests::bot(&app.db, "codex");
+        let bot = test_bot(&app.db, "codex");
         let chat = format!("dm-{}", bot.id);
         {
             let c = app.db.0.lock().unwrap();

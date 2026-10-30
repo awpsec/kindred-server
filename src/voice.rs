@@ -577,6 +577,26 @@ where
 }
 
 #[cfg(test)]
+fn test_bot(db: &Db, provider: &str) -> crate::db::Bot {
+    let bot = crate::db::Bot {
+        id: db::id(),
+        name: "Voice teammate".into(),
+        instructions: "Use the tools.".into(),
+        provider: provider.into(),
+        model: "test/model".into(),
+        reasoning_effort: String::new(),
+        memory: String::new(),
+        auto_approve: false,
+        approval_mode: "inherit".into(),
+        profile: Default::default(),
+    };
+    // Match the production creation path, which atomically creates the bot's DM.
+    // Saving preferences alone deliberately does not create a conversation.
+    db.create_bot(&bot).unwrap();
+    bot
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use axum::http::Request;
@@ -599,7 +619,7 @@ mod tests {
     fn live_work_uses_bot_provider_and_closing_never_repeats_dispatched_work() {
         for provider in ["openrouter", "codex", "claude-code"] {
             let app = crate::tests::app();
-            let bot = crate::tests::bot(&app.db, provider);
+            let bot = test_bot(&app.db, provider);
             let chat = format!("dm-{}",bot.id);
             let mut t = Transcript::default();
             t.append(&fragment("a","input","Find a local bicycle repair shop with a website and phone number.",1)).unwrap();
@@ -623,7 +643,7 @@ mod tests {
     }
     #[test]
     fn corrections_steer_running_work_and_results_reach_voice_once_and_stay_in_chat() {
-        let app=crate::tests::app();let bot=crate::tests::bot(&app.db,"openrouter");let chat=format!("dm-{}",bot.id);
+        let app=crate::tests::app();let bot=test_bot(&app.db,"openrouter");let chat=format!("dm-{}",bot.id);
         let mut t=Transcript::default();t.append(&fragment("a","input","Find a bike shop nearby.",1)).unwrap();
         let id=record(&app.db,&chat,&t);let first=work::dispatch(&app.db,&id,"a",&t).unwrap().unwrap();
         let run=app.db.claim_bot(&bot.id).unwrap().unwrap();assert_eq!(run.id,first);
@@ -643,7 +663,7 @@ mod tests {
     }
     #[test]
     fn pending_choices_are_announced_without_answering_or_approving_them() {
-        let app=crate::tests::app();let bot=crate::tests::bot(&app.db,"codex");let chat=format!("dm-{}",bot.id);
+        let app=crate::tests::app();let bot=test_bot(&app.db,"codex");let chat=format!("dm-{}",bot.id);
         let mut t=Transcript::default();t.append(&fragment("a","input","Help me choose a route.",1)).unwrap();let id=record(&app.db,&chat,&t);
         work::dispatch(&app.db,&id,"choice",&t).unwrap();let run=app.db.claim_bot(&bot.id).unwrap().unwrap();
         app.db.ask_question(&run,crate::questions::QuestionInput{topic_key:"voice-route".into(),question:"Which route?".into(),context:"The riverside route adds ten minutes.".into(),options:vec!["Riverside".into(),"Direct".into()]}).unwrap();
@@ -654,7 +674,7 @@ mod tests {
     }
     #[test]
     fn late_transcript_tail_is_handed_off_once_after_restart() {
-        let app=crate::tests::app();let bot=crate::tests::bot(&app.db,"openrouter");let chat=format!("dm-{}",bot.id);
+        let app=crate::tests::app();let bot=test_bot(&app.db,"openrouter");let chat=format!("dm-{}",bot.id);
         let mut t=Transcript::default();let id=record(&app.db,&chat,&t);
         assert!(work::dispatch(&app.db,&id,"early",&t).unwrap().is_none());
         t.append(&fragment("a","input","Find a bicycle shop.",1)).unwrap();checkpoint(&app.db,&id,&t,15).unwrap();work::dispatch(&app.db,&id,"early",&t).unwrap();
@@ -685,7 +705,7 @@ mod tests {
     fn receipt_handoff_and_future_context_are_atomic_and_provider_independent() {
         for provider in ["openrouter", "codex", "claude-code"] {
             let app = crate::tests::app();
-            let b = crate::tests::bot(&app.db, provider);
+            let b = test_bot(&app.db, provider);
             let chat = format!("dm-{}", b.id);
             let mut t = Transcript::default();
             t.append(&fragment("a", "input", "Please review tomorrow's plan.", 1))
@@ -718,7 +738,7 @@ mod tests {
     #[test]
     fn restart_recovers_once_and_empty_calls_do_not_create_tasks() {
         let app = crate::tests::app();
-        let b = crate::tests::bot(&app.db, "openrouter");
+        let b = test_bot(&app.db, "openrouter");
         let chat = format!("dm-{}", b.id);
         let empty = record(&app.db, &chat, &Transcript::default());
         recover(&app.db).unwrap();
@@ -839,7 +859,7 @@ mod tests {
         let start = Instant::now() - Duration::from_secs(90);
         assert_eq!(elapsed(start, Some(start + Duration::from_secs(83))), 83);
         let app = crate::tests::app();
-        let mut bot = crate::tests::bot(&app.db, "openrouter");
+        let mut bot = test_bot(&app.db, "openrouter");
         let chat = format!("dm-{}", bot.id);
         let mut transcript = Transcript::default();
         transcript
@@ -863,7 +883,7 @@ mod tests {
     #[test]
     fn recovery_skips_live_calls_and_retries_a_full_task_queue_without_duplicates() {
         let app = crate::tests::app();
-        let bot = crate::tests::bot(&app.db, "openrouter");
+        let bot = test_bot(&app.db, "openrouter");
         let chat = format!("dm-{}", bot.id);
         let mut t = Transcript::default();
         t.append(&fragment("a", "input", "Review the plan.", 1))
@@ -910,7 +930,7 @@ mod tests {
             root.join("state.db").to_string_lossy().into_owned();
         let key = "sk-proj-voice-fixture-not-a-real-credential";
         crate::connections::save_decisions(&app, Some(key)).unwrap();
-        let bot = crate::tests::bot(&app.db, "openrouter");
+        let bot = test_bot(&app.db, "openrouter");
         let ticket = Ticket {
             id: db::id(),
             chat: format!("dm-{}", bot.id),
