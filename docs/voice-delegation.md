@@ -25,11 +25,12 @@ tests and the conversation-update tests. The tests cover duplicate delegation,
 corrections, pending questions, public result delivery, trailing transcript input,
 recovery, provider independence and the existing local WebSocket relay fixture.
 
-The preparation checks passed production `cargo check`, Chromium/WebKit decision
-card tests at desktop and phone widths, and eleven isolated tests using production
-delegation/transcript code with a database fixture. Those isolated tests do not
-exercise the full scheduler, an external model or native audio. The full server
-test compilation was terminated under memory pressure and is still required.
+The server test harness compiled and all 15 `voice::` tests passed during release
+preparation on 2026-10-30. Fixtures now use the production bot-creation path,
+including its direct conversation. Coverage includes the local WebSocket relay,
+correction steering, public results, pending approvals and restart deduplication.
+Chromium/WebKit decision-card and voice adapter tests also passed. These checks
+use local provider fixtures; they do not validate real provider audio or a device.
 
 An existing task-question browser fixture expects four top-level progress rows
 but observes zero on both the preceding source and this candidate. Reconcile
