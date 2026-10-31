@@ -27,6 +27,8 @@ use std::{
 use tokio_tungstenite::tungstenite::{Message as UpstreamMessage, client::IntoClientRequest};
 mod work;
 pub(crate) mod session;
+mod options;
+use options::{PaceUpdate, SpeakingPace};
 
 macro_rules! require {
     ($condition:expr,$message:literal) => {
@@ -52,12 +54,15 @@ const VOICES: &[&str] = &[
 pub struct Preferences {
     pub enabled: bool,
     pub voice: String,
+    #[serde(default)]
+    pub pace: SpeakingPace,
 }
 impl Default for Preferences {
     fn default() -> Self {
         Self {
             enabled: false,
             voice: "marin".into(),
+            pace: SpeakingPace::Normal,
         }
     }
 }
@@ -71,7 +76,7 @@ fn preferences(db: &Db) -> Preferences {
 pub async fn settings(State(app): State<Shared>) -> Result<Json<Value>, Error> {
     let prefs = preferences(&app.db);
     Ok(Json(
-        json!({"configured":crate::connections::decisions_key(&app).is_some(),"enabled":prefs.enabled,"voice":prefs.voice,"model":"gpt-live-1","catalog_source":"openai_documentation","catalog_url":"https://developers.openai.com/api/reference/resources/live/methods/create","voices":VOICES.iter().map(|id| json!({"id":id,"name":format!("{}{}",id[..1].to_uppercase(),&id[1..])})).collect::<Vec<_>>()}),
+        json!({"configured":crate::connections::decisions_key(&app).is_some(),"enabled":prefs.enabled,"voice":prefs.voice,"pace":prefs.pace,"voice_changes":"next_call","model":"gpt-live-1","catalog_source":"openai_documentation","catalog_url":"https://developers.openai.com/api/reference/resources/live/methods/create","voices":VOICES.iter().map(|id| json!({"id":id,"name":format!("{}{}",id[..1].to_uppercase(),&id[1..])})).collect::<Vec<_>>()}),
     ))
 }
 pub async fn save_settings(
@@ -87,8 +92,8 @@ pub async fn save_settings(
         "Connect your OpenAI API key first."
     );
     require!(
-        app.voice.active.lock().unwrap().is_none(),
-        "End your call before changing its voice."
+        app.voice.active.lock().unwrap().is_none() || prefs.enabled == preferences(&app.db).enabled,
+        "End your call before turning voice calls on or off."
     );
     app.db
         .save_setting("voice", &serde_json::to_value(prefs)?)?;
@@ -562,7 +567,10 @@ where
     let input = work::context(&app.db, &chat.id)?;
     let run = session::begin(&app.db, ticket)?;
     let delegation = session::configuration(app,&bot,&run)?;
+    let initial_pace = preferences(&app.db).pace;
+    let mut pace_update = PaceUpdate::new(initial_pace);
     let instructions = format!("You are the AI voice of {}, a teammate in Kindred. Speak naturally and briefly, listen to interruptions, and keep the conversation flowing while tools work. Do not claim to be human. Bot role: {}. You have a recent chat excerpt; the call's private backend has the bot's context and tools. Generate <|SpawnThinking|> for a clear request needing current facts, tools, memory beyond your excerpt, or substantive reasoning. Clarify ambiguity aloud before acting. Do not delegate greetings or small talk. Never invent results. Give verified findings in the call; a concise recap with useful links is saved to chat after hangup. Do not say results were posted to chat during the call. Required action approvals remain explicit controls in chat; spoken agreement does not bypass them. Do not narrate every handoff or fill pauses with repeated checking acknowledgments.", bot.name,bot.profile.label);
+    let instructions = format!("{instructions} {}",initial_pace.instruction());
     send_upstream(&mut upstream,json!({"type":"session.start","session":{"model":"gpt-live-1","store":false,"instructions":instructions,"input":input,"audio":{"format":{"type":"audio/pcm","rate":24000},"output":{"voice":ticket.voice}},"delegation":delegation}})).await?;
     let mut pending = std::collections::VecDeque::<session::ToolCall>::new();
     let mut running = futures_util::stream::FuturesUnordered::new();
@@ -601,6 +609,8 @@ where
             },
             incoming=upstream.next()=>{
                 let event=match incoming {Some(Ok(UpstreamMessage::Text(text)))=>serde_json::from_str::<Value>(&text)?,Some(Ok(UpstreamMessage::Ping(bytes)))=>{upstream.send(UpstreamMessage::Pong(bytes)).await?;continue;},Some(Ok(_))=>continue,_=>break};
+                if let Some(result)=pace_update.handle(&event) {send(client,result).await?;continue;}
+                if PaceUpdate::is_options_error(&event) {continue;}
                 match event["type"].as_str().unwrap_or("") {
                     "session.started"=>{ensure!(started.is_none(),"Duplicate start.");started=Some(Instant::now());connected=Instant::now();last_audio=Instant::now();
                         {let c=app.db.0.lock().unwrap();ensure!(!crate::workspace_transfer::frozen(&c)?,"This workspace is moving.");c.execute("UPDATE voice_calls SET started=? WHERE id=?",params![db::now(),ticket.id])?;}
@@ -686,6 +696,8 @@ where
                     return Err(MissingAudio.into());
                 }
                 if started.is_some() && closing.is_none() {
+                    if let Some(result)=pace_update.timeout() {send(client,result).await?;}
+                    if let Some(command)=pace_update.command(preferences(&app.db).pace) {send_upstream(&mut upstream,command).await?;}
                     let waiting=app.db.0.lock().unwrap().query_row("SELECT EXISTS(SELECT 1 FROM approvals WHERE run_id=?1 AND status='pending') OR EXISTS(SELECT 1 FROM user_tasks WHERE run_id=?1 AND status IN ('pending','ready')) OR EXISTS(SELECT 1 FROM questions WHERE run_id=?1 AND status='pending')",[&run.id],|r|r.get::<_,bool>(0))?;
                     if waiting && !action_notice {
                         send_upstream(&mut upstream,json!({"type":"session.commentary.append","event_id":db::id(),"delegation_id":null,"content":"The current action needs your explicit review or participation using the pending card in chat. It has not completed. Spoken agreement does not submit that card."})).await?;
@@ -972,6 +984,8 @@ mod tests {
         assert_eq!(v["catalog_source"], "openai_documentation");
         assert_eq!(v["enabled"], false);
         assert_eq!(v["voice"], "marin");
+        assert_eq!(v["pace"], "normal");
+        assert_eq!(v["voice_changes"], "next_call");
         assert_eq!(v["voices"].as_array().unwrap().len(), 31);
         assert!(
             v["voices"]
@@ -992,7 +1006,8 @@ mod tests {
                 State(app.clone()),
                 Json(Preferences {
                     enabled: false,
-                    voice: "invented".into()
+                    voice: "invented".into(),
+                    pace: SpeakingPace::Normal,
                 })
             )
             .await
@@ -1010,6 +1025,20 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(denied.status(), 403);
+    }
+    #[tokio::test]
+    async fn voice_options_preserve_legacy_preferences_and_active_calls() {
+        let app=crate::tests::app();
+        app.db.save_setting("voice",&json!({"enabled":false,"voice":"willow"})).unwrap();
+        assert_eq!(preferences(&app.db).pace,SpeakingPace::Normal);
+        assert!(serde_json::from_value::<Preferences>(json!({"enabled":false,"voice":"marin","pace":"very-fast"})).is_err());
+        *app.voice.active.lock().unwrap()=Some("existing-call".into());
+        let result=save_settings(State(app.clone()),Json(Preferences{enabled:false,voice:"cedar".into(),pace:SpeakingPace::Faster})).await.ok().expect("active call options save");
+        assert_eq!(result.0["voice"],"cedar");assert_eq!(result.0["pace"],"faster");
+        assert_eq!(app.voice.active.lock().unwrap().as_deref(),Some("existing-call"));
+        app.db.save_setting("voice",&json!({"enabled":true,"voice":"cedar","pace":"faster"})).unwrap();
+        assert!(save_settings(State(app.clone()),Json(Preferences{enabled:false,voice:"cedar".into(),pace:SpeakingPace::Normal})).await.is_err());
+        assert!(preferences(&app.db).enabled);
     }
     #[test]
     fn closing_freezes_elapsed_time_and_archived_bots_keep_the_receipt() {
@@ -1139,6 +1168,10 @@ mod tests {
                     send_upstream(&mut ws,json!({"type":"response.event","delegation_id":"delegation-one","event":{"type":"response.completed","response":{"id":"response-two","output":[]}}})).await.unwrap();
                     send_upstream(&mut ws,json!({"type":"session.output_audio.delta","delta":"AgADAA=="})).await.unwrap();
                 }
+                if value["type"]=="session.instructions.append" {
+                    assert!(value["content"].as_str().unwrap().contains("a little faster"));
+                    send_upstream(&mut ws,json!({"type":"session.instructions.appended","client_event_id":value["event_id"]})).await.unwrap();
+                }
                 if value["type"] == "session.close" {
                     send_upstream(&mut ws, fragment("b", "input", " the plan.", 100))
                         .await
@@ -1208,6 +1241,10 @@ mod tests {
         assert_eq!(reply["data"],"AgADAA==");
         assert!(app.db.chat_messages(&ticket.chat).unwrap().is_empty());
         assert_eq!(app.db.bot(&bot.id).unwrap().memory.matches("north entrance").count(),1);
+        assert!(save_settings(State(app.clone()),Json(Preferences{enabled:true,voice:"cedar".into(),pace:SpeakingPace::Faster})).await.is_ok());
+        let options=tokio::time::timeout(Duration::from_secs(5),client.next()).await.unwrap().unwrap().unwrap();
+        let options:Value=serde_json::from_str(options.to_text().unwrap()).unwrap();
+        assert_eq!(options["type"],"options_applied");assert_eq!(options["pace"],"faster");
         send_upstream(&mut client,json!({"type":"end"})).await.unwrap();
         assert!(
             tokio::time::timeout(Duration::from_secs(10), result_rx)
@@ -1216,6 +1253,8 @@ mod tests {
                 .unwrap()
         );
         let commands = provider_task.await.unwrap();
+        assert_eq!(commands.iter().filter(|v|v["type"]=="session.instructions.append").count(),1);
+        assert!(!commands.iter().any(|v|v["type"]=="session.start"||v["type"]=="session.update"),"voice selection never reconnects or sends unsupported audio updates");
         assert_eq!(commands.iter().filter(|v|v["type"]=="response.item.create").count(),1);
         assert_eq!(commands.iter().filter(|v|v["type"]=="response.create").count(),1);
         assert_eq!(
