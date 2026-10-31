@@ -7,7 +7,7 @@ use anyhow::{Result, bail};
 use rusqlite::OptionalExtension;
 use serde_json::{Value, json};
 
-pub const VERSION: &str = "43";
+pub const VERSION: &str = "44";
 pub const CORE: &str = include_str!("prompts/00-core.md");
 pub const BOUNDED_CORE: &str = include_str!("prompts/00-bounded-core.md");
 pub const CHAPTERS: &[(&str, &str)] = &[
