@@ -24,6 +24,10 @@ const TABLES: &[&str] = &[
     "chat_messages",
     "voice_calls",
     "voice_delegations",
+    "voice_sessions",
+    "voice_session_items",
+    "voice_tool_calls",
+    "voice_deferred_messages",
     "message_reactions",
     "chat_completion_receipts",
     "chat_completion_pending",
@@ -291,7 +295,7 @@ impl Db {
             tables.keys().all(|t| TABLES.contains(&t.as_str()))
                 && TABLES.iter().all(|t| matches!(
                     *t,
-                    "message_send_modes" | "message_progress" | "queued_message_claims" | "connector_artifacts"
+                    "message_send_modes" | "message_progress" | "queued_message_claims" | "connector_artifacts" | "voice_sessions" | "voice_session_items" | "voice_tool_calls" | "voice_deferred_messages"
                         | "visual_panels"
                     | "workspace_artifacts"
                     | "workspace_artifact_versions"
@@ -335,7 +339,7 @@ impl Db {
         for table in TABLES {
             if matches!(
                 *table,
-                "message_send_modes" | "message_progress" | "queued_message_claims" | "connector_artifacts"
+                "message_send_modes" | "message_progress" | "queued_message_claims" | "connector_artifacts" | "voice_sessions" | "voice_session_items" | "voice_tool_calls" | "voice_deferred_messages"
                     | "visual_panels"
                     | "workspace_artifacts"
                     | "workspace_artifact_versions"

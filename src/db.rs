@@ -311,7 +311,7 @@ impl Db {
             "UPDATE approvals SET status='expired' WHERE status='pending'",
             [],
         )?;
-        c.execute_batch("INSERT INTO chat_messages(chat_id,sender,body,kind,run_id,created) SELECT chat_id,bot_id,CASE WHEN error='' THEN output ELSE error END,'result',id,max(created,COALESCE((SELECT max(m.created) FROM chat_messages m WHERE m.run_id=runs.id),created)) FROM runs WHERE chat_id!='' AND status IN ('completed','failed','interrupted','cancelled') AND NOT EXISTS(SELECT 1 FROM routine_execution WHERE run_id=runs.id) AND NOT EXISTS(SELECT 1 FROM chat_messages WHERE run_id=runs.id AND kind='result') AND NOT (status='completed' AND error='' AND (trim(output)='' OR EXISTS(SELECT 1 FROM routine_runs WHERE run_id=runs.id AND quiet=1) OR EXISTS(SELECT 1 FROM events WHERE run_id=runs.id AND kind='initiative_quiet') OR EXISTS(SELECT 1 FROM events WHERE run_id=runs.id AND kind IN ('question_wait','process_wait'))));")?;
+        c.execute_batch("INSERT INTO chat_messages(chat_id,sender,body,kind,run_id,created) SELECT chat_id,bot_id,CASE WHEN error='' THEN output ELSE error END,'result',id,max(created,COALESCE((SELECT max(m.created) FROM chat_messages m WHERE m.run_id=runs.id),created)) FROM runs WHERE chat_id!='' AND NOT EXISTS(SELECT 1 FROM events WHERE run_id=runs.id AND kind='voice_session') AND status IN ('completed','failed','interrupted','cancelled') AND NOT EXISTS(SELECT 1 FROM routine_execution WHERE run_id=runs.id) AND NOT EXISTS(SELECT 1 FROM chat_messages WHERE run_id=runs.id AND kind='result') AND NOT (status='completed' AND error='' AND (trim(output)='' OR EXISTS(SELECT 1 FROM routine_runs WHERE run_id=runs.id AND quiet=1) OR EXISTS(SELECT 1 FROM events WHERE run_id=runs.id AND kind='initiative_quiet') OR EXISTS(SELECT 1 FROM events WHERE run_id=runs.id AND kind IN ('question_wait','process_wait'))));")?;
         crate::chats::repair_projection(&c)?;
         crate::progress_updates::repair_task_markers(&c)?;
         crate::routine_controls::remove_archived_bot_schedules(&c)?;
@@ -475,7 +475,7 @@ impl Db {
     }
     pub fn runs(&self, bot: Option<&str>) -> Result<Vec<Run>> {
         let c = self.0.lock().unwrap();
-        let rows = c.prepare("SELECT * FROM runs WHERE (?1 IS NULL OR bot_id=?1) AND (status IN ('running','awaiting_user','awaiting_approval','cancelling') OR id IN (SELECT run_id FROM command_jobs WHERE status IN ('starting','running')) OR rowid IN (SELECT rowid FROM runs WHERE (?1 IS NULL OR bot_id=?1) ORDER BY created DESC,rowid DESC LIMIT 100)) ORDER BY created DESC,rowid DESC")?.query_map([bot],run_row)?.collect::<rusqlite::Result<_>>()?;
+        let rows = c.prepare("SELECT * FROM runs WHERE (?1 IS NULL OR bot_id=?1) AND NOT EXISTS(SELECT 1 FROM events WHERE run_id=runs.id AND kind='voice_session') AND (status IN ('running','awaiting_user','awaiting_approval','cancelling') OR id IN (SELECT run_id FROM command_jobs WHERE status IN ('starting','running')) OR rowid IN (SELECT rowid FROM runs WHERE (?1 IS NULL OR bot_id=?1) ORDER BY created DESC,rowid DESC LIMIT 100)) ORDER BY created DESC,rowid DESC")?.query_map([bot],run_row)?.collect::<rusqlite::Result<_>>()?;
         Ok(rows)
     }
     pub fn run(&self, id: &str) -> Result<Run> {
@@ -581,7 +581,7 @@ impl Db {
             // descendant, not just rows that directly own an initiative check.
             // Scan FIFO order and stop at the first ordinary task; keep only the
             // earliest automatic task as a fallback without loading the queue.
-            let mut queued = tx.prepare("SELECT * FROM runs WHERE status='queued' AND bot_id=?1 AND EXISTS(SELECT 1 FROM bots WHERE id=?1 AND COALESCE(json_extract(profile,'$.archived'),0)=0) AND NOT EXISTS(SELECT 1 FROM runs WHERE bot_id=?1 AND status IN ('running','awaiting_user','awaiting_approval','cancelling')) ORDER BY created,rowid")?;
+            let mut queued = tx.prepare("SELECT * FROM runs WHERE status='queued' AND bot_id=?1 AND EXISTS(SELECT 1 FROM bots WHERE id=?1 AND COALESCE(json_extract(profile,'$.archived'),0)=0) AND NOT EXISTS(SELECT 1 FROM runs active WHERE bot_id=?1 AND status IN ('running','awaiting_user','awaiting_approval','cancelling') AND NOT EXISTS(SELECT 1 FROM events WHERE run_id=active.id AND kind='voice_session')) ORDER BY created,rowid")?;
             let rows = queued.query_map([bot], run_row)?;
             let mut ordinary = None;
             let mut automatic = None;
@@ -802,8 +802,9 @@ impl Db {
             "INSERT INTO events(run_id,kind,body,created) VALUES(?,?,?,?)",
             params![run, kind, body.to_string(), created],
         )?;
-        if kind=="tool_started" {crate::progress_updates::observe_tool(&tx,run,body["tool"].as_str().unwrap_or(""))?;}
+        if kind=="tool_started" && !crate::voice::session::is_run(&tx,run)? {crate::progress_updates::observe_tool(&tx,run,body["tool"].as_str().unwrap_or(""))?;}
         if kind == "assistant"
+            && !crate::voice::session::is_run(&tx,run)?
             && !initiative_assistant
             && !tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM routine_runs WHERE run_id=?1) OR EXISTS(SELECT 1 FROM routine_execution WHERE run_id=?1)",

@@ -137,6 +137,9 @@ pub fn refresh_on_claim(c: &Connection, run: &mut Run) -> Result<()> {
 }
 
 fn resume(c: &Connection, parent_id: &str) -> Result<()> {
+    // A live call consumes helper receipts itself. Hangup or restart must not
+    // turn that private work into another ordinary chat task.
+    if crate::voice::session::is_run(c,parent_id)? {return Ok(());}
     let process_wait: bool = c.query_row(
         "SELECT EXISTS(SELECT 1 FROM command_waits WHERE run_id=? AND continuation='')",
         [parent_id],

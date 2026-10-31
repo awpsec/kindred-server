@@ -227,11 +227,15 @@ impl Db {
             q
         };
         let deferred = q.status == "pending";
+        let voice = crate::voice::session::is_run(&tx,&run.id)?;
         if deferred {
             tx.execute(
                 "INSERT INTO events(run_id,kind,body,created) VALUES(?,'question_wait',?,?)",
                 params![run.id, json!({"id":q.id}).to_string(), db::now()],
             )?;
+            if voice && q.run_id==run.id {
+                tx.execute("UPDATE runs SET status='awaiting_user' WHERE id=? AND status='running'",[&run.id])?;
+            }
         }
         tx.commit()?;
         Ok(
@@ -247,6 +251,9 @@ impl Db {
         if q.status == "dismissed" { return Ok(q); }
         ensure!(q.status == "pending", "This question is no longer waiting for an answer");
         tx.execute("UPDATE questions SET status='dismissed' WHERE id=? AND status='pending'", [id])?;
+        if crate::voice::session::is_run(&tx,&q.run_id)? {
+            tx.execute("UPDATE runs SET status='running' WHERE id=? AND status='awaiting_user'",[&q.run_id])?;
+        }
         tx.execute("INSERT INTO events(run_id,kind,body,created) VALUES(?,'question_dismissed',?,?)",
             params![q.run_id, json!({"id":id,"instruction":"Dismissed without an answer. No option was selected and no dependent action is authorized."}).to_string(), db::now()])?;
         let result = tx.query_row("SELECT * FROM questions WHERE id=?", [id], row)?;
@@ -291,6 +298,15 @@ impl Db {
         );
         let original_run =
             tx.query_row("SELECT * FROM runs WHERE id=?", [&q.run_id], db::run_row)?;
+        if crate::voice::session::is_run(&tx,&q.run_id)? {
+            ensure!(tx.query_row("SELECT EXISTS(SELECT 1 FROM voice_sessions s JOIN voice_calls v ON v.id=s.call_id JOIN runs r ON r.id=s.run_id WHERE s.run_id=? AND v.finished=0 AND r.status IN ('running','awaiting_user'))",[&q.run_id],|r|r.get::<_,bool>(0))?,"This call has ended. Ask again to start new work.");
+            tx.execute("UPDATE questions SET status='answered',answer=?,selected=?,continuation_run_id=run_id,answered_at=? WHERE id=?",params![text,answer.selected,db::now(),id])?;
+            tx.execute("UPDATE runs SET status='running' WHERE id=? AND status='awaiting_user'",[&q.run_id])?;
+            tx.execute("INSERT INTO events(run_id,kind,body,created) VALUES(?,'question_answered',?,?)",params![q.run_id,json!({"id":id,"answer":text,"selected":answer.selected,"continuation_run_id":q.run_id}).to_string(),db::now()])?;
+            let result=tx.query_row("SELECT * FROM questions WHERE id=?",[id],row)?;
+            tx.commit()?;
+            return Ok(result);
+        }
         let original = &original_run.prompt;
         let collaboration = crate::collaboration::is_child(&tx, &q.run_id)?;
         let new_round = db::id();
@@ -352,7 +368,11 @@ impl Db {
         Ok(result)
     }
     pub fn turn_deferred(&self, run: &str) -> Result<bool> {
-        Ok(self.0.lock().unwrap().query_row(
+        let c=self.0.lock().unwrap();
+        if crate::voice::session::is_run(&c,run)? {
+            return Ok(c.query_row("SELECT EXISTS(SELECT 1 FROM questions WHERE run_id=? AND status='pending')",[run],|r|r.get(0))?);
+        }
+        Ok(c.query_row(
             "SELECT EXISTS(SELECT 1 FROM events WHERE run_id=? AND kind IN ('question_wait','process_wait'))",
             [run],
             |r| r.get(0),

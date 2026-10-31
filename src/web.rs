@@ -695,6 +695,7 @@ async fn approvals(State(app): State<Shared>) -> Result<Json<Vec<Value>>> {
     let mut approvals=app.db.approvals()?;
     let c=app.db.0.lock().unwrap();
     for approval in &mut approvals {
+        approval["voice_run"]=crate::voice::session::review_owner(&c,approval["run_id"].as_str().unwrap_or(""))?;
         if let Some(id)=approval["args"]["artifact_id"].as_str() {
             approval["connector_artifact"]=crate::connector_artifacts::record(&c,id)?;
         }
@@ -1498,8 +1499,11 @@ async fn marketplace_tools(
     ))
 }
 
-async fn user_tasks(State(app): State<Shared>) -> Result<Json<Vec<crate::user_tasks::UserTask>>> {
-    Ok(Json(app.db.user_tasks()?))
+async fn user_tasks(State(app): State<Shared>) -> Result<Json<Vec<Value>>> {
+    let mut tasks=app.db.user_tasks()?.into_iter().map(serde_json::to_value).collect::<serde_json::Result<Vec<_>>>()?;
+    let c=app.db.0.lock().unwrap();
+    for task in &mut tasks {task["voice_run"]=crate::voice::session::review_owner(&c,task["run_id"].as_str().unwrap_or(""))?;}
+    Ok(Json(tasks))
 }
 // User input goes directly to the paused screen, never through run events or a model tool call.
 async fn enter_user_task_code(State(app): State<Shared>, Path(id): Path<String>, Json(v): Json<Value>) -> Result<Json<Value>> {

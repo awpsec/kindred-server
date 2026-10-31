@@ -1,5 +1,5 @@
-//! Live uses the ordinary bot scheduler, tools and approval pipeline. This ledger
-//! records which spoken input was handed off so closing a call never replays it.
+//! Legacy handoff recovery and shared call history. New calls use session.rs;
+//! old saved transcripts retain their original delivery receipts on upgrade.
 use super::*;
 use crate::chats::Chat;
 use rusqlite::Connection;
@@ -22,6 +22,7 @@ fn covered(c: &Connection, call: &str) -> Result<usize> {
         |r| r.get(0),
     )?)
 }
+#[cfg(test)]
 pub(super) fn has_new_input(db: &Db, call: &str, t: &Transcript) -> Result<bool> {
     Ok(user_count(t) > covered(&db.0.lock().unwrap(), call)?)
 }
@@ -119,6 +120,7 @@ pub(super) fn finish_tail(
 ) -> Result<Option<String>> {
     queue(c, call, chat, t, true)
 }
+#[cfg(test)]
 pub(super) fn dispatch(
     db: &Db,
     call: &str,
@@ -179,6 +181,7 @@ pub(super) fn dispatch(
 
 // Follow an accepted steer or an explicitly answered question to its actual task.
 // Uncertain transport remains a failure to review, never a reason to retry work.
+#[cfg(test)]
 fn owner(c: &Connection, source: &str) -> Result<String> {
     let mut run = source.to_owned();
     let mut seen = HashSet::new();
@@ -192,11 +195,13 @@ fn owner(c: &Connection, source: &str) -> Result<String> {
     Ok(run)
 }
 
+#[cfg(test)]
 #[derive(Default)]
 pub(super) struct Updates {
     seen: HashSet<String>,
     states: HashMap<String, String>,
 }
+#[cfg(test)]
 impl Updates {
     pub(super) fn poll(&mut self, db: &Db, call: &str) -> Result<Vec<Value>> {
         let c = db.0.lock().unwrap();
@@ -257,6 +262,7 @@ impl Updates {
         Ok(events)
     }
 }
+#[cfg(test)]
 fn chunks(text: &str) -> Vec<&str> {
     // A byte is an upper bound for a byte-tokenizer token. Leave room for framing
     // within the API's 500-token cap, including non-Latin text and long URLs.
@@ -272,6 +278,7 @@ fn chunks(text: &str) -> Vec<&str> {
     }
     chunks
 }
+#[cfg(test)]
 pub(super) fn append(kind: &str, delegation: &str, content: &str) -> Value {
     json!({"type":format!("session.{kind}.append"),"event_id":uuid::Uuid::new_v4().to_string(),"delegation_id":delegation,"content":content})
 }
@@ -280,7 +287,7 @@ pub(super) fn context(db: &Db, chat: &str) -> Result<Vec<Value>> {
     super::restore_context(db, &mut messages)?;
     let seqs: Vec<i64> = messages.iter().filter_map(|m| m["seq"].as_i64()).collect();
     let hidden = crate::continuity::store::hidden_sources(db, chat, &seqs)?;
-    let mut input: Vec<Value> = messages.iter().rev().filter(|m| !hidden.contains(&m["seq"].as_i64().unwrap_or(0)) && ["message","result","voice_call"].contains(&m["kind"].as_str().unwrap_or(""))).take(16).map(|m| {
+    let mut input: Vec<Value> = messages.iter().rev().filter(|m| !hidden.contains(&m["seq"].as_i64().unwrap_or(0)) && ["message","result","voice_call","voice_recap"].contains(&m["kind"].as_str().unwrap_or(""))).take(16).map(|m| {
         let user = m["sender"] == "user";
         let text = m["text"].as_str().unwrap_or("");
         json!({"type":"message","role":if user {"user"} else {"assistant"},"content":[{"type":if user {"input_text"} else {"output_text"},"text":if text.chars().count()>1000 {format!("[Recent excerpt; use the bot to retrieve full context] {}",recent(text,1000))} else {text.to_owned()}}]})

@@ -101,7 +101,7 @@ pub fn migrate(c: &Connection) -> Result<()> {
       UPDATE chat_messages SET history_order=printf('%020d:%020d',seq,COALESCE(source_event_seq,9223372036854775807)) WHERE kind='result' AND history_order IS NULL;
       INSERT OR IGNORE INTO chat_messages(chat_id,sender,body,kind,run_id,created,source_event_seq,history_order)
       SELECT r.chat_id,r.bot_id,json_extract(e.body,'$.text'),'assistant',r.id,e.created,e.seq,(SELECT printf('%020d:%020d',m.seq,e.seq) FROM chat_messages m WHERE m.run_id=r.id AND m.kind='result' LIMIT 1) FROM events e JOIN runs r ON r.id=e.run_id JOIN chats c ON c.id=r.chat_id
-      WHERE e.kind='assistant' AND json_type(e.body,'$.text')='text' AND trim(json_extract(e.body,'$.text'))!=''
+      WHERE e.kind='assistant' AND NOT EXISTS(SELECT 1 FROM events call WHERE call.run_id=r.id AND call.kind='voice_session') AND json_type(e.body,'$.text')='text' AND trim(json_extract(e.body,'$.text'))!=''
       AND NOT EXISTS(SELECT 1 FROM routine_runs rr WHERE rr.run_id=r.id)
       AND NOT EXISTS(SELECT 1 FROM initiative_runs i WHERE i.run_id=r.id)
       AND NOT EXISTS(SELECT 1 FROM events background WHERE background.run_id=r.id AND background.kind='initiative_background')
@@ -427,7 +427,7 @@ impl Db {
                 row["question"] = json!(self.question(row["text"].as_str().unwrap_or(""))?);
                 row["text"] = row["question"]["question"].clone();
             }
-            if row["kind"] == "result" {
+            if row["kind"] == "result" || row["kind"] == "voice_recap" {
                 row["attachments"] = json!(self.attachments(row["run_id"].as_str().unwrap_or(""))?);
             }
             row["progress"] = crate::progress_updates::message(&self.0.lock().unwrap(), row["seq"].as_i64().unwrap())?;
@@ -677,7 +677,7 @@ impl Db {
             for source in &runs {
                 // Only a running task can accept a fresh followup at a tool boundary.
                 // Waiting/finished tasks retain the ordinary queued send.
-                tx.execute("INSERT INTO steering_requests(source_run_id,run_id,created) SELECT s.id,t.id,? FROM runs s JOIN runs t ON s.bot_id=t.bot_id AND s.chat_id=t.chat_id WHERE s.id=? AND t.status='running' AND t.id<>s.id ORDER BY t.rowid DESC LIMIT 1",params![db::now(),source])?;
+                tx.execute("INSERT INTO steering_requests(source_run_id,run_id,created) SELECT s.id,t.id,? FROM runs s JOIN runs t ON s.bot_id=t.bot_id AND s.chat_id=t.chat_id WHERE s.id=? AND t.status='running' AND t.id<>s.id AND NOT EXISTS(SELECT 1 FROM events WHERE run_id=t.id AND kind='voice_session') ORDER BY t.rowid DESC LIMIT 1",params![db::now(),source])?;
             }
         }
         if let Some(key) = request_id {
@@ -790,6 +790,10 @@ impl Db {
             [&run.id],
         )? == 0
         {
+            tx.commit()?;
+            return Ok(());
+        }
+        if crate::voice::session::is_run(&tx,&run.id)? {
             tx.commit()?;
             return Ok(());
         }
@@ -1021,8 +1025,10 @@ mod delivery_tests {
             .filter(|r| r.status == "queued")
             .collect::<Vec<_>>();
         assert_eq!(follow.len(), 1);
-        assert!(follow[0].prompt.contains("No written result was returned"));
-        assert!(follow[0].prompt.contains("Review this with your teammate"));
+        let state:Value=serde_json::from_str(follow[0].prompt.split_once("Continuation state (attributed data): ").unwrap().1).unwrap();
+        assert_eq!(state["returned_results"][0]["status"],"completed");
+        assert_eq!(state["returned_results"][0]["reported_result"]["text"],"");
+        assert_eq!(state["original_assignment"]["request"]["text"],"Review this with your teammate");
         assert!(
             !db.chat_messages(&child.chat_id)
                 .unwrap()

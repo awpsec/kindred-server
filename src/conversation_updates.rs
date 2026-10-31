@@ -22,7 +22,7 @@ pub fn migrate(c: &Connection) -> Result<()> {
     Ok(())
 }
 fn push_targets(c: &Connection) -> Result<Vec<(String,String)>> {
-    Ok(c.prepare("SELECT s.id,t.id FROM runs s JOIN runs t ON t.bot_id=s.bot_id AND t.chat_id=s.chat_id JOIN run_message_sources m ON m.run_id=s.id JOIN chat_messages msg ON msg.seq=m.message_seq WHERE s.status='queued' AND t.status IN ('running','awaiting_approval') AND s.rowid>t.rowid AND s.depth=0 AND s.reply_to='' AND msg.sender='user' AND msg.kind IN ('message','voice_call') AND msg.suppressed=0 AND NOT EXISTS(SELECT 1 FROM queue_push_requests WHERE source_run_id=s.id) AND NOT EXISTS(SELECT 1 FROM followup_offer_sources WHERE source_run_id=s.id) AND NOT EXISTS(SELECT 1 FROM run_commands WHERE run_id=s.id) AND NOT EXISTS(SELECT 1 FROM routine_runs WHERE run_id=s.id) AND NOT EXISTS(SELECT 1 FROM questions WHERE continuation_run_id=s.id) ORDER BY s.rowid")?.query_map([],|r|Ok((r.get(0)?,r.get(1)?)))?.collect::<rusqlite::Result<_>>()?)
+    Ok(c.prepare("SELECT s.id,t.id FROM runs s JOIN runs t ON t.bot_id=s.bot_id AND t.chat_id=s.chat_id JOIN run_message_sources m ON m.run_id=s.id JOIN chat_messages msg ON msg.seq=m.message_seq WHERE s.status='queued' AND NOT EXISTS(SELECT 1 FROM events WHERE run_id=t.id AND kind='voice_session') AND t.status IN ('running','awaiting_approval') AND s.rowid>t.rowid AND s.depth=0 AND s.reply_to='' AND msg.sender='user' AND msg.kind IN ('message','voice_call') AND msg.suppressed=0 AND NOT EXISTS(SELECT 1 FROM queue_push_requests WHERE source_run_id=s.id) AND NOT EXISTS(SELECT 1 FROM followup_offer_sources WHERE source_run_id=s.id) AND NOT EXISTS(SELECT 1 FROM run_commands WHERE run_id=s.id) AND NOT EXISTS(SELECT 1 FROM routine_runs WHERE run_id=s.id) AND NOT EXISTS(SELECT 1 FROM questions WHERE continuation_run_id=s.id) ORDER BY s.rowid")?.query_map([],|r|Ok((r.get(0)?,r.get(1)?)))?.collect::<rusqlite::Result<_>>()?)
 }
 
 /// Repair only the old Claude failure shape with a recorded final answer before
@@ -235,7 +235,7 @@ impl Db {
             ensure!(owner == target, "This message already joined another task");
             return Ok(json!({"status":"steered","run_id":target}));
         }
-        let valid:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM runs s JOIN runs t ON t.id=?2 JOIN run_message_sources m ON m.run_id=s.id JOIN chat_messages msg ON msg.seq=m.message_seq WHERE s.id=?1 AND s.id<>t.id AND s.bot_id=t.bot_id AND s.chat_id=t.chat_id AND s.status='queued' AND t.status IN ('running','awaiting_approval','awaiting_user') AND s.depth=0 AND s.reply_to='' AND msg.sender='user' AND msg.kind IN ('message','voice_call') AND NOT EXISTS(SELECT 1 FROM run_commands WHERE run_id=s.id) AND NOT EXISTS(SELECT 1 FROM routine_runs WHERE run_id=s.id) AND NOT EXISTS(SELECT 1 FROM questions WHERE continuation_run_id=s.id))",params![source,target],|r|r.get(0))?;
+        let valid:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM runs s JOIN runs t ON t.id=?2 JOIN run_message_sources m ON m.run_id=s.id JOIN chat_messages msg ON msg.seq=m.message_seq WHERE s.id=?1 AND s.id<>t.id AND NOT EXISTS(SELECT 1 FROM events WHERE run_id=t.id AND kind='voice_session') AND s.bot_id=t.bot_id AND s.chat_id=t.chat_id AND s.status='queued' AND t.status IN ('running','awaiting_approval','awaiting_user') AND s.depth=0 AND s.reply_to='' AND msg.sender='user' AND msg.kind IN ('message','voice_call') AND NOT EXISTS(SELECT 1 FROM run_commands WHERE run_id=s.id) AND NOT EXISTS(SELECT 1 FROM routine_runs WHERE run_id=s.id) AND NOT EXISTS(SELECT 1 FROM questions WHERE continuation_run_id=s.id))",params![source,target],|r|r.get(0))?;
         ensure!(
             valid,
             "This message can only steer an active task for the same bot and conversation. It remains queued if that task already finished."
@@ -1371,7 +1371,8 @@ pub fn with_live_context(db: &Db, run: &Run, mut result: Value) -> Result<Value>
     )?;
     let mode=crate::progress_updates::resolved(&db.bot(&run.bot_id)?, &db.setting("general")?.unwrap_or_default());
     let initiative = crate::initiative::is_run(&db.0.lock().unwrap(), &run.id)?;
-    let update_due = !routine && !initiative && db::now() - last_reply >= crate::progress_updates::seconds(&mode);
+    let voice = crate::voice::session::is_run(&db.0.lock().unwrap(),&run.id)?;
+    let update_due = !routine && !initiative && !voice && db::now() - last_reply >= crate::progress_updates::seconds(&mode);
     // Context enrichment must never turn an already-completed tool action into
     // a failure if conversation membership changes while that action runs.
     let planning = db
