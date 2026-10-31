@@ -1,7 +1,11 @@
 //! Slack events are matched locally. Only new matching messages queue model work.
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod onboarding_tests;
 mod transport;
+mod onboarding;
+pub use onboarding::{setup_monitor, complete_setup_route};
 use crate::{
     db::{self, Db},
     runtime::{App, Shared},
@@ -70,37 +74,43 @@ pub struct Watch {
     pub rules: Vec<Rule>,
     pub enabled: bool,
 }
-/// Event setup tools are exposed only after the workspace has a connection.
-/// Unconfigured workspaces retain the small discovery/setup entry point.
+/// Management tools appear after a connection exists.
+/// Discovery and guided setup are always available.
 pub fn specs(app: &App) -> Vec<Value> {
     let connected=app.db.0.lock().unwrap().query_row("SELECT EXISTS(SELECT 1 FROM slack_accounts WHERE json_extract(body,'$.status')!='disconnected')",[],|r|r.get::<_,bool>(0)).unwrap_or(false);
     let specs = [
         (
+            "slack_monitor_setup",
+            "Prepare requested Slack event monitoring. Returns accounts/rules or a connection card. Reuse topic_key across continuations. Change it only for new requests. Never ask for tokens in chat. ChatGPT Slack is separate.",
+            json!({"topic_key":{"type":"string","maxLength":100},"account_id":{"type":"string"},"account_name":{"type":"string","maxLength":80}}),
+            vec!["topic_key"],
+        ),
+        (
             "slack_monitors_list",
-            "List this bot's Slack monitors and workspace identities. No connection: Settings > Slack monitoring; never request tokens in chat. ChatGPT Slack is separate. Events use no polling model or new reply permissions.",
+            "List this bot's Slack monitors and account health.",
             json!({}),
             vec![],
         ),
         (
             "slack_channels",
-            "List joined channels for account_id from slack_monitors_list. Follow next_cursor; use returned IDs.",
+            "List joined channels for a listed account_id. Follow next_cursor. Use returned IDs.",
             json!({"account_id":{"type":"string"},"cursor":{"type":"string"}}),
             vec!["account_id"],
         ),
         (
             "slack_monitor_save",
-            "Save on user request using account_id from slack_monitors_list. Supply ALL rules when editing. OR rules deduplicate and ignore self/edits/deletes; busy bots get batches. Reply permissions remain. Saved settings do not prove delivery.",
+            "Save this bot's requested monitor with a listed account_id and ALL rules. OR rules deduplicate and ignore self/edits/deletes. Busy bots get batches. Reply permissions stay unchanged. Verify delivery separately.",
             json!({"id":{"type":"string"},"account_id":{"type":"string"},"instructions":{"type":"string","maxLength":16000},"enabled":{"type":"boolean"},"rules":{"type":"array","minItems":1,"maxItems":32,"items":{"type":"object","properties":{"event":{"type":"string","enum":["all_messages","mentions"]},"scope":{"type":"string","enum":["all_channels","channel","direct_messages"]},"channel_id":{"type":"string"}},"required":["event","scope"],"additionalProperties":false}}}),
             vec!["account_id", "instructions", "enabled", "rules"],
         ),
         (
             "slack_monitor_control",
-            "Pause/resume/remove this bot's monitor by ID. Pause/remove drop pending events and queued checks, preserving running work/history. Resume starts with new events. Normal approval.",
+            "Pause/resume/remove this bot's monitor with normal approval. Pause/remove drop queued events only. Resume gets new events.",
             json!({"id":{"type":"string"},"action":{"type":"string","enum":["pause","resume","remove"]}}),
             vec!["id", "action"],
         ),
     ];
-    specs.into_iter().filter(|(name,_,_,_)|connected || *name=="slack_monitors_list")
+    specs.into_iter().filter(|(name,_,_,_)|connected || matches!(*name,"slack_monitors_list"|"slack_monitor_setup"))
         .map(|(name,description,properties,required)|json!({"type":"function","name":name,"description":description,"inputSchema":{"type":"object","properties":properties,"required":required,"additionalProperties":false}})).collect()
 }
 fn valid_id(value: &str, prefix: &[u8]) -> bool {
@@ -180,7 +190,7 @@ pub fn view(app: &App, bot: Option<&str>) -> Result<Value> {
         items.push(item);
     }
     Ok(
-        json!({"connections":connections,"items":items,"delivery":"Slack Events API · Socket Mode","setup":"Settings → Slack monitoring → Connect Slack","scope_note":"All channels means channels available to this Slack identity and the app's event subscriptions. DMs belong to this connected identity. New messages only; reconnecting does not scan history."}),
+        json!({"connections":connections,"items":items,"delivery":"Slack Events API · Socket Mode","setup":"Call slack_monitor_setup to configure monitoring in chat. Settings → Slack monitoring also manages connections and rules.","scope_note":"All channels means channels available to this Slack identity and the app's event subscriptions. DMs belong to this connected identity. New messages only; reconnecting does not scan history."}),
     )
 }
 pub async fn list(State(app): State<Shared>) -> Result<Json<Value>, crate::web::Error> {

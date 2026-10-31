@@ -61,7 +61,7 @@ pub fn work_title(tool:&str)->Option<&'static str> {
         "skill_save"|"skill_import_local"|"skill_refresh_local"|"skill_rename"|"skill_delete"=>Some("Maintain bot skills"),
         "workspace_import_start"|"workspace_import_draft"|"workspace_sync_prepare"|"workspace_sync_apply"=>Some("Update workspace"),
         "send_to_bot"=>Some("Coordinate teammate work"),
-        "checklist_create"|"checklist_update"|"reminder_set"|"reminder_update"|"routine_create"|"routine_update"|"routine_control"|"inbox_monitor_setup"|"inbox_monitor_save"=>Some("Manage plans and schedules"),
+        "checklist_create"|"checklist_update"|"reminder_set"|"reminder_update"|"routine_create"|"routine_update"|"routine_control"|"inbox_monitor_setup"|"inbox_monitor_save"|"slack_monitor_setup"|"slack_monitor_save"|"slack_monitor_control"=>Some("Manage plans and schedules"),
         "visual_panel"=>Some("Prepare interactive panel"),
         _=>None,
     }

@@ -168,6 +168,7 @@ pub fn router(app: Shared) -> Router {
         )
         .route("/inbox-monitors/{id}/pause", post(crate::mail_watch::pause))
         .route("/slack-monitoring", get(crate::slack_watch::list))
+        .route("/slack-setup/{id}/complete", post(crate::slack_watch::complete_setup_route))
         .route("/slack-connections", post(crate::slack_watch::connect))
         .route("/slack-connections/{id}", axum::routing::delete(crate::slack_watch::disconnect))
         .route("/slack-connections/{id}/channels", get(crate::slack_watch::channels_route))

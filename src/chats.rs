@@ -415,6 +415,7 @@ impl Db {
                         let q = self.question(id)?;
                         card["completed"] = json!(q.status != "pending");
                         card["declined"] = json!(q.selected == Some(1));
+                        card["dismissed"] = json!(q.status == "dismissed");
                         row["text"] = json!(card.to_string());
                     }
                 }

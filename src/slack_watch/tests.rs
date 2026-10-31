@@ -398,7 +398,8 @@ fn rate_limit_is_visible_without_creating_model_work() {
 #[test]
 fn tools_are_available_on_all_providers_without_bloating_unconnected_workspaces() {
     let empty = crate::tests::app();
-    assert_eq!(specs(&empty).len(), 1);
+    assert_eq!(specs(&empty).len(), 2);
+    assert!(specs(&empty).iter().any(|t|t["name"]=="slack_monitor_setup"));
     let (app, _, w) = setup();
     for provider in ["codex", "openrouter", "claude-code"] {
         let mut bot = app.db.bot(&w.bot_id).unwrap();
@@ -406,6 +407,7 @@ fn tools_are_available_on_all_providers_without_bloating_unconnected_workspaces(
         app.db.save_bot(&bot).unwrap();
         let tools = crate::runtime::tool_specs_for(&app, &bot);
         for name in [
+            "slack_monitor_setup",
             "slack_monitors_list",
             "slack_channels",
             "slack_monitor_save",
@@ -414,7 +416,7 @@ fn tools_are_available_on_all_providers_without_bloating_unconnected_workspaces(
             let tool = tools.iter().find(|v| v["name"] == name).unwrap();
             assert_eq!(tool["inputSchema"]["additionalProperties"], false);
         }
-        let id = app.db.queue(&bot.id, "Monitor the helpdesk", 0).unwrap();
+        let id = app.db.queue(&bot.id, "Monitor all messages in #urgent-requests, mentions across all channels, and all DMs to Helpdesk. Preserve existing rules and help with actual requests. Stay quiet when there is nothing to do.", 0).unwrap();
         let run = app.db.run(&id).unwrap();
         crate::instructions::build(
             &app,
