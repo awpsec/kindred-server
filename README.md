@@ -1,6 +1,6 @@
 # Kindred Server
 
-<img src="ui/favicon.svg" width="64" height="64" alt="Kindred logo">
+<img src="ui/brand-icon.svg" width="64" height="64" alt="Kindred logo">
 
 **The always-on home for your Kindred workspace.**
 

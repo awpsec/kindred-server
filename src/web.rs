@@ -1837,6 +1837,24 @@ fn static_assets<S: Clone + Send + Sync + 'static>() -> Router<S> {
                 )
             }),
         )
+        .route("/brand-icon.svg", get(|| async {
+            ([(header::CONTENT_TYPE, "image/svg+xml")], include_str!("../ui/brand-icon.svg"))
+        }))
+        .route("/brand-icon-light.svg", get(|| async {
+            ([(header::CONTENT_TYPE, "image/svg+xml")], include_str!("../ui/brand-icon-light.svg"))
+        }))
+        .route("/brand-icon-dark.svg", get(|| async {
+            ([(header::CONTENT_TYPE, "image/svg+xml")], include_str!("../ui/brand-icon-dark.svg"))
+        }))
+        .route("/brand-wordmark.svg", get(|| async {
+            ([(header::CONTENT_TYPE, "image/svg+xml")], include_str!("../ui/brand-wordmark.svg"))
+        }))
+        .route("/brand-icon.png", get(|| async {
+            ([(header::CONTENT_TYPE, "image/png")], include_bytes!("../ui/brand-icon.png").as_slice())
+        }))
+        .route("/apple-touch-icon.png", get(|| async {
+            ([(header::CONTENT_TYPE, "image/png")], include_bytes!("../ui/apple-touch-icon.png").as_slice())
+        }))
         .route(
             "/audio/kindred-pop.wav",
             get(|| async {
