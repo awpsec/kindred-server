@@ -60,7 +60,7 @@ fs.mkdirSync(artifacts,{recursive:true});
     await p.goto(origin);await p.locator('#bot-details').click();
     const section=p.getByRole('region',{name:'Routines',exact:true}),row=id=>section.locator('[data-routine-id="'+id+'"]');
     await row('mail').waitFor();assert.equal(await section.locator('li').count(),4);assert.equal(await section.getByText('Atlas only').count(),0);
-    assert.equal(await p.locator('#details-content > .detail-link').allTextContents().then(v=>v.join('|')),'Connections|Skills|Artifacts');
+    assert.equal(await p.locator('#details-content > .detail-link').allTextContents().then(v=>v.join('|')),'Connections|Skills|Slack monitoring|Artifacts');
     assert.match(await row('weekly').textContent(),/Paused · Weekdays · Hourly · 09:00–17:00 · America\/New_York/);
     assert.equal(await row('daily').locator('button').count(),3);assert.equal(await row('daily').locator('button svg').count(),3);
     // Pause/resume, failed action recovery, and no double submits while pending.
@@ -104,11 +104,13 @@ fs.mkdirSync(artifacts,{recursive:true});
     await p.setViewportSize({width:1280,height:940});
     // Confirmation cancellation must not write. An active monitor is paused before deletion;
     // if delete fails, keep it visible as paused, ready to retry.
-    const beforeCancel=writes.length;p.once('dialog',d=>d.dismiss());await row('daily').getByRole('button',{name:'Delete Morning review',exact:true}).click();assert.equal(writes.length,beforeCancel);
-    rejectDelete=true;p.once('dialog',d=>d.accept());await row('mail').getByRole('button',{name:'Delete Urgent mail',exact:true}).click();
+    const confirmation=p.locator('.routine-delete-dialog');
+    const deleteRoutine=async id=>{await row(id).locator('[data-routine-action=delete]').click();await confirmation.getByRole('button',{name:'Delete routine',exact:true}).click();};
+    const beforeCancel=writes.length;await row('daily').getByRole('button',{name:'Delete Morning review',exact:true}).click();await confirmation.getByRole('button',{name:'Cancel',exact:true}).click();assert.equal(writes.length,beforeCancel);
+    rejectDelete=true;await deleteRoutine('mail');
     await p.locator('#notice').getByText('Unable to remove monitor. Try again.',{exact:true}).waitFor();await row('mail').getByRole('button',{name:'Resume Urgent mail',exact:true}).waitFor();assert(!monitors[0].enabled);
-    rejectDelete=false;p.once('dialog',d=>d.accept());await row('mail').getByRole('button',{name:'Delete Urgent mail',exact:true}).click();await row('mail').waitFor({state:'detached'});
-    p.once('dialog',d=>d.accept());await row('daily').getByRole('button',{name:'Delete Morning review',exact:true}).click();await row('daily').waitFor({state:'detached'});assert(!scheduled.some(r=>r.id==='daily'));
+    rejectDelete=false;await deleteRoutine('mail');await row('mail').waitFor({state:'detached'});
+    await deleteRoutine('daily');await row('daily').waitFor({state:'detached'});assert(!scheduled.some(r=>r.id==='daily'));
     await p.locator('#bots').getByRole('button',{name:'Atlas',exact:true}).click();await row('other').waitFor();assert.equal(await section.locator('li').count(),1);
     await p.locator('#bots').getByRole('button',{name:'Empty bot',exact:true}).click();await section.getByText('No routines yet.',{exact:true}).waitFor();assert.equal(await section.locator('li').count(),0);
     assert.deepEqual(errors,[]);console.log(JSON.stringify({engine,botScoped:true,pauseResume:true,editInPlace:true,pausedEditPreserved:true,expiredOnceGuard:true,monitorDeleteGuard:true,errorsRecover:true,emptyState:true,responsive:true,writes:writes.length}));

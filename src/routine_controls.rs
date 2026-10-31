@@ -161,7 +161,9 @@ mod tests {
                 .unwrap()
                 .contains(&once.id)
         );
+        crate::routine_completion::complete(&app.db.0.lock().unwrap(), &run, &json!({"outcome":"report","report":"Done"})).unwrap();
         app.db.finish(&run, "completed", "Done", "").unwrap();
+        assert_eq!(app.db.run(&run).unwrap().status, "completed");
         app.db.event(&run, "run_finished", json!({})).unwrap();
         app.db
             .0
@@ -221,6 +223,7 @@ mod tests {
         );
         let repeating = routine(&app, &b.id, None);
         let run = app.db.run_routine_now(&repeating.id).unwrap();
+        crate::routine_completion::complete(&app.db.0.lock().unwrap(), &run, &json!({"outcome":"report","report":"Done"})).unwrap();
         app.db.finish(&run, "completed", "Done", "").unwrap();
         app.db.event(&run, "run_finished", json!({})).unwrap();
         assert!(
@@ -296,6 +299,7 @@ mod tests {
             app.db.run_routine_now(&r.id).unwrap(),
             first["run_id"].as_str().unwrap()
         );
+        crate::routine_completion::complete(&app.db.0.lock().unwrap(), first["run_id"].as_str().unwrap(), &json!({"outcome":"report","report":"Fixture"})).unwrap();
         app.db
             .finish(
                 first["run_id"].as_str().unwrap(),
@@ -304,6 +308,7 @@ mod tests {
                 "",
             )
             .unwrap();
+        assert_eq!(app.db.run(first["run_id"].as_str().unwrap()).unwrap().status, "completed");
         let again = text(
             runtime::call_tool(&app, &b, &current, "routine_control", args)
                 .await
