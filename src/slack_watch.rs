@@ -157,13 +157,13 @@ fn credential_path(app: &App) -> PathBuf {
 }
 fn credentials(app: &App, id: &str) -> Result<Credentials> {
     let bytes =
-        std::fs::read(credential_path(app)).context("Reconnect Slack in Settings → Slack monitoring")?;
+        std::fs::read(credential_path(app)).context("Reconnect Slack in Settings → Connections → Slack")?;
     let store: Value =
         serde_json::from_slice(&bytes).context("Slack credential store unavailable")?;
     serde_json::from_str(
         store[format!("slack:{id}")]
             .as_str()
-            .context("Reconnect Slack in Settings → Slack monitoring")?,
+            .context("Reconnect Slack in Settings → Connections → Slack")?,
     )
     .context("Slack credentials unavailable")
 }
@@ -190,7 +190,7 @@ pub fn view(app: &App, bot: Option<&str>) -> Result<Value> {
         items.push(item);
     }
     Ok(
-        json!({"connections":connections,"items":items,"delivery":"Slack Events API · Socket Mode","setup":"Call slack_monitor_setup to configure monitoring in chat. Settings → Slack monitoring also manages connections and rules.","scope_note":"All channels means channels available to this Slack identity and the app's event subscriptions. DMs belong to this connected identity. New messages only; reconnecting does not scan history."}),
+        json!({"connections":connections,"items":items,"delivery":"Slack Events API · Socket Mode","setup":"Call slack_monitor_setup to configure monitoring in chat. Settings → Connections → Slack also manages connections and rules.","scope_note":"All channels means channels available to this Slack identity and the app's event subscriptions. DMs belong to this connected identity. New messages only; reconnecting does not scan history."}),
     )
 }
 pub async fn list(State(app): State<Shared>) -> Result<Json<Value>, crate::web::Error> {
