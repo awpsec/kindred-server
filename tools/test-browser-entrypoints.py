@@ -19,7 +19,7 @@ class Entrypoints(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix='kindred-entrypoints-') as temporary:
             fixture=Path(temporary);fixture.chmod(0o755);(fixture/'passwd').write_text('root:x:0:0:root:/root:/bin/sh\nbot:x:1000:1000:fixture:/home/bot:/bin/sh\n');(fixture/'group').write_text('root:x:0:\nbot:x:1000:\n');lib=fixture/'lib';lib.mkdir();home=fixture/'home';home.mkdir();workspace=fixture/'workspace';workspace.mkdir();commands=fixture/'bin';commands.mkdir();runtime=fixture/'runtime';runtime.mkdir(mode=0o700)
             profile=home/'.local/share/kindred/browser';profile.mkdir(parents=True,mode=0o700);profile.parent.chmod(0o700);(profile/'Local State').write_text('{}')
-            for name in ['browser-launch.py','start-desktop.sh','desktop-launch']:
+            for name in ['browser-launch.py','start-desktop.sh','desktop-launch','screen-ownership.py']:
                 shutil.copyfile(ROOT/'deploy'/name,lib/name);(lib/name).chmod(0o755)
             if os.environ.get('KINDRED_TEST_BROWSER_BASELINE') == '1':
                 (lib/'desktop-launch').write_bytes(subprocess.check_output(['git','show','d724df072e47b828cc355ed77c55762968c6739f:deploy/desktop-launch'],cwd=ROOT))
@@ -49,7 +49,7 @@ try:
   assert time.monotonic()<deadline,'Startup request deadline'
   time.sleep(.05)
 finally:
- os.killpg(start.pid,signal.SIGTERM)
+ if start.poll() is None:os.killpg(start.pid,signal.SIGTERM)
  try:start.wait(timeout=3)
  except subprocess.TimeoutExpired:os.killpg(start.pid,signal.SIGKILL);start.wait(timeout=3)
 script="""import os,subprocess,time,json
@@ -71,7 +71,7 @@ print(json.dumps({'captured':4,'loopbackCDPByEntry':[('--remote-debugging-port=0
 for row in rows:
  assert row['display']==':1' and row['bus'].startswith(('unix:path=','unix:abstract=')) and row['runtime']=='/tmp/kindred-entry-runtime'
  assert '--user-data-dir=/home/bot/.local/share/kindred/browser' in row['args']
- for flag in ['--remote-debugging-address=127.0.0.1','--remote-debugging-port=0','--restore-last-session','--window-size=1120,680']:assert flag in row['args']
+ for flag in ['--remote-debugging-address=127.0.0.1','--remote-debugging-port=0','--restore-last-session','--window-size=1120,680','--force-renderer-accessibility']:assert flag in row['args']
 assert len({row['bus'] for row in rows[1:]})==1
 assert '--new-window' in rows[2]['args'] and rows[3]['args'][-1]=='https://example.test'
 assert profile.stat().st_uid==1000 and profile.stat().st_mode&0o777==0o700
