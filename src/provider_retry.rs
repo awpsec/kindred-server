@@ -172,6 +172,13 @@ mod tests {
     use crate::tests;
     use std::{cell::Cell, future::ready};
     #[tokio::test]
+    async fn usage_limit_is_not_retried_or_relabelled_as_connection_failure() {
+        let app=tests::app();let bot=tests::bot(&app.db,"claude-code");
+        app.db.queue(&bot.id,"Check",0).unwrap();let run=app.db.claim().unwrap().unwrap();let calls=Cell::new(0);
+        let result=retry(&app,&run,||{calls.set(calls.get()+1);ready(Err(anyhow::anyhow!(crate::cli_providers::CLAUDE_USAGE_LIMIT)))},&[Duration::ZERO;5]).await;
+        assert_eq!(calls.get(),1);assert_eq!(result.unwrap_err().to_string(),crate::cli_providers::CLAUDE_USAGE_LIMIT);
+    }
+    #[tokio::test]
     async fn uncertain_followup_disables_automatic_provider_replay() {
         use std::sync::atomic::{AtomicUsize,Ordering};
         let app=crate::tests::app();let bot=crate::tests::bot(&app.db,"codex");app.db.queue(&bot.id,"Root action",0).unwrap();let run=app.db.claim_bot(&bot.id).unwrap().unwrap();let source=app.db.chat_send(&run.chat_id,"Followup",&[]).unwrap()[0].clone();app.db.request_steering(&source,&run.id).unwrap();let offer=app.db.offer_followups(&run).unwrap().unwrap();app.db.dispatch_followup(&run,offer["id"].as_str().unwrap()).unwrap();let calls=AtomicUsize::new(0);
@@ -185,7 +192,9 @@ mod tests {
         app.db.event(&run.id,"assistant",json!({"text":"Original action done."})).unwrap();
         let source=app.db.chat_send(&run.chat_id,"Different followup",&[]).unwrap()[0].clone();app.db.request_steering(&source,&run.id).unwrap();
         let offer=app.db.offer_followups(&run).unwrap().unwrap();
+        crate::progress_updates::finish_message(&app.db,&run.id,"Original action done.").unwrap();
         app.db.event(&run.id,"followup_parent_completed",json!({"offer_id":offer["id"],"output":"Original action done."})).unwrap();
+        app.db.event(&run.id,"assistant",json!({"text":"Working on the follow-up.","phase":"commentary"})).unwrap();
         app.db.dispatch_followup(&run,offer["id"].as_str().unwrap()).unwrap();
         let calls=Cell::new(0);
         let output=retry(&app,&run,||{calls.set(calls.get()+1);ready(Err(blip()))},&[Duration::ZERO;5]).await.unwrap();
@@ -195,6 +204,8 @@ mod tests {
         assert_eq!(app.db.run(&source).unwrap().status,"interrupted");
         let messages=app.db.chat_messages(&run.chat_id).unwrap();
         assert_eq!(messages.iter().filter(|m|m["status_notice"].is_object()).count(),1);
+        assert_eq!(messages.iter().filter(|m|m["text"]=="Original action done.").count(),1,"Recovered parent reply is not duplicated after follow-up progress");
+        assert_eq!(messages.iter().filter(|m|m["text"]=="Working on the follow-up.").count(),1);
         let next=app.db.continue_task(&source).unwrap();assert_eq!(app.db.run(&next).unwrap().prompt,"Different followup");
     }
     #[tokio::test]

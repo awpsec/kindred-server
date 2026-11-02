@@ -18,6 +18,16 @@ use tokio::io::BufReader;
 
 const HELPER: &str = "/usr/local/lib/kindred/provider-cli.py";
 pub(crate) const CLAUDE_SESSION_EXPIRED: &str = "Claude could not refresh its sign-in session. Reconnect Claude in Settings → Connections, then continue this task.";
+pub(crate) const CLAUDE_USAGE_LIMIT: &str = "Claude has reached its subscription usage limit. Wait for the limit to reset or choose another configured provider, then continue this task. No alternate provider was used.";
+
+fn claude_usage_limit(provider: &str, frame: &Value) -> bool {
+    provider == "claude-code" && frame["is_error"] == true
+        && frame["text"].as_str().is_some_and(|text| {
+            let text = text.trim().to_ascii_lowercase();
+            ["you've hit your session limit", "you've hit your weekly limit", "you've hit your usage limit"]
+                .iter().any(|prefix| text.starts_with(prefix))
+        })
+}
 
 fn expired_claude_session(provider: &str, frame: &Value) -> bool {
     provider == "claude-code"
@@ -242,6 +252,9 @@ async fn run_child(app:&App,bot:&Bot,run:&Run,mut child:tokio::process::Child)->
                     // silence to wait four minutes for and retry five times.
                     if expired_claude_session(&bot.provider, &frame) {
                         bail!(CLAUDE_SESSION_EXPIRED);
+                    }
+                    if claude_usage_limit(&bot.provider, &frame) {
+                        bail!(CLAUDE_USAGE_LIMIT);
                     }
                     continue;
                 }
@@ -542,6 +555,22 @@ send({'type':'complete','output':'First opening\nFirst final\nSecond opening\nSe
         assert_eq!(frame_timeout(true, 600, Some(Duration::from_secs(300))), Duration::from_secs(3300));
         assert_eq!(frame_timeout(true, 600, Some(Duration::from_secs(3590))), Duration::from_secs(10));
         assert_eq!(frame_timeout(true, 600, Some(Duration::from_secs(3601))), Duration::ZERO);
+    }
+    #[tokio::test]
+    async fn explicit_claude_usage_limit_stops_before_timeout() {
+        let app=crate::tests::app();let bot=crate::tests::bot(&app.db,"claude-code");
+        app.db.queue(&bot.id,"Synthetic check",0).unwrap();let run=app.db.claim_bot(&bot.id).unwrap().unwrap();
+        let script=r#"import sys,json,time
+json.loads(sys.stdin.readline())
+print(json.dumps({'type':'assistant','is_error':True,'text':"You've hit your session limit · resets 9:50pm (UTC)"}),flush=True)
+time.sleep(30)
+"#;
+        let child=tokio::process::Command::new("python3").args(["-u","-c",script]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit()).kill_on_drop(true).spawn().unwrap();
+        let error=tokio::time::timeout(Duration::from_secs(3),run_child(&app,&bot,&run,child)).await.unwrap().unwrap_err();
+        assert_eq!(error.to_string(),CLAUDE_USAGE_LIMIT);
+        assert!(!claude_usage_limit("claude-code",&json!({"text":"You've hit your session limit"})));
+        assert!(!claude_usage_limit("kimi-code",&json!({"is_error":true,"text":"You've hit your session limit"})));
+        assert!(!claude_usage_limit("claude-code",&json!({"is_error":true,"text":"Connection reset"})));
     }
     #[test]
     fn claude_session_expiry_requires_provider_error_provenance() {

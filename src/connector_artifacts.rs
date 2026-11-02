@@ -208,11 +208,26 @@ pub fn record(c: &Connection, id: &str) -> Result<Value> {
     // sends, without executing or changing the recorded action.
     value["email_send"] = json!(email_send(&json!({"toolkit":value["connector"],"tool_name":value["tool"]})));
     value["email"] = email_fields(&value["input"]);
+    value.as_object_mut().unwrap().remove("remote_draft_preview");
+    if value["email_send"] == true && crate::email_draft_preview::reference(&value["input"]).is_some() {
+        let mut args=value["review_scope"].clone();
+        if !args.is_object() {
+            let raw:Option<String>=c.query_row("SELECT args FROM approvals WHERE id=?",[value["approval_id"].as_str().unwrap_or("")],|r|r.get(0)).optional()?;
+            args=raw.and_then(|s|serde_json::from_str(&s).ok()).unwrap_or(Value::Null);
+        }
+        if args.is_object() {
+            args["input"]=value["input"].clone();
+            if let Some(preview)=crate::email_draft_preview::resolve(c,value["run_id"].as_str().unwrap_or(""),&args)? {
+                value["email"]=preview["email"].clone();
+                value["remote_draft_preview"]=json!(true);
+            }
+        }
+    }
     value["body_resave_required"] = json!(value["kind"] == "email" && crate::connector_edits::validate_email_delivery(&value).is_err());
     value["review_requested"]=json!(c.query_row("SELECT EXISTS(SELECT 1 FROM chat_send_receipts WHERE request_id=?)",[id],|r|r.get::<_,bool>(0))?);
     if crate::connector_edits::read_only(&value) {
         if let Some(fields) = value["email"].as_object_mut() {
-            for field in fields.values_mut() {
+            for field in fields.values_mut().filter(|v| v.is_object()) {
                 field["editable"] = json!(false);
             }
         }
@@ -231,7 +246,7 @@ pub fn create(db: &Db, run: &Run, args: &Value) -> Result<String> {
         "Connector input too large for review"
     );
     let id = db::id();
-    let body = json!({"connector":service(args),"connection":str_at(args,&["connection","toolkit"]),"source":match args["origin"].as_str(){Some("claude-account")=>"Claude",Some("codex-account")=>"Codex",_=>"Kindred"},"tool":tool_name(args),"kind":kind(args),"title":title(args),"email_send":email_send(args),"retry_unknown":run.prompt.starts_with("Prepare a NEW email revision for my review.") && run.prompt.contains("This may already have been sent"),"account":str_at(args,&["account_name","account_id"]),"original_input":input(args),"input":input(args),"records":[],"forced":args["forced"]==true,"read_only":args["read_only"]==true,"display_read_only":args["read_only"]==true || (args["origin"]=="claude-account" && read_only_hint(args))});
+    let body = json!({"review_scope":{"origin":args["origin"],"account_key":args["account_key"],"connector_key":args["connector_key"]},"connector":service(args),"connection":str_at(args,&["connection","toolkit"]),"source":match args["origin"].as_str(){Some("claude-account")=>"Claude",Some("codex-account")=>"Codex",_=>"Kindred"},"tool":tool_name(args),"kind":kind(args),"title":title(args),"email_send":email_send(args),"retry_unknown":run.prompt.starts_with("Prepare a NEW email revision for my review.") && run.prompt.contains("This may already have been sent"),"account":str_at(args,&["account_name","account_id"]),"original_input":input(args),"input":input(args),"records":[],"forced":args["forced"]==true,"read_only":args["read_only"]==true,"display_read_only":args["read_only"]==true || (args["origin"]=="claude-account" && read_only_hint(args))});
     let mut c = db.0.lock().unwrap();
     let tx = c.transaction()?;
     crate::progress_updates::qualify(&tx,&run.id,"Use connected service")?;
@@ -255,6 +270,14 @@ pub async fn review(
         .as_str()
         .context("Connector card missing")?
         .to_owned();
+    if email_send(args) && crate::email_draft_preview::reference(input(args)).is_some() {
+        let card=record(&app.db.0.lock().unwrap(),&id)?;
+        if card["remote_draft_preview"] != true {
+            let message="Load this remote draft with the same connection's full draft-read tool, then request sending it again. Kindred needs its recipients and complete body for review; do not repeat this send before reading it. Nothing was sent.";
+            complete(&app.db,&id,&json!({"text":message,"failed":true}),true)?;
+            anyhow::bail!(message);
+        }
+    }
     let allowed = match runtime::approve_required(app, bot, run, tool, args, force).await {
         Ok(allowed) => allowed,
         Err(error) => {
@@ -407,6 +430,7 @@ fn received_email(value: &Value) -> Option<Value> {
             ("from", &["from", "sender"][..]),
             ("to", &["to", "toRecipients"][..]),
             ("cc", &["cc", "ccRecipients"][..]),
+            ("bcc", &["bcc", "bccRecipients"][..]),
         ] {
             if let Some(v) = keys.iter().find_map(|k| value.get(*k)) {
                 let text = if label == "subject" {
@@ -436,6 +460,14 @@ fn received_email(value: &Value) -> Option<Value> {
                     .into(),
                     json!(runtime::bounded(content, 16000)),
                 );
+            }
+        }
+        if !email.contains_key("body") && !email.contains_key("body_html") {
+            for key in ["plaintextBody", "body_text", "textBody", "htmlBody", "body_html", "html_body"] {
+                if let Some(body) = value[key].as_str() {
+                    email.insert(if key.to_ascii_lowercase().contains("html") { "body_html" } else { "body" }.into(),json!(runtime::bounded(body,16000)));
+                    break;
+                }
             }
         }
         if !email.contains_key("body") && !email.contains_key("body_html") {
@@ -571,6 +603,7 @@ pub fn complete(db: &Db, id: &str, result: &Value, failed: bool) -> Result<()> {
     let mut c = db.0.lock().unwrap();
     let tx = c.transaction()?;
     let mut value = record(&tx, id)?;
+    crate::email_draft_preview::save_result(&tx,&value,result,failed)?;
     let mut records = Vec::new();
     if !failed {
         records =
@@ -746,6 +779,41 @@ mod tests {
         .unwrap()["revision"]
             .as_i64()
             .unwrap()
+    }
+    #[tokio::test]
+    async fn remote_draft_receipt_review_preserves_exact_dispatch_and_legacy_pending_cards() {
+        for origin in ["claude-account","codex-account","kindred"] {
+            let (app,_,run,mut args,_)=fixture();args["origin"]=json!(origin);
+            let body=if origin=="codex-account" { r#"{"literal":"JSON belongs in this email"}"# } else {"Exact complete draft body"};
+            let mut read=args.clone();read["tool_name"]=json!("get_draft");read["input"]=json!({"draftId":"draft-fixture"});
+            let read_id=create(&app.db,&run,&read).unwrap();
+            complete(&app.db,&read_id,&json!({"content":[{"type":"text","text":json!({"id":"draft-fixture","toRecipients":["review@example.invalid"],"plaintextBody":body,"subject":"Reviewed remotely","attachments":[{"filename":"report.docx","content":"DO_NOT_RETAIN"}]}).to_string()}]}),false).unwrap();
+            let evidence:String=app.db.0.lock().unwrap().query_row("SELECT body FROM events WHERE kind='connector_preview_result' AND run_id=? ORDER BY seq DESC LIMIT 1",[&run.id],|r|r.get(0)).unwrap();assert!(!evidence.contains("DO_NOT_RETAIN"));
+            args["input"]=json!({"draftId":"draft-fixture"});let id=create(&app.db,&run,&args).unwrap();args["artifact_id"]=json!(id);
+            let rev=pending(&app,&run,&args);
+            // Old pending cards have no new provenance field; their persisted
+            // approval still contains the authoritative account binding.
+            app.db.0.lock().unwrap().execute("UPDATE connector_artifacts SET body=json_remove(body,'$.review_scope') WHERE id=?",[&id]).unwrap();
+            let card=record(&app.db.0.lock().unwrap(),&id).unwrap();
+            assert_eq!(card["email"]["body"]["text"],body);assert_eq!(card["email"]["body"]["editable"],false);assert_eq!(card["remote_draft_preview"],true);
+            assert!(update(&app,&id,&json!({"action":"edit","revision":rev,"fields":{"body":"Not the remote draft"}})).is_err());
+            update(&app,&id,&json!({"action":"approve","revision":rev})).unwrap();
+            app.db.finish(&run.id,"running","","").unwrap();set_status(&app.db,&id,"ready").unwrap();
+            dispatch(&app.db,&run,&args).unwrap();assert!(dispatch(&app.db,&run,&args).is_err());
+            assert_eq!(record(&app.db.0.lock().unwrap(),&id).unwrap()["input"],json!({"draftId":"draft-fixture"}));
+        }
+    }
+    #[tokio::test]
+    async fn incomplete_remote_draft_returns_to_bot_instead_of_unanswerable_approval() {
+        let (app,bot,run,mut args,_)=fixture();args["input"]=json!({"draftId":"not-read"});
+        let id=create(&app.db,&run,&args).unwrap();args["artifact_id"]=json!(id);
+        let err=review(&app,&bot,&run,"claude_connector",&mut args,false).await.unwrap_err();
+        assert!(err.to_string().contains("full draft-read"));assert!(app.db.approvals().unwrap().is_empty());
+        assert_eq!(record(&app.db.0.lock().unwrap(),&id).unwrap()["status"],"failed");
+        assert!(dispatch(&app.db,&run,&args).is_err());
+        // A stale serialized display flag must never authorize a missing read.
+        app.db.0.lock().unwrap().execute("UPDATE connector_artifacts SET body=json_set(body,'$.remote_draft_preview',json('true')) WHERE id=?",[&id]).unwrap();
+        assert_ne!(record(&app.db.0.lock().unwrap(),&id).unwrap()["remote_draft_preview"],true);
     }
     #[test]
     fn push_cancels_email_review_without_allowing_send_or_losing_receipt() {

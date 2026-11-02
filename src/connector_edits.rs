@@ -231,6 +231,9 @@ fn synchronize_email_body(next: &mut Value, meta: &Value, text: &str) -> Result<
 // HTML. Refuse them until an explicit Save regenerates the alternatives. Never
 // repair a payload silently during approval or dispatch.
 pub fn validate_email_delivery(card: &Value) -> Result<()> {
+    if card["email_send"] == true && crate::email_draft_preview::reference(&card["input"]).is_some() {
+        ensure!(card["remote_draft_preview"] == true, "Load the complete remote draft before approving this send. Nothing was sent.");
+    }
     if card["kind"] != "email" || card["edited_by_user"] != true {
         return Ok(());
     }

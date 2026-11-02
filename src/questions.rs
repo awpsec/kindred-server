@@ -251,6 +251,7 @@ impl Db {
         if q.status == "dismissed" { return Ok(q); }
         ensure!(q.status == "pending", "This question is no longer waiting for an answer");
         tx.execute("UPDATE questions SET status='dismissed' WHERE id=? AND status='pending'", [id])?;
+        crate::collaboration::dismissed_question(&tx, &q.run_id)?;
         if crate::voice::session::is_run(&tx,&q.run_id)? {
             tx.execute("UPDATE runs SET status='running' WHERE id=? AND status='awaiting_user'",[&q.run_id])?;
         }

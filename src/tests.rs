@@ -695,6 +695,32 @@ fn legacy_bot_profile_migration_preserves_identity_and_history() {
 }
 #[tokio::test]
 async fn desktop_ticket_requires_auth_origin_and_explicit_takeover() {
+    // Session creation now checks real screen readiness. Give this auth test
+    // its own ready-screen transport instead of accidentally SSHing a host.
+    #[cfg(unix)]
+    if std::env::var_os("KINDRED_TICKET_AUTH_FIXTURE").is_none() {
+        use std::os::unix::fs::PermissionsExt;
+        let root=std::env::temp_dir().join(format!("kindred-ticket-auth-{}",db::id()));
+        std::fs::create_dir(&root).unwrap();let ssh=root.join("ssh");
+        std::fs::write(&ssh,r#"#!/usr/bin/python3
+import json,sys
+assert 'kindred-guest' in sys.argv
+command=sys.argv[-1]
+if command.endswith('guest-rpc'):
+    request=json.load(sys.stdin)
+    assert request['tool']=='screen_ensure'
+    print('{}')
+else:
+    assert 'Observe a managed screen' in command
+    print(json.dumps({'state':'ready'}))
+"#).unwrap();std::fs::set_permissions(&ssh,std::fs::Permissions::from_mode(0o700)).unwrap();
+        let output=std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact","tests::desktop_ticket_requires_auth_origin_and_explicit_takeover","--nocapture"])
+            .env("KINDRED_TICKET_AUTH_FIXTURE","1")
+            .env("PATH",format!("{}:{}",root.display(),std::env::var("PATH").unwrap_or_default())).output().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(output.status.success(),"{}{}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));return;
+    }
     let app = app();
     let b = bot(&app.db, "codex");
     app.db.screen(&b.id).unwrap();

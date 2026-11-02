@@ -141,7 +141,7 @@ pub fn source_refs(c: &Connection, run: &Run, args: &Value) -> Result<Value> {
             let valid: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM continuity_current_messages m WHERE m.seq=? AND m.chat_id=? AND m.suppressed=0 AND NOT EXISTS(SELECT 1 FROM continuity_source_state s WHERE s.message_seq=m.seq AND s.status<>'active'))",params![seq,run.chat_id],|r|r.get(0))?;
             ensure!(
                 valid,
-                "Source must be a current retained message in this conversation"
+                "Source message_seq {seq} is not a current retained message in this conversation. Use an exact message_seq returned by continuity_read or continuity_search here; do not use another chat's message or a run ID"
             );
             let body: String =
                 c.query_row("SELECT body FROM chat_messages WHERE seq=?", [seq], |r| {
@@ -152,7 +152,7 @@ pub fn source_refs(c: &Connection, run: &Run, args: &Value) -> Result<Value> {
             let valid: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM events e JOIN runs r ON r.id=e.run_id WHERE e.seq=? AND r.bot_id=? AND r.chat_id=? AND e.kind IN ('tool_result','tool_started','run_finished'))",params![seq,run.bot_id,run.chat_id],|r|r.get(0))?;
             ensure!(
                 valid,
-                "Event source must belong to this bot and conversation"
+                "Source event_seq {seq} must be a tool_result, tool_started or run_finished event from this bot in this conversation. Read this task's receipts for an exact event_seq"
             );
             let source_run: String =
                 c.query_row("SELECT run_id FROM events WHERE seq=?", [seq], |r| r.get(0))?;
@@ -185,7 +185,7 @@ pub fn save_meta(c: &Connection, run: &Run, args: &Value, revision: i64) -> Resu
     if statement != "inference" {
         ensure!(
             !sources.as_array().unwrap().is_empty(),
-            "Attributed statements require source references"
+            "Attributed statements require sources: use exact message_seq or event_seq objects from this conversation. Read current evidence before saving; do not invent IDs"
         );
     }
     if statement == "user_statement" {
@@ -277,6 +277,8 @@ fn link(c: &Connection, run: &Run, kind: &str, id: &str) -> Result<Value> {
 
 pub fn obligation_save(db: &Db, run: &Run, args: &Value) -> Result<Value> {
     super::require_chat(db, run)?;
+    ensure!(args["expected_revision"].as_i64().is_some_and(|n| n >= 0),
+        "Supply expected_revision: 0 for a new obligation, or the revision from continuity_read before editing");
     let key = args["key"].as_str().unwrap_or("").trim();
     let description = args["description"].as_str().unwrap_or("").trim();
     let status = args["status"].as_str().unwrap_or("open");

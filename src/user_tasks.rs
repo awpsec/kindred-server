@@ -552,8 +552,10 @@ mod tests {
         assert_eq!(continued.load(Ordering::SeqCst), 1);
         assert_eq!(app.db.user_task(&task.id).unwrap().status, "resumed");
         assert_eq!(app.db.run(&run.id).unwrap().status, "completed");
-        assert_eq!(app.db.run(&next).unwrap().status, "steered");
-        assert!(app.db.claim_bot(&bot.id).unwrap().is_none());
+        // This fixture resumes a tool, not a provider conversation turn. The
+        // queued user message must survive until a provider actually accepts it.
+        assert_eq!(app.db.run(&next).unwrap().status, "queued");
+        assert_eq!(app.db.claim_bot(&bot.id).unwrap().unwrap().id, next);
         assert_eq!(
             app.db
                 .events(&run.id)
@@ -561,7 +563,7 @@ mod tests {
                 .iter()
                 .filter(|e| e["kind"] == "user_followups")
                 .count(),
-            1
+            0
         );
         // A stale Done click cannot release later manual control.
         app.db.screen_set_takeover(slot, true).unwrap();

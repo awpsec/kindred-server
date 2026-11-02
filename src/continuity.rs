@@ -209,8 +209,10 @@ pub fn save(db: &Db, run: &Run, args: &Value) -> Result<Value> {
     );
     ensure!(
         matches!(status, "active" | "closed"),
-        "Invalid continuity status"
+        "Use continuity status active or closed"
     );
+    ensure!(args["expected_revision"].as_i64().is_some_and(|n| n >= 0),
+        "Supply expected_revision: 0 for a new topic, or the revision from continuity_read before editing");
     let mut c = db.0.lock().unwrap();
     let tx = c.transaction()?;
     let revision: i64 = tx

@@ -31,6 +31,22 @@ fn packet(text: &str) -> Value {
 }
 
 #[test]
+fn invalid_source_and_missing_revision_explain_recovery_without_writing() {
+    let db=Db::open(":memory:").unwrap();let (_,run)=setup(&db);let (_,other)=setup(&db);
+    let foreign=message(&db,&other,"Private to another conversation");
+    let mut args=json!({"topic":"work","summary":"Observed state","status":"active","statement_kind":"observation","sources":[{"message_seq":foreign}]});
+    assert!(continuity::save(&db,&run,&args).unwrap_err().to_string().contains("Supply expected_revision"));
+    args["expected_revision"]=json!(0);
+    let error=continuity::save(&db,&run,&args).unwrap_err().to_string();assert!(error.contains(&format!("message_seq {foreign}")));assert!(error.contains("this conversation"));
+    assert_eq!(db.0.lock().unwrap().query_row("SELECT count(*) FROM continuity_notes WHERE bot_id=?",[&run.bot_id],|r|r.get::<_,i64>(0)).unwrap(),0);
+    let mut obligation=json!({"key":"review","description":"Review evidence","status":"waiting","sources":[]});
+    assert!(store::obligation_save(&db,&run,&obligation).unwrap_err().to_string().contains("Supply expected_revision"));
+    let local=message(&db,&run,"Review the evidence later");obligation["expected_revision"]=json!(0);obligation["sources"]=json!([{"message_seq":local}]);
+    store::obligation_save(&db,&run,&obligation).unwrap();
+    assert!(store::obligation_save(&db,&run,&obligation).unwrap_err().to_string().contains("changed"));
+}
+
+#[test]
 fn task_timeline_markers_are_not_recall_sources_or_conversational_antecedents() {
     let app=app();let b=bot(&app.db,"codex");
     let mut first=None;

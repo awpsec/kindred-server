@@ -53,8 +53,25 @@ pub fn completed(c: &Connection, run: &Run) -> Result<()> {
     }
     Ok(())
 }
+/// A dismissed decision is neither an answer nor a helper completion. Close
+/// its waiting edges and pause dependent returns without waking any bot or
+/// cancelling other helpers. Walk ancestors so nested waits do not stay stuck.
+pub fn dismissed_question(c: &Connection, run: &str) -> Result<()> {
+    if c.query_row("SELECT EXISTS(SELECT 1 FROM questions WHERE run_id=? AND status='pending')",[run],|r|r.get::<_,bool>(0))? { return Ok(()); }
+    let mut child = run.to_owned();
+    let mut seen = std::collections::HashSet::new();
+    while seen.insert(child.clone()) {
+        let parent: Option<String> = c.query_row("SELECT parent_run_id FROM collaboration_requests WHERE child_run_id=? AND continuation_run_id=''",[&child],|r|r.get(0)).optional()?;
+        let Some(parent) = parent else { break; };
+        c.execute("UPDATE collaboration_requests SET resolved=1,continuation_run_id='dismissed' WHERE child_run_id=?",[&child])?;
+        child = parent;
+    }
+    Ok(())
+}
 pub fn recover(c: &Connection) -> Result<()> {
     let tx = c.unchecked_transaction()?;
+    let dismissed=tx.prepare("SELECT DISTINCT q.run_id FROM questions q JOIN collaboration_requests e ON e.child_run_id=q.run_id WHERE q.status='dismissed' AND e.continuation_run_id='' AND NOT EXISTS(SELECT 1 FROM questions p WHERE p.run_id=q.run_id AND p.status='pending')")?.query_map([],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    for run in dismissed { dismissed_question(&tx,&run)?; }
     let runs=tx.prepare("SELECT r.* FROM runs r WHERE r.status IN ('completed','failed','interrupted','cancelled') AND (EXISTS(SELECT 1 FROM collaboration_requests WHERE child_run_id=r.id AND resolved=0 AND continuation_run_id='') OR EXISTS(SELECT 1 FROM collaboration_requests WHERE parent_run_id=r.id AND continuation_run_id='')) AND NOT EXISTS(SELECT 1 FROM events WHERE run_id=r.id AND kind IN ('question_wait','process_wait')) ORDER BY r.depth DESC,r.created")?.query_map([],db::run_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
     for run in runs {
         completed(&tx, &run)?;
@@ -413,6 +430,25 @@ mod tests {
                 assert!(queued(&db,&b.id).is_empty(),"display never schedules a continuation");
                 db.cancel(&parent).unwrap();assert!(db.current_delegations().unwrap().is_empty());
             } else {assert!(projection.is_empty());}
+        }
+    }
+    #[test]
+    fn dismissal_clears_nested_waits_without_waking_or_cancelling_other_helpers() {
+        for legacy in [false,true] {
+            let db=Db::open(":memory:").unwrap();let a=crate::tests::bot(&db,"codex");let b=crate::tests::bot(&db,"codex");let d=crate::tests::bot(&db,"codex");let sibling=crate::tests::bot(&db,"codex");
+            let root=db.queue(&a.id,"Ask helpers",0).unwrap();let parent=db.run(&root).unwrap();
+            let middle=db.chat_handoff(&parent,&b.id,"Review").unwrap();let child=db.chat_handoff(&db.run(&middle).unwrap(),&d.id,"Ask a choice").unwrap();
+            let other=db.chat_handoff(&parent,&sibling.id,"Independent review").unwrap();finish(&db,&root,"");finish(&db,&middle,"");
+            db.finish(&child,"running","","").unwrap();
+            let q=db.ask_question(&db.run(&child).unwrap(),serde_json::from_value(json!({"topic_key":"choice","question":"Proceed?","context":"Synthetic decision; no action occurred.","options":["Yes","No"]})).unwrap()).unwrap();
+            let q:Value=serde_json::from_str(q["text"].as_str().unwrap()).unwrap();let id=q["question"]["id"].as_str().unwrap();finish(&db,&child,"");
+            recover(&db.0.lock().unwrap()).unwrap();assert!(db.collaboration_waits(&db.run(&child).unwrap().chat_id).unwrap().iter().any(|w|w["run_id"]==child),"Pending question retains its wait");
+            if legacy {db.0.lock().unwrap().execute("UPDATE questions SET status='dismissed' WHERE id=?",[id]).unwrap();} else {db.dismiss_question(id).unwrap();db.dismiss_question(id).unwrap();}
+            recover(&db.0.lock().unwrap()).unwrap();recover(&db.0.lock().unwrap()).unwrap();
+            assert!(!db.collaboration_waits(&db.run(&child).unwrap().chat_id).unwrap().iter().any(|w|w["run_id"]==child||w["run_id"]==middle),"Dismissed branch and ancestor stop waiting");
+            let waits=db.collaboration_waits(&parent.chat_id).unwrap();assert_eq!(waits.len(),1);assert_eq!(waits[0]["run_id"],other);
+            assert_eq!(db.run(&other).unwrap().status,"queued");finish(&db,&other,"Independent result");
+            assert!(queued(&db,&a.id).is_empty());assert!(queued(&db,&b.id).is_empty());assert!(queued(&db,&d.id).is_empty());
         }
     }
     #[test]

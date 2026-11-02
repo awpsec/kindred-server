@@ -43,6 +43,7 @@ mod config;
 mod connections;
 mod connector_artifacts;
 mod connector_edits;
+mod email_draft_preview;
 mod email_contacts;
 mod connector_policy;
 mod connector_records;

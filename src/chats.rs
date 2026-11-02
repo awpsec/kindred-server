@@ -855,7 +855,10 @@ impl Db {
             format!("{}: {}", done.status, done.error)
         };
         if !silent && exists == 0 {
-            let promoted = tx.execute("UPDATE chat_messages SET kind='result',body=?2 WHERE run_id=?1 AND kind='assistant' AND suppressed=0 AND trim(body,char(9)||char(10)||char(13)||' ')=?2 AND source_event_seq=(SELECT max(source_event_seq) FROM chat_messages WHERE run_id=?1)",params![run.id,text])?;
+            // A failed inline follow-up can return the verified parent reply
+            // after newer progress has appeared. Promote that existing final
+            // reply rather than append a second copy below the follow-up.
+            let promoted = tx.execute("UPDATE chat_messages SET kind='result',body=?2 WHERE seq=(SELECT m.seq FROM chat_messages m WHERE m.run_id=?1 AND m.kind='assistant' AND m.suppressed=0 AND trim(m.body,char(9)||char(10)||char(13)||' ')=?2 AND (m.source_event_seq=(SELECT max(source_event_seq) FROM chat_messages WHERE run_id=?1) OR EXISTS(SELECT 1 FROM message_progress p WHERE p.message_seq=m.seq AND p.phase='final_answer')) ORDER BY m.seq DESC LIMIT 1)",params![run.id,text])?;
             if promoted == 0 {
                 tx.execute("INSERT INTO chat_messages(chat_id,sender,body,kind,run_id,created) VALUES(?,?,?,'result',?,?)",params![chat.id,bot.id,text,run.id,db::now()])?;
             }
