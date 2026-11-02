@@ -19,7 +19,7 @@ fn call_owns_work_for_every_bot_provider_without_chat_or_queue_activity() {
     for provider in ["codex","claude-code","openrouter"] {
         let (app,bot,ticket,run)=setup(provider);
         let config=configuration(&app,&bot,&run).unwrap();
-        assert_eq!(config["type"],"responses");assert_eq!(config["responses"]["model"],MODEL);
+        assert_eq!(config["type"],"responses");assert_eq!(config["responses"]["model"],"gpt-6.1-terra");
         assert!(config["responses"]["tools"].as_array().unwrap().iter().any(|t|t["type"]=="web_search"));
         assert!(config["responses"]["tools"].as_array().unwrap().iter().any(|t|t["name"]=="remember"));
         assert!(!config["responses"]["tools"].as_array().unwrap().iter().any(|t|t["name"]=="ask_question"));
@@ -238,7 +238,7 @@ async fn recap_uses_no_tools_and_rejects_incomplete_or_empty_provider_output() {
     for (status,text,success) in [("completed","We chose the [north entrance](https://example.com/route).",true),("incomplete","Partial",false),("completed","",false)] {
         let router=axum::Router::new().route("/",axum::routing::post(move |axum::Json(body):axum::Json<Value>|async move {
             assert_eq!(body["tools"],json!([]));assert_eq!(body["store"],false);
-            assert_eq!(body["model"],MODEL);assert!(body["input"].as_str().unwrap().contains("north"));
+            assert_eq!(body["model"],"gpt-6.1-terra");assert_eq!(body["reasoning"]["effort"],"none");assert!(body["input"].as_str().unwrap().contains("north"));
             let input: Value = serde_json::from_str(body["input"].as_str().unwrap()).unwrap();
             assert_eq!(input["bot"]["name"], "Voice teammate");
             assert!(input["bot"]["id"].is_string());
