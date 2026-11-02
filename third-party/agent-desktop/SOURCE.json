@@ -1,0 +1,23 @@
+{
+  "schema": 1,
+  "name": "agent-desktop",
+  "version": "1.0.2",
+  "source": "https://github.com/vercel-labs/agent-desktop",
+  "source_commit": "a47ed664e0db00d1d4df364eb3fe8a5599882f3c",
+  "license": "Apache-2.0",
+  "target": "x86_64-unknown-linux-gnu",
+  "archive_url": "https://github.com/vercel-labs/agent-desktop/releases/download/v1.0.2/agent-desktop-v1.0.2-x86_64-unknown-linux-gnu.tar.gz",
+  "archive_sha256": "ad661b7a3fd8f990a769243f4889a240ca0e2c8dab3ef5bddd6019086c71e0b4",
+  "archive_bytes": 3359127,
+  "packaged_path": "deploy/vendor/agent-desktop.tar.gz",
+  "files": {
+    "agent-desktop-linux-clipboard-owner": {
+      "sha256": "bf17de139902724e86b3616970b7b7f16f5f1fb4143910b532a38dd2182720fa",
+      "bytes": 586512
+    },
+    "agent-desktop": {
+      "sha256": "05427281a6746489bc0e15c16698a70a86322125c76c7a9e2f4c2d7a12bf7c5b",
+      "bytes": 6967864
+    }
+  }
+}

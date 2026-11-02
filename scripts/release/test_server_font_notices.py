@@ -34,7 +34,7 @@ class ServerFontNoticesTests(unittest.TestCase):
             def git(*args):
                 # This tests file selection before/after editing, not release eligibility.
                 return b"" if args == ("status", "--porcelain") else original_git(*args)
-            with patch.object(package, "driver_payload", return_value=None), patch.object(package, "git", side_effect=git), patch.object(package.subprocess, "check_output", side_effect=output), contextlib.redirect_stdout(io.StringIO()):
+            with patch.object(package, "agent_desktop_payload", return_value=None), patch.object(package, "driver_payload", return_value=None), patch.object(package, "git", side_effect=git), patch.object(package.subprocess, "check_output", side_effect=output), contextlib.redirect_stdout(io.StringIO()):
                 package.package(binary, root / "output")
             with zipfile.ZipFile(root / "output" / ("kindred-standalone-" + version + ".zip")) as archive:
                 for name in ["DMSans-LICENSE.txt", "DMSans-SOURCE.json", "Manrope-LICENSE.txt", "Manrope-SOURCE.json", "LICENSE.txt", "SOURCE.json", "Liberation-LICENSE.txt", "Liberation-SOURCE.json"]:

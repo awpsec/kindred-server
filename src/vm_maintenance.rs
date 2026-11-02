@@ -174,7 +174,11 @@ async fn update_guest_runtime(app: &App) -> Result<()> {
     command.arg(format!("sudo -n python3 -c '{helper}' {hash} {}",env!("CARGO_PKG_VERSION")));
     let output=vm::capture(command,Some(bytes),90,4096).await?;
     let receipt:Value=serde_json::from_slice(&output)?;
-    verified_runtime_update(&receipt, update_optional_driver(app)).await
+    verified_runtime_update(&receipt, async {
+        let driver = update_optional_driver(app).await;
+        let desktop = update_optional_agent_desktop(app).await;
+        driver.and(desktop)
+    }).await
 }
 
 async fn runtime_bytes()->Result<(Vec<u8>,String)> {
@@ -189,7 +193,7 @@ async fn runtime_bytes()->Result<(Vec<u8>,String)> {
 fn managed_launchers() -> Value {
     serde_json::json!({
         "wait-screen-ready":{"source":include_str!("../deploy/wait-screen-ready"),"previous_sha256":["69e2c4b24709917c9a0b038e17dd9b1e2f6f028859d66b1078dd026f22c35eff",null]},
-        "browser-launch.py":{"source":include_str!("../deploy/browser-launch.py"),"previous_sha256":["f0d21bee517c16ce234a4ac233dfbf8b1009ddcc70ec0063bbaadd3bd4ded9a8","1166f7ad32848fa71b4084960825bc40c9bbe03300d8c23c0d6710533efd8ee2",null]},
+        "browser-launch.py":{"source":include_str!("../deploy/browser-launch.py"),"previous_sha256":["a928c56462fdca1e4bdb67fa3e48c9cfb4d7bdb9d25fead06c927f1fb7c5d295","f0d21bee517c16ce234a4ac233dfbf8b1009ddcc70ec0063bbaadd3bd4ded9a8","1166f7ad32848fa71b4084960825bc40c9bbe03300d8c23c0d6710533efd8ee2",null]},
         "desktop-launch":{"source":include_str!("../deploy/desktop-launch"),"previous_sha256":["b8b477780f13889b14176510d6d2c805b4eb9c6e6d73ade8c3793c41cddf9645", "ee430558ef4fd501d1dd55a453e4de9c9d9fc58018464a1091dee7adfccaa1df", "8cae9194cb3d1dc53606cb52aa254a531364bce3c006c0444d93088def9c2ba3"]},
         "start-desktop.sh":{"source":include_str!("../deploy/start-desktop.sh"),"previous_sha256":["df6b0b492f39da89f743df24793606ad35244fb8616e3ad88ad3dae3c4cf467c", "45eb0cdb9e2ea03b86f8c6d21d96f769ebaa07d86d04e2f442da6732b6aaf3c6", "3d10321fd71359ceac432daa657b299d346aeb6142d07fe33a42d372733803d4"]},
         "ensure-screen":{"source":include_str!("../deploy/ensure-screen"),"previous_sha256":["de417ce99b63a1effd3f4c37efab7fb2e285ed7a7bfb8888ded84cbfc4fc27d9"]},
@@ -324,6 +328,30 @@ async fn update_optional_driver(app: &App) -> Result<()> {
         let receipt:Value=serde_json::from_slice(&output)?;
         ensure!(receipt["sha256"]==hash && receipt["updated"].is_boolean(),"Guest driver receipt did not verify");
     }
+    Ok(())
+}
+
+async fn update_optional_agent_desktop(app: &App) -> Result<()> {
+    let manifest:Value=serde_json::from_str(include_str!("../deploy/agent-desktop-manifest.json"))?;
+    let software=std::env::var("KINDRED_GUEST_SOFTWARE").unwrap_or_else(|_|"/opt/kindred/guest".into());
+    let payload=std::path::PathBuf::from(software).join("vendor/agent-desktop.tar.gz");
+    if !payload.is_file() { return Ok(()); }
+    ensure!(tokio::fs::metadata(&payload).await?.len()==manifest["archive_bytes"].as_u64().unwrap_or(0),"Agent desktop archive size mismatch");
+    let bytes=tokio::fs::read(payload).await?;
+    let digest=ring::digest::digest(&ring::digest::SHA256,&bytes);
+    let hash=digest.as_ref().iter().map(|b|format!("{b:02x}")).collect::<String>();
+    ensure!(Some(hash.as_str())==manifest["archive_sha256"].as_str(),"Agent desktop archive hash mismatch");
+    let resources=serde_json::json!({"manifest":manifest,
+        "launcher":include_str!("../deploy/agent-desktop-launch.py"),
+        "skill":include_str!("../deploy/agent-desktop-skill.md"),
+        "license":include_str!("../third-party/agent-desktop/LICENSE.txt")});
+    let declaration=format!("RESOURCES = json.loads({})",serde_json::to_string(&serde_json::to_string(&resources)?)?);
+    let helper=include_str!("../deploy/install-agent-desktop.py").replace("RESOURCES = None",&declaration).replace('\'',"'\"'\"'");
+    let mut command=vm::ssh(&app.config.vm);
+    command.arg(format!("sudo -n python3 -c '{helper}' --receive"));
+    let output=vm::capture(command,Some(bytes),90,4096).await?;
+    let receipt:Value=serde_json::from_slice(&output)?;
+    ensure!(receipt["archive_sha256"]==hash && receipt["updated"].is_boolean(),"Guest agent desktop receipt did not verify");
     Ok(())
 }
 

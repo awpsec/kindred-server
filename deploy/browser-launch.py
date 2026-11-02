@@ -129,7 +129,7 @@ def browser_arguments(profile, mode='restore', url=None):
         raise BrowserContextError('Invalid browser launch action.')
     args = ['--remote-debugging-address=127.0.0.1', '--remote-debugging-port=0',
             '--user-data-dir=' + str(profile), '--no-first-run', '--window-size=1120,680',
-            '--restore-last-session']
+            '--restore-last-session', '--force-renderer-accessibility']
     if mode == 'new':
         args.append('--new-window')
     if mode == 'url':

@@ -24,6 +24,8 @@ Newly configured Kindred profile VMs may provide passwordless sudo for administe
 
 The shell is useful for files, scripts, software, structured data and repeatable local transformations. Choose bounded commands and inspect errors. A shell command can still have external effects through network requests. Its execution inside the VM does not make sending, publishing, purchasing or changing a remote system a local-only action.
 
+For native applications and controls that expose accessibility, Kindred includes `agent-desktop` in updated Bot Computers. Load its focused guide with `guest_exec` command `agent-desktop skills get kindred`, `use_desktop=true`, when desktop work would benefit. It reads named controls and uses qualified references on your assigned screen. Prefer these semantic targets where supported; retain existing computer/browser tools for unsupported input, visual verification and canvas apps. An older guest may lack it; use existing tools rather than installing an arbitrary version. Never override DISPLAY/session variables, switch screens, bypass human control, or repeat an action whose delivery is uncertain. All providers use the same capability through Kindred's approved guest tool.
+
 ## Paired local desktop
 
 Local desktop access is a supported Kindred capability with separate gates. Global Local access must be enabled in the workspace settings. Your own bot must have Local access enabled and a specific desktop selected. That desktop must be registered in this workspace, online, and configured to permit the operation. These gates are independent.
