@@ -287,10 +287,21 @@ pub(super) fn context(db: &Db, chat: &str) -> Result<Vec<Value>> {
     super::restore_context(db, &mut messages)?;
     let seqs: Vec<i64> = messages.iter().filter_map(|m| m["seq"].as_i64()).collect();
     let hidden = crate::continuity::store::hidden_sources(db, chat, &seqs)?;
-    let mut input: Vec<Value> = messages.iter().rev().filter(|m| !hidden.contains(&m["seq"].as_i64().unwrap_or(0)) && ["message","result","voice_call","voice_recap"].contains(&m["kind"].as_str().unwrap_or(""))).take(16).map(|m| {
+    // Bound bytes as well as message count: a long multilingual chat must fit
+    // Live's initial-history budget, leaving room for identity and memory.
+    let mut remaining = 5000usize;
+    let mut input: Vec<Value> = messages.iter().rev().filter(|m| !hidden.contains(&m["seq"].as_i64().unwrap_or(0)) && ["message","result","voice_call","voice_recap"].contains(&m["kind"].as_str().unwrap_or(""))).take(16).filter_map(|m| {
         let user = m["sender"] == "user";
         let text = m["text"].as_str().unwrap_or("");
-        json!({"type":"message","role":if user {"user"} else {"assistant"},"content":[{"type":if user {"input_text"} else {"output_text"},"text":if text.chars().count()>1000 {format!("[Recent excerpt; use the bot to retrieve full context] {}",recent(text,1000))} else {text.to_owned()}}]})
+        if remaining < 100 || text.trim().is_empty() { return None; }
+        let limit=remaining.min(1000);
+        let text=if text.len()>limit {
+            let mut start=text.len().saturating_sub(limit-40);
+            while !text.is_char_boundary(start) {start+=1;}
+            format!("[Earlier portion omitted] {}",&text[start..])
+        } else {text.to_owned()};
+        remaining=remaining.saturating_sub(text.len());
+        Some(json!({"type":"message","role":if user {"user"} else {"assistant"},"content":[{"type":if user {"input_text"} else {"output_text"},"text":text}]}))
     }).collect();
     input.reverse();
     Ok(input)
@@ -365,5 +376,19 @@ mod tests {
         let input = serde_json::to_string(&context(&app.db, &chat).unwrap()).unwrap();
         assert!(input.contains("Portland"));
         assert!(!input.contains("hidden private text"));
+    }
+    #[test]
+    fn recent_history_is_bounded_in_bytes_and_keeps_newest_unicode_messages() {
+        let app=crate::tests::app();let bot=test_bot(&app.db,"codex");let chat=format!("dm-{}",bot.id);
+        for n in 0..24 {
+            let text=format!("{} newest-{n}","🎙会話".repeat(400));
+            app.db.0.lock().unwrap().execute("INSERT INTO chat_messages(chat_id,sender,body,kind,created) VALUES(?,'user',?,'message',?)",params![chat,text,n]).unwrap();
+        }
+        let input=context(&app.db,&chat).unwrap();
+        let texts:Vec<&str>=input.iter().map(|m|m["content"][0]["text"].as_str().unwrap()).collect();
+        assert!(texts.iter().map(|t|t.len()).sum::<usize>()<=5000);
+        assert!(texts.iter().all(|t|t.len()<=1000));
+        assert!(texts.last().unwrap().ends_with("newest-23"));
+        assert!(!texts.concat().contains("newest-0"));
     }
 }

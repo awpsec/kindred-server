@@ -26,6 +26,7 @@ use std::{
 };
 use tokio_tungstenite::tungstenite::{Message as UpstreamMessage, client::IntoClientRequest};
 mod work;
+mod conversation;
 pub(crate) mod session;
 mod options;
 use options::{PaceUpdate, SpeakingPace};
@@ -568,13 +569,12 @@ where
 {
     let chat = app.db.chat(&ticket.chat)?;
     let bot = app.db.bot(&chat.members[0])?;
-    let input = work::context(&app.db, &chat.id)?;
+    let input = conversation::input(&app.db, &chat.id, &bot)?;
     let run = session::begin(&app.db, ticket)?;
     let delegation = session::configuration(app,&bot,&run)?;
     let initial_pace = preferences(&app.db).pace;
     let mut pace_update = PaceUpdate::new(initial_pace);
-    let instructions = format!("You are {}, the same AI teammate the user talks with in this Kindred chat, now speaking in a call. Calls and chat share your identity: speak as I, and refer to shared discussions as we. Do not describe yourself as a separate voice assistant. Speak naturally and briefly, listen to interruptions, and keep the conversation flowing while tools work. Do not claim to be human. Bot role: {}. You have a recent chat excerpt; the call's private backend has your context and tools. Generate <|SpawnThinking|> for a clear request needing current facts, tools, memory beyond your excerpt, or substantive reasoning. Clarify ambiguity aloud before acting. Do not delegate greetings or small talk. Never invent results. Give verified findings in the call; a concise recap with useful links is saved to chat after hangup. Do not say results were posted to chat during the call. Required action approvals remain explicit controls in chat; spoken agreement does not bypass them. Do not narrate every handoff or fill pauses with repeated checking acknowledgments.", bot.name,bot.profile.label);
-    let instructions = format!("{instructions} {}",initial_pace.instruction());
+    let instructions = conversation::instructions(&bot, initial_pace);
     send_upstream(&mut upstream,json!({"type":"session.start","session":{"model":"gpt-live-1","store":false,"instructions":instructions,"input":input,"audio":{"format":{"type":"audio/pcm","rate":24000},"output":{"voice":ticket.voice}},"delegation":delegation}})).await?;
     let mut pending = std::collections::VecDeque::<session::ToolCall>::new();
     let mut running = futures_util::stream::FuturesUnordered::new();
@@ -590,6 +590,7 @@ where
     let mut confirmed = false;
     let mut last_audio = Instant::now();
     let mut muted = false;
+    let mut opening = conversation::Opening::default();
     loop {
         if closing.is_none() && running.is_empty() {
             if let Some(tool)=pending.pop_front() {
@@ -619,9 +620,10 @@ where
                     "session.started"=>{ensure!(started.is_none(),"Duplicate start.");started=Some(Instant::now());connected=Instant::now();last_audio=Instant::now();
                         {let c=app.db.0.lock().unwrap();ensure!(!crate::workspace_transfer::frozen(&c)?,"This workspace is moving.");c.execute("UPDATE voice_calls SET started=? WHERE id=?",params![db::now(),ticket.id])?;}
                         send(client,json!({"type":"started","id":ticket.id,"started_ms":db::now()*1000})).await?;},
-                    "session.input_transcript.delta"|"session.output_transcript.delta"=>{transcript.append(&event)?;if event["type"]=="session.input_transcript.delta" {health.input_transcript_events+=1;}else{health.output_transcript_events+=1;}if let Some(start)=started {checkpoint(&app.db,&ticket.id,&transcript,elapsed(start,closing))?;}},
-                    "session.output_audio.delta"=>{if closing.is_none(){let bytes=audio_bytes(&event["delta"],96000)?;health.output_frames+=1;health.output_bytes+=bytes.len() as u64;send(client,json!({"type":"audio","data":event["delta"]})).await?;}},
+                    "session.input_transcript.delta"|"session.output_transcript.delta"=>{if event["delta"].as_str().is_some_and(|text|!text.trim().is_empty()) {opening.activity();}transcript.append(&event)?;if event["type"]=="session.input_transcript.delta" {health.input_transcript_events+=1;}else{health.output_transcript_events+=1;}if let Some(start)=started {checkpoint(&app.db,&ticket.id,&transcript,elapsed(start,closing))?;}},
+                    "session.output_audio.delta"=>{if closing.is_none(){let bytes=audio_bytes(&event["delta"],96000)?;opening.audio(&bytes,false);health.output_frames+=1;health.output_bytes+=bytes.len() as u64;send(client,json!({"type":"audio","data":event["delta"]})).await?;}},
                     "session.delegation.created"=>{
+                        opening.activity();
                         ensure!(started.is_some(),"Call has not started.");
                         ensure!(event["delegation"]["target"]=="responses","Unexpected voice work mode.");
                         let id=event["delegation"]["id"].as_str().context("Missing voice delegation ID.")?;
@@ -685,7 +687,7 @@ where
                 let event=match incoming {Some(Ok(Message::Text(text)))=>serde_json::from_str::<Value>(&text)?,Some(Ok(Message::Pong(_)))=>{last_client=Instant::now();continue;},Some(Ok(Message::Ping(bytes)))=>{client.send(Message::Pong(bytes)).await?;last_client=Instant::now();continue;},_=>json!({"type":"end"})};
                 last_client=Instant::now();
                 let command=match event["type"].as_str().unwrap_or("") {
-                    "audio"=>{ensure!(started.is_some(),"Call has not started.");let bytes=audio_bytes(&event["data"],48000)?;last_audio=Instant::now();health.input_frames+=1;health.input_bytes+=bytes.len() as u64;if bytes.chunks_exact(2).any(|s|i16::from_le_bytes([s[0],s[1]]).unsigned_abs()>128){health.input_active_frames+=1;}json!({"type":"session.input_audio.append","audio":event["data"]})},
+                    "audio"=>{ensure!(started.is_some(),"Call has not started.");let bytes=audio_bytes(&event["data"],48000)?;opening.audio(&bytes,true);last_audio=Instant::now();health.input_frames+=1;health.input_bytes+=bytes.len() as u64;if bytes.chunks_exact(2).any(|s|i16::from_le_bytes([s[0],s[1]]).unsigned_abs()>128){health.input_active_frames+=1;}json!({"type":"session.input_audio.append","audio":event["data"]})},
                     "mute"=>{muted=event["muted"]==true;last_audio=Instant::now();json!({"type":if muted{"session.input_audio.mute"}else{"session.input_audio.unmute"},"event_id":uuid::Uuid::new_v4().to_string()})},
                     "end"=>{closing=Some(Instant::now());json!({"type":"session.close"})},
                     "ping"=>{send(client,json!({"type":"pong"})).await?;continue;},
@@ -707,6 +709,10 @@ where
                         send_upstream(&mut upstream,json!({"type":"session.commentary.append","event_id":db::id(),"delegation_id":null,"content":"The current action needs your explicit review or participation using the pending card in chat. It has not completed. Spoken agreement does not submit that card."})).await?;
                     }
                     action_notice=waiting;
+                    if let Some(start)=started {
+                        let ready=!muted && !waiting && health.input_frames>0 && last_audio.elapsed()<Duration::from_secs(1);
+                        if let Some(command)=opening.command(start.elapsed(),ready) {send_upstream(&mut upstream,command).await?;}
+                    }
                 }
                 if closing.is_some_and(|t|t.elapsed()>Duration::from_secs(15)){break;}
                 if started.is_none()&&connected.elapsed()>Duration::from_secs(20){anyhow::bail!("Voice start timed out.");}

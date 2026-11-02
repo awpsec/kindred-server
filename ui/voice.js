@@ -1,6 +1,6 @@
-// The server owns credentials, the call transcript, private work session and one recap.
+// The server owns credentials, the call transcript, private work session and requested follow-ups.
 // Tones are original, short state cues, never recordings from another application.
-const callTones={connecting:[[392,0,.09],[494,.12,.09]],connected:[[523,0,.11],[659,.13,.11]],ended:[[494,0,.12],[330,.14,.12]],error:[[330,0,.14],[262,.17,.14]]};
+const callTones={connecting:[[392,0,.14]],connected:[[523,0,.11],[659,.13,.11]],ended:[[494,0,.12],[330,.14,.12]],error:[[330,0,.14],[262,.17,.14]]};
 // Each position has a fixed profile. Only current PCM energy changes its height;
 // this is a meter, never a scrolling recording of previous audio samples.
 export function voiceWaveLevels(input,output,count,reduceMotion=false){
@@ -162,7 +162,7 @@ export function createVoiceUI({api,composer,editor,send,bot,chatId,icon,avatar,n
     if(op?.native)return;try{
       const {context,ready}=effectsContext();stopTones();const version=cueRevision;
       void ready.then(()=>{if(version!==cueRevision||effects!==context||context.state!=='running'||(operation!==op&&!['ended','error'].includes(kind)))return;
-        for(const [frequency,delay,duration] of callTones[kind]){const source=context.createOscillator(),gain=context.createGain(),at=context.currentTime+.015+delay;source.type='sine';source.frequency.value=frequency;gain.gain.setValueAtTime(0,at);gain.gain.linearRampToValueAtTime(.055,at+.012);gain.gain.exponentialRampToValueAtTime(.0001,at+duration);source.connect(gain).connect(context.destination);cueNodes.set(source,gain);source.onended=()=>{cueNodes.delete(source);source.disconnect();gain.disconnect();idleEffects();};source.start(at);source.stop(at+duration+.015);}
+        for(const [frequency,delay,duration] of callTones[kind]){const source=context.createOscillator(),gain=context.createGain(),at=context.currentTime+.015+delay;source.type='sine';source.frequency.value=frequency;gain.gain.setValueAtTime(0,at);gain.gain.linearRampToValueAtTime(kind==='connecting'?.035:.055,at+.012);gain.gain.exponentialRampToValueAtTime(.0001,at+duration);source.connect(gain).connect(context.destination);cueNodes.set(source,gain);source.onended=()=>{cueNodes.delete(source);source.disconnect();gain.disconnect();idleEffects();};source.start(at);source.stop(at+duration+.015);}
       }).catch(()=>{});
     }catch{} // A cue must never prevent ending or starting a call.
   }
@@ -217,11 +217,11 @@ export function createVoiceUI({api,composer,editor,send,bot,chatId,icon,avatar,n
     const select=node('select','voice-choice');select.disabled=true;select.setAttribute('aria-label','Voice');const voiceRow=node('div','setting-row'),voiceLabel=node('span','','Voice'),choices=node('div','voice-selection'),play=button('Preview voice','play',()=>void previewVoice(),'voice-preview');choices.append(select,play);voiceRow.append(voiceLabel,choices);
     const pace=node('select','voice-pace'),paceRow=node('label','setting-row','Speaking pace');pace.setAttribute('aria-label','Speaking pace');for(const value of ['slower','normal','faster']){const option=node('option','',value[0].toUpperCase()+value.slice(1));option.value=value;pace.append(option);}paceRow.append(pace);
     const nextCall=node('p','muted small voice-next-call','Voice changes apply to your next call. Speaking pace updates during this call.');nextCall.hidden=!operation;
-    const note=node('p','muted small'),context=node('p','muted small','Talk and get results in the call. A short recap with useful links appears in chat afterward.'),error=node('p','muted small voice-settings-error');error.setAttribute('role','status');
+    const note=node('p','muted small'),context=node('p','muted small','Talk and get results in the call. Requested links and follow-ups appear in chat.'),error=node('p','muted small voice-settings-error');error.setAttribute('role','status');
     const connect=node('button','subtle-button','Connect OpenAI in Connections');connect.type='button';connect.onclick=()=>openSettings('connections');
     body.append(label,voiceRow,paceRow,nextCall,note,context,error,connect);details.append(summary,body);settings.append(details);details.addEventListener('toggle',()=>{if(!details.open)stopPreview();});
     const owner=settings;
-    const populate=()=>{if(settings!==owner)return;select.replaceChildren();for(const voice of config?.voices||[]){const option=node('option','',voice.name);option.value=voice.id;select.append(option);}select.value=config?.voice||'';note.textContent=config?.configured?'AI voice · Calls, tools, recaps and previews use your OpenAI API credits.':'Connect an OpenAI API key to enable calls.';connect.hidden=!!config?.configured;render();};
+    const populate=()=>{if(settings!==owner)return;select.replaceChildren();for(const voice of config?.voices||[]){const option=node('option','',voice.name);option.value=voice.id;select.append(option);}select.value=config?.voice||'';note.textContent=config?.configured?'AI voice · Calls, tools, follow-ups and previews use your OpenAI API credits.':'Connect an OpenAI API key to enable calls.';connect.hidden=!!config?.configured;render();};
     const save=async()=>{if(owner.dataset.saving==='true')return;const changes={enabled:enabled.checked,voice:select.value,pace:pace.value};stopPreview();owner.dataset.saving='true';render();error.textContent='';const current=revision;try{const result=await api('/voice/settings','PUT',changes);if(current!==revision)return;config=result;}catch(e){if(current===revision)error.textContent=e.message;}finally{owner.dataset.saving='false';if(current===revision)populate();}};
     enabled.onchange=save;select.onchange=save;pace.onchange=save;populate();void init().then(populate);return settings;
   }

@@ -2,12 +2,21 @@
 use super::*;
 use axum::response::IntoResponse;
 
-const SAMPLE: &str = "Hi, this is a preview of my voice. Ready when you are.";
+const SAMPLE: &str = "Hi there, I'm ready when you are.";
 const MAX_CLIP_BYTES: usize = 24_000 * 2 * 10;
+const CACHE_LIMIT: usize = 8;
+const CACHE_TTL: Duration = Duration::from_secs(30 * 60);
 
 #[derive(Default)]
 pub(super) struct State {
     current: Mutex<Option<(String, tokio::sync::watch::Sender<bool>)>>,
+    samples: Mutex<std::collections::VecDeque<CachedSample>>,
+}
+struct CachedSample {
+    credential: Vec<u8>,
+    voice: String,
+    created: Instant,
+    wav: Vec<u8>,
 }
 struct PreviewLease<'a> {
     state: &'a State,
@@ -23,6 +32,40 @@ impl Drop for PreviewLease<'_> {
     }
 }
 impl State {
+    fn cached(&self, key: &str, voice: &str, now: Instant) -> Option<Vec<u8>> {
+        let credential = ring::digest::digest(&ring::digest::SHA256, key.as_bytes());
+        let mut samples = self.samples.lock().unwrap();
+        samples.retain(|s| {
+            s.credential == credential.as_ref()
+                && now.saturating_duration_since(s.created) < CACHE_TTL
+        });
+        let index = samples.iter().position(|s| s.voice == voice)?;
+        let sample = samples.remove(index)?;
+        let bytes = sample.wav.clone();
+        samples.push_back(sample);
+        Some(bytes)
+    }
+    fn remember(&self, key: &str, voice: &str, wav: Vec<u8>, now: Instant) {
+        if wav.len() > MAX_CLIP_BYTES + 44 {
+            return;
+        }
+        let credential = ring::digest::digest(&ring::digest::SHA256, key.as_bytes());
+        let mut samples = self.samples.lock().unwrap();
+        samples.retain(|s| {
+            s.credential == credential.as_ref()
+                && s.voice != voice
+                && now.saturating_duration_since(s.created) < CACHE_TTL
+        });
+        while samples.len() >= CACHE_LIMIT {
+            samples.pop_front();
+        }
+        samples.push_back(CachedSample {
+            credential: credential.as_ref().to_vec(),
+            voice: voice.into(),
+            created: now,
+            wav,
+        });
+    }
     fn acquire(&self) -> PreviewLease<'_> {
         let mut current = self.current.lock().unwrap();
         if let Some((_, old)) = current.take() {
@@ -65,6 +108,15 @@ pub async fn render(
         require!(active.is_none(), "End your call before previewing a voice.");
         app.voice.preview.acquire()
     };
+    // Only fixed, provider-generated samples are retained, in account-local RAM.
+    // Replaying a voice does not open another paid session. Credentials, account
+    // access and active-call checks still run before every cache lookup.
+    if let Some(wav) = app.voice.preview.cached(&key, &input.voice, Instant::now()) {
+        if *lease.cancel.borrow() {
+            return Err(cancelled());
+        }
+        return Ok(response(wav));
+    }
     let mut request = ENDPOINT.into_client_request()?;
     request
         .headers_mut()
@@ -88,19 +140,29 @@ pub async fn render(
     })
     .await;
     let pcm = clip.ok().and_then(Result::ok).ok_or_else(unavailable)?;
+    if *lease.cancel.borrow() {
+        return Err(cancelled());
+    }
     require!(
         !app.account_disabled() && crate::connections::decisions_key(&app).as_deref() == Some(&key),
         "This account is unavailable."
     );
-    Ok((
+    let wav = wav(&pcm);
+    app.voice
+        .preview
+        .remember(&key, &input.voice, wav.clone(), Instant::now());
+    Ok(response(wav))
+}
+fn response(wav: Vec<u8>) -> Response {
+    (
         [
             ("Content-Type", "audio/wav"),
             ("Cache-Control", "no-store"),
             ("X-Content-Type-Options", "nosniff"),
         ],
-        wav(&pcm),
+        wav,
     )
-        .into_response())
+        .into_response()
 }
 fn cancelled() -> Error {
     Error::with_status(StatusCode::CONFLICT, "Voice preview cancelled.")
@@ -242,6 +304,89 @@ fn wav(pcm: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cached_previews_expire_evict_and_never_cross_credentials() {
+        let state = State::default();
+        let now = Instant::now();
+        for n in 0..CACHE_LIMIT {
+            state.remember("key-a", &format!("voice-{n}"), vec![n as u8], now);
+        }
+        assert_eq!(state.cached("key-a", "voice-0", now), Some(vec![0]));
+        state.remember("key-a", "new", vec![99], now);
+        assert!(state.cached("key-a", "voice-1", now).is_none());
+        assert_eq!(state.cached("key-a", "voice-0", now), Some(vec![0]));
+        assert_eq!(state.samples.lock().unwrap().len(), CACHE_LIMIT);
+        assert!(state.cached("key-a", "voice-0", now + CACHE_TTL).is_none());
+        state.remember("key-a", "marin", vec![1], now);
+        assert!(state.cached("key-b", "marin", now).is_none());
+        assert!(state.cached("key-a", "marin", now).is_none());
+        state.remember("key-a", "oversized", vec![0; MAX_CLIP_BYTES + 45], now);
+        assert!(state.samples.lock().unwrap().is_empty());
+    }
+    #[tokio::test]
+    async fn cached_preview_route_reuses_audio_but_preserves_call_and_credential_guards() {
+        use tower::ServiceExt;
+        let root = std::env::temp_dir().join(format!("kindred-preview-cache-{}", db::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut app = crate::tests::app();
+        std::sync::Arc::get_mut(&mut app).unwrap().config.database =
+            root.join("state.db").to_string_lossy().into_owned();
+        let key = "sk-proj-fixture-preview-cache-not-real";
+        crate::connections::save_decisions(&app, Some(key)).unwrap();
+        let bytes = wav(&[0, 1, 2, 3]);
+        app.voice
+            .preview
+            .remember(key, "marin", bytes.clone(), Instant::now());
+        for active in [false, false, true] {
+            *app.voice.active.lock().unwrap() = active.then(|| "fixture-call".into());
+            let request = axum::http::Request::builder()
+                .method("POST")
+                .uri("/api/voice/preview")
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {}", app.token))
+                .body(axum::body::Body::from(r#"{"voice":"marin"}"#))
+                .unwrap();
+            let response = tokio::time::timeout(
+                Duration::from_secs(1),
+                crate::web::router(app.clone()).oneshot(request),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(response.status().as_u16(), if active { 400 } else { 200 });
+            if !active {
+                assert_eq!(response.headers()["cache-control"], "no-store");
+                assert_eq!(
+                    axum::body::to_bytes(response.into_body(), 1000)
+                        .await
+                        .unwrap()
+                        .as_ref(),
+                    bytes
+                );
+            }
+        }
+        *app.voice.active.lock().unwrap() = None;
+        crate::connections::save_decisions(&app, None).unwrap();
+        assert!(
+            render(
+                axum::extract::State(app.clone()),
+                Json(Preview {
+                    voice: "marin".into()
+                })
+            )
+            .await
+            .is_err()
+        );
+        let calls: i64 = app
+            .db
+            .0
+            .lock()
+            .unwrap()
+            .query_row("SELECT count(*) FROM voice_calls", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(calls, 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn preview_trims_continuous_silence_and_preserves_pcm() {
         let mut clip = Clip::default();

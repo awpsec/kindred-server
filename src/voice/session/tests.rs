@@ -109,6 +109,26 @@ fn call_identity_reaches_chat_context_and_recap_for_every_provider() {
 }
 
 #[test]
+fn quiet_completion_is_durable_without_a_summary_bubble_or_late_replay() {
+    for spoken in ["Hey, I'm just testing.","What is five plus seven?"] {
+        let (app,_,ticket,run)=setup("codex");
+        let mut transcript=Transcript::default();
+        transcript.append(&json!({"type":"session.input_transcript.delta","event_id":"u","delta":spoken,"start_ms":0,"end_ms":10})).unwrap();
+        checkpoint(&app.db,&ticket.id,&transcript,12).unwrap();
+        super::super::finish(&app.db,&ticket.id,true).unwrap();
+        save_recap(&app.db,&ticket.id,"").unwrap();
+        save_recap(&app.db,&ticket.id,"Late duplicate summary must not appear.").unwrap();
+        super::super::recover(&app.db).unwrap();
+        let messages=app.db.chat_messages(&ticket.chat).unwrap();
+        assert_eq!(messages.len(),1);assert_eq!(messages[0]["kind"],"voice_call");
+        assert_eq!(app.db.run(&run.id).unwrap().status,"completed");
+        let (state,seq,finished,raw):(String,Option<i64>,bool,String)=app.db.0.lock().unwrap().query_row("SELECT s.recap_state,s.recap_seq,v.finished,v.transcript FROM voice_sessions s JOIN voice_calls v ON v.id=s.call_id WHERE s.call_id=?",[&ticket.id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
+        assert_eq!(state,"complete");assert!(seq.is_none() && finished);
+        assert!(raw.contains(spoken));assert!(app.db.queued_bots().unwrap().is_empty());
+    }
+}
+
+#[test]
 fn unfinished_actions_are_recorded_without_becoming_chat_tasks_on_recovery() {
     let (app,_,ticket,run)=setup("codex");utterance(&app,&ticket);
     accept_tool(&app.db,&ticket.id,"r",&function("unknown-outcome","remember",json!({"text":"example","mode":"append"}))).unwrap();
@@ -235,9 +255,11 @@ fn restart_keeps_private_work_hidden_and_publishes_attachments_only_once() {
 #[tokio::test]
 async fn recap_uses_no_tools_and_rejects_incomplete_or_empty_provider_output() {
     use std::future::IntoFuture;
-    for (status,text,success) in [("completed","We chose the [north entrance](https://example.com/route).",true),("incomplete","Partial",false),("completed","",false)] {
+    for (status,text,success) in [("completed",r#"{"requested_followup":true,"message":"[North entrance](https://example.com/route)"}"#,true),("completed",r#"{"requested_followup":false,"message":""}"#,true),("incomplete","Partial",false),("completed","",false),("completed",r#"{"requested_followup":true,"message":""}"#,false)] {
         let router=axum::Router::new().route("/",axum::routing::post(move |axum::Json(body):axum::Json<Value>|async move {
             assert_eq!(body["tools"],json!([]));assert_eq!(body["store"],false);
+            assert_eq!(body["text"]["format"]["type"],"json_schema");
+            assert_eq!(body["text"]["format"]["strict"],true);
             assert_eq!(body["model"],"gpt-6.1-terra");assert_eq!(body["reasoning"]["effort"],"none");assert!(body["input"].as_str().unwrap().contains("north"));
             let input: Value = serde_json::from_str(body["input"].as_str().unwrap()).unwrap();
             assert_eq!(input["bot"]["name"], "Voice teammate");
@@ -246,6 +268,7 @@ async fn recap_uses_no_tools_and_rejects_incomplete_or_empty_provider_output() {
             let instructions = body["instructions"].as_str().unwrap();
             assert!(instructions.contains("same teammate in the call and chat"));
             assert!(instructions.contains("Use first person"));
+            assert!(instructions.contains("Default to silence") && instructions.contains("arithmetic") && instructions.contains("Do not narrate"));
             assert!(instructions.contains("use tool receipts to verify completion"));
             axum::Json(json!({"status":status,"output":[{"type":"message","content":[{"type":"output_text","text":text}]}]}))
         }));
@@ -258,7 +281,7 @@ async fn recap_uses_no_tools_and_rejects_incomplete_or_empty_provider_output() {
         checkpoint(&app.db, &ticket.id, &t, 42).unwrap();
         let result=generate_recap("fixture-only",summary_input(&app.db,&ticket.id).unwrap(),&url).await;
         assert_eq!(result.is_ok(),success);
-        if success {assert!(result.unwrap().contains("https://example.com/route"));}
+        if success {let result=result.unwrap();if text.contains("https://example.com/route") {assert!(result.contains("https://example.com/route"));}else{assert!(result.is_empty());}}
         server.abort();
     }
 }
@@ -333,7 +356,7 @@ async fn provider_accepts_call_configuration_and_a_tool_free_recap() {
         false
     }).await.unwrap_or(false);
     assert!(closed,"Provider did not confirm closing the synthetic session");
-    let recap=generate_recap(key,json!({"call_transcript":"User: Use the north entrance. AI: Agreed.","backend_messages":[{"text":"Route notes: https://example.com/route"}],"unfinished_or_failed_actions":0}),RECAP_ENDPOINT).await.expect("Provider recap request failed");
+    let recap=generate_recap(key,json!({"call_transcript":"User: Please put the route link in chat after our call. AI: I found the north entrance route.","backend_messages":[{"text":"Route notes: https://example.com/route"}],"unfinished_or_failed_actions":0}),RECAP_ENDPOINT).await.expect("Provider recap request failed");
     assert!(recap.contains("https://example.com/route"));
     assert!(app.db.queued_bots().unwrap().is_empty());
     assert!(app.db.chat_messages(&ticket.chat).unwrap().is_empty());
@@ -350,4 +373,69 @@ fn overlapping_delegations_wait_for_all_results_before_one_resume() {
     assert!(ready_to_resume(&responses));
     for state in responses.values_mut().filter(|s|s.ready()) {state.continued=true;}
     assert!(!ready_to_resume(&responses));
+}
+
+#[tokio::test]
+#[ignore = "Explicit provider acceptance: one synthetic voice session and three short follow-up classifications"]
+async fn provider_keeps_named_identity_context_and_quiet_followups() {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use base64::Engine;
+    let path=std::env::var("KINDRED_VOICE_CHECK_CREDENTIAL_FILE").expect("Explicit check credential file required");
+    let credentials:Value=serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    let key=credentials["decisions"].as_str().filter(|s|!s.is_empty()).expect("No OpenAI credential configured");
+    let (app,mut bot,ticket,run)=setup("codex");
+    bot.name="Cobalt".into();bot.profile.label="Project coordinator".into();
+    bot.instructions="Use relaxed, concise language.".into();
+    app.db.0.lock().unwrap().execute("INSERT INTO chat_messages(chat_id,sender,body,kind,created) VALUES(?,'user','Our Juniper meeting is in Portland.','message',1)",[&ticket.chat]).unwrap();
+    let mut request=ENDPOINT.into_client_request().unwrap();request.headers_mut().insert("Authorization",format!("Bearer {key}").parse().unwrap());
+    let (mut provider,_)=tokio::time::timeout(Duration::from_secs(15),tokio_tungstenite::connect_async(request)).await.unwrap().expect("Provider transport unavailable");
+    let instructions=super::super::conversation::instructions(&bot,SpeakingPace::Normal);
+    let input=super::super::conversation::input(&app.db,&ticket.chat,&bot).unwrap();
+    send_upstream(&mut provider,json!({"type":"session.start","session":{"model":"gpt-live-1","store":false,"instructions":instructions,"input":input,"audio":{"format":{"type":"audio/pcm","rate":24000},"output":{"voice":"juni"}},"delegation":configuration(&app,&bot,&run).unwrap()}})).await.unwrap();
+    let mut started=false;let mut transcript=String::new();let mut audible=false;
+    let mut audio=tokio::time::interval(Duration::from_millis(40));
+    let silence=base64::engine::general_purpose::STANDARD.encode([0u8;1920]);
+    let end=tokio::time::Instant::now()+Duration::from_secs(18);
+    loop {
+        tokio::select! {
+            _=tokio::time::sleep_until(end)=>break,
+            _=audio.tick(),if started=>send_upstream(&mut provider,json!({"type":"session.input_audio.append","audio":silence})).await.unwrap(),
+            incoming=provider.next()=>{
+                let incoming=incoming.expect("Provider closed early").expect("Provider transport failed");
+                if !incoming.is_text(){continue;}
+                let event:Value=serde_json::from_str(incoming.to_text().unwrap()).unwrap();
+                assert_ne!(event["type"],"error","Provider rejected configuration");
+                assert_ne!(event["type"],"session.delegation.created","Identity and recent context must not need tool work");
+                if event["type"]=="session.started" {
+                    started=true;
+                    send_upstream(&mut provider,json!({"type":"session.commentary.append","event_id":"identity-check","delegation_id":null,"content":"For this synthetic connection check, briefly say your configured name and the meeting city from the supplied chat history, then listen. Do not use tools."})).await.unwrap();
+                }
+                if event["type"]=="session.output_transcript.delta" {transcript.push_str(event["delta"].as_str().unwrap_or(""));}
+                if event["type"]=="session.output_audio.delta" {
+                    let bytes=audio_bytes(&event["delta"],96_000).unwrap();
+                    audible |= bytes.chunks_exact(2).any(|s|i16::from_le_bytes([s[0],s[1]]).unsigned_abs()>256);
+                }
+                if audible && transcript.to_lowercase().contains("cobalt") && transcript.to_lowercase().contains("portland") {break;}
+            }
+        }
+    }
+    send_upstream(&mut provider,json!({"type":"session.close"})).await.unwrap();
+    let closed=tokio::time::timeout(Duration::from_secs(5),async {
+        while let Some(Ok(incoming))=provider.next().await {
+            if incoming.is_text() && serde_json::from_str::<Value>(incoming.to_text().unwrap()).unwrap()["type"]=="session.closed" {return true;}
+        }false
+    }).await.unwrap_or(false);
+    assert!(started && closed && audible,"Synthetic identity session failed to produce audio or close");
+    assert!(transcript.to_lowercase().contains("cobalt"),"Configured identity was not spoken");
+    assert!(transcript.to_lowercase().contains("portland"),"Recent chat context was not spoken");
+    for (spoken,written) in [
+        ("user: Hey man, I'm just testing.\nassistant: Alright, test away!",false),
+        ("user: What's five plus seven?\nassistant: Twelve.",false),
+        ("user: Please put the route link in chat so I can open it after our call.\nassistant: I found the north entrance route.",true),
+    ] {
+        let followup=generate_recap(key,json!({"bot":{"name":"Cobalt"},"call_transcript":spoken,"backend_messages":if written {json!([{"text":"North entrance: https://example.com/route"}])}else{json!([])},"unfinished_or_failed_actions":0}),RECAP_ENDPOINT).await.expect("Provider follow-up failed");
+        if written {assert!(followup.contains("https://example.com/route"));}else{assert!(followup.is_empty(),"Casual or arithmetic call produced a visible follow-up");}
+    }
+    assert!(app.db.queued_bots().unwrap().is_empty());
+    println!("Provider acceptance passed: selected name and recent city spoken; casual and arithmetic calls silent; requested link retained. No audio or transcript retained; no production chats or tools used.");
 }
