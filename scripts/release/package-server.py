@@ -4,6 +4,7 @@ Run after committing and building the server from a clean checkout. This creates
 local candidates only; it never publishes or changes a running installation.
 """
 import argparse
+import importlib.util
 import hashlib
 import json
 import os
@@ -107,10 +108,33 @@ def driver_payload(payload, archive=None):
     return manifest, data
 
 
-def package(binary, output, cua_driver=None, cua_driver_archive=None):
+def agent_desktop_payload(archive=None):
+    manifest_path=ROOT/'deploy/agent-desktop-manifest.json'
+    if not manifest_path.exists():
+        if archive is not None:raise ValueError('Agent desktop archive supplied without manifest')
+        return None
+    manifest=json.loads(manifest_path.read_text())
+    if (manifest.get('schema')!=1 or manifest.get('name')!='agent-desktop'
+        or manifest.get('target')!='x86_64-unknown-linux-gnu'
+        or manifest.get('packaged_path')!='deploy/vendor/agent-desktop.tar.gz'
+        or manifest.get('license')!='Apache-2.0'
+        or set(manifest.get('files',{}))!={'agent-desktop','agent-desktop-linux-clipboard-owner'}):
+        raise ValueError('Invalid agent desktop manifest')
+    if json.loads((ROOT/'third-party/agent-desktop/SOURCE.json').read_text())!=manifest:
+        raise ValueError('Agent desktop provenance mismatch')
+    archive=archive or ROOT/manifest['packaged_path']
+    if archive.is_symlink() or not archive.is_file():raise ValueError('Stage pinned agent desktop archive before packaging')
+    spec=importlib.util.spec_from_file_location('agent_desktop_package',ROOT/'deploy/install-agent-desktop.py')
+    helper=importlib.util.module_from_spec(spec);spec.loader.exec_module(helper)
+    data=archive.read_bytes();helper.verified(data,manifest)
+    return manifest,data
+
+
+def package(binary, output, cua_driver=None, cua_driver_archive=None, agent_desktop_archive=None):
     if git("status", "--porcelain").strip():
         raise ValueError("Commit the server source before building a release candidate")
     driver = driver_payload(cua_driver, cua_driver_archive)
+    agent_desktop = agent_desktop_payload(agent_desktop_archive)
     version = tomllib.loads((ROOT / "Cargo.toml").read_text())["package"]["version"]
     source = git("rev-parse", "HEAD").decode().strip()
     data = binary.read_bytes()
@@ -148,6 +172,13 @@ def package(binary, output, cua_driver=None, cua_driver_archive=None):
         if manifest["packaged_path"] in tracked:
             raise ValueError("Generated driver binary must not be tracked in Git")
         metadata["cua_driver"] = manifest
+    if agent_desktop:
+        agent_manifest,agent_data=agent_desktop
+        required=['deploy/agent-desktop-manifest.json','deploy/agent-desktop-launch.py','deploy/agent-desktop-skill.md','deploy/install-agent-desktop.py',
+                  'third-party/agent-desktop/SOURCE.json','third-party/agent-desktop/LICENSE.txt','third-party/agent-desktop/INTEGRATION.md']
+        if any(name not in tracked for name in required):raise ValueError('Agent desktop sources and notices must be tracked')
+        if agent_manifest['packaged_path'] in tracked:raise ValueError('Generated agent desktop archive must not be tracked')
+        metadata['agent_desktop']=agent_manifest
     output.mkdir(parents=True, exist_ok=True)
     archive = output / f"kindred-standalone-{version}.zip"
     if archive.exists():
@@ -166,6 +197,10 @@ def package(binary, output, cua_driver=None, cua_driver_archive=None):
             info.external_attr = 0o100755 << 16
             info.compress_type = zipfile.ZIP_DEFLATED
             z.writestr(info, driver_data)
+        if agent_desktop:
+            info=zipfile.ZipInfo(agent_manifest['packaged_path'],stamp)
+            info.create_system=3;info.external_attr=0o100644<<16;info.compress_type=zipfile.ZIP_DEFLATED
+            z.writestr(info,agent_data)
         info = zipfile.ZipInfo("bundle.json", stamp)
         info.create_system = 3
         info.external_attr = 0o100644 << 16
@@ -178,6 +213,8 @@ def package(binary, output, cua_driver=None, cua_driver_archive=None):
             raise ValueError("Packaged binary changed")
         if driver and z.read(manifest["packaged_path"]) != driver_data:
             raise ValueError("Packaged driver changed")
+        if agent_desktop and z.read(agent_manifest['packaged_path'])!=agent_data:
+            raise ValueError('Packaged agent desktop changed')
     metadata["standalone_sha256"] = hashlib.sha256(archive.read_bytes()).hexdigest()
     metadata["bytes"] = archive.stat().st_size
     (output / "SOURCE.json").write_text(json.dumps(metadata, indent=2) + "\n")
@@ -190,5 +227,6 @@ if __name__ == "__main__":
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--cua-driver", type=Path, help="Verified generated driver binary; defaults to manifest packaged_path")
     parser.add_argument("--cua-driver-archive", type=Path, help="Retained pinned release tar.gz; required with driver manifest")
+    parser.add_argument("--agent-desktop-archive", type=Path, help="Pinned Linux archive; defaults to deploy/vendor/agent-desktop.tar.gz")
     args = parser.parse_args()
-    package(args.binary, args.output, args.cua_driver, args.cua_driver_archive)
+    package(args.binary, args.output, args.cua_driver, args.cua_driver_archive, args.agent_desktop_archive)

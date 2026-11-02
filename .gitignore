@@ -24,3 +24,4 @@ __pycache__/
 
 /deploy/vendor/cua-driver
 /deploy/vendor/cua-driver.previous
+/deploy/vendor/agent-desktop.tar.gz

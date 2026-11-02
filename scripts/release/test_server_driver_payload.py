@@ -42,7 +42,7 @@ class DriverPayload(unittest.TestCase):
             root.mkdir()
             original = packager.ROOT
             # Use real tracked distribution resources, but synthetic ELF payloads.
-            resources = packager.git("ls-files", "-z").decode().split("\0")
+            resources = [name for name in packager.git("ls-files", "-z").decode().split("\0") if name != "deploy/agent-desktop-manifest.json"]
             for name in resources:
                 if name and (name.startswith(("deploy/", "third-party/", "harness/pi/", "ui/fonts/", "docs/PROVIDER_MARKS")) or name in {"Cargo.toml", "compose.yaml", "compose.kvm.yaml", "LICENSE", "THIRD_PARTY_NOTICES.md", "ui/artifact-vendor.js.LEGAL.txt"}):
                     destination = root / name
