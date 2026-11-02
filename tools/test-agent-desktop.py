@@ -9,6 +9,9 @@ from pathlib import Path
 import tarfile
 import tempfile
 import unittest
+import contextlib
+import zipfile
+from unittest.mock import patch
 
 ROOT=Path(__file__).resolve().parents[1]
 def load(name,path):
@@ -80,5 +83,24 @@ class Tests(unittest.TestCase):
         manifest,data=packager.agent_desktop_payload(Path(path))
         self.assertEqual(manifest['archive_sha256'],hashlib.sha256(data).hexdigest())
         self.assertEqual(set(installer.verified(data,manifest)),{'agent-desktop','agent-desktop-linux-clipboard-owner'})
+    def test_release_zip_carries_offline_runtime_guide_and_license(self):
+        path=os.environ.get('KINDRED_AGENT_DESKTOP_ARCHIVE')
+        if not path:self.skipTest('Set KINDRED_AGENT_DESKTOP_ARCHIVE for release ZIP check')
+        version=packager.tomllib.loads((ROOT/'Cargo.toml').read_text())['package']['version']
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder);binary=root/'synthetic';binary.write_bytes(b'\x7fELF\x02'+bytes(13)+b'\x3e\x00')
+            tracked=packager.git('ls-files','-z')
+            def fixture_git(*args):
+                if args==('status','--porcelain'):return b''
+                if args==('rev-parse','HEAD'):return b'a'*40
+                if args==('show','-s','--format=%ct','HEAD'):return b'1793628000'
+                return tracked
+            with patch.object(packager,'git',side_effect=fixture_git),patch.object(packager,'driver_payload',return_value=None),patch.object(packager.subprocess,'check_output',return_value='kindred '+version),contextlib.redirect_stdout(io.StringIO()):
+                packager.package(binary,root/'output',agent_desktop_archive=Path(path))
+            with zipfile.ZipFile(root/'output'/('kindred-standalone-'+version+'.zip')) as archive:
+                self.assertEqual(archive.read('deploy/vendor/agent-desktop.tar.gz'),Path(path).read_bytes())
+                for name in ['deploy/agent-desktop-skill.md','deploy/agent-desktop-launch.py','third-party/agent-desktop/LICENSE.txt']:
+                    self.assertEqual(archive.read(name),(ROOT/name).read_bytes())
+                self.assertEqual(json.loads(archive.read('bundle.json'))['agent_desktop'],installer.resources()['manifest'])
 
 if __name__=='__main__':unittest.main()
