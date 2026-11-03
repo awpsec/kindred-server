@@ -31,7 +31,10 @@ fn bookkeeping(name: &str) -> bool {
 pub fn read_call(c: &Connection, run: &str, name: &str, call: &str) -> Result<bool> {
     if read_tool(name) { return Ok(true); }
     if !matches!(name, "connector_execute" | "codex_connector") { return Ok(false); }
-    Ok(c.query_row("SELECT EXISTS(SELECT 1 FROM events requested JOIN events started ON started.run_id=requested.run_id AND started.seq>requested.seq AND started.kind='tool_started' JOIN connector_artifacts a ON a.id=json_extract(started.body,'$.args.artifact_id') AND a.run_id=requested.run_id WHERE requested.run_id=?1 AND requested.kind='tool_requested' AND json_extract(requested.body,'$.call_id')=?2 AND json_extract(requested.body,'$.tool')=?3 AND json_extract(started.body,'$.tool')=?3 AND json_extract(a.body,'$.read_only')=1 AND json_extract(started.body,'$.args.read_only')=1 AND NOT EXISTS(SELECT 1 FROM events newer WHERE newer.run_id=requested.run_id AND newer.seq>requested.seq AND newer.seq<started.seq AND newer.kind IN ('tool_requested','tool_result') AND json_extract(newer.body,'$.tool')=?3))", params![run,call,name], |r| r.get(0))?)
+    Ok(read_artifact(c,run,name,call)?.is_some())
+}
+fn read_artifact(c: &Connection, run: &str, name: &str, call: &str) -> Result<Option<String>> {
+    Ok(c.query_row("SELECT a.id FROM events requested JOIN events started ON started.run_id=requested.run_id AND started.seq>requested.seq AND started.kind='tool_started' JOIN connector_artifacts a ON a.id=json_extract(started.body,'$.args.artifact_id') AND a.run_id=requested.run_id WHERE requested.run_id=?1 AND requested.kind='tool_requested' AND json_extract(requested.body,'$.call_id')=?2 AND json_extract(requested.body,'$.tool')=?3 AND json_extract(started.body,'$.tool')=?3 AND json_extract(a.body,'$.read_only')=1 AND json_extract(started.body,'$.args.read_only')=1 AND NOT EXISTS(SELECT 1 FROM events newer WHERE newer.run_id=requested.run_id AND newer.seq>requested.seq AND newer.seq<started.seq AND newer.kind IN ('tool_requested','tool_result') AND json_extract(newer.body,'$.tool')=?3) LIMIT 1", params![run,call,name], |r| r.get(0)).optional()?)
 }
 pub fn transport_error(error: &anyhow::Error) -> bool {
     if let Some(e) = error.downcast_ref::<crate::rpc::CodexTurnError>() { return e.routine_retryable; }
@@ -40,6 +43,11 @@ pub fn transport_error(error: &anyhow::Error) -> bool {
     for cause in error.chain() {
         if let Some(e) = cause.downcast_ref::<reqwest::Error>() {
             if let Some(status) = e.status() { return matches!(status.as_u16(), 408 | 500 | 502 | 503 | 504); }
+        }
+    }
+    for cause in error.chain() {
+        if let Some(e) = cause.downcast_ref::<std::io::Error>() {
+            return matches!(e.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted | std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::UnexpectedEof);
         }
     }
     error.chain().any(|cause| {
@@ -115,6 +123,21 @@ pub fn recoverable_outcome(c: &Connection, run: &str) -> Result<bool> {
     if outcome.as_deref().is_some_and(|v| v != "error") { return Ok(false); }
     Ok(failures(c, run)?.0 && safe_to_resume(c, run)?)
 }
+// Suppress only a failed read card bound to an authoritative recoverable result.
+// Keep the artifact and all receipts in Activity; leave approvals/writes alone.
+pub fn suppress_failed_read_cards(c: &Connection, run: &str) -> Result<()> {
+    let mut q = c.prepare("SELECT body FROM events WHERE run_id=? AND kind='tool_result' AND json_extract(body,'$.failed')=1 AND json_extract(body,'$.retryable_read')=1")?;
+    let rows = q.query_map([run], |r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    for row in rows {
+        let body: Value = serde_json::from_str(&row)?;
+        let name = body["tool"].as_str().unwrap_or("");
+        if !matches!(name,"codex_connector"|"connector_execute") { continue; }
+        if let Some(artifact) = read_artifact(c,run,name,body["call_id"].as_str().unwrap_or(""))? {
+            c.execute("UPDATE chat_messages SET suppressed=1 WHERE run_id=?1 AND kind='connector_artifact' AND body=?2 AND EXISTS(SELECT 1 FROM connector_artifacts WHERE id=?2 AND run_id=?1 AND status='failed' AND json_extract(body,'$.read_only')=1)", params![run,artifact])?;
+        }
+    }
+    Ok(())
+}
 // Reservation and archiving a provisional error are atomic. A crash after
 // reservation consumes the attempt; reentry cannot reset the occurrence budget.
 pub fn enter(app: &App, run: &Run) -> Result<()> {
@@ -134,6 +157,7 @@ pub fn reserve(app: &App, run: &Run, delay: Duration) -> Result<bool> {
     if used >= LIMIT || !safe_to_resume(&tx, &run.id)? || !crate::routine_completion::current(&tx, &run.id)?
         || !tx.query_row("SELECT status='running' FROM runs WHERE id=?", [&run.id], |r| r.get::<_,bool>(0))? { return Ok(false); }
     tx.execute("INSERT INTO events(run_id,kind,body,created) SELECT run_id,'routine_recovery_outcome',json_object('outcome',outcome,'report',report),? FROM routine_completion WHERE run_id=? AND outcome='error'", params![crate::db::now(),run.id])?;
+    suppress_failed_read_cards(&tx,&run.id)?;
     tx.execute("DELETE FROM routine_completion WHERE run_id=? AND outcome='error'", [&run.id])?;
     tx.execute("INSERT INTO events(run_id,kind,body,created) VALUES(?,'provider_retry',?,?)", params![run.id,json!({"attempt":used+1,"limit":LIMIT,"scope":"routine","phase":"retrying","delay_seconds":delay.as_secs()}).to_string(),crate::db::now()])?;
     tx.commit()?;

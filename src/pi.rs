@@ -109,6 +109,24 @@ fn provider_error(frame: &Value) -> String {
     }
 }
 
+// Keep the machine status and the existing public wording together at the
+// actual bridge error boundary. Model text cannot mark a failure retryable.
+pub(crate) fn provider_failure(provider: &str, frame: &Value) -> anyhow::Error {
+    let message = if provider.starts_with("custom-") {
+        provider_error(frame).replace("OpenRouter", "The custom provider")
+            .replace("balance and ZDR eligibility", "credentials and quota")
+    } else if matches!(provider, "opencode" | "opencode-go") {
+        provider_error(frame).replace("OpenRouter", if provider == "opencode-go" {"OpenCode Go"} else {"OpenCode Zen"})
+            .replace("balance and ZDR eligibility", "API key, plan and quota")
+    } else { provider_error(frame) };
+    if frame["code"] == "provider_http" {
+        crate::routine_recovery::HttpFailure {
+            status: frame["status"].as_u64().filter(|n| (100..=599).contains(n)).unwrap_or(0) as u16,
+            message,
+        }.into()
+    } else { anyhow::anyhow!(message) }
+}
+
 async fn run_worker(
     app: &App,
     bot: &Bot,
@@ -170,23 +188,7 @@ async fn run_worker(
                 .context("Pi harness startup timed out")??
         };
         match frame["type"].as_str().unwrap_or("") {
-            "error" => {
-                let message =
-                if bot.provider.starts_with("custom-") {
-                    provider_error(&frame)
-                        .replace("OpenRouter", "The custom provider")
-                        .replace("balance and ZDR eligibility", "credentials and quota")
-                } else if matches!(bot.provider.as_str(), "opencode" | "opencode-go") {
-                    provider_error(&frame).replace("OpenRouter", if bot.provider == "opencode-go" {"OpenCode Go"} else {"OpenCode Zen"}).replace("balance and ZDR eligibility", "API key, plan and quota")
-                } else {
-                    provider_error(&frame)
-                };
-                if frame["code"] == "provider_http" {
-                    return Err(crate::routine_recovery::HttpFailure { status: frame["status"].as_u64().filter(|n| (100..=599).contains(n)).unwrap_or(0) as u16, message }.into());
-                }
-                bail!(message);
-            }
-
+            "error" => return Err(provider_failure(&bot.provider, &frame)),
             "ready" => {
                 ensure!(
                     !ready

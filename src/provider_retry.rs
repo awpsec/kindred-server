@@ -177,6 +177,7 @@ where F: FnMut() -> Fut, Fut: Future<Output=Result<String>> {
             }
         };
         if !can_recover || used >= recovery::LIMIT {
+            if can_recover { recovery::suppress_failed_read_cards(&app.db.0.lock().unwrap(),&run.id)?; }
             if used > 0 {
                 app.db.event(&run.id, "provider_retry", json!({"attempt":used,"limit":recovery::LIMIT,"scope":"routine","phase":if can_recover {"exhausted"} else {"finished"}}))?;
             }

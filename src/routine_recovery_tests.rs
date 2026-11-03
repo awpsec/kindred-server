@@ -250,3 +250,100 @@ async fn real_dispatcher_allows_quiet_after_refused_quiet_and_verified_readback(
     assert_eq!(app.db.run(&run.id).unwrap().status,"completed");
     assert!(!app.db.chat_messages(&run.chat_id).unwrap().iter().any(|m|m["kind"]=="result"));
 }
+
+#[test]
+fn actual_pi_error_frames_preserve_http_status_and_normal_retry_policy() {
+    for provider in ["openrouter","custom-fixture","opencode","opencode-go"] {
+        for status in [401,429,503] {
+            let error=crate::pi::provider_failure(provider,&json!({"type":"error","code":"provider_http","status":status}));
+            assert_eq!(error.downcast_ref::<recovery::HttpFailure>().unwrap().status,status as u16);
+            assert_eq!(recovery::transport_error(&error),status==503,"{provider} {status}");
+            assert!(error.to_string().contains(&format!("HTTP {status}")));
+            if provider=="openrouter" || provider.starts_with("custom-") {
+                assert_eq!(super::transient(&error),status==429 || status==503,"ordinary task retry policy is unchanged");
+            }
+        }
+        let redirect=crate::pi::provider_failure(provider,&json!({"type":"error","code":"transport"}));
+        assert!(!recovery::transport_error(&redirect),"opaque redirects are not safe recovery evidence");
+    }
+    let denied=anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::PermissionDenied)).context("Codex request timed out");
+    assert!(!recovery::transport_error(&denied));
+}
+
+fn connector_card(app: &App, run: &Run, readonly: bool, failed: bool, retryable: bool) -> String {
+    let args=json!({"origin":"codex-account","account_key":"fixture","connector_key":"slack","tool_name":"fixture-action","arguments":{},"read_only":readonly});
+    let call=db::id();
+    app.db.event(&run.id,"tool_requested",json!({"tool":"codex_connector","call_id":call,"args":args})).unwrap();
+    let artifact=crate::connector_artifacts::create(&app.db,run,&args).unwrap();
+    let mut trusted=args; trusted["artifact_id"]=json!(artifact);
+    app.db.event(&run.id,"tool_started",json!({"tool":"codex_connector","args":trusted})).unwrap();
+    crate::connector_artifacts::complete(&app.db,&artifact,&json!({"text":"Fixture receipt"}),failed).unwrap();
+    app.db.event(&run.id,"tool_result",json!({"tool":"codex_connector","call_id":call,"failed":failed,"retryable_read":retryable})).unwrap();
+    artifact
+}
+fn suppressed(app: &App, id: &str) -> bool {
+    app.db.0.lock().unwrap().query_row("SELECT suppressed FROM chat_messages WHERE kind='connector_artifact' AND body=?",[id],|r|r.get(0)).unwrap()
+}
+
+#[tokio::test]
+async fn exhausted_read_recovery_leaves_one_failure_and_private_artifact_receipts() {
+    let app=tests::app(); let (_bot,run)=scheduled(&app,"codex"); let cards=std::cell::RefCell::new(Vec::<String>::new());
+    let result=retry(&app,&run,|| {
+        for id in cards.borrow().iter() { assert!(suppressed(&app,id)); }
+        cards.borrow_mut().push(connector_card(&app,&run,true,true,true));
+        complete(&app,&run,"error").unwrap(); ready(Ok(String::new()))
+    },&[Duration::ZERO;5]).await;
+    assert_eq!(cards.borrow().len(),3);
+    for id in cards.borrow().iter() {
+        assert!(suppressed(&app,id));
+        assert_eq!(crate::connector_artifacts::record(&app.db.0.lock().unwrap(),id).unwrap()["status"],"failed");
+    }
+    finish(&app,&run,result);
+    let messages=app.db.chat_messages(&run.chat_id).unwrap();
+    assert_eq!(messages.iter().filter(|m|m["kind"]=="result").count(),1);
+    assert!(!messages.iter().any(|m|m["kind"]=="connector_artifact"));
+}
+
+#[test]
+fn artifact_suppression_never_hides_writes_successes_or_nonrecoverable_failures() {
+    let app=tests::app(); let (_bot,run)=scheduled(&app,"codex");
+    let eligible=connector_card(&app,&run,true,true,true);
+    let denied=connector_card(&app,&run,true,true,false);
+    let write=connector_card(&app,&run,false,true,true);
+    let success=connector_card(&app,&run,true,false,true);
+    recovery::suppress_failed_read_cards(&app.db.0.lock().unwrap(),&run.id).unwrap();
+    assert!(suppressed(&app,&eligible));
+    for id in [denied,write,success] { assert!(!suppressed(&app,&id)); }
+}
+
+#[tokio::test]
+async fn sqlite_restart_retains_budget_and_requires_explicit_continuation() {
+    let path=std::env::temp_dir().join(format!("kindred-routine-recovery-{}.db",db::id()));
+    let mut app=tests::app();
+    std::sync::Arc::get_mut(&mut app).unwrap().db=db::Db::open(path.to_str().unwrap()).unwrap();
+    let (_bot,run)=scheduled(&app,"codex");
+    read(&app,&run,json!({"query":"already read"}),false,false);
+    recovery::enter(&app,&run).unwrap();
+    assert!(recovery::reserve(&app,&run,Duration::from_secs(5)).unwrap());
+    assert_eq!(retries(&app,&run),1);
+    drop(app);
+    let mut app=tests::app();
+    std::sync::Arc::get_mut(&mut app).unwrap().db=db::Db::open(path.to_str().unwrap()).unwrap();
+    assert_eq!(app.db.run(&run.id).unwrap().status,"interrupted");
+    assert_eq!(retries(&app,&run),1);
+    assert!(app.db.claim_bot(&run.bot_id).unwrap().is_none());
+    let calls=Cell::new(0);
+    assert!(retry(&app,&run,|| {calls.set(calls.get()+1);ready(Ok(String::new()))},&[Duration::ZERO;5]).await.is_err());
+    assert_eq!(calls.get(),0);
+    let next=app.db.continue_task(&run.id).unwrap();let next=app.db.run(&next).unwrap();
+    let next=app.db.claim_bot(&next.bot_id).unwrap().unwrap();
+    let result=retry(&app,&next,|| {
+        calls.set(calls.get()+1);
+        if calls.get()==1 {ready(Err(anyhow::anyhow!("Codex request timed out")))}
+        else {complete(&app,&next,"quiet").unwrap();ready(Ok(String::new()))}
+    },&[Duration::ZERO;5]).await;
+    assert_eq!(calls.get(),2);assert_eq!(retries(&app,&next),2);
+    finish(&app,&next,result);assert_eq!(app.db.run(&next.id).unwrap().status,"completed");
+    assert_eq!(app.db.events(&run.id).unwrap().iter().filter(|e|e["kind"]=="tool_requested").count(),1);
+    drop(app);std::fs::remove_file(path).unwrap();
+}
