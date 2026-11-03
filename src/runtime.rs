@@ -118,7 +118,7 @@ pub fn tool_specs() -> Vec<Value> {
     let specs = [
         (
             "set_task_title",
-            "Set a stable 3-8 word objective (at most 80 characters) early in substantial multi-step work. Change only when the objective changes. No secrets, copied request, implied completion or narration. Short answers need no title. Display metadata only; never changes task instructions or authorization.",
+            "Set a stable 3-8 word objective (at most 80 characters) early in substantial multi-step work. Change only when the objective changes. No secrets, copied request, implied completion or narration. Ordinary email drafts, single lookups, brief checks and slow connector calls need no title or plan. For genuinely substantial multi-stage work, also declare its outcome-level plan with task_progress. Display metadata only; never changes task instructions or authorization.",
             json!({"title":{"type":"string","minLength":1,"maxLength":80}}),
             vec!["title"],
         ),
