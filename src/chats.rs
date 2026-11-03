@@ -338,8 +338,9 @@ impl Db {
             "SELECT EXISTS(SELECT 1 FROM chat_messages WHERE chat_id=?1 AND suppressed=0 AND (created,COALESCE(history_order,printf('%020d:%020d',seq,0)))<(?2,?3)), EXISTS(SELECT 1 FROM chat_messages WHERE chat_id=?1 AND suppressed=0 AND (created,COALESCE(history_order,printf('%020d:%020d',seq,0)))>(?4,?5))",
             params![id,first_time,rows.first().and_then(|r|r["history_order"].as_str()),last_time,rows.last().and_then(|r|r["history_order"].as_str())], |r| Ok((r.get(0)?,r.get(1)?)))?;
         drop(c);
+        let waiting_states = crate::waiting_state::for_chat(&self.0.lock().unwrap(),id)?;
         Ok(
-            json!({"chat":chat,"messages":self.decorate_chat_messages(rows)?,"pending_waits":self.collaboration_waits(id)?,"commands":crate::command_jobs::chat_jobs(self,id)?,"page":{"has_before":has_before,"has_after":has_after,"first":first,"last":last}}),
+            json!({"chat":chat,"messages":self.decorate_chat_messages(rows)?,"pending_waits":self.collaboration_waits(id)?,"waiting_states":waiting_states,"commands":crate::command_jobs::chat_jobs(self,id)?,"page":{"has_before":has_before,"has_after":has_after,"first":first,"last":last}}),
         )
     }
     fn decorate_chat_messages(&self, mut rows: Vec<Value>) -> Result<Vec<Value>> {

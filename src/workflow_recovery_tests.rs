@@ -76,7 +76,7 @@ fn answer(text: &str) -> Option<Value> {
 
 fn calls(items: &[(&str, &str, Value)]) -> Option<Value> {
     Some(
-        json!({"choices":[{"message":{"role":"assistant","tool_calls":items.iter().map(|(id,name,args)|json!({"id":id,"type":"function","function":{"name":name,"arguments":args.to_string()}})).collect::<Vec<_>>()},"finish_reason":"tool_calls"}]}),
+        json!({"choices":[{"message":{"role":"assistant","tool_calls":items.iter().map(|(id,name,args)|json!({"id":id,"type":"function","function":crate::tool_catalog::fixture_function(name,args.clone())})).collect::<Vec<_>>()},"finish_reason":"tool_calls"}]}),
     )
 }
 

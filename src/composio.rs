@@ -936,6 +936,7 @@ pub async fn execute(app: &App, bot: &Bot, run: &Run, args: &Value) -> Result<Va
             "This connection is read-only. Change access in Settings to request a mutation."
         );
     }
+    crate::email_draft_preview::bind_precondition(&app.db.0.lock().unwrap(),&run.id,&mut review,&schema["input_parameters"])?;
     let artifact = crate::connector_artifacts::create(&app.db, run, &review)?;
     review["artifact_id"] = json!(artifact);
     let result:Result<Value>=async {

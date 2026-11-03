@@ -78,7 +78,7 @@ async fn real_sdk_converts_a_workspace_and_merges_an_origin_sync() {
             assert!(messages.contains("Nothing is installed yet"));
             json!({"role":"assistant","content":"The conversion draft is ready for your review."})
         } else {
-            json!({"role":"assistant","tool_calls":[{"id":format!("workspace_{turn}"),"type":"function","function":{"name":name,"arguments":args.to_string()}}]})
+            json!({"role":"assistant","tool_calls":[{"id":format!("workspace_{turn}"),"type":"function","function":crate::tool_catalog::fixture_function(name,args)}]})
         };
         crate::pi::sse_response(
             json!({"choices":[{"message":message,"finish_reason":if done {"stop"} else {"tool_calls"}}]}),

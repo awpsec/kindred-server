@@ -434,7 +434,11 @@ pub fn decide_checked(
     let artifact = args["artifact_id"].as_str();
     if let Some(artifact) = artifact {
         let card = crate::connector_artifacts::record(&tx, artifact)?;
-        if approved { crate::connector_edits::validate_email_delivery(&card)?; }
+        if approved {
+            crate::connector_edits::validate_email_delivery(&card)?;
+            let run: String = tx.query_row("SELECT run_id FROM approvals WHERE id=?",[id],|r|r.get(0))?;
+            crate::email_draft_preview::pin(&tx,artifact,&run,&args)?;
+        }
         ensure!(
             revision == card["revision"].as_i64()
                 && card["status"] == "pending"

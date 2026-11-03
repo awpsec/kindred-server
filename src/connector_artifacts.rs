@@ -217,9 +217,14 @@ pub fn record(c: &Connection, id: &str) -> Result<Value> {
         }
         if args.is_object() {
             args["input"]=value["input"].clone();
-            if let Some(preview)=crate::email_draft_preview::resolve(c,value["run_id"].as_str().unwrap_or(""),&args)? {
-                value["email"]=preview["email"].clone();
-                value["remote_draft_preview"]=json!(true);
+            args["remote_precondition"]=value["remote_precondition"].clone();
+            let current=crate::email_draft_preview::resolve(c,value["run_id"].as_str().unwrap_or(""),&args)?.map(|p|crate::email_draft_preview::contract(&p,&args));
+            if let Some(frozen)=value.get("draft_contract").cloned().or_else(||current.clone()) {
+                let unchanged=current.as_ref().is_some_and(|c|c["digest"]==frozen["digest"]);
+                value["email"]=frozen["content"]["email"].clone();
+                value["review_digest"]=frozen["digest"].clone();
+                value["draft_contract_changed"]=json!(!unchanged);
+                value["remote_draft_preview"]=json!(unchanged);
             }
         }
     }
@@ -246,7 +251,7 @@ pub fn create(db: &Db, run: &Run, args: &Value) -> Result<String> {
         "Connector input too large for review"
     );
     let id = db::id();
-    let body = json!({"review_scope":{"origin":args["origin"],"account_key":args["account_key"],"connector_key":args["connector_key"]},"connector":service(args),"connection":str_at(args,&["connection","toolkit"]),"source":match args["origin"].as_str(){Some("claude-account")=>"Claude",Some("codex-account")=>"Codex",_=>"Kindred"},"tool":tool_name(args),"kind":kind(args),"title":title(args),"email_send":email_send(args),"retry_unknown":run.prompt.starts_with("Prepare a NEW email revision for my review.") && run.prompt.contains("This may already have been sent"),"account":str_at(args,&["account_name","account_id"]),"original_input":input(args),"input":input(args),"records":[],"forced":args["forced"]==true,"read_only":args["read_only"]==true,"display_read_only":args["read_only"]==true || (args["origin"]=="claude-account" && read_only_hint(args))});
+    let body = json!({"remote_precondition":args["remote_precondition"],"review_scope":{"origin":args["origin"],"account_key":args["account_key"],"connector_key":args["connector_key"]},"connector":service(args),"connection":str_at(args,&["connection","toolkit"]),"source":match args["origin"].as_str(){Some("claude-account")=>"Claude",Some("codex-account")=>"Codex",_=>"Kindred"},"tool":tool_name(args),"kind":kind(args),"title":title(args),"email_send":email_send(args),"retry_unknown":run.prompt.starts_with("Prepare a NEW email revision for my review.") && run.prompt.contains("This may already have been sent"),"account":str_at(args,&["account_name","account_id"]),"original_input":input(args),"input":input(args),"records":[],"forced":args["forced"]==true,"read_only":args["read_only"]==true,"display_read_only":args["read_only"]==true || (args["origin"]=="claude-account" && read_only_hint(args))});
     let mut c = db.0.lock().unwrap();
     let tx = c.transaction()?;
     crate::progress_updates::qualify(&tx,&run.id,"Use connected service")?;
@@ -716,6 +721,9 @@ pub fn update(app: &App, id: &str, v: &Value) -> Result<Value> {
             "Unsupported connector card action"
         );
         let card = record(&app.db.0.lock().unwrap(), &id)?;
+        if action == "approve" && card["review_digest"].is_string() {
+            ensure!(v["review_digest"] == card["review_digest"], "This draft changed. Review the current card before approving.");
+        }
         let feedback = if action == "changes" {
             Some(
                 v["feedback"]
@@ -797,11 +805,35 @@ mod tests {
             let card=record(&app.db.0.lock().unwrap(),&id).unwrap();
             assert_eq!(card["email"]["body"]["text"],body);assert_eq!(card["email"]["body"]["editable"],false);assert_eq!(card["remote_draft_preview"],true);
             assert!(update(&app,&id,&json!({"action":"edit","revision":rev,"fields":{"body":"Not the remote draft"}})).is_err());
-            update(&app,&id,&json!({"action":"approve","revision":rev})).unwrap();
+            update(&app,&id,&json!({"action":"approve","revision":rev,"review_digest":card["review_digest"]})).unwrap();
             app.db.finish(&run.id,"running","","").unwrap();set_status(&app.db,&id,"ready").unwrap();
             dispatch(&app.db,&run,&args).unwrap();assert!(dispatch(&app.db,&run,&args).is_err());
             assert_eq!(record(&app.db.0.lock().unwrap(),&id).unwrap()["input"],json!({"draftId":"draft-fixture"}));
         }
+    }
+    #[test]
+    fn changed_remote_draft_cannot_replace_frozen_review_or_dispatch() {
+        let (app,_,run,mut args,_) = fixture();
+        args["input"] = json!({"draftId":"frozen-draft"});
+        let save = |body: &str, version: &str| {
+            let mut read=args.clone();read["tool_name"]=json!("get_draft");
+            let id=create(&app.db,&run,&read).unwrap();
+            complete(&app.db,&id,&json!({"id":"frozen-draft","to":["review@example.invalid"],"plaintextBody":body,"etag":version}),false).unwrap();
+        };
+        save("Original message","v1");
+        let id=create(&app.db,&run,&args).unwrap();
+        let mut send=args.clone();send["artifact_id"]=json!(id);
+        let rev=pending(&app,&run,&send);
+        let first=record(&app.db.0.lock().unwrap(),&id).unwrap();
+        assert!(update(&app,&id,&json!({"action":"approve","revision":rev,"review_digest":"wrong"})).is_err());
+        save("Changed message","v2");
+        let changed=record(&app.db.0.lock().unwrap(),&id).unwrap();
+        assert_eq!(changed["email"]["body"]["text"],"Original message");
+        assert_eq!(changed["draft_contract_changed"],true);
+        assert_eq!(changed["review_digest"],first["review_digest"]);
+        assert!(update(&app,&id,&json!({"action":"approve","revision":rev,"review_digest":first["review_digest"]})).is_err());
+        assert!(dispatch(&app.db,&run,&send).is_err());
+        assert_eq!(app.db.approvals().unwrap().len(),1);
     }
     #[tokio::test]
     async fn incomplete_remote_draft_returns_to_bot_instead_of_unanswerable_approval() {

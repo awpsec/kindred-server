@@ -744,12 +744,24 @@ pub async fn approve_required(
     }
 }
 pub async fn call_tool(app: &App, bot: &Bot, run: &Run, name: &str, args: Value) -> Result<Value> {
+    // Unwrap before lifecycle, ownership and event handling, so every action
+    // keeps its original identity and cannot bypass normal runtime policy.
+    let resolved = if name == "tool_execute" {
+        match crate::tool_catalog::resolve(app, bot, run, args.clone()) {
+            Ok(call) => Some(call),
+            Err(error) => return Ok(tool_error_result(error)),
+        }
+    } else { None };
+    let (name, args) = match resolved.as_ref() {
+        Some((name, arguments)) => (name.as_str(), arguments.clone()),
+        None => (name, args),
+    };
     ensure!(crate::initiative::active(&app.db.0.lock().unwrap(), &run.id)?, "Initiative was turned off or stopped, or its commitment or source changed. This action was not executed.");
     ensure!(!app.db.pushed_followups_pending(&run.id)?, "The user pushed a new message. Finish this response now to receive it before starting another action. This call was not executed.");
     ensure!(initiative_remaining(&app.db, &run.id, db::now())?.is_none_or(|remaining| !remaining.is_zero()),
         "This initiative check reached its 15-minute budget. Completed work is preserved.");
     crate::provider_retry::check_tool_budget(app, run)?;
-    if !crate::desktop_sessions::uses_desktop(name, &args) && name != "request_user_action" {
+    if !crate::desktop_sessions::uses_desktop(name, &args) && !crate::desktop_sessions::preserves_desktop(name) {
         app.desktop_sessions.release(&run.id);
     }
     let call_id = db::id();
@@ -790,6 +802,7 @@ async fn call_tool_inner(
     name: &str,
     args: Value,
 ) -> Result<Value> {
+    if name == "tool_describe" { return crate::tool_catalog::describe(app, bot, run, &args); }
     let initiative = crate::initiative::is_run(&app.db.0.lock().unwrap(), &run.id)?;
     ensure!(!initiative || !initiative_management_tool(name),
         "Initiative cannot change routines, inbox monitors or standing permissions, or start interactive connector setup. Leave existing automation in place and report a suggested change to the owner.");

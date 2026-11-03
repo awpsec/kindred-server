@@ -140,9 +140,10 @@ async fn run_worker(
         .spawn().context("Start the Pi harness. Install the pinned Node runtime and harness dependencies; no alternate provider was used")?;
     let mut input = child.stdin.take().unwrap();
     let mut output = BufReader::new(child.stdout.take().unwrap());
-    let tools = runtime::tool_specs_for_run(app, bot, run);
+    let tools = crate::tool_catalog::advertised(app, bot, run);
     let allowed: HashSet<String> = tools
         .iter()
+        .chain(crate::tool_catalog::available(app,bot,run).iter())
         .filter_map(|t| t["name"].as_str().map(str::to_owned))
         .collect();
     send(&mut input, json!({
@@ -723,7 +724,7 @@ mod workflow_delivery_tests {
         };
         let mut message = json!({"role":"assistant","content":text});
         let finish = if let Some((name, args)) = tool {
-            message["tool_calls"] = json!([{"id":format!("call_{turn}"),"type":"function","function":{"name":name,"arguments":args.to_string()}}]);
+            message["tool_calls"] = json!([{"id":format!("call_{turn}"),"type":"function","function":crate::tool_catalog::fixture_function(name,args)}]);
             "tool_calls"
         } else {
             "stop"

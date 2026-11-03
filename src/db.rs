@@ -860,6 +860,7 @@ impl Db {
             [run],
         )?;
         if let Some(artifact) = args["artifact_id"].as_str() {
+            crate::email_draft_preview::pin(&c,artifact,run,args)?;
             c.execute("UPDATE connector_artifacts SET approval_id=?,status='pending' WHERE id=? AND run_id=?",params![id,artifact,run])?;
             c.execute("UPDATE connector_artifacts SET body=json_set(body,'$.forced',json(?)),revision=revision+1 WHERE id=?",params![if args["forced"]==true{"true"}else{"false"},artifact])?;
             c.execute("INSERT INTO chat_messages(chat_id,sender,body,kind,run_id,created) SELECT chat_id,bot_id,id,'connector_artifact',run_id,created FROM connector_artifacts WHERE id=? AND NOT EXISTS(SELECT 1 FROM chat_messages WHERE kind='connector_artifact' AND body=?)",params![artifact,artifact])?;

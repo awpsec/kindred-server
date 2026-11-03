@@ -195,7 +195,7 @@ fn a_small_context_model_can_start_maintenance_when_memory_is_full() {
     let run=app.db.run(&id).unwrap();
     crate::memory_maintenance::remember(&app.db,&run,&serde_json::json!({"mode":"append","text":"New rule. ".repeat(300)})).unwrap();
     let bot=app.db.bot(&bot.id).unwrap();
-    let tools=runtime::tool_specs_for(&app,&bot);
+    let tools=crate::tool_catalog::advertised(&app,&bot,&run);
     let instructions=crate::instructions::build(&app,&bot,&run,&tools,Some(32000)).unwrap();
     assert!(instructions.contains("memory_maintenance"));
     assert!(instructions.contains("memory_read_next_offset"));

@@ -592,7 +592,12 @@ async fn activity(State(app): State<Shared>) -> Result<Json<Value>> {
                 if commands == 1 { "" } else { "s" }
             );
         }
-        result.insert(run.bot_id,json!({"commands":commands,"run_id":run.id,"status":run.status,"shape":shape,"label":label,"completed_at":completed_at,"started_at":started_at,"run_created_at":run.created,"server_time":db::now(),"model_progress_state":last.filter(|e|e["kind"]=="model_progress").map(|e|e["body"]["state"].clone()),"awaiting":if run.status=="awaiting_user" {"user"} else if run.status=="awaiting_approval" || (run.status=="running" && local.as_ref().is_some_and(|v|v["phase"]=="awaiting_approval")) {"approval"} else if run.status=="running" && local.as_ref().is_some_and(|v|v["phase"]!="running") {"device"} else {""},"local":local,"provider_retry":provider_retry,"last_active_at":completed_at.as_i64().unwrap_or(run.created)}));
+        let waiting = crate::waiting_state::for_run(&app.db.0.lock().unwrap(), &run.id)?;
+        if waiting["kind"] != "" && provider_retry.is_none() && local.is_none() {
+            label = waiting["label"].as_str().unwrap_or("").to_owned();
+            shape = "waiting".into();
+        }
+        result.insert(run.bot_id,json!({"waiting":waiting,"commands":commands,"run_id":run.id,"status":run.status,"shape":shape,"label":label,"completed_at":completed_at,"started_at":started_at,"run_created_at":run.created,"server_time":db::now(),"model_progress_state":last.filter(|e|e["kind"]=="model_progress").map(|e|e["body"]["state"].clone()),"awaiting":if run.status=="awaiting_user" {"user"} else if run.status=="awaiting_approval" || (run.status=="running" && local.as_ref().is_some_and(|v|v["phase"]=="awaiting_approval")) {"approval"} else if run.status=="running" && local.as_ref().is_some_and(|v|v["phase"]!="running") {"device"} else {""},"local":local,"provider_retry":provider_retry,"last_active_at":completed_at.as_i64().unwrap_or(run.created)}));
     }
     Ok(Json(Value::Object(result)))
 }

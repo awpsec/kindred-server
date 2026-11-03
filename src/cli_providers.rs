@@ -132,9 +132,10 @@ pub async fn run(app: &App, bot: &Bot, run: &Run) -> Result<String> {
 async fn run_child(app:&App,bot:&Bot,run:&Run,mut child:tokio::process::Child)->Result<String> {
     let mut input = child.stdin.take().unwrap();
     let mut output = BufReader::new(child.stdout.take().unwrap());
-    let tools = runtime::tool_specs_for_run(app, bot, run);
+    let tools = crate::tool_catalog::advertised(app, bot, run);
     let allowed: HashSet<_> = tools
         .iter()
+        .chain(crate::tool_catalog::available(app,bot,run).iter())
         .filter_map(|t| t["name"].as_str().map(str::to_owned))
         .collect();
     crate::pi::send(&mut input,json!({"type":"start","protocol":1,"followup_protocol":1,"provider":bot.provider,"model":bot.model,"reasoning_effort":bot.reasoning_effort,

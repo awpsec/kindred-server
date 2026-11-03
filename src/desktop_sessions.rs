@@ -108,6 +108,14 @@ pub fn uses_desktop(tool: &str, args: &serde_json::Value) -> bool {
             | "computer_scroll"
     ) || (tool == "guest_exec" && args["use_desktop"] == true)
 }
+/// These bounded local bookkeeping reads/writes cannot alter the display or
+/// wait on another actor. Retain the existing lease and observed frame only;
+/// never reacquire control or treat stale coordinates as fresh evidence.
+pub fn preserves_desktop(tool: &str) -> bool {
+    matches!(tool, "request_user_action" | "tool_describe" | "kindred_guide" |
+        "set_task_title" | "task_progress" | "memory_read" | "remember" |
+        "continuity_read" | "continuity_save" | "receipts_read")
+}
 pub async fn enter(app: &App, run: &Run, tool: &str) -> Result<OwnedMutexGuard<Session>> {
     let mut session = app.desktop_sessions.session(&run.id).lock_owned().await;
     let slot = crate::screen_capacity::reserve(app,&run.bot_id).await?;
@@ -183,6 +191,20 @@ mod tests {
         let run = app.db.claim_bot(&bot.id).unwrap().unwrap();
         let slot = app.db.screen(&bot.id).unwrap();
         (bot, run, slot)
+    }
+    #[tokio::test]
+    async fn local_bookkeeping_keeps_observation_but_external_work_releases_it() {
+        let app = crate::tests::app();
+        let (bot, run, slot) = run(&app);
+        let mut session=enter(&app,&run,"computer_screenshot").await.unwrap();
+        session.observed(&json!({"image":"fixture"}));drop(session);
+        let result=crate::runtime::call_tool(&app,&bot,&run,"tool_describe",json!({"names":["remember"]})).await.unwrap();
+        assert_ne!(result["failed"],true);
+        assert!(app.screen_lock(slot).try_lock_owned().is_err());
+        assert!(enter(&app,&run,"computer_click").await.is_ok());
+        crate::runtime::call_tool(&app,&bot,&run,"bots_list",json!({})).await.unwrap();
+        assert!(app.screen_lock(slot).try_lock_owned().is_ok());
+        assert!(enter(&app,&run,"computer_click").await.is_err());
     }
     #[tokio::test]
     async fn missing_post_input_observation_invalidates_previous_image() {

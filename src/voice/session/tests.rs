@@ -439,3 +439,24 @@ async fn provider_keeps_named_identity_context_and_quiet_followups() {
     assert!(app.db.queued_bots().unwrap().is_empty());
     println!("Provider acceptance passed: selected name and recent city spoken; casual and arithmetic calls silent; requested link retained. No audio or transcript retained; no production chats or tools used.");
 }
+
+#[tokio::test]
+async fn deferred_tools_cannot_bypass_private_call_rules() {
+    let (app,bot,ticket,run)=setup("codex");
+    for (id,name,args) in [
+        ("no-question","ask_question",json!({"question":"Hidden question"})),
+        ("no-chat","chat_post",json!({"chat_id":run.chat_id,"text":"Do not post this during the call"})),
+    ] {
+        let item=function(id,"tool_execute",json!({"name":name,"arguments":args}));
+        let tool=accept_tool(&app.db,&ticket.id,"response",&item).unwrap().unwrap();
+        let (_,result)=execute(app.clone(),bot.clone(),run.clone(),ticket.id.clone(),tool).await;
+        assert_eq!(result["failed"],true);
+    }
+    assert!(app.db.chat_messages(&ticket.chat).unwrap().is_empty());
+    let item=function("remember-deferred","tool_execute",json!({"name":"remember","arguments":{"text":"A preference from this call","mode":"append"}}));
+    let tool=accept_tool(&app.db,&ticket.id,"response",&item).unwrap().unwrap();
+    let (_,result)=execute(app.clone(),bot.clone(),run.clone(),ticket.id.clone(),tool).await;
+    assert_ne!(result["failed"],true);
+    assert!(accept_tool(&app.db,&ticket.id,"response",&item).unwrap().is_none());
+    assert_eq!(app.db.bot(&bot.id).unwrap().memory.matches("A preference from this call").count(),1);
+}

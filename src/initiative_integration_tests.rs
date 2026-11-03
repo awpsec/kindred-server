@@ -29,7 +29,7 @@ fn answer(text: &str) -> Value {
     json!({"choices":[{"message":{"role":"assistant","content":text},"finish_reason":"stop"}]})
 }
 fn action(id: &str, text: &str, name: &str, args: Value) -> Value {
-    json!({"choices":[{"message":{"role":"assistant","content":text,"tool_calls":[{"id":id,"type":"function","function":{"name":name,"arguments":args.to_string()}}]},"finish_reason":"tool_calls"}]})
+    json!({"choices":[{"message":{"role":"assistant","content":text,"tool_calls":[{"id":id,"type":"function","function":crate::tool_catalog::fixture_function(name,args)}]},"finish_reason":"tool_calls"}]})
 }
 async fn endpoint(replies: Vec<Value>, stall: bool, fail: bool) -> (String, Script, tokio::task::JoinHandle<()>) {
     let script=Script{replies:Arc::new(replies),requests:Default::default(),reached:Default::default(),stall,fail};

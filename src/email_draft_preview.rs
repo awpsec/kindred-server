@@ -35,7 +35,7 @@ fn attachment_metadata(v: &Value) -> Value {
             .flatten()
             .map(|a| {
                 let mut safe = serde_json::Map::new();
-                for key in ["filename", "name", "mimeType", "contentType", "size"] {
+                for key in ["id", "file_id", "artifact_id", "filename", "name", "mimeType", "contentType", "size"] {
                     if a.get(key).is_some() {
                         safe.insert(key.into(), a[key].clone());
                     }
@@ -116,6 +116,12 @@ fn full_email(v: &Value) -> Option<Value> {
     }
     if v["attachments"].is_array() {
         fields["attachments"] = attachment_metadata(&v["attachments"]);
+    }
+    for key in ["etag", "@odata.etag", "changeKey", "version", "historyId"] {
+        if let Some(version) = v.get(key).filter(|v| v.is_string() || v.is_number()) {
+            fields["provider_version"] = json!({"field":key,"value":version});
+            break;
+        }
     }
     Some(fields)
 }
@@ -213,6 +219,48 @@ pub fn resolve(c: &Connection, run: &str, args: &Value) -> Result<Option<Value>>
         }
     }
     Ok(preview)
+}
+
+pub fn contract(preview: &Value, args: &Value) -> Value {
+    let content = json!({"draft_id":reference(crate::connector_artifacts::input(args)),
+        "origin":args["origin"],"account_key":args["account_key"],"connector_key":args["connector_key"],
+        "email":preview["email"]});
+    let digest = ring::digest::digest(&ring::digest::SHA256, content.to_string().as_bytes());
+    json!({"version":1,"digest":digest.as_ref().iter().map(|b|format!("{b:02x}")).collect::<String>(),
+        "content":content,"source_event_seq":preview["source_event_seq"],
+        "recipient_provenance":"same-account full draft receipt",
+        "remote_validation":if args["remote_precondition"].is_object(){"provider If-Match bound to reviewed ETag"}else{"receipt-bound; external atomic compare-and-send unavailable"}})
+}
+
+/// Freeze the reviewed evidence durably. A later receipt cannot silently replace
+/// what was approved, including after restart or a provider-side draft edit.
+pub fn pin(c: &Connection, id: &str, run: &str, args: &Value) -> Result<()> {
+    if !crate::connector_artifacts::email_send(args) { return Ok(()); }
+    if let Some(preview) = resolve(c, run, args)? {
+        c.execute("UPDATE connector_artifacts SET body=json_set(body,'$.draft_contract',json(?)) WHERE id=? AND json_extract(body,'$.draft_contract') IS NULL",
+            params![contract(&preview,args).to_string(),id])?;
+    }
+    Ok(())
+}
+
+/// Bind an ETag only when the live tool schema advertises an If-Match input.
+/// Never invent unsupported provider arguments or equate historyId with ETag.
+pub fn bind_precondition(c: &Connection, run: &str, args: &mut Value, schema: &Value) -> Result<()> {
+    if !crate::connector_artifacts::email_send(args) || reference(crate::connector_artifacts::input(args)).is_none() {
+        return Ok(());
+    }
+    let properties = schema.get("properties").unwrap_or(schema);
+    let Some(field) = ["if_match", "ifMatch"].into_iter().find(|key| properties[*key]["type"] == "string") else { return Ok(()); };
+    let preview = resolve(c,run,args)?.ok_or_else(||anyhow::anyhow!("Read the complete remote draft, including its ETag, before requesting this conditional send. Nothing was sent."))?;
+    let version = &preview["email"]["provider_version"];
+    anyhow::ensure!(matches!(version["field"].as_str(),Some("etag"|"@odata.etag")), "Read this draft's current ETag before requesting this conditional send. Nothing was sent.");
+    let value = version["value"].as_str().filter(|s|!s.is_empty() && *s!="*").ok_or_else(||anyhow::anyhow!("The remote draft has no usable ETag. Nothing was sent."))?;
+    let input = crate::connector_artifacts::input(args);
+    anyhow::ensure!(input.get(field).is_none_or(|v|v==value), "The draft version changed. Read the draft again before sending.");
+    let key = if args["arguments"].is_object() {"arguments"} else {"input"};
+    args[key][field] = json!(value);
+    args["remote_precondition"] = json!({"field":field,"value":value});
+    Ok(())
 }
 
 /// Retain provider-neutral draft evidence without attachment contents.
@@ -361,6 +409,20 @@ mod tests {
             )
             .is_none()
         );
+    }
+    #[test]
+    fn advertised_etag_precondition_is_bound_without_guessing_provider_fields() {
+        let c=db();
+        let mut a=args();a["connection"]=json!("Gmail");a["tool_name"]=json!("send_message");
+        receipt(&c,json!({"draftId":"draft-1"}),"get_draft",json!({"id":"draft-1","to":["review@example.invalid"],"body":"Exact message","etag":"version-1"}),false);
+        let schema=json!({"properties":{"draftId":{"type":"string"},"if_match":{"type":"string"}}});
+        bind_precondition(&c,"run",&mut a,&schema).unwrap();
+        assert_eq!(a["input"]["if_match"],"version-1");
+        a["input"]["if_match"]=json!("*");
+        assert!(bind_precondition(&c,"run",&mut a,&schema).is_err());
+        let mut unsupported=args();unsupported["connection"]=json!("Gmail");unsupported["tool_name"]=json!("send_message");
+        bind_precondition(&c,"run",&mut unsupported,&json!({"properties":{"draftId":{"type":"string"}}})).unwrap();
+        assert_eq!(unsupported["input"],json!({"draftId":"draft-1"}));
     }
     #[test]
     fn bcc_only_and_html_body_are_complete_but_foreign_drafts_are_not() {

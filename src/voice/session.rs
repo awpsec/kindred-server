@@ -70,7 +70,7 @@ pub fn begin(db: &Db, ticket: &Ticket) -> Result<Run> {
 }
 
 pub fn tools(app: &Shared, bot: &Bot, run: &Run) -> Vec<Value> {
-    crate::runtime::tool_specs_for_run(app, bot, run).into_iter()
+    crate::tool_catalog::advertised(app, bot, run).into_iter()
         // Clarification is part of the spoken conversation. These tools create
         // ordinary turns/headers and are not the call's execution mechanism.
         .filter(|s| !matches!(s["name"].as_str(),Some("ask_question"|"set_task_title"|"task_progress"|"finish_quietly"|"command_wait")))
@@ -117,17 +117,20 @@ pub fn accept_tool(db: &Db, call: &str, response: &str, item: &Value) -> Result<
 pub async fn execute(app: Shared, bot: Bot, run: Run, call: String, tool: ToolCall) -> (ToolCall,Value) {
     let result = async {
         ensure!(!app.account_disabled() && !app.db.bot(&bot.id)?.profile.archived,"The bot is unavailable.");
-        ensure!(tools(&app,&bot,&run).iter().any(|s|s["name"]==tool.name),"This tool is unavailable during a call.");
+        ensure!(tools(&app,&bot,&run).iter().chain(crate::tool_catalog::available(&app,&bot,&run).iter()).any(|s|s["name"]==tool.name),"This tool is unavailable during a call.");
         let args:Value=serde_json::from_str(&tool.arguments)?;
         ensure!(args.is_object(),"Tool arguments must be an object.");
-        if tool.name=="chat_post" { ensure!(args["chat_id"].as_str()!=Some(&run.chat_id),"Return this result to the call. The recap is saved after hangup."); }
+        let (action_name,args) = if tool.name=="tool_execute" {
+            crate::tool_catalog::resolve(&app,&bot,&run,args)?
+        } else { (tool.name.clone(),args) };
+        if action_name=="chat_post" { ensure!(args["chat_id"].as_str()!=Some(&run.chat_id),"Return this result to the call. The recap is saved after hangup."); }
         let changed=app.db.0.lock().unwrap().execute("UPDATE voice_tool_calls SET state='started' WHERE call_id=? AND id=? AND state='pending'",params![call,tool.id])?;
         ensure!(changed==1,"This action was already attempted; do not repeat it.");
         let mut lease=None;
         let slot=app.db.existing_screen(&bot.id)?.unwrap_or(0);
         let (result,_) = crate::runtime::drive_run(&app,&run,slot,&mut lease,async {
-            let result=crate::runtime::call_tool(&app,&bot,&run,&tool.name,args).await?;
-            let result=if tool.name=="send_to_bot" && result["failed"]!=true {
+            let result=crate::runtime::call_tool(&app,&bot,&run,&action_name,args).await?;
+            let result=if action_name=="send_to_bot" && result["failed"]!=true {
                 resolve_handoff(&app,&run).await?
             } else {resolve_question(&app,&run,result).await?};
             Ok(result.to_string())

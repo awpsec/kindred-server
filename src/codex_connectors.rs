@@ -520,6 +520,7 @@ async fn execute_rpc(
     )?;
     let force = identity["permission_persistence_available"] != true;
     let mut review = json!({"origin":"codex-account","account_key":args["account_key"],"connector_key":identity["connector_key"],"connection":identity["connection"],"account_name":"Linked account selected by Codex (not independently identified)","tool_name":args["tool_name"],"arguments":args["arguments"],"forced":force,"permission_persistence_available":!force,"read_only":identity["tool"]["read_only"],"app_id":args["app_id"],"server":args["server"]});
+    crate::email_draft_preview::bind_precondition(&app.db.0.lock().unwrap(),&run.id,&mut review,&identity["tool"]["inputSchema"])?;
     let id = connector_artifacts::create(&app.db, run, &review)?;
     review["artifact_id"] = json!(id);
     if !connector_artifacts::review(app, bot, run, "codex_connector", &mut review, force).await? {

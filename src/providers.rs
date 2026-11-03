@@ -248,7 +248,7 @@ async fn codex_rpc(app: &App, bot: &Bot, run: &Run, rpc: &mut Rpc) -> Result<Str
     );
     let models = codex_models(rpc).await?;
     let (model, effort) = codex_selection(&models, &bot.model, &bot.reasoning_effort)?;
-    let tools = runtime::tool_specs_for_run(app, bot, run);
+    let tools = crate::tool_catalog::advertised(app, bot, run);
     let effective = rpc
         .request(
             "config/read",
@@ -504,7 +504,7 @@ mod tests {
 import json,sys
 mode=sys.argv[1]
 def send(value):print(json.dumps(value),flush=True)
-def checkpoint():send({'id':'checkpoint','method':'item/tool/call','params':{'tool':'initiative_checkpoint','arguments':{'notes':'Checked synthetic contract; already reported.'}}})
+def checkpoint():send({'id':'describe','method':'item/tool/call','params':{'tool':'tool_describe','arguments':{'names':['initiative_checkpoint']}}})
 for line in sys.stdin:
  value=json.loads(line);method=value.get('method')
  if method=='initialized':continue
@@ -514,7 +514,7 @@ for line in sys.stdin:
  elif method=='config/read':result={'config':{}}
  elif method=='thread/start':
   names=[tool['name'] for tool in value['params']['dynamicTools']]
-  assert 'initiative_checkpoint' in names and 'ask_question' not in names and 'request_user_action' not in names
+  assert 'tool_describe' in names and 'tool_execute' in names and 'ask_question' not in names and 'request_user_action' not in names
   result={'thread':{'id':'initiative-thread'}}
  elif method=='app/installed':result={'apps':[]}
  elif method=='mcpServerStatus/list':result={'data':[],'nextCursor':None}
@@ -530,6 +530,10 @@ for line in sys.stdin:
   assert value['error']['code']==-32000 and 'Background initiative' in value['error']['message']
   assert 'owner' in value['error']['message'] and 'finish_quietly' in value['error']['message']
   checkpoint();continue
+ elif value.get('id')=='describe':
+  assert value['result']['success'] is True and 'initiative_checkpoint' in json.dumps(value['result'])
+  send({'id':'checkpoint','method':'item/tool/call','params':{'tool':'tool_execute','arguments':{'name':'initiative_checkpoint','arguments':{'notes':'Checked synthetic contract; already reported.'}}}})
+  continue
  elif value.get('id')=='checkpoint':
   assert value['result']['success'] is True
   if mode=='quiet':
