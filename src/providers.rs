@@ -864,8 +864,9 @@ for line in sys.stdin:
     #[tokio::test]
     async fn codex_human_subtask_returns_to_the_same_rpc_call_and_turn() {
         for stale in [false, true] {
+            let observation_marker=std::env::temp_dir().join(format!("kindred-handoff-observed-{}",crate::db::id()));
             let script = r#"
-import sys,json
+import sys,json,time,os
 def send(v): print(json.dumps(v),flush=True)
 started=0
 stale=sys.argv[1]=="true"
@@ -906,13 +907,17 @@ for line in sys.stdin:
         assert 'Done with subtask' in text
         assert 'intermediate checkpoint' in text and 'Check whether a prior request exists' in text
         assert 'Do not repeat' in text
+        if not stale:
+            deadline=time.monotonic()+3
+            while not os.path.exists(sys.argv[2]) and time.monotonic()<deadline: time.sleep(0.005)
+            assert os.path.exists(sys.argv[2]), 'synthetic screenshot receipt not persisted'
         send({'method':'item/completed','params':{'item':{'type':'agentMessage','text':'Prior request exists: fixture record R-42. No new request submitted.'}}})
         send({'method':'turn/completed','params':{'turn':{'status':'completed'}}})
         if not stale: break
     else: raise AssertionError('Unexpected frame')
 "#;
             let mut command = tokio::process::Command::new("python3");
-            command.args(["-u", "-c", script, if stale { "true" } else { "false" }]);
+            command.args(["-u", "-c", script, if stale { "true" } else { "false" }]).arg(&observation_marker);
             let mut rpc = Rpc::spawn(command).await.unwrap();
             let app = crate::tests::app();
             let bot = crate::tests::bot(&app.db, "codex");
@@ -939,6 +944,7 @@ for line in sys.stdin:
                 None
             } else {
                 let observed = app.clone();
+                let marker=observation_marker.clone();
                 Some(tokio::spawn(async move {
                     loop {
                         if observed
@@ -956,6 +962,8 @@ for line in sys.stdin:
                                     json!({"tool":"computer_screenshot","has_image":true,"failed":false}),
                                 )
                                 .unwrap();
+                            // The fake provider must not finish before its synthetic screen read.
+                            std::fs::write(&marker,b"observed").unwrap();
                             break;
                         }
                         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -973,6 +981,7 @@ for line in sys.stdin:
             let (output, abrupt) = result.unwrap();
             if let Some(observation) = observation {
                 observation.await.unwrap();
+                std::fs::remove_file(&observation_marker).unwrap();
             }
             assert!(!abrupt);
             let output = output.unwrap();
