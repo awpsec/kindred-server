@@ -19,16 +19,19 @@ fn codex_tool_result(result: &Value) -> Value {
 // changes a provider error, successful tool completion, or deferred decision.
 pub(crate) fn routine_empty_error(app: &App, run: &Run) -> Result<Option<String>> {
     use rusqlite::OptionalExtension;
-    let failure: Option<(String, String, bool)> = app.db.0.lock().unwrap().query_row(
+    let c = app.db.0.lock().unwrap();
+    if !crate::routine_recovery::scheduled(&c,&run.id)? { return Ok(None); }
+    let failure_seq = crate::routine_recovery::latest_failure(&c, &run.id)?.unwrap_or(0);
+    let failure: Option<(String, String, bool)> = c.query_row(
         "SELECT substr(CASE WHEN e.kind='tool_result' THEN COALESCE(json_extract(e.body,'$.tool'),'tool') ELSE 'the provider' END,1,128),
              CASE WHEN e.kind='tool_result' THEN substr(json_extract(e.body,'$.text'),1,2048) ELSE '' END, e.kind!='tool_result'
-         FROM events e WHERE e.run_id=?1 AND ((e.kind='tool_result' AND json_extract(e.body,'$.failed')=1)
-             OR (e.kind IN ('assistant','provider_diagnostic') AND json_extract(e.body,'$.status_notice')='provider_error'))
+         FROM events e WHERE ((e.kind='tool_result' AND e.seq=?2 AND json_extract(e.body,'$.failed')=1)
+             OR (e.run_id=?1 AND e.kind IN ('assistant','provider_diagnostic') AND e.seq>?3 AND json_extract(e.body,'$.status_notice')='provider_error'))
          AND json_type(e.body,'$.text')='text' AND length(trim(json_extract(e.body,'$.text')))>0
          AND EXISTS(SELECT 1 FROM routine_runs WHERE run_id=?1)
          AND NOT EXISTS(SELECT 1 FROM routine_completion WHERE run_id=?1)
          ORDER BY CASE WHEN json_extract(e.body,'$.tool') IN ('finish_quietly','routine_complete') THEN 1 ELSE 0 END, e.seq DESC LIMIT 1",
-        [&run.id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        rusqlite::params![run.id,failure_seq,crate::routine_recovery::boundary(&c,&run.id)?], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     ).optional()?;
     Ok(failure.and_then(|(tool, text, provider_notice)| {
         if provider_notice {
@@ -463,7 +466,7 @@ async fn codex_rpc(app: &App, bot: &Bot, run: &Run, rpc: &mut Rpc) -> Result<Str
                 }
                 if output.trim().is_empty() {
                     if let Some(error) = routine_empty_error(app, run)? {
-                        bail!(error);
+                        return Err(crate::routine_recovery::Unclassified(error).into());
                     }
                     ensure!(app
                             .db

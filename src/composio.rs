@@ -351,7 +351,7 @@ impl Client {
                 429 => "Composio rate limit reached. Try again later.",
                 _ => "Composio request failed. Check the connection and Composio dashboard logs.",
             };
-            bail!(
+            return Err(crate::routine_recovery::HttpFailure { status: status.as_u16(), message: format!(
                 "{help} (HTTP {} at {}{}{})",
                 status.as_u16(),
                 path.split('/').nth(1).unwrap_or("API"),
@@ -365,7 +365,7 @@ impl Client {
                 } else {
                     format!("; request {request_id}")
                 }
-            );
+            ) }.into());
         }
         if bytes.is_empty() {
             return Ok(json!({}));

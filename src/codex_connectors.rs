@@ -547,7 +547,7 @@ async fn execute_rpc(
             crate::connector_results::response(&app.db, run, &value, failed)
         }
         Err(e) => {
-            let value = json!({"text":e.to_string(),"failed":true});
+            let value = json!({"text":e.to_string(),"failed":true,"_retryable_read":identity["tool"]["read_only"]==true && crate::routine_recovery::transport_error(&e)});
             connector_artifacts::complete(&app.db, &id, &value, true)?;
             Ok(value)
         }

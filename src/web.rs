@@ -569,8 +569,13 @@ async fn activity(State(app): State<Shared>) -> Result<Json<Value>> {
         }
         let provider_retry = crate::provider_retry::progress(&app, &run)?;
         if let Some(retry) = &provider_retry {
-            shape = "worry".into();
-            label = format!("Connection issue - retrying ({}/5)", retry["attempt"]);
+            if retry["scope"] == "routine" {
+                shape = "think".into();
+                label = "Working through the check".into();
+            } else {
+                shape = "worry".into();
+                label = format!("Connection issue - retrying ({}/{})", retry["attempt"], retry["limit"]);
+            }
         }
         let completed_at = events
             .iter()

@@ -446,7 +446,7 @@ async fn run_child(app:&App,bot:&Bot,run:&Run,mut child:tokio::process::Child)->
                 );
                 if text.trim().is_empty() {
                     if let Some(error) = crate::providers::routine_empty_error(app, run)? {
-                        bail!(error);
+                        return Err(crate::routine_recovery::Unclassified(error).into());
                     }
                 }
                 ensure!(

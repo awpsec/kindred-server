@@ -772,11 +772,17 @@ pub async fn call_tool(app: &App, bot: &Bot, run: &Run, name: &str, args: Value)
     )?;
     let pointer_args = (name == "computer_click").then(|| args.clone());
     let outcome = call_tool_inner(app, bot, run, name, args).await;
+    let retryable_read = match &outcome {
+        Err(error) => crate::routine_recovery::transport_error(error),
+        // Only the verified Codex dispatcher supplies this internal receipt.
+        Ok(value) => name == "codex_connector" && value["_retryable_read"] == true,
+    } && crate::routine_recovery::read_call(&app.db.0.lock().unwrap(), &run.id, name, &call_id)?;
     let mut result = match outcome {
         Ok(result) => result,
         Err(error) => tool_error_result(error),
     };
-    app.db.event(&run.id,"tool_result",json!({"tool":name,"call_id":call_id,"text":result["text"],"has_image":result["image"].as_str().is_some_and(|s|!s.trim().is_empty()),"failed":result["failed"] == true,"uncertain_effect":result["uncertain_effect"],"page_action_receipt":result["page_action_receipt"],"action_applied":result["action_applied"],"observation_after_action":result["observation_after_action"],"width":result["width"],"height":result["height"],"timed_out":result["timed_out"],"stopped":result["stopped"],"exit_code":result["exit_code"],"elapsed_seconds":result["elapsed_seconds"]}))?;
+    if let Some(object) = result.as_object_mut() { object.remove("_retryable_read"); }
+    app.db.event(&run.id,"tool_result",json!({"tool":name,"call_id":call_id,"text":result["text"],"has_image":result["image"].as_str().is_some_and(|s|!s.trim().is_empty()),"failed":result["failed"] == true,"retryable_read":retryable_read,"uncertain_effect":result["uncertain_effect"],"page_action_receipt":result["page_action_receipt"],"action_applied":result["action_applied"],"observation_after_action":result["observation_after_action"],"width":result["width"],"height":result["height"],"timed_out":result["timed_out"],"stopped":result["stopped"],"exit_code":result["exit_code"],"elapsed_seconds":result["elapsed_seconds"]}))?;
     if let Some(args) = pointer_args.filter(|args| result["failed"] != true && args["target"].is_null()) {
         // Visual telemetry must never turn an already executed click into a retryable failure.
         let _ = app.db.save_setting(&format!("computer-pointer:{}",bot.id), &json!({"id":call_id,"bot_id":bot.id,"x":args["x"],"y":args["y"],"button":args["button"].as_i64().unwrap_or(1),"created":db::now()}));

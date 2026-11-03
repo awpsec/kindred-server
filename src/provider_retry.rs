@@ -90,6 +90,9 @@ where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<String>>,
 {
+    if crate::routine_recovery::scheduled(&app.db.0.lock().unwrap(), &run.id)? {
+        return retry_routine(app, run, attempt, &delays[..crate::routine_recovery::LIMIT]).await;
+    }
     for number in 0..=5 {
         ensure!(
             !app.account_disabled() && !app.db.cancelled(&run.id),
@@ -150,6 +153,43 @@ where
         }
     }
     unreachable!()
+}
+
+// This replaces (never nests within) the ordinary five-retry loop for routines.
+async fn retry_routine<F, Fut>(app: &App, run: &Run, mut attempt: F, delays: &[Duration]) -> Result<String>
+where F: FnMut() -> Fut, Fut: Future<Output=Result<String>> {
+    use crate::routine_recovery as recovery;
+    let mut used = recovery::spent(&app.db.0.lock().unwrap(), &run.id)?;
+    // A new, explicitly continued run may execute once even when its occurrence
+    // spent the recovery budget. Reentering an already dispatched run may not.
+    recovery::enter(app,run)?;
+    loop {
+        ensure!(!app.account_disabled() && !app.db.cancelled(&run.id), "Run cancelled");
+        app.db.event(&run.id, "routine_provider_attempt", json!({"recoveries_used":used}))?;
+        let result = attempt().await;
+        let can_recover = !app.db.turn_deferred(&run.id)? && {
+            let c = app.db.0.lock().unwrap();
+            let handoff: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM followup_offers WHERE run_id=? AND state IN ('dispatching','transported','uncertain'))", [&run.id], |r|r.get(0))?;
+            !handoff && recovery::safe_to_resume(&c, &run.id)? && match &result {
+                Ok(_) => recovery::recoverable_outcome(&c, &run.id)?,
+                Err(error) => recovery::transport_error(error) ||
+                    (error.is::<recovery::Unclassified>() && recovery::recoverable_outcome(&c, &run.id)?),
+            }
+        };
+        if !can_recover || used >= recovery::LIMIT {
+            if used > 0 {
+                app.db.event(&run.id, "provider_retry", json!({"attempt":used,"limit":recovery::LIMIT,"scope":"routine","phase":if can_recover {"exhausted"} else {"finished"}}))?;
+            }
+            // Explicit error outcome remains for Db::finish to publish once.
+            // Empty completion with no failure evidence is never made quiet.
+            return result;
+        }
+        let delay = delays[used];
+        if !recovery::reserve(app, run, delay)? { return result; }
+        used += 1;
+        tokio::time::sleep(delay).await;
+        ensure!(!app.account_disabled() && !app.db.cancelled(&run.id), "Run cancelled");
+    }
 }
 
 pub fn progress(app: &App, run: &Run) -> Result<Option<Value>> {
@@ -472,3 +512,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "routine_recovery_tests.rs"]
+mod routine_tests;

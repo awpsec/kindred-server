@@ -20,6 +20,7 @@ pub struct Rpc {
 pub(crate) struct CodexTurnError {
     message: String,
     pub(crate) retryable: bool,
+    pub(crate) routine_retryable: bool,
 }
 impl CodexTurnError {
     pub(crate) fn from_value(error: &Value) -> Self {
@@ -36,6 +37,15 @@ impl CodexTurnError {
         Self {
             message: error_message(error["message"].as_str().unwrap_or("The provider did not supply an error description.")),
             retryable,
+            routine_retryable: match info.as_str() {
+                Some("flexUnavailable" | "serverOverloaded" | "internalServerError") => true,
+                Some(_) => false,
+                None => ["httpConnectionFailed", "responseStreamConnectionFailed", "responseStreamDisconnected"]
+                    .iter().any(|kind| info.get(*kind).filter(|v| v.is_object()).is_some_and(|details| {
+                        let status = &details["httpStatusCode"];
+                        status.is_null() || status.as_u64().is_some_and(|n| matches!(n, 408 | 500 | 502 | 503 | 504))
+                    })),
+            },
         }
     }
 }

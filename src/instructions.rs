@@ -299,7 +299,8 @@ pub fn build(
         crate::task_recovery::metadata(&app.db.0.lock().unwrap(), &run.id, "provider_retry")?;
     let retry_context = if retry.is_some() {
         json!({
-            "instructions":"The provider connection failed during this SAME task. Continue only unfinished work. The original request does not authorize repeating completed actions. Review the saved activity and approvals before acting. Never repeat an external write with an uncertain outcome or override a declined action. Verify current state first. Missing/truncated history is not evidence an action did not happen.",
+            "cause":if retry.as_ref().is_some_and(|v|v["scope"]=="routine") {"A temporary read or connection failure interrupted this routine. The same occurrence is recovering quietly; do not repeat successful reads or announce intermediate failures. Classify the completed check with routine_complete or finish_quietly."} else {"The provider connection failed."},
+            "instructions":"Recovery continues this SAME task. Continue only unfinished work. The original request does not authorize repeating completed actions. Review the saved activity and approvals before acting. Never repeat an external write with an uncertain outcome or override a declined action. Verify current state first. Missing/truncated history is not evidence an action did not happen.",
             "activity":if crate::continuity::store::session_valid(&app.db.0.lock().unwrap(),&run.id)? {selected(app.db.events(&run.id)?.into_iter().rev().collect(),32000,4000,100)}else{json!({"readback":"receipts_read","source_context_invalidated":true})},
             "approvals":if crate::continuity::store::session_valid(&app.db.0.lock().unwrap(),&run.id)? {json!(app.db.run_approvals(&run.id)?)}else{Value::Null}
         })

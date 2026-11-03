@@ -101,6 +101,7 @@ mod recovery_isolation_tests;
 mod resources;
 mod routine_controls;
 mod routine_completion;
+mod routine_recovery;
 #[cfg(test)]
 mod routine_completion_tests;
 #[cfg(test)]

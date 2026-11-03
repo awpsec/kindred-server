@@ -170,8 +170,8 @@ async fn run_worker(
                 .context("Pi harness startup timed out")??
         };
         match frame["type"].as_str().unwrap_or("") {
-            "error" => bail!(
-                "{}",
+            "error" => {
+                let message =
                 if bot.provider.starts_with("custom-") {
                     provider_error(&frame)
                         .replace("OpenRouter", "The custom provider")
@@ -180,8 +180,13 @@ async fn run_worker(
                     provider_error(&frame).replace("OpenRouter", if bot.provider == "opencode-go" {"OpenCode Go"} else {"OpenCode Zen"}).replace("balance and ZDR eligibility", "API key, plan and quota")
                 } else {
                     provider_error(&frame)
+                };
+                if frame["code"] == "provider_http" {
+                    return Err(crate::routine_recovery::HttpFailure { status: frame["status"].as_u64().filter(|n| (100..=599).contains(n)).unwrap_or(0) as u16, message }.into());
                 }
-            ),
+                bail!(message);
+            }
+
             "ready" => {
                 ensure!(
                     !ready
@@ -295,7 +300,7 @@ async fn run_worker(
                 );
                 if result.trim().is_empty() {
                     if let Some(error) = crate::providers::routine_empty_error(app, run)? {
-                        bail!(error);
+                        return Err(crate::routine_recovery::Unclassified(error).into());
                     }
                     ensure!(app
                             .db
