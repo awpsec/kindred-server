@@ -146,7 +146,8 @@ async fn retry_budget_survives_reentry_and_manual_continue_gets_one_fresh_attemp
 #[tokio::test]
 async fn cancellation_during_routine_backoff_starts_no_second_call() {
     let app=tests::app(); let (_bot,run)=scheduled(&app,"codex"); let calls=Cell::new(0);
-    let work=retry(&app,&run,|| { calls.set(calls.get()+1); ready(Err(anyhow::anyhow!("Codex request timed out"))) },&[Duration::from_millis(20);5]);
+    let delays=[Duration::from_millis(20);5];
+    let work=retry(&app,&run,|| { calls.set(calls.get()+1); ready(Err(anyhow::anyhow!("Codex request timed out"))) },&delays);
     let stop=async { tokio::time::sleep(Duration::from_millis(5)).await; app.db.cancel(&run.id).unwrap(); };
     let (result,())=tokio::join!(work,stop); assert!(result.is_err()); assert_eq!(calls.get(),1);
 }
