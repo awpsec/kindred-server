@@ -78,6 +78,15 @@ elif mode=='decision':
  commentary()
  tool('ask_question',{'topic_key':'synthetic-routine-choice','question':'Continue this check?',
       'context':'Synthetic check needs your choice.','options':['Continue','Leave it']},True)
+elif mode=='report':
+ assert not tool('commands_list',{}).get('failed')
+ text='Completed the check. One item needs your review.'
+ if provider=='codex':
+  send({'method':'item/completed','params':{'item':{'type':'agentMessage','phase':'final_answer','text':text}}})
+  send({'method':'turn/completed','params':{'turn':{'id':'routine-turn','status':'completed'}}})
+ else:
+  send({'type':'assistant','text':text,'phase':'final_answer'})
+  send({'type':'complete','output':text})
 elif mode=='empty':empty()
 elif mode in ('provider_notice','provider_notice_html'):
  assert provider=='claude-code'
@@ -284,4 +293,16 @@ fn routine_empty_diagnostic_is_bounded_scoped_and_prefers_work_failure() {
     routine_completion::complete(&app.db.0.lock().unwrap(), &completed.id, &json!({"outcome":"error","report":"Explicit routine error"})).unwrap();
     app.db.event(&completed.id, "tool_result", json!({"tool":"connector_tools_list","failed":true,"text":"Late tool error"})).unwrap();
     assert!(routine_empty_error(&app, &completed).unwrap().is_none());
+}
+
+#[tokio::test]
+async fn routine_provider_protocols_accept_a_terminal_report_without_a_completion_tool() {
+    for provider in ["codex", "claude-code", "openrouter"] {
+        let app=tests::app();let (bot,run)=scheduled(&app,provider);
+        let result=protocol(&app,&bot,&run,"report").await;
+        assert!(result.is_ok(),"{provider}: {result:?}");finish(&app,&run,result);
+        let saved=app.db.run(&run.id).unwrap();assert_eq!(saved.status,"completed","{provider}");assert!(saved.error.is_empty());
+        let messages=app.db.chat_messages(&run.chat_id).unwrap();
+        assert_eq!(messages.iter().filter(|m|m["kind"]=="result"&&m["text"]=="Completed the check. One item needs your review.").count(),1,"{provider}");
+    }
 }

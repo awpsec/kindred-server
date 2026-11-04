@@ -32,7 +32,7 @@ pub fn context(db: &Db, bot: &Bot) -> Result<Value> {
         "frequent" => "Give frequent useful milestones, never narrate each action.",
         _ => "Give useful opening and milestone updates; stay quiet between them.",
     };
-    Ok(json!({"mode":mode,"minimum_interval_seconds":seconds(&mode),"guidance":format!("{style} For ordinary drafts, lookups and brief checks, work quietly and return the result; do not announce a long job or create a plan merely because tools are needed. No click, coordinate, loading or retry narration. Questions, approvals, blockers and direct status answers stay immediate. Final-answer detail is unchanged. Explicit user requests and quiet routine rules take precedence.")}))
+    Ok(json!({"mode":mode,"minimum_interval_seconds":seconds(&mode),"guidance":format!("{style} For brief drafts, lookups and checks, work quietly; tools alone need no long-job announcement or plan. Do not narrate clicks, coordinates, loading or retries. Show questions, approvals, blockers and status immediately. Keep final detail. User requests and quiet routines override cadence.")}))
 }
 
 // Run-start and emission snapshots do not retrofit untagged historical messages.

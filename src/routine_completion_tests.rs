@@ -73,7 +73,7 @@ fn omission_is_an_actionable_failure_but_provider_failure_is_preserved() {
     let app = tests::app();
     let bot = tests::bot(&app.db, "codex");
     let id = scheduled(&app, &bot);
-    finish(&app, &id, "completed", "No change prose", "");
+    finish(&app, &id, "completed", "", "");
     let run = app.db.run(&id).unwrap();
     assert_eq!(run.status, "failed");
     assert!(run.error.contains("did not classify"));
@@ -348,9 +348,7 @@ fn real_due_scheduler_snapshots_completion_policy() {
         policy::root(&app.db.0.lock().unwrap(), &run.id).unwrap(),
         Some(run.id.clone())
     );
-    app.db
-        .finish(&run.id, "completed", "Unclassified final", "")
-        .unwrap();
+    app.db.finish(&run.id, "completed", "", "").unwrap();
     assert_eq!(app.db.run(&run.id).unwrap().status, "failed");
 }
 #[test]
@@ -405,4 +403,256 @@ fn occurrence_publication_receipt_prevents_a_second_public_report() {
             .iter()
             .any(|v| v["run_id"] == next)
     );
+}
+
+#[test]
+fn successful_terminal_reports_are_saved_once_for_every_provider_without_replaying_work() {
+    for provider in [
+        "claude-code",
+        "codex",
+        "openrouter",
+        "custom-00000000-0000-4000-8000-000000000001",
+        "kimi-code",
+        "opencode",
+        "opencode-go",
+    ] {
+        let app = tests::app();
+        let bot = tests::bot(&app.db, provider);
+        let id = scheduled(&app, &bot);
+        app.db
+            .event(
+                &id,
+                "tool_requested",
+                json!({"tool":"artifact_update","call_id":"saved","args":{}}),
+            )
+            .unwrap();
+        app.db
+            .event(
+                &id,
+                "tool_result",
+                json!({"tool":"artifact_update","call_id":"saved","failed":false}),
+            )
+            .unwrap();
+        finish(
+            &app,
+            &id,
+            "completed",
+            "Draft saved. Please review before sending.",
+            "",
+        );
+        finish(&app, &id, "completed", "Late duplicate callback", "");
+        let run = app.db.run(&id).unwrap();
+        assert_eq!(run.status, "completed");
+        assert!(run.error.is_empty());
+        assert_eq!(run.output, "Draft saved. Please review before sending.");
+        assert_eq!(results(&app, &id).len(), 1);
+        let c = app.db.0.lock().unwrap();
+        assert_eq!(
+            c.query_row(
+                "SELECT outcome FROM routine_completion WHERE run_id=?",
+                [&id],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            "report"
+        );
+        assert_eq!(
+            c.query_row(
+                "SELECT count(*) FROM events WHERE run_id=? AND kind='tool_requested'",
+                [&id],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+    }
+}
+
+#[test]
+fn terminal_text_cannot_hide_missing_output_failed_or_unfinished_actions() {
+    for mode in [
+        "empty",
+        "marker",
+        "failed",
+        "uncertain",
+        "pending",
+        "missing_receipt",
+        "provider_error",
+    ] {
+        let app = tests::app();
+        let bot = tests::bot(&app.db, "claude-code");
+        let id = scheduled(&app, &bot);
+        match mode {
+            "failed" => {
+                app.db
+                    .event(
+                        &id,
+                        "tool_result",
+                        json!({"tool":"command_read","failed":true,"text":"Missing source"}),
+                    )
+                    .unwrap();
+            }
+            "uncertain" => {
+                app.db
+                    .event(
+                        &id,
+                        "tool_result",
+                        json!({"tool":"computer_click","failed":false,"uncertain_effect":true}),
+                    )
+                    .unwrap();
+            }
+            "missing_receipt" => {
+                app.db
+                    .event(
+                        &id,
+                        "tool_requested",
+                        json!({"tool":"artifact_update","call_id":"unknown"}),
+                    )
+                    .unwrap();
+            }
+            "provider_error" => {
+                app.db
+                    .event(
+                        &id,
+                        "provider_diagnostic",
+                        json!({"status_notice":"provider_error","text":"Provider unavailable"}),
+                    )
+                    .unwrap();
+            }
+            "pending" => {
+                app.db.0.lock().unwrap().execute("INSERT INTO approvals(id,run_id,tool,args,status) VALUES('pending',?,'test','{}','pending')",[&id]).unwrap();
+            }
+            _ => {}
+        }
+        let output = match mode {
+            "empty" => "  ",
+            "marker" => "<finish_quietly/>",
+            _ => "Looks complete",
+        };
+        finish(&app, &id, "completed", output, "");
+        assert_eq!(app.db.run(&id).unwrap().status, "failed", "{mode}");
+        assert_eq!(
+            app.db
+                .0
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT count(*) FROM routine_completion WHERE run_id=?",
+                    [&id],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0,
+            "{mode}"
+        );
+    }
+}
+
+#[test]
+fn legacy_bookkeeping_repair_preserves_history_and_does_not_replay_or_hide_real_failures() {
+    let app = tests::app();
+    let bot = tests::bot(&app.db, "claude-code");
+    for mode in [
+        "report",
+        "failed_tool",
+        "empty",
+        "superseded",
+        "real_error",
+        "already_published",
+    ] {
+        let id = scheduled(&app, &bot);
+        let text = if mode == "empty" {
+            ""
+        } else {
+            "Draft saved; review before sending."
+        };
+        if mode == "failed_tool" {
+            app.db
+                .event(
+                    &id,
+                    "tool_result",
+                    json!({"tool":"command_read","failed":true,"text":"Source unavailable"}),
+                )
+                .unwrap();
+        }
+        // Reproduce the old finalization policy, retaining its provider receipt.
+        app.db
+            .event(&id, "routine_provider_final", json!({"text":text}))
+            .unwrap();
+        finish(
+            &app,
+            &id,
+            "failed",
+            text,
+            if mode == "real_error" {
+                "Actual provider outage"
+            } else {
+                policy::UNCLASSIFIED
+            },
+        );
+        if mode == "superseded" {
+            app.db.continue_task(&id).unwrap();
+        }
+        if mode == "already_published" {
+            let prior = scheduled(&app, &bot);
+            app.db
+                .0
+                .lock()
+                .unwrap()
+                .execute(
+                    "INSERT INTO routine_publications VALUES(?,?)",
+                    rusqlite::params![id, prior],
+                )
+                .unwrap();
+        }
+        let before = app
+            .db
+            .chat_messages(&app.db.run(&id).unwrap().chat_id)
+            .unwrap();
+        let count = app.db.events(&id).unwrap().len();
+        {
+            let c = app.db.0.lock().unwrap();
+            policy::repair_terminal_reports(&c).unwrap();
+            policy::repair_terminal_reports(&c).unwrap();
+        }
+        let run = app.db.run(&id).unwrap();
+        assert_eq!(
+            run.status,
+            if mode == "report" {
+                "completed"
+            } else {
+                "failed"
+            },
+            "{mode}"
+        );
+        let after = app.db.chat_messages(&run.chat_id).unwrap();
+        assert_eq!(before.len(), after.len());
+        assert_eq!(
+            before.iter().map(|m| m["seq"].clone()).collect::<Vec<_>>(),
+            after.iter().map(|m| m["seq"].clone()).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            app.db.events(&id).unwrap().len(),
+            count + usize::from(mode == "report")
+        );
+        if mode == "report" {
+            assert_eq!(results(&app, &id)[0]["text"], text);
+            assert!(run.error.is_empty());
+        } else {
+            assert_eq!(
+                app.db
+                    .0
+                    .lock()
+                    .unwrap()
+                    .query_row(
+                        "SELECT count(*) FROM routine_completion WHERE run_id=?",
+                        [&id],
+                        |r| r.get::<_, i64>(0)
+                    )
+                    .unwrap(),
+                0,
+                "{mode}"
+            );
+        }
+    }
 }

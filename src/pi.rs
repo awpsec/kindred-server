@@ -791,8 +791,8 @@ mod workflow_delivery_tests {
                 assert_eq!(calls.load(Ordering::SeqCst), 3);
             } else {
                 let done=app.db.run(&run.id).unwrap();
-                assert_eq!(done.status,"failed");assert!(done.error.contains("did not classify"));
-                assert_eq!(messages.len(),1);assert!(!messages[0]["text"].as_str().unwrap().contains("Unclassified no-change prose"));
+                assert_eq!(done.status,"completed");assert!(done.error.is_empty());
+                assert_eq!(messages.len(),1);assert_eq!(messages[0]["text"],"Unclassified no-change prose");
                 assert_eq!(calls.load(Ordering::SeqCst),3);
             }
             assert!(

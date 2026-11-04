@@ -1,7 +1,10 @@
-//! Structured outcomes for new scheduled occurrences; never classify prose.
+//! Durable scheduled outcomes. A successful provider final can be a report;
+//! quiet success requires an explicit receipt. Never infer an all-clear from prose.
 use anyhow::{Result, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
+
+pub const UNCLASSIFIED: &str = "This routine did not classify its result. Review task details and retry the check; no successful all-clear was recorded.";
 
 pub fn migrate(c: &Connection) -> Result<()> {
     c.execute_batch("CREATE TABLE IF NOT EXISTS routine_execution(run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,root_run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE);
@@ -152,6 +155,19 @@ pub fn complete(c: &Connection, run: &str, args: &Value) -> Result<Value> {
         json!({"routine_complete":true,"outcome":outcome,"text":"Routine outcome recorded. No further public reply is needed."}),
     )
 }
+// The provider's successful terminal response is itself an explicit report.
+// Do not force a replay of completed work just to obtain a bookkeeping tool.
+// Quiet success still requires its durable tool receipt, and real failures or
+// unfinished actions cannot be laundered into success by nonempty prose.
+fn terminal_report(c: &Connection, run: &str, output: &str) -> Result<bool> {
+    if output.trim().is_empty()
+        || crate::quiet_output::is_marker(output)
+        || crate::routine_recovery::blocks_quiet(c, run)?
+    {
+        return Ok(false);
+    }
+    Ok(!c.query_row("SELECT EXISTS(SELECT 1 FROM approvals WHERE run_id=?1 AND status='pending') OR EXISTS(SELECT 1 FROM questions WHERE run_id=?1 AND status='pending') OR EXISTS(SELECT 1 FROM user_tasks WHERE run_id=?1 AND status IN ('pending','ready')) OR EXISTS(SELECT 1 FROM connector_artifacts WHERE run_id=?1 AND status IN ('preparing','pending','approved','ready','executing','interrupted')) OR EXISTS(SELECT 1 FROM events WHERE run_id=?1 AND kind='tool_result' AND (json_extract(body,'$.uncertain_effect')=1 OR json_extract(body,'$.timed_out')=1 OR json_extract(body,'$.stopped')=1)) OR EXISTS(SELECT 1 FROM events requested WHERE requested.run_id=?1 AND requested.kind='tool_requested' AND NOT EXISTS(SELECT 1 FROM events result WHERE result.run_id=requested.run_id AND result.seq>requested.seq AND result.kind='tool_result' AND json_extract(result.body,'$.call_id')=json_extract(requested.body,'$.call_id')))",[run],|r|r.get::<_,bool>(0))?)
+}
 // None preserves the real provider failure/yield/legacy policy. Provisional final
 // prose remains in the private event record when an explicit report replaces it.
 pub fn finalize(
@@ -165,13 +181,22 @@ pub fn finalize(
         return Ok(None);
     }
     if c.query_row("SELECT EXISTS(SELECT 1 FROM events WHERE run_id=? AND kind IN ('question_wait','process_wait'))",[run],|r|r.get::<_,bool>(0))? {return Ok(None);}
-    let outcome: Option<(String, String)> = c
+    let mut outcome: Option<(String, String)> = c
         .query_row(
             "SELECT outcome,report FROM routine_completion WHERE run_id=?",
             [run],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;
+    if outcome.is_none() && terminal_report(c, run, output)? {
+        c.execute(
+            "INSERT INTO routine_completion VALUES(?,'report',?)",
+            params![run, output],
+        )?;
+        c.execute("UPDATE routine_runs SET quiet=0 WHERE run_id=?", [run])?;
+        c.execute("INSERT INTO events(run_id,kind,body,created) VALUES(?,'routine_terminal_report','{}',?)", params![run,crate::db::now()])?;
+        outcome = Some(("report".into(), output.into()));
+    }
     if !output.is_empty() {
         c.execute(
             "INSERT INTO events(run_id,kind,body,created) VALUES(?,'routine_provider_final',?,?)",
@@ -179,10 +204,10 @@ pub fn finalize(
         )?;
     }
     Ok(Some(match outcome {
-        Some((kind,report)) if kind=="report"=>("completed".into(),report,String::new()),
-        Some((kind,report)) if kind=="error"=>("failed".into(),output.into(),report),
-        Some((_kind,_))=>("completed".into(),String::new(),String::new()),
-        None=>("failed".into(),output.into(),"This routine did not classify its result. Review task details and retry the check; no successful all-clear was recorded.".into()),
+        Some((kind, report)) if kind == "report" => ("completed".into(), report, String::new()),
+        Some((kind, report)) if kind == "error" => ("failed".into(), output.into(), report),
+        Some((_kind, _)) => ("completed".into(), String::new(), String::new()),
+        None => ("failed".into(), output.into(), UNCLASSIFIED.into()),
     }))
 }
 pub fn publish(c: &Connection, run: &str, completed: bool) -> Result<bool> {
@@ -216,4 +241,38 @@ pub fn publish(c: &Connection, run: &str, completed: bool) -> Result<bool> {
         c.execute("UPDATE routine_runs SET quiet=1 WHERE run_id=?", [run])?;
     }
     Ok(winner == run)
+}
+
+// Repair only this exact bookkeeping failure. Keep the original event evidence,
+// existing message sequence, timestamps and unread position. No provider call,
+// external action, fresh notification or old report redelivery is scheduled.
+pub fn repair_terminal_reports(c: &Connection) -> Result<()> {
+    let tx = c.unchecked_transaction()?;
+    let rows=tx.prepare("SELECT r.id,r.output FROM runs r JOIN routine_execution x ON x.run_id=r.id WHERE r.status='failed' AND r.error=? AND NOT EXISTS(SELECT 1 FROM routine_completion WHERE run_id=r.id) AND NOT EXISTS(SELECT 1 FROM routine_publications p WHERE p.root_run_id=x.root_run_id AND p.run_id!=r.id) AND NOT EXISTS(SELECT 1 FROM approvals WHERE run_id=r.id AND status!='approved') AND NOT EXISTS(SELECT 1 FROM user_tasks WHERE run_id=r.id AND status NOT IN ('completed','resumed')) AND EXISTS(SELECT 1 FROM events e WHERE e.run_id=r.id AND e.kind='routine_provider_final' AND json_extract(e.body,'$.text')=r.output)")?
+        .query_map([UNCLASSIFIED],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    for (run, output) in rows {
+        if !current(&tx, &run)? || !terminal_report(&tx, &run, &output)? {
+            continue;
+        }
+        tx.execute(
+            "INSERT INTO routine_completion VALUES(?,'report',?)",
+            params![run, output],
+        )?;
+        tx.execute("UPDATE routine_runs SET quiet=0 WHERE run_id=?", [&run])?;
+        ensure!(
+            publish(&tx, &run, true)?,
+            "Routine repair publication changed"
+        );
+        tx.execute(
+            "UPDATE runs SET status='completed',error='' WHERE id=?",
+            [&run],
+        )?;
+        tx.execute(
+            "UPDATE chat_messages SET body=? WHERE run_id=? AND kind='result'",
+            params![output, run],
+        )?;
+        tx.execute("INSERT INTO events(run_id,kind,body,created) VALUES(?,'routine_terminal_report_repaired',?,?)",params![run,json!({"previous_status":"failed","previous_error":UNCLASSIFIED}).to_string(),crate::db::now()])?;
+    }
+    tx.commit()?;
+    Ok(())
 }
