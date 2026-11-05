@@ -7,7 +7,7 @@ mode=${2:-activate}
 case "$mode" in activate|--stage-only) ;; *) echo "Use --stage-only to prepare without changing the active harness" >&2; exit 1;; esac
 case "$prefix" in /*) ;; *) echo 'Install prefix must be an absolute path' >&2; exit 1;; esac
 source=$(CDPATH= cd -- "$(dirname -- "$0")/../harness/pi" && pwd)
-version=0.44.5
+version=0.44.6
 node_version=24.14.0
 case "$(uname -m)" in x86_64) arch=x64;; aarch64|arm64) arch=arm64;; *) echo 'Supported Linux architectures: x86_64 and arm64' >&2; exit 1;; esac
 release="$prefix/releases/$version"
@@ -23,7 +23,7 @@ curl --proto '=https' --tlsv1.2 -fsSL "https://nodejs.org/dist/v$node_version/$a
 mkdir "$stage/node"
 tar -xJf "$stage/$archive" -C "$stage/node" --strip-components=1
 rm -- "$stage/$archive"
-cp "$source/package.json" "$source/package-lock.json" "$source/worker.mjs" "$source/session.mjs" "$source/opencode-models.json" "$stage/"
+cp "$source/package.json" "$source/package-lock.json" "$source/worker.mjs" "$source/session.mjs" "$source/context.mjs" "$source/opencode-models.json" "$stage/"
 export PATH="$stage/node/bin:$PATH"
 (cd "$stage" && npm ci --omit=dev --ignore-scripts --no-audit --no-fund && node worker.mjs --check)
 chmod 755 "$stage"

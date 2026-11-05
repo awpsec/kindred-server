@@ -1,9 +1,10 @@
+import { ContextError, readCheckpoint, restoreSessionManager, checkpointFrame } from './context.mjs';
 import opencodeModels from './opencode-models.json' with { type: 'json' };
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  estimateTokens, getLastAssistantUsage, createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager,
+  estimateTokens, getLastAssistantUsage, createAgentSession, DefaultResourceLoader, ModelRuntime, SettingsManager,
 } from '@earendil-works/pi-coding-agent';
 import { InMemoryCredentialStore, InMemoryModelsStore } from '@earendil-works/pi-ai';
 
@@ -41,10 +42,13 @@ function outputLimit(info) {
 }
 // Pi appends its host cwd even with a custom system prompt. Kindred's tools
 // execute in the bot VM, so that ephemeral host path is not a usable workspace.
-export function customToolContext(context, harnessDirectory) {
+export function stableToolContext(context, harnessDirectory) {
   const suffix = `\nCurrent working directory: ${harnessDirectory.replace(/\\/g, '/')}\n`;
   const prompt = context.systemPrompt || '';
-  return { ...context, systemPrompt: (prompt.endsWith(suffix) ? prompt.slice(0, -suffix.length) : prompt)
+  return { ...context, systemPrompt: prompt.endsWith(suffix) ? prompt.slice(0, -suffix.length) : prompt };
+}
+export function customToolContext(context, harnessDirectory) {
+  return { ...context, systemPrompt: stableToolContext(context, harnessDirectory).systemPrompt
     + '\n\nKindred tool environment: guest_exec and computer tools run in the bot VM, not in this model harness process. Use /workspace for VM working files. Chat uploads are not staged there until read_attachment is called with the exact attachment ID from the conversation; use the path it returns. Do not search the host temporary directory or scan the filesystem to locate chat uploads. Local-desktop tools, when available, target their explicitly selected device.\n' };
 }
 
@@ -271,6 +275,9 @@ export async function runSession(request, callTool, emit, signal, options = {}) 
   if (new Set(names).size !== names.length || names.some(name => !/^[a-z][a-z0-9_]{0,63}$/.test(name))) throw new HarnessError('tools');
   const adapter = providerAdapter(request);
   if (request.reasoning_effort && !adapter.model.reasoning) throw new HarnessError('reasoning');
+  let checkpoint;
+  try { checkpoint = readCheckpoint(request, adapter.model.api, SDK_VERSION); }
+  catch (error) { throw new HarnessError(error instanceof ContextError ? error.code : 'context_checkpoint'); }
   const temporary = await mkdtemp(join(tmpdir(), 'kindred-pi-'));
   let session, currentInputId='initial';
   const timeoutMs = request.request_timeout_ms ?? 1_800_000;
@@ -318,7 +325,7 @@ export async function runSession(request, callTool, emit, signal, options = {}) 
       if (++modelCalls > request.max_steps + 1 && request.max_steps > 0) {
         failure.value = new HarnessError('budget'); throw failure.value;
       }
-      if (custom) context = customToolContext(context, temporary);
+      context = custom ? customToolContext(context, temporary) : stableToolContext(context, temporary);
       const requestId = modelCalls;
       progress = progressReporter(emit, custom);
       progress('waiting');
@@ -378,7 +385,7 @@ export async function runSession(request, callTool, emit, signal, options = {}) 
       cwd: temporary, agentDir: temporary, modelRuntime, model: adapter.model,
       thinkingLevel: request.reasoning_effort || 'off',
       tools: names, noTools: 'builtin', customTools, resourceLoader: loader,
-      sessionManager: SessionManager.inMemory(temporary), settingsManager,
+      sessionManager: restoreSessionManager(temporary, checkpoint), settingsManager,
     }));
     if (session.getActiveToolNames().sort().join(',') !== [...names].sort().join(',')) throw new HarnessError('tools');
     session.agent.toolExecution = 'sequential';
@@ -430,10 +437,10 @@ export async function runSession(request, callTool, emit, signal, options = {}) 
       if (event.type === 'compaction_start') emit({ type: 'context', state: 'compacting' });
       if (event.type === 'compaction_end') emit({ type: 'context', state: event.errorMessage || event.aborted ? 'failed' : 'compacted', ...(!event.errorMessage && !event.aborted && typeof event.result?.summary === 'string' ? { summary: event.result.summary.slice(0, 24000) } : {}) });
     });
-    emit({ type: 'ready', protocol: 1, sdk_version: SDK_VERSION, provider: request.provider, model: request.model, native_followup:request.followup_protocol===1 });
+    emit({ type: 'ready', protocol: 1, sdk_version: SDK_VERSION, provider: request.provider, model: request.model, native_followup:request.followup_protocol===1, ...(request.context_protocol === 1 ? { context_protocol: 1 } : {}) });
     if (signal?.aborted) throw new HarnessError('aborted');
     try {
-      let prompt=request.prompt;
+      let prompt=request.live_context ? `${request.live_context}\n\n${request.prompt}` : request.prompt;
       while (true) {
         emptyEnding = false;
         await session.prompt(prompt, { expandPromptTemplates: false });
@@ -451,6 +458,7 @@ export async function runSession(request, callTool, emit, signal, options = {}) 
         }
         if(signal?.aborted) throw new HarnessError('aborted');
         if (failure.value) throw failure.value;
+        if (request.context_protocol === 1) emit(checkpointFrame(pruneScreenshots(session.sessionManager.buildSessionContext().messages), request, adapter.model.api, currentInputId, SDK_VERSION));
         if (!options.nextTurn) break;
         const next=await options.nextTurn(currentInputId);
         if (!next) break;

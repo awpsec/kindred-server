@@ -53,7 +53,7 @@ function receive(frame) {
   const entry = pending.get(frame.id); pending.delete(frame.id); entry.resolve(frame.result);
 }
 if (process.argv.includes('--check')) {
-  send({ protocol: 1, sdk_version: SDK_VERSION, providers: ['openrouter', 'openai-compatible', 'opencode', 'opencode-go'] });
+  send({ protocol: 1, sdk_version: SDK_VERSION, context_protocol: 1, providers: ['openrouter', 'openai-compatible', 'opencode', 'opencode-go'] });
 } else {
   process.stdin.on('data', chunk => {
     try {

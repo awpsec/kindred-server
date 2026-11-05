@@ -1,7 +1,7 @@
 {
   "name": "kindred-pi-harness",
   "private": true,
-  "version": "0.44.5",
+  "version": "0.44.6",
   "type": "module",
   "engines": {
     "node": ">=22.19.0"

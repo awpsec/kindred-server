@@ -13,6 +13,100 @@ fn codex_tool_result(result: &Value) -> Value {
     json!({"contentItems":items,"success":result["failed"]!=true})
 }
 
+// App-server's `total` is cumulative across model responses and turns; `last`
+// describes just one response, not a turn. Keep one updatable receipt per
+// invocation, in provider_accounts' existing retry namespace. Summing either
+// notifications or `last` would double count repeated delivery and follow-ups.
+struct CodexUsage {
+    thread: String,
+    baseline: Option<[u64; 3]>,
+    latest: Option<[u64; 3]>,
+    reported: bool,
+    current_total_known: bool,
+    last_input_tokens: Option<u64>,
+}
+impl CodexUsage {
+    fn new(thread: &str, baseline: Option<[u64; 3]>) -> Self {
+        let baseline = baseline.filter(|counts| counts.iter().all(|n| *n <= 1_000_000_000)
+            && counts[2] <= counts[0]);
+        Self { thread: thread.into(), baseline, latest: baseline, reported: false, current_total_known: false, last_input_tokens: None }
+    }
+
+    fn counts(value: &Value) -> Option<[u64; 3]> {
+        let count = |key: &str| value[key].as_u64().filter(|n| *n <= 1_000_000_000);
+        let counts = [count("inputTokens")?, count("outputTokens")?, count("cachedInputTokens")?];
+        (counts[2] <= counts[0]).then_some(counts)
+    }
+
+    fn begin_turn(&mut self) { self.reported = false; self.current_total_known = false; self.last_input_tokens = None; }
+
+    fn update(&mut self, params: &Value, current_turn: Option<&str>) -> bool {
+        if params["threadId"].as_str() != Some(self.thread.as_str())
+            || current_turn.is_none() || params["turnId"].as_str() != current_turn {
+            return false;
+        }
+        let Some(total) = Self::counts(&params["tokenUsage"]["total"]) else {
+            // Missing data is unknown, including when a usable `last` exists.
+            self.reported = false;
+            self.current_total_known = false;
+            return true;
+        };
+        if self.latest.is_some_and(|previous| (0..3).any(|i| total[i] < previous[i])) {
+            // Ignore stale/out-of-order snapshots. A counter reset is not a
+            // new request and must not cause previously counted work to recur.
+            return false;
+        }
+        self.latest = Some(total);
+        self.reported = self.baseline.is_some();
+        self.current_total_known = true;
+        self.last_input_tokens = params["tokenUsage"]["last"]["inputTokens"].as_u64()
+            .filter(|n| *n <= 1_000_000_000);
+        true
+    }
+
+    fn record(&self, app: &App, bot: &Bot, run: &Run, model: &str) -> Result<()> {
+        let counts = match (self.latest, self.baseline) {
+            (Some(total), Some(baseline)) => std::array::from_fn(|i| total[i] - baseline[i]),
+            _ => [0; 3],
+        };
+        let mut selected = bot.clone();
+        selected.model = model.into();
+        crate::provider_accounts::record(app, &selected, run, &json!({
+            "request_id":1,"input_tokens":counts[0],"output_tokens":counts[1],
+            "cached_tokens":counts[2],"tokens_reported":self.reported,
+            "cost":null,"cost_source":"subscription"
+        }))
+    }
+}
+
+fn codex_checkpoint(checkpoint: Option<&Value>) -> Option<(&str, Option<[u64; 3]>)> {
+    let checkpoint = checkpoint?;
+    if checkpoint["schema"] != 1 { return None; }
+    let thread = checkpoint["thread_id"].as_str().filter(|id| !id.is_empty() && id.len() <= 256)?;
+    let totals = checkpoint["usage_totals"].as_array().filter(|v| v.len() == 3)
+        .and_then(|v| Some([v[0].as_u64()?,v[1].as_u64()?,v[2].as_u64()?]));
+    let totals = totals.filter(|v| v.iter().all(|n| *n <= 1_000_000_000) && v[2] <= v[0]);
+    Some((thread, totals))
+}
+
+fn codex_thread_missing(error: &anyhow::Error) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.starts_with("codex rejected thread/resume:")
+        && (message.contains("thread not found") || message.contains("thread was not found")
+            || message.contains("no rollout found") || message.contains("unknown thread"))
+}
+
+fn checkpoint_codex_context(app: &App, bot: &Bot, run: &Run, prepared: &crate::harness_context::Prepared, usage: &CodexUsage) {
+    let checkpoint = json!({"schema":1,"thread_id":usage.thread,
+        "usage_totals":if usage.current_total_known {usage.latest} else {None},
+        "estimated_tokens":usage.last_input_tokens.unwrap_or(0)});
+    // Work already completed. A stale lease or storage failure must not turn
+    // success into a retry that could replay external actions.
+    if !matches!(crate::harness_context::complete(app,bot,run,prepared,&checkpoint),Ok(true)) {
+        let _=app.db.event(&run.id,"harness_checkpoint_not_saved",json!({"provider":"codex"}));
+    }
+}
+
 // Empty provider output is not a quiet-completion receipt. Keep the underlying
 // scheduled-check failure useful, especially when finish_quietly was refused
 // afterwards. This only supplies diagnostics; it never records an outcome or
@@ -184,7 +278,7 @@ fn codex_reasoner_config(effective: &Value) -> Result<Value> {
         effective.is_object(),
         "Codex effective configuration is unavailable"
     );
-    let mut config = json!({"features.shell_tool":false,"features.unified_exec":false,"features.apps":false,"web_search":"disabled","apps":{"_default":{"enabled":false,"open_world_enabled":false}}});
+    let mut config = json!({"features.shell_tool":false,"features.unified_exec":false,"features.apps":false,"features.multi_agent":false,"features.multi_agent_v2":false,"web_search":"disabled","apps":{"_default":{"enabled":false,"open_world_enabled":false}}});
     if let Some(servers) = effective.get("mcp_servers").filter(|v| !v.is_null()) {
         let servers = servers
             .as_object()
@@ -259,26 +353,73 @@ async fn codex_rpc(app: &App, bot: &Bot, run: &Run, rpc: &mut Rpc) -> Result<Str
         )
         .await?;
     let config = codex_reasoner_config(&effective["config"])?;
-    let mut params = json!({"cwd":"/workspace","ephemeral":true,"approvalPolicy":"on-request","sandbox":"read-only","developerInstructions":runtime::instructions_for(app,bot,run,&tools,None)?,"dynamicTools":tools,"config":config});
-    params["model"] = json!(model);
-    let thread = rpc.request("thread/start", params).await?;
+    let identity = json!({"model":model,"effort":effort,"account":account["account"],"config":config,
+        "context_identity_verified":rpc.context_account.is_some(),"context_account":rpc.context_account,
+        "vm":app.config.vm,"connection_generation":crate::harness_context::connection_generation(&app.db,"codex")?});
+    let authority=crate::harness_native::authority(app,&identity);
+    let mut prepared=crate::harness_context::prepare(app,bot,run,&tools,None,"codex-v1",&identity)?;
+    let mut saved=codex_checkpoint(prepared.checkpoint.as_ref()).map(|(id,totals)|(id.to_owned(),totals));
+    if let Some((id,_))=&saved {
+        if !crate::harness_native::touch(app,bot,run,&authority,&prepared.session_id,id).unwrap_or(false) {
+            // Unknown ownership or cleanup already claimed this transcript.
+            prepared=crate::harness_context::prepare(app,bot,run,&tools,None,"codex-v1",&identity)?;
+            saved=None;
+        }
+    }
+    if rpc.context_account.is_some() && crate::harness_native::drain(app,bot,&authority,rpc).await.is_err() {
+        let _=app.db.event(&run.id,"harness_cleanup_pending",json!({"provider":"codex"}));
+    }
+    let mut resumed = false;
+    let mut baseline = Some([0;3]);
+    let resumed_thread=if let Some((saved_id,saved_totals))=saved {
+        match rpc.request_guarded("thread/resume",json!({"threadId":saved_id,"excludeTurns":true,"cwd":"/workspace","model":model,"approvalPolicy":"on-request","sandbox":"read-only","developerInstructions":prepared.instructions,"config":config})).await {
+            Ok(thread)=>{
+                ensure!(thread.pointer("/thread/id").and_then(Value::as_str)==Some(saved_id.as_str()),"Codex resumed a different thread");
+                resumed=true;baseline=saved_totals;Some(thread)
+            }
+            Err(error) if codex_thread_missing(&error)=>{
+                // No model turn or tool dispatch has occurred. Re-prepare the
+                // in-flight lease once, discarding the missing native thread.
+                prepared=crate::harness_context::prepare(app,bot,run,&tools,None,"codex-v1",&identity)?;
+                ensure!(prepared.checkpoint.is_none(),"Missing Codex thread was not invalidated");
+                None
+            }
+            Err(error)=>return Err(error),
+        }
+    } else {
+        if prepared.checkpoint.is_some() {
+            prepared=crate::harness_context::prepare(app,bot,run,&tools,None,"codex-v1",&identity)?;
+            ensure!(prepared.checkpoint.is_none(),"Invalid Codex checkpoint was not invalidated");
+        }
+        None
+    };
+    let persistent=resumed || (prepared.retention_enabled() && crate::harness_native::reserve(app,bot,run,&authority,&prepared.session_id).unwrap_or(false));
+    let thread=match resumed_thread {
+        Some(thread)=>thread,
+        None=>rpc.request_guarded("thread/start",json!({"cwd":"/workspace","ephemeral":!persistent,"approvalPolicy":"on-request","sandbox":"read-only","developerInstructions":prepared.instructions,"dynamicTools":tools,"config":config,"model":model})).await?,
+    };
     let thread_id = thread
         .pointer("/thread/id")
         .and_then(Value::as_str)
         .context("Codex didn't return a thread ID")?
         .to_owned();
+    if persistent && !resumed {
+        crate::harness_native::register(app,bot,run,&authority,&prepared.session_id,&thread_id)?;
+    }
     verify_codex_reasoner_tools(rpc, &thread_id).await?;
     app.db.event(
         &run.id,
         "model_selected",
-        json!({"provider":"codex","model":model,"reasoning_effort":effort}),
+        json!({"provider":"codex","model":model,"reasoning_effort":effort,"context_resumed":resumed}),
     )?;
     let started=rpc.request(
         "turn/start",
-        json!({"threadId":thread_id,"effort":effort,"input":[{"type":"text","text":run.prompt}]}),
+        json!({"threadId":thread_id,"effort":effort,"input":[{"type":"text","text":prepared.input(&run.prompt)}]}),
     )
     .await?;
     let mut current_turn=started.pointer("/turn/id").and_then(Value::as_str).map(str::to_owned);
+    let mut usage = CodexUsage::new(&thread_id, baseline);
+    usage.record(app, bot, run, &model)?;
     let mut followup_offer:Option<(String,String)>=None;
     let mut output = String::new();
     let mut output_bytes = 0usize;
@@ -362,7 +503,7 @@ async fn codex_rpc(app: &App, bot: &Bot, run: &Run, rpc: &mut Rpc) -> Result<Str
                         )?;
                     }
                     // Native input requests use the same persistent cards. Never continue
-                    // this ephemeral turn with an empty answer or replay a saved decision.
+                    // this native turn with an empty answer or replay a saved decision.
                     end_turn = true;
                     app.db
                         .event(&run.id, "question_wait", json!({"source":"native_input"}))?;
@@ -374,7 +515,7 @@ async fn codex_rpc(app: &App, bot: &Bot, run: &Run, rpc: &mut Rpc) -> Result<Str
                 }
             };
             // A persisted decision resumes via a new bounded turn after the answer.
-            // Close the ephemeral RPC while its tool call is blocked: do not send
+            // Close the RPC while its tool call is blocked: do not send
             // an empty answer that could start another model step before shutdown.
             if end_turn {
                 if let Some((offer,_))=followup_offer.take(){app.db.defer_followup(run,&offer)?;}
@@ -402,6 +543,11 @@ async fn codex_rpc(app: &App, bot: &Bot, run: &Run, rpc: &mut Rpc) -> Result<Str
             continue;
         }
         match method {
+            "thread/tokenUsage/updated" => {
+                if usage.update(p, current_turn.as_deref()) {
+                    usage.record(app, bot, run, &model)?;
+                }
+            }
             "item/completed"
                 if p.pointer("/item/type").and_then(Value::as_str) == Some("agentMessage") =>
             {
@@ -446,7 +592,7 @@ async fn codex_rpc(app: &App, bot: &Bot, run: &Run, rpc: &mut Rpc) -> Result<Str
                     app.db.dispatch_followup(run,runtime::string(&offer,"id")?)?;
                     let next=rpc.request("turn/start",json!({"threadId":thread_id,"effort":effort,"input":[{"type":"text","text":crate::conversation_updates::followup_prompt(&offer)?}]})).await?;
                     let turn=next.pointer("/turn/id").and_then(Value::as_str).context("Codex follow-up turn identity missing")?;
-                    let id=runtime::string(&offer,"id")?;app.db.followup_transported(run,id)?;current_turn=Some(turn.into());followup_offer=Some((id.into(),turn.into()));output.clear();continue;
+                    let id=runtime::string(&offer,"id")?;app.db.followup_transported(run,id)?;current_turn=Some(turn.into());followup_offer=Some((id.into(),turn.into()));output.clear();usage.begin_turn();usage.record(app,bot,run,&model)?;continue;
                 }
                 // A provider can finish internally while a long human tool call
                 // is waiting. Do not publish its queued, pre-handoff conclusion.
@@ -461,7 +607,9 @@ async fn codex_rpc(app: &App, bot: &Bot, run: &Run, rpc: &mut Rpc) -> Result<Str
                         "handoff_verification_continued",
                         json!({"reason":"missing_post_handoff_observation"}),
                     )?;
-                    rpc.request("turn/start",json!({"threadId":thread_id,"effort":effort,"input":[{"type":"text","text":format!("The human subtask has returned control. Respect its tool result: a skipped step is incomplete and must never be treated as successful. Your previous reply did not inspect the resulting page. Continue this same task by taking a fresh computer_screenshot, then continue the unfinished original task. Do not repeat form submission, verification clicks, account creation, or other completed actions. If the screenshot cannot be obtained, state that verification is incomplete. {}",crate::user_tasks::continuation_context(run))}]})).await?;
+                    let next=rpc.request("turn/start",json!({"threadId":thread_id,"effort":effort,"input":[{"type":"text","text":format!("The human subtask has returned control. Respect its tool result: a skipped step is incomplete and must never be treated as successful. Your previous reply did not inspect the resulting page. Continue this same task by taking a fresh computer_screenshot, then continue the unfinished original task. Do not repeat form submission, verification clicks, account creation, or other completed actions. If the screenshot cannot be obtained, state that verification is incomplete. {}",crate::user_tasks::continuation_context(run))}]})).await?;
+                    current_turn=next.pointer("/turn/id").and_then(Value::as_str).map(str::to_owned);
+                    usage.begin_turn();usage.record(app,bot,run,&model)?;
                     continue;
                 }
                 if output.trim().is_empty() {
@@ -478,6 +626,7 @@ async fn codex_rpc(app: &App, bot: &Bot, run: &Run, rpc: &mut Rpc) -> Result<Str
                         "Codex completed without a result"
                     );
                 }
+                if persistent {checkpoint_codex_context(app,bot,run,&prepared,&usage);}
                 return Ok(output);
             }
             "error" => {
@@ -501,6 +650,229 @@ mod routine_protocol_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codex_resume_fallback_only_accepts_explicit_missing_thread_errors() {
+        for text in ["Codex rejected thread/resume: thread not found", "Codex rejected thread/resume: no rollout found for thread id"] {
+            assert!(codex_thread_missing(&anyhow::anyhow!(text)));
+        }
+        for text in ["Codex request timed out", "Codex rejected thread/resume: forbidden", "Codex rejected turn/start: thread not found", "unknown thread"] {
+            assert!(!codex_thread_missing(&anyhow::anyhow!(text)));
+        }
+        assert!(codex_checkpoint(Some(&json!({"schema":2,"thread_id":"a"}))).is_none());
+        assert_eq!(codex_checkpoint(Some(&json!({"schema":1,"thread_id":"a","usage_totals":[1,2,3]}))),Some(("a",None)));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_persistent_context_reuses_exact_thread_without_replaying_actions() {
+        for mode in ["reuse","missing","scope-reset","account-reset","checkpoint-failure","resume-denied","turn-failed"] {
+            let app=crate::tests::app();let mut bot=crate::tests::bot(&app.db,"codex");
+            let script=r#"
+import json,sys
+phase=int(sys.argv[1]);mode=sys.argv[2];started=0;resumed=0;turns=0;native_id='retained-thread'
+def send(v):print(json.dumps(v),flush=True)
+def done():
+ total={'inputTokens':1200 if resumed and not started else 1000,'outputTokens':130 if resumed and not started else 100,'cachedInputTokens':900 if resumed and not started else 800,'reasoningOutputTokens':10,'totalTokens':1330 if resumed and not started else 1100}
+ send({'method':'thread/tokenUsage/updated','params':{'threadId':native_id,'turnId':'current-turn','tokenUsage':{'total':total,'last':{'inputTokens':200,'outputTokens':30,'cachedInputTokens':100,'reasoningOutputTokens':10,'totalTokens':230}}}})
+ send({'method':'item/completed','params':{'turnId':'current-turn','item':{'type':'agentMessage','phase':'final_answer','text':'Synthetic finished'}}})
+ send({'method':'turn/completed','params':{'threadId':native_id,'turn':{'id':'current-turn','status':'completed'}}})
+for line in sys.stdin:
+ v=json.loads(line);m=v.get('method');p=v.get('params',{})
+ if m=='initialized':continue
+ if m=='initialize':result={}
+ elif m=='account/read':result={'account':{'type':'chatgpt','email':'other@example.invalid' if phase==2 and mode=='account-reset' else 'fixture@example.invalid'}}
+ elif m=='model/list':result={'data':[{'model':'test/model','isDefault':True,'defaultReasoningEffort':'medium','supportedReasoningEfforts':[{'reasoningEffort':'medium'}]}],'nextCursor':None}
+ elif m=='config/read':result={'config':{}}
+ elif m=='thread/delete':
+  assert phase==2 and p['threadId']=='retained-thread'
+  result={}
+ elif m=='thread/resume':
+  resumed+=1;assert phase==2 and resumed==1 and started==0 and mode not in ('scope-reset','account-reset','checkpoint-failure')
+  assert p['threadId']=='retained-thread' and 'dynamicTools' not in p and 'history' not in p
+  assert 'Current Kindred task context' not in p['developerInstructions']
+  assert p['config']['features.apps']==False
+  if mode in ('missing','resume-denied'):
+   send({'id':v['id'],'error':{'code':-32000,'message':'thread not found' if mode=='missing' else 'unauthorized'}});continue
+  result={'thread':{'id':'retained-thread'}}
+ elif m=='thread/start':
+  started+=1;assert started==1 and turns==0
+  if phase==2:native_id='replacement-thread'
+  assert phase==1 or mode in ('missing','scope-reset','account-reset','checkpoint-failure')
+  assert p['ephemeral']==False and 'dynamicTools' in p and 'history' not in p
+  assert 'Current Kindred task context' not in p['developerInstructions']
+  result={'thread':{'id':native_id}}
+ elif m=='app/installed':result={'apps':[]}
+ elif m=='mcpServerStatus/list':result={'data':[],'nextCursor':None}
+ elif m=='turn/start':
+  turns+=1;assert turns==1 and p['threadId']==native_id
+  assert p['input'][0]['text'].endswith('# Current user input\n'+('FIRST_ACTION' if phase==1 else 'SECOND_QUESTION'))
+  send({'id':v['id'],'result':{'turn':{'id':'current-turn'}}})
+  if phase==2 and mode=='turn-failed':
+   send({'method':'turn/completed','params':{'threadId':native_id,'turn':{'id':'current-turn','status':'failed','error':{'message':'synthetic refusal','codexErrorInfo':'badRequest'}}}});continue
+  if phase==1:send({'id':'once','method':'item/tool/call','params':{'tool':'checklist_create','arguments':{'key':'synthetic-once','title':'Synthetic action performed once','items':[{'title':'Review synthetic evidence','owner':'bot'}]}}})
+  else:done()
+  continue
+ elif v.get('id')=='once':
+  assert phase==1 and v['result']['success'];done();continue
+ else:raise AssertionError('Unexpected frame: '+str(v))
+ send({'id':v['id'],'result':result})
+"#;
+            if mode=="checkpoint-failure" {
+                app.db.0.lock().unwrap().execute_batch("CREATE TRIGGER fail_context_write BEFORE UPDATE OF checkpoint ON harness_contexts WHEN NEW.checkpoint IS NOT NULL BEGIN SELECT RAISE(FAIL,'synthetic checkpoint unavailable'); END;").unwrap();
+            }
+            let mut run_ids=Vec::new();
+            for phase in [1,2] {
+                if phase==2 && mode=="scope-reset" {bot.instructions.push_str(" New scope.");app.db.save_bot(&bot).unwrap();}
+                app.db.queue(&bot.id,if phase==1 {"FIRST_ACTION"} else {"SECOND_QUESTION"},0).unwrap();
+                let run=app.db.claim_bot(&bot.id).unwrap().unwrap();run_ids.push(run.id.clone());
+                let mut command=tokio::process::Command::new("python3");command.args(["-u","-c",script,&phase.to_string(),mode]);let mut rpc=Rpc::spawn(command).await.unwrap();
+                let result=tokio::time::timeout(Duration::from_secs(10),codex_rpc(&app,&bot,&run,&mut rpc)).await.unwrap();drop(rpc);
+                if phase==2 && matches!(mode,"resume-denied"|"turn-failed") {
+                    assert!(result.is_err(),"{mode}");
+                    let checkpoint:Option<String>=app.db.0.lock().unwrap().query_row("SELECT checkpoint FROM harness_contexts WHERE bot_id=?",[&bot.id],|r|r.get(0)).unwrap();assert!(checkpoint.is_none());
+                } else {
+                    let output=result.unwrap();assert_eq!(output,"Synthetic finished","{mode}");app.db.finish(&run.id,"completed",&output,"").unwrap();
+                    let checkpoint:Option<String>=app.db.0.lock().unwrap().query_row("SELECT checkpoint FROM harness_contexts WHERE bot_id=?",[&bot.id],|r|r.get(0)).unwrap();
+                    if mode=="checkpoint-failure" {assert!(checkpoint.is_none());}
+                    else {let checkpoint:Value=serde_json::from_str(&checkpoint.expect(mode)).unwrap();assert_eq!(checkpoint["thread_id"],if phase==1 || mode=="reuse" {"retained-thread"} else {"replacement-thread"});assert_eq!(checkpoint["estimated_tokens"],200);}
+                }
+            }
+            let executed:usize=run_ids.iter().map(|id|app.db.events(id).unwrap().iter().filter(|e|e["kind"]=="tool_result"&&e["body"]["tool"]=="checklist_create").count()).sum();
+            assert_eq!(executed,1,"{mode}: prior action replayed");
+            let lists:i64=app.db.0.lock().unwrap().query_row("SELECT COUNT(*) FROM checklists WHERE bot_id=?",[&bot.id],|r|r.get(0)).unwrap();
+            assert_eq!(lists,1,"{mode}: checklist was not created exactly once");
+            if mode=="reuse" {
+                let counts:(i64,i64,i64)=app.db.0.lock().unwrap().query_row("SELECT input_tokens,output_tokens,cached_tokens FROM provider_usage WHERE run_id=?",[&run_ids[1]],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();assert_eq!(counts,(200,30,100));
+            }
+        }
+    }
+
+    fn codex_usage_frame(thread: &str, turn: &str, input: u64, output: u64, cached: u64) -> Value {
+        json!({"threadId":thread,"turnId":turn,"tokenUsage":{
+            "total":{"inputTokens":input,"outputTokens":output,"cachedInputTokens":cached,
+                "reasoningOutputTokens":output / 2,"totalTokens":input + output},
+            "last":{"inputTokens":10,"outputTokens":2,"cachedInputTokens":5,
+                "reasoningOutputTokens":1,"totalTokens":12}
+        }})
+    }
+
+    #[test]
+    fn codex_usage_cumulative_snapshots_followups_and_retries_do_not_double_count() {
+        let app=crate::tests::app();let bot=crate::tests::bot(&app.db,"codex");
+        app.db.queue(&bot.id,"Synthetic usage",0).unwrap();let run=app.db.claim_bot(&bot.id).unwrap().unwrap();
+        let mut usage=CodexUsage::new("thread",Some([0;3]));usage.record(&app,&bot,&run,"selected-model").unwrap();
+        for (turn,input,output,cached) in [("one",100,20,80),("one",100,20,80),("one",200,50,140),("two",250,60,180),("two",250,60,180)] {
+            usage.begin_turn();
+            assert!(usage.update(&codex_usage_frame("thread",turn,input,output,cached),Some(turn)));
+            usage.record(&app,&bot,&run,"selected-model").unwrap();
+        }
+        assert!(!usage.update(&codex_usage_frame("thread","two",200,50,140),Some("two")));
+        assert!(!usage.update(&codex_usage_frame("other-thread","two",999,999,0),Some("two")));
+        assert!(!usage.update(&codex_usage_frame("thread","one",999,999,0),Some("two")));
+        usage.record(&app,&bot,&run,"selected-model").unwrap();
+        let c=app.db.0.lock().unwrap();
+        let receipt:(i64,i64,i64,i64,i64,Option<f64>,String,String)=c.query_row(
+            "SELECT COUNT(*),SUM(input_tokens),SUM(output_tokens),SUM(cached_tokens),MIN(tokens_reported),cost,cost_source,model FROM provider_usage WHERE run_id=?",
+            [&run.id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?))).unwrap();
+        assert_eq!(receipt,(1,250,60,180,1,None,"subscription".into(),"selected-model".into()));
+        drop(c);
+        app.db.event(&run.id,"provider_retry",json!({"attempt":1})).unwrap();
+        let mut retry=CodexUsage::new("new-thread",Some([0;3]));
+        assert!(retry.update(&codex_usage_frame("new-thread","retry",40,10,20),Some("retry")));
+        retry.record(&app,&bot,&run,"selected-model").unwrap();
+        let counts:(i64,i64,i64,i64)=app.db.0.lock().unwrap().query_row(
+            "SELECT COUNT(*),SUM(input_tokens),SUM(output_tokens),SUM(cached_tokens) FROM provider_usage WHERE run_id=?",
+            [&run.id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
+        assert_eq!(counts,(2,290,70,200));
+    }
+
+    #[test]
+    fn codex_usage_missing_invalid_and_unverified_resume_baselines_stay_unknown() {
+        let app=crate::tests::app();let bot=crate::tests::bot(&app.db,"codex");
+        app.db.queue(&bot.id,"Synthetic unknown usage",0).unwrap();let run=app.db.claim_bot(&bot.id).unwrap().unwrap();
+        let mut usage=CodexUsage::new("thread",None);
+        assert!(usage.update(&codex_usage_frame("thread","one",900,90,800),Some("one")));
+        usage.record(&app,&bot,&run,"test/model").unwrap();
+        let receipt:(i64,i64,Option<f64>,String)=app.db.0.lock().unwrap().query_row(
+            "SELECT input_tokens,tokens_reported,cost,cost_source FROM provider_usage WHERE run_id=?",
+            [&run.id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
+        assert_eq!(receipt,(0,0,None,"subscription".into()));
+        let mut usage=CodexUsage::new("thread",Some([0;3]));
+        for bad in [Value::Null,json!({"inputTokens":1,"outputTokens":2}),json!({"inputTokens":-1,"outputTokens":2,"cachedInputTokens":0}),json!({"inputTokens":1,"outputTokens":2,"cachedInputTokens":2}),json!({"inputTokens":1_000_000_001u64,"outputTokens":2,"cachedInputTokens":0})] {
+            let mut frame=codex_usage_frame("thread","one",100,20,80);frame["tokenUsage"]["total"]=bad;
+            assert!(usage.update(&frame,Some("one")));assert!(!usage.reported);assert_eq!(usage.latest,Some([0;3]));
+        }
+        assert!(!usage.update(&codex_usage_frame("thread","one",100,20,80),None));
+        assert!(usage.update(&codex_usage_frame("thread","one",0,0,0),Some("one")));assert!(usage.reported);
+        usage.begin_turn();assert!(!usage.reported);
+    }
+
+    #[test]
+    fn codex_usage_resume_subtracts_prior_thread_totals() {
+        let mut usage=CodexUsage::new("thread",Some([1000,100,800]));
+        assert!(usage.update(&codex_usage_frame("thread","new",1120,130,900),Some("new")));
+        assert_eq!(usage.latest,Some([1120,130,900]));assert!(usage.reported);
+        let app=crate::tests::app();let bot=crate::tests::bot(&app.db,"codex");
+        app.db.queue(&bot.id,"Synthetic resumed usage",0).unwrap();let run=app.db.claim_bot(&bot.id).unwrap().unwrap();
+        usage.record(&app,&bot,&run,"test/model").unwrap();
+        let counts:(i64,i64,i64)=app.db.0.lock().unwrap().query_row(
+            "SELECT input_tokens,output_tokens,cached_tokens FROM provider_usage WHERE run_id=?",
+            [&run.id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+        assert_eq!(counts,(120,30,100));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_usage_rpc_records_subscription_totals_and_unknown_notifications() {
+        for mode in ["reported","missing","last-only","followup","unverified","capped"] {
+            let script=r#"
+import json,sys
+mode=sys.argv[1];turn=0
+def send(v):print(json.dumps(v),flush=True)
+for line in sys.stdin:
+ v=json.loads(line);m=v.get('method')
+ if m=='initialized':continue
+ if m=='initialize':result={}
+ elif m=='account/read':result={'account':{'type':'chatgpt'}}
+ elif m=='model/list':result={'data':[{'model':'test/model','isDefault':True,'defaultReasoningEffort':'medium','supportedReasoningEfforts':[{'reasoningEffort':'medium'}]}],'nextCursor':None}
+ elif m=='config/read':result={'config':{}}
+ elif m=='thread/start':
+  assert v['params']['ephemeral']==(mode in ('unverified','capped'))
+  result={'thread':{'id':'usage-thread'}}
+ elif m=='app/installed':result={'apps':[]}
+ elif m=='mcpServerStatus/list':result={'data':[],'nextCursor':None}
+ elif m=='turn/start':
+  turn+=1;assert turn<=2
+  tid='turn-'+str(turn)
+  send({'id':v['id'],'result':{'turn':{'id':tid}}})
+  if mode!='missing':
+   usage={'last':{'inputTokens':10,'outputTokens':2,'cachedInputTokens':5,'reasoningOutputTokens':1,'totalTokens':12}}
+   if mode!='last-only':usage['total']={'inputTokens':100*turn,'outputTokens':20*turn,'cachedInputTokens':80*turn,'reasoningOutputTokens':10*turn,'totalTokens':120*turn}
+   frame={'method':'thread/tokenUsage/updated','params':{'threadId':'usage-thread','turnId':tid,'tokenUsage':usage}}
+   send(frame);send(frame)
+  send({'method':'item/completed','params':{'turnId':tid,'item':{'type':'agentMessage','text':'Usage checked'}}})
+  send({'method':'turn/completed','params':{'threadId':'usage-thread','turn':{'id':tid,'status':'completed'}}})
+  continue
+ else:raise AssertionError('Unexpected frame: '+str(v))
+ send({'id':v['id'],'result':result})
+"#;
+            let app=crate::tests::app();let bot=crate::tests::bot(&app.db,"codex");
+            app.db.queue(&bot.id,"Synthetic usage RPC",0).unwrap();let run=app.db.claim_bot(&bot.id).unwrap().unwrap();
+            if mode=="followup" {let source=app.db.chat_send(&run.chat_id,"Synthetic followup",&[]).unwrap()[0].clone();app.db.request_steering(&source,&run.id).unwrap();}
+            if mode=="capped" {for i in 0..128 {assert!(crate::harness_native::reserve(&app,&bot,&run,"fixture-authority",&format!("pending-slot-{i}")).unwrap());}}
+            let mut command=tokio::process::Command::new("python3");command.args(["-u","-c",script,mode]);let mut rpc=Rpc::spawn(command).await.unwrap();
+            if mode=="unverified" {rpc.context_account=None;}
+            let result=tokio::time::timeout(Duration::from_secs(5),codex_rpc(&app,&bot,&run,&mut rpc)).await.unwrap().unwrap();
+            assert_eq!(result,"Usage checked");drop(rpc);
+            let receipt:(i64,i64,i64,i64,i64,Option<f64>,String)=app.db.0.lock().unwrap().query_row(
+                "SELECT COUNT(*),SUM(input_tokens),SUM(output_tokens),SUM(cached_tokens),MIN(tokens_reported),cost,cost_source FROM provider_usage WHERE run_id=?",
+                [&run.id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?))).unwrap();
+            let turns=if mode=="followup" {2} else if matches!(mode,"reported"|"unverified"|"capped") {1} else {0};
+            if matches!(mode,"unverified"|"capped") {let saved:i64=app.db.0.lock().unwrap().query_row("SELECT COUNT(*) FROM harness_contexts WHERE bot_id=? AND checkpoint IS NOT NULL",[&bot.id],|r|r.get(0)).unwrap();assert_eq!(saved,0);}
+            assert_eq!(receipt,(1,100*turns,20*turns,80*turns,if turns>0 {1} else {0},None,"subscription".into()),"{mode}");
+        }
+    }
     #[cfg(unix)]
     async fn initiative_codex_protocol(mode: &str) {
         let script = r#"
@@ -651,7 +1023,7 @@ for line in sys.stdin:
   started+=1;assert started<=2 and v['params']['threadId']=='same-thread'
   text=v['params']['input'][0]['text']
   if started==1:
-   assert text=='Synthetic original task'
+   assert text.endswith('# Current user input\nSynthetic original task')
    send({'id':v['id'],'result':{}})
    send({'id':'tool-1','method':'item/tool/call','params':{'tool':'remember','arguments':{'text':'Completed once'}}});continue
   assert 'Exact synthetic followup' in text and 'Synthetic original task' not in text and 'Other private bot' not in text
@@ -691,7 +1063,7 @@ for line in sys.stdin:
  elif m=='app/installed':result={'apps':[]}
  elif m=='mcpServerStatus/list':result={'data':[],'nextCursor':None}
  elif m=='turn/start':
-  started+=1;assert started==1 and v['params']['input'][0]['text']=='Original task'
+  started+=1;assert started==1 and v['params']['input'][0]['text'].endswith('# Current user input\nOriginal task')
   send({'id':v['id'],'result':{'turn':{'id':'active-turn'}}})
   send({'id':'call-1','method':'item/tool/call','params':{'tool':'remember','arguments':{'text':'Once'}}});continue
  elif m=='turn/steer':
@@ -809,10 +1181,9 @@ for line in sys.stdin:
                 )
             } else {
                 let messages = body["messages"].as_array().unwrap();
-                assert_eq!(
-                    messages[1]["content"][0]["text"],
-                    "Continue the original request"
-                );
+                let current=messages[1]["content"][0]["text"].as_str().unwrap();
+                assert!(current.starts_with("# Current Kindred task context\n"));
+                assert!(current.ends_with("\n\nContinue the original request"));
                 assert_eq!(messages[2]["tool_calls"][0]["id"], "human-call");
                 assert_eq!(messages[3]["tool_call_id"], "human-call");
                 assert!(
@@ -879,6 +1250,7 @@ for line in sys.stdin:
     elif m=='app/installed': send({'id':v['id'],'result':{'apps':[]}})
     elif m=='mcpServerStatus/list': send({'id':v['id'],'result':{'data':[{'name':'fixture_native','runtimeStatus':'disabled','tools':{}}],'nextCursor':None}})
     elif m=='config/read': send({'id':v['id'],'result':{'config':{'mcp_servers':{'fixture_native':{'enabled':True}}},'origins':{}}})
+    elif m=='thread/delete': send({'id':v['id'],'result':{}})
     elif m=='thread/start':
         assert any(t['name']=='request_user_action' for t in v['params']['dynamicTools'])
         assert v['params']['config']['features.apps']==False
@@ -897,7 +1269,7 @@ for line in sys.stdin:
             send({'method':'item/completed','params':{'item':{'type':'agentMessage','text':'Still waiting for the human.'}}})
             send({'method':'turn/completed','params':{'turn':{'status':'completed'}}})
             break
-        assert v['params']['input'][0]['text']=='Check whether a prior request exists; read only, do not submit a new request.'
+        assert v['params']['input'][0]['text'].endswith('# Current user input\nCheck whether a prior request exists; read only, do not submit a new request.')
         send({'id':v['id'],'result':{}})
         send({'method':'item/completed','params':{'item':{'type':'agentMessage','phase':'commentary','text':'I will open the sign-in step.'}}})
         send({'id':'human-rpc','method':'item/tool/call','params':{'tool':'request_user_action','arguments':{'title':'Sign in','instructions':'Use the browser'}}})
@@ -1023,6 +1395,7 @@ for line in sys.stdin:
     elif m=='app/installed': send({'id':v['id'],'result':{'apps':[]}})
     elif m=='mcpServerStatus/list': send({'id':v['id'],'result':{'data':[{'name':'fixture_native','runtimeStatus':'disabled','tools':{}}],'nextCursor':None}})
     elif m=='config/read': send({'id':v['id'],'result':{'config':{'mcp_servers':{'fixture_native':{'enabled':True}}},'origins':{}}})
+    elif m=='thread/delete': send({'id':v['id'],'result':{}})
     elif m=='thread/start':
         assert any(t['name']=='ask_question' for t in v['params']['dynamicTools'])
         assert v['params']['developerInstructions'].startswith('# Kindred operating contract')

@@ -519,13 +519,13 @@ test('custom environment correction removes only the SDK cwd suffix and preserve
  assert.strictEqual(fixed.messages,context.messages);
 });
 
-test('actual custom requests and summary recovery get the VM environment, hosted requests stay unchanged',async()=>{
+test('actual custom requests and summary recovery get VM guidance, all requests omit ephemeral host cwd',async()=>{
  for(const custom of [true,false]){
   let calls=0;const value=custom?customRequest():request();
   const result=await runSession(value,async()=>({text:'unused'}),()=>{},undefined,{fetch:async req=>{
    calls++;const body=await req.json();const system=body.messages.find(m=>m.role==='system').content;
    assert(system.startsWith(value.instructions));
-   assert.equal(system.includes('Current working directory: /tmp/kindred-pi-'),!custom);
+   assert.equal(system.includes('Current working directory: /tmp/kindred-pi-'),false);
    assert.equal(system.includes('Kindred tool environment:'),custom);
    if(custom&&calls===1)return sse({role:'assistant',reasoning_content:'private reasoning'});
    return sse({role:'assistant',content:'Finished.'});

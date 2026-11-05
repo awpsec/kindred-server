@@ -144,6 +144,23 @@ async fn run_worker(
         ),
         "Choose Low, Medium, High or the provider default thinking level"
     );
+    if !fixture {
+        let mut probe = Command::new(&config.node_binary);
+        probe.arg(&config.worker_script).arg("--check").env_clear()
+            .env("PI_OFFLINE", "1").env("NO_COLOR", "1").kill_on_drop(true);
+        #[cfg(windows)]
+        if let Some(root) = std::env::var_os("SystemRoot") { probe.env("SystemRoot", root); }
+        let checked = tokio::time::timeout(Duration::from_secs(20), probe.output()).await
+            .context("Pi context capability check timed out")??;
+        let capability: Value = serde_json::from_slice(&checked.stdout).unwrap_or(Value::Null);
+        ensure!(checked.status.success() && capability["context_protocol"] == 1,
+            "Update the installed Kindred Pi harness before continuing; this version requires resumable context support.");
+    }
+    let tools = crate::tool_catalog::advertised(app, bot, run);
+    // The credential participates only in the hashed scope identity; it is not
+    // serialized in the checkpoint or written to diagnostics.
+    let prepared = crate::harness_context::prepare(app,bot,run,&tools,model_info["context_window"].as_u64(),"pi-0.85.1-context-v1",
+        &json!({"endpoint":endpoint,"credential":key,"model":model_info,"effort":bot.reasoning_effort,"zdr":app.config.openrouter.require_zdr}))?;
     let mut command = Command::new(&config.node_binary);
     command
         .arg(&config.worker_script)
@@ -158,7 +175,6 @@ async fn run_worker(
         .spawn().context("Start the Pi harness. Install the pinned Node runtime and harness dependencies; no alternate provider was used")?;
     let mut input = child.stdin.take().unwrap();
     let mut output = BufReader::new(child.stdout.take().unwrap());
-    let tools = crate::tool_catalog::advertised(app, bot, run);
     let allowed: HashSet<String> = tools
         .iter()
         .chain(crate::tool_catalog::available(app,bot,run).iter())
@@ -169,7 +185,8 @@ async fn run_worker(
         "session_id":format!("{}:{}",bot.id,run.chat_id),
         "model_info":model_info, "api_key":key, "endpoint":endpoint, "fixture":fixture,
         "request_timeout_ms":app.config.request_timeout_seconds * 1000,
-        "instructions":runtime::instructions_for(app, bot, run, &tools, model_info["context_window"].as_u64())?, "prompt":run.prompt, "tools":tools,
+        "instructions":prepared.instructions, "live_context":prepared.live_context, "prompt":run.prompt, "tools":tools,
+        "context_protocol":1,"context_checkpoint":prepared.checkpoint,
         "reasoning_effort":bot.reasoning_effort, "require_zdr":app.config.openrouter.require_zdr,
         "max_steps":app.config.max_steps
     })).await?;
@@ -179,6 +196,7 @@ async fn run_worker(
     let mut ready = false;
     let mut result = String::new();
     let mut call_ids = HashSet::new();
+    let mut pending_checkpoint = None;
     loop {
         let frame = if ready {
             read(&mut output).await?
@@ -195,7 +213,8 @@ async fn run_worker(
                         && frame["protocol"] == 1
                         && valid_sdk_version(&frame["sdk_version"])
                         && frame["provider"] == bot.provider
-                        && frame["model"] == bot.model,
+                        && frame["model"] == bot.model
+                        && (fixture || frame["context_protocol"] == 1),
                     "Unexpected Pi harness version or model selection"
                 );
                 ready = true;native_followup=frame["native_followup"]==true;
@@ -273,6 +292,11 @@ async fn run_worker(
             "usage" if ready => {
                 crate::provider_accounts::record(app, bot, run, &frame)?;
             }
+            "checkpoint" if ready => {
+                ensure!(frame["input_id"].as_str() == Some(followup_offer.as_deref().unwrap_or("initial")),
+                    "Unmatched Pi context checkpoint");
+                pending_checkpoint = if frame["state"] == "ready" { Some(frame["checkpoint"].clone()) } else { None };
+            }
             "context" if ready => {
                 if matches!(
                     frame["state"].as_str(),
@@ -318,6 +342,10 @@ async fn run_worker(
                     .await
                     .context("Pi harness did not exit after completion")??;
                 ensure!(status.success(), "Pi harness exited unsuccessfully");
+                if let Some(checkpoint) = pending_checkpoint.as_ref() {
+                    // Cache persistence never converts completed work into a retry.
+                    let _ = crate::harness_context::complete(app,bot,run,&prepared,checkpoint);
+                }
                 // Earlier assistant messages describe tool work; don't concatenate
                 // acknowledgements into the final conversational answer.
                 let answer = app

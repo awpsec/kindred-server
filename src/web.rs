@@ -1145,6 +1145,7 @@ async fn codex(State(app): State<Shared>, Path(action): Path<String>) -> Result<
         return Ok(Json(crate::codex_connectors::refresh(&app).await?));
     }
     if matches!(action.as_str(), "login" | "logout") {
+        crate::harness_context::connection_changed(&app.db,"codex")?;
         crate::connector_policy::clear_catalogue_for(&app.db, "codex-account")?;
     }
     if action == "login" {

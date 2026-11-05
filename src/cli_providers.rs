@@ -17,6 +17,12 @@ use std::{
 use tokio::io::BufReader;
 
 const HELPER: &str = "/usr/local/lib/kindred/provider-cli.py";
+#[derive(Debug)]
+struct MissingContext;
+impl std::fmt::Display for MissingContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f,"Saved provider context is unavailable before input") }
+}
+impl std::error::Error for MissingContext {}
 pub(crate) const CLAUDE_SESSION_EXPIRED: &str = "Claude could not refresh its sign-in session. Reconnect Claude in Settings → Connections, then continue this task.";
 pub(crate) const CLAUDE_USAGE_LIMIT: &str = "Claude has reached its subscription usage limit. Wait for the limit to reset or choose another configured provider, then continue this task. No alternate provider was used.";
 
@@ -61,6 +67,9 @@ async fn account(app: &Shared, provider: &str, action: &str, v: &mut Value) -> R
     }
     if action == "login" {
         vm::ensure_running(&app.config.vm).await?;
+    }
+    if matches!(action,"login" | "logout" | "login-complete") {
+        crate::harness_context::connection_changed(&app.db,provider)?;
     }
     // Headless authentication needs no display or reservation.
     let selected=if action=="login" && provider=="kimi-code" {
@@ -120,16 +129,33 @@ pub async fn run(app: &App, bot: &Bot, run: &Run) -> Result<String> {
                 )),
         "Choose the provider default thinking level for this subscription"
     );
-    let mut cmd = vm::ssh(&app.config.vm);
-    cmd.arg(format!("python3 {HELPER} worker {}", bot.provider));
-    let child = cmd
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()?;
-    run_child(app,bot,run,child).await
+    let context_enabled = if bot.provider == "claude-code" {
+        let mut probe = vm::ssh(&app.config.vm);
+        probe.arg(format!("python3 {HELPER} context-capabilities"));
+        // Managed computers synchronize the bridge before work. An externally
+        // managed computer can still have the older bridge: keep its complete
+        // original prompt until maintenance upgrades it. Never send split input
+        // or consume a checkpoint unless the capability is confirmed first.
+        vm::capture(probe,None,20,4096).await.ok()
+            .and_then(|bytes|serde_json::from_slice::<Value>(&bytes).ok())
+            .is_some_and(|v|v["context_protocol"]==1 && v["providers"].as_array().is_some_and(|p|p.iter().any(|v|v=="claude-code")))
+    } else { false };
+    for attempt in 0..2 {
+        let mut cmd = vm::ssh(&app.config.vm);
+        cmd.arg(format!("python3 {HELPER} worker {}", bot.provider));
+        let child = cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).kill_on_drop(true).spawn()?;
+        match run_child_context(app,bot,run,child,context_enabled).await {
+            Err(error) if attempt == 0 && error.downcast_ref::<MissingContext>().is_some() => continue,
+            result => return result,
+        }
+    }
+    unreachable!()
 }
-async fn run_child(app:&App,bot:&Bot,run:&Run,mut child:tokio::process::Child)->Result<String> {
+#[cfg(test)]
+async fn run_child(app:&App,bot:&Bot,run:&Run,child:tokio::process::Child)->Result<String> {
+    run_child_context(app,bot,run,child,false).await
+}
+async fn run_child_context(app:&App,bot:&Bot,run:&Run,mut child:tokio::process::Child,context_enabled:bool)->Result<String> {
     let mut input = child.stdin.take().unwrap();
     let mut output = BufReader::new(child.stdout.take().unwrap());
     let tools = crate::tool_catalog::advertised(app, bot, run);
@@ -138,8 +164,15 @@ async fn run_child(app:&App,bot:&Bot,run:&Run,mut child:tokio::process::Child)->
         .chain(crate::tool_catalog::available(app,bot,run).iter())
         .filter_map(|t| t["name"].as_str().map(str::to_owned))
         .collect();
-    crate::pi::send(&mut input,json!({"type":"start","protocol":1,"followup_protocol":1,"provider":bot.provider,"model":bot.model,"reasoning_effort":bot.reasoning_effort,
-        "instructions":runtime::instructions_for(app,bot,run,&tools,None)?,"prompt":run.prompt,"tools":tools,"max_steps":app.config.max_steps})).await?;
+    let prepared = if context_enabled {Some(crate::harness_context::prepare(app,bot,run,&tools,None,"claude-cli-context-v1",&json!({"effort":bot.reasoning_effort}))?)} else {None}
+        .filter(|p|p.retention_enabled());
+    let mut start=json!({"type":"start","protocol":1,"followup_protocol":1,"provider":bot.provider,"model":bot.model,"reasoning_effort":bot.reasoning_effort,
+        "instructions":if let Some(p)=&prepared {p.instructions.clone()} else {runtime::instructions_for(app,bot,run,&tools,None)?},"prompt":run.prompt,"tools":tools,"max_steps":app.config.max_steps});
+    if let Some(p)=&prepared {
+        start["context_protocol"]=json!(1);start["context_session_id"]=json!(p.session_id);
+        start["context_resume"]=json!(p.resumed);start["live_context"]=json!(p.live_context);
+    }
+    crate::pi::send(&mut input,start).await?;
     let mut followup_offer:Option<String>=None;
     let mut initial_boundary=false;
     let mut ready = false;
@@ -199,6 +232,10 @@ async fn run_child(app:&App,bot:&Bot,run:&Run,mut child:tokio::process::Child)->
                         && frame["reasoning_effort"].as_str().unwrap_or("") == bot.reasoning_effort,
                     "Unexpected subscription provider handshake"
                 );
+                if let Some(p)=&prepared {
+                    ensure!(frame["context_protocol"]==1 && frame["context_session_id"].as_str()==Some(p.session_id.as_str()),
+                        "Provider context handshake did not match this conversation");
+                }
                 ready = true;
                 if let Some(rows) = frame["connectors"].as_array() {
                     ensure!(
@@ -454,7 +491,20 @@ async fn run_child(app:&App,bot:&Bot,run:&Run,mut child:tokio::process::Child)->
                     "Provider completed without a result"
                 );
                 crate::progress_updates::finish_message(&app.db, &run.id, &final_reply)?;
+                if let Some(p)=&prepared {
+                    if frame["context_checkpoint"]["session_id"].as_str()==Some(p.session_id.as_str()) {
+                        // The helper emits a checkpoint only after its native CLI
+                        // has exited cleanly and flushed its own transcript.
+                        let _=crate::harness_context::complete(app,bot,run,p,&frame["context_checkpoint"]);
+                    }
+                }
                 return Ok(final_reply);
+            }
+            "error" if context_enabled && !ready && calls.is_empty() && connector_calls.is_empty()
+                && frame["code"]=="context_unavailable" && frame["context_pre_input"]==true && frame["context_protocol"]==1 => {
+                // A cache miss before any input is a fresh bootstrap, not a
+                // retry of a task or an external action.
+                return Err(MissingContext.into());
             }
             "error" if frame["code"] == "tool_bridge_unavailable" => bail!(
                 "Claude could not connect to Kindred tools. This task did not continue without tools. Retry when the bot computer is available."
@@ -481,6 +531,71 @@ pub(crate) async fn routine_protocol_fixture(app: &App, bot: &Bot, run: &Run, sc
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn legacy_helper_receives_complete_context_without_session_extension() {
+        let app=crate::tests::app();let bot=crate::tests::bot(&app.db,"claude-code");
+        app.db.queue(&bot.id,"Original user request",0).unwrap();let run=app.db.claim_bot(&bot.id).unwrap().unwrap();
+        let script=r#"import sys,json
+r=json.loads(sys.stdin.readline())
+assert '# Current Kindred task context' in r['instructions']
+assert '# Live Kindred context' in r['instructions']
+assert r['prompt']=='Original user request'
+assert 'context_protocol' not in r and 'context_session_id' not in r and 'live_context' not in r
+print(json.dumps({'type':'ready','protocol':1,'provider':r['provider'],'model':r['model'],'reasoning_effort':r['reasoning_effort']}),flush=True)
+print(json.dumps({'type':'assistant','text':'Legacy completed'}),flush=True)
+print(json.dumps({'type':'complete','output':'Legacy completed'}),flush=True)
+"#;
+        let child=tokio::process::Command::new("python3").args(["-u","-c",script])
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit()).kill_on_drop(true).spawn().unwrap();
+        assert_eq!(run_child_context(&app,&bot,&run,child,false).await.unwrap(),"Legacy completed");
+        let count:i64=app.db.0.lock().unwrap().query_row("SELECT COUNT(*) FROM harness_contexts",[],|r|r.get(0)).unwrap();assert_eq!(count,0);
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn claude_context_protocol_reuses_only_completed_generation_and_keeps_new_input() {
+        let app=crate::tests::app();let bot=crate::tests::bot(&app.db,"claude-code");
+        let mut saved_session=String::new();
+        for phase in 0..2 {
+            app.db.queue(&bot.id,if phase==0 {"First request"} else {"Followup request"},0).unwrap();
+            let run=app.db.claim_bot(&bot.id).unwrap().unwrap();
+            let script=r#"import sys,json
+def send(v):print(json.dumps(v),flush=True)
+r=json.loads(sys.stdin.readline());phase=int(sys.argv[1])
+assert r['context_protocol']==1 and r['context_resume']==bool(phase)
+assert '# Current Kindred task context' not in r['instructions']
+assert r['live_context'].startswith('# Current Kindred task context')
+assert r['prompt']==('Followup request' if phase else 'First request')
+if phase:assert r['context_session_id']==sys.argv[2]
+send({'type':'ready','protocol':1,'provider':r['provider'],'model':r['model'],'reasoning_effort':r['reasoning_effort'],'context_protocol':1,'context_session_id':r['context_session_id']})
+send({'type':'assistant','text':'Completed once'})
+send({'type':'complete','output':'Completed once','context_checkpoint':{'schema':1,'protocol':1,'session_id':r['context_session_id'],'estimated_tokens':100}})
+"#;
+            let child=tokio::process::Command::new("python3").args(["-u","-c",script,&phase.to_string(),&saved_session])
+                .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit()).kill_on_drop(true).spawn().unwrap();
+            assert_eq!(run_child_context(&app,&bot,&run,child,true).await.unwrap(),"Completed once");
+            saved_session=app.db.0.lock().unwrap().query_row("SELECT session_id FROM harness_contexts WHERE bot_id=?",[&bot.id],|r|r.get(0)).unwrap();
+            app.db.finish(&run.id,"completed","Completed once","").unwrap();
+            assert!(!app.db.events(&run.id).unwrap().iter().any(|e|e["kind"]=="tool_started"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn claude_missing_checkpoint_is_only_recoverable_before_provider_input() {
+        for pre_input in [true,false] {
+            let app=crate::tests::app();let bot=crate::tests::bot(&app.db,"claude-code");
+            app.db.queue(&bot.id,"Synthetic check",0).unwrap();let run=app.db.claim_bot(&bot.id).unwrap().unwrap();
+            let script=r#"import sys,json
+r=json.loads(sys.stdin.readline())
+print(json.dumps({'type':'error','code':'context_unavailable','context_protocol':1,'context_pre_input':sys.argv[1]=='true'}),flush=True)
+"#;
+            let child=tokio::process::Command::new("python3").args(["-u","-c",script,if pre_input {"true"} else {"false"}])
+                .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit()).kill_on_drop(true).spawn().unwrap();
+            let error=run_child_context(&app,&bot,&run,child,true).await.unwrap_err();
+            assert_eq!(error.downcast_ref::<MissingContext>().is_some(),pre_input);
+        }
+    }
     use super::*;
     #[tokio::test]
     async fn waiting_correction_stops_new_tools_and_is_delivered_once_in_same_session() {

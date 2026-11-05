@@ -8,6 +8,8 @@ use tokio::{
 };
 
 pub struct Rpc {
+    /// Opaque digest of the selected provider account, never access/refresh tokens.
+    pub(crate) context_account: Option<String>,
     child: Child,
     input: ChildStdin,
     output: BufReader<ChildStdout>,
@@ -101,10 +103,27 @@ pub(crate) fn guest_command(binary: &str) -> String {
 }
 impl Rpc {
     pub async fn connect(config: &Vm) -> Result<Self> {
+        // account/read exposes only email/plan on supported app-server versions.
+        // Workspace switches can keep the same email, so bind persisted context
+        // to the selected account ID in this dedicated guest sign-in store too.
+        let code = r#"import hashlib,json,pathlib
+try:
+ d=json.loads(pathlib.Path('/home/bot/.local/share/kindred/codex/auth.json').read_text())
+ a=d.get('tokens',{}).get('account_id')
+ print(hashlib.sha256(('kindred-codex-account-v1:'+a).encode()).hexdigest() if isinstance(a,str) and a.strip() else '')
+except Exception: print('')
+"#;
+        let mut probe=vm::ssh(config);
+        probe.arg(format!("python3 -c '{}'",code.replace('\'',"'\"'\"'")));
+        let identity=vm::capture(probe,None,10,1024).await.ok()
+            .and_then(|data|String::from_utf8(data).ok()).map(|s|s.trim().to_owned())
+            .filter(|s|s.len()==64&&s.bytes().all(|b|b.is_ascii_hexdigit()));
         let mut cmd = vm::ssh(config);
         // Dedicated guest auth store; never touch the operator's regular Codex installation.
         cmd.arg(guest_command(&config.codex_binary));
-        Self::spawn(cmd).await
+        let mut rpc=Self::spawn(cmd).await?;
+        rpc.context_account=identity;
+        Ok(rpc)
     }
     pub async fn spawn(mut cmd: Command) -> Result<Self> {
         cmd.stdin(Stdio::piped())
@@ -115,6 +134,7 @@ impl Rpc {
             .spawn()
             .context("start Codex app-server inside the VM")?;
         let mut rpc = Self {
+            context_account: if cfg!(test) {Some("synthetic-protocol-fixture".into())} else {None},
             input: child.stdin.take().unwrap(),
             output: BufReader::new(child.stdout.take().unwrap()),
             child,
