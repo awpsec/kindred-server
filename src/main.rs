@@ -150,6 +150,7 @@ mod server_update;
 mod workflow_recovery_tests;
 mod workspace_import;
 mod workspace_transfer;
+mod workspace_migration;
 
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};

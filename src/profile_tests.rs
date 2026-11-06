@@ -1667,3 +1667,27 @@ async fn account_management_rechecks_admin_after_external_writer_lock() {
  let (status,_)=f.request("POST","/identity/admin",bt,json!({"action":"disable","user_id":target,"disabled":true})).await;release.join().unwrap();assert_eq!(status,400);
  let disabled:bool=f.p.registry.lock().unwrap().query_row("SELECT disabled FROM accounts WHERE id=?",[target],|r|r.get(0)).unwrap();assert!(!disabled);
 }
+
+#[tokio::test]
+async fn complete_migration_routes_are_origin_checked_and_profile_scoped() {
+    let f=Fixture::new(false);
+    for name in ["migration-worker.py","migration-files.py","migration-journal.py","vm-manager.py"] {
+        std::fs::copy(Path::new(env!("CARGO_MANIFEST_DIR")).join("deploy").join(name),f.root.join(name)).unwrap();
+    }
+    let owner=f.register("migration-owner").await;
+    let stranger=f.register("migration-other").await;
+    let token=owner["token"].as_str().unwrap();let other=stranger["token"].as_str().unwrap();
+    let id=uuid::Uuid::new_v4().to_string();
+    assert!(!f.request("POST","/identity/migration","",json!({"action":"preflight"})).await.0.is_success());
+    let (status,prepared)=f.request("POST","/identity/migration",token,json!({"action":"prepare","id":id,"peer":{"server":"https://destination.invalid","profile":uuid::Uuid::new_v4()}})).await;
+    assert_eq!(status,200,"{prepared}");
+    let (_,own)=f.request("POST","/identity/migration",token,json!({"action":"status","id":id})).await;
+    assert_eq!(own["state"],"prepared");assert!(own.get("activation_secret").is_none());
+    let (_,other_status)=f.request("POST","/identity/migration",other,json!({"action":"status","id":id,"profile":owner["profile_id"]})).await;
+    assert_eq!(other_status["state"],"absent");
+    assert!(!f.request("POST","/identity/migration",other,json!({"action":"cancel","id":id})).await.0.is_success());
+    let mut headers=HeaderMap::new();headers.insert(header::AUTHORIZATION,format!("Bearer {token}").parse().unwrap());
+    headers.insert(header::ORIGIN,"https://attacker.invalid".parse().unwrap());
+    assert!(migration_request(State(f.p.clone()),headers,Json(json!({"action":"cancel","id":id}))).await.is_err());
+    assert_eq!(f.request("POST","/identity/migration",token,json!({"action":"cancel","id":id})).await.0,200);
+}

@@ -50,17 +50,39 @@ pub fn save_credential(app: &App, name: &str, environment: &str, key: &str) -> R
     }
     save_credential_at(key_path(app), name, key)
 }
+static CREDENTIAL_WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub(crate) fn save_credential_at(path: PathBuf, name: &str, key: &str) -> Result<()> {
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _guard = LOCK
+    let _guard = CREDENTIAL_WRITE
         .lock()
         .map_err(|_| anyhow::anyhow!("Credential store unavailable"))?;
-    let mut keys: serde_json::Map<String, Value> = match std::fs::read(&path) {
-        Ok(bytes) => serde_json::from_slice(&bytes)?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Default::default(),
-        Err(e) => return Err(e.into()),
-    };
+    let mut keys = read_credential_store(&path)?;
     keys.insert(name.into(), json!(key));
+    write_credential_store(&path, &keys)
+}
+
+fn read_credential_store(path: &std::path::Path) -> Result<serde_json::Map<String, Value>> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Default::default()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+pub(crate) fn merge_migration_credentials(path: &std::path::Path, incoming: &serde_json::Map<String, Value>) -> Result<()> {
+    let _guard = CREDENTIAL_WRITE.lock().map_err(|_| anyhow::anyhow!("Credential store unavailable"))?;
+    let mut keys = read_credential_store(path)?;
+    for (name, value) in incoming {
+        let value = value.as_str().ok_or_else(|| anyhow::anyhow!("Invalid transferred credential"))?;
+        if value.is_empty() { continue; }
+        ensure!(keys.get(name).and_then(Value::as_str).is_none_or(|old| old.is_empty() || old == value),
+            "The destination account's connection settings changed. Reconcile its API keys before resuming migration.");
+        keys.insert(name.clone(), json!(value));
+    }
+    write_credential_store(path, &keys)
+}
+
+fn write_credential_store(path: &std::path::Path, keys: &serde_json::Map<String, Value>) -> Result<()> {
     let temporary = path.with_extension(format!("credentials-{}", uuid::Uuid::new_v4().simple()));
     let mut options = std::fs::OpenOptions::new();
     options.create_new(true).write(true);
@@ -72,7 +94,9 @@ pub(crate) fn save_credential_at(path: PathBuf, name: &str, key: &str) -> Result
     let mut file = options.open(&temporary)?;
     file.write_all(serde_json::to_vec(&keys)?.as_slice())?;
     file.sync_all()?;
-    std::fs::rename(&temporary, &path)?;
+    std::fs::rename(&temporary, path)?;
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() { std::fs::File::open(parent)?.sync_all()?; }
     Ok(())
 }
 pub fn default_apps() -> Value {

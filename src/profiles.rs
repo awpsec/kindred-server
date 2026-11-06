@@ -413,6 +413,7 @@ pub fn router(portal: Portal) -> Router {
             "/identity/transfer",
             get(transfer_status).post(transfer_prepare),
         )
+        .route("/identity/migration", post(migration_request).layer(DefaultBodyLimit::max(6 * 1024 * 1024)))
         .route("/identity/transfer/cancel", post(transfer_cancel))
         .route("/identity/transfer/finish", post(transfer_finish))
         .route(
@@ -486,7 +487,7 @@ async fn meta(State(p): State<Portal>) -> ApiResult {
     let registration=p.registration_open(&c)?;
     drop(c);
     Ok(Json(
-        json!({"docker_network":network_settings::meta(&p),"profiles":true,"server_chats":true,"mobile_pairing":true,"mobile_pairing_private_http":true,"connection_access":true,"connection_policy_digest":p.config.connection_policy_digest(),"deployment":if std::env::var("KINDRED_DEPLOYMENT").as_deref()==Ok("standalone"){"standalone"}else{"hosted"},"first_user":first,"legacy_claim":first&&p.legacy.is_some(),"registration":registration,"version":env!("CARGO_PKG_VERSION")}),
+        json!({"docker_network":network_settings::meta(&p),"workspace_migration":1,"profiles":true,"server_chats":true,"mobile_pairing":true,"mobile_pairing_private_http":true,"connection_access":true,"connection_policy_digest":p.config.connection_policy_digest(),"deployment":if std::env::var("KINDRED_DEPLOYMENT").as_deref()==Ok("standalone"){"standalone"}else{"hosted"},"first_user":first,"legacy_claim":first&&p.legacy.is_some(),"registration":registration,"version":env!("CARGO_PKG_VERSION")}),
     ))
 }
 async fn register(State(p): State<Portal>, headers: HeaderMap, Json(v): Json<Value>) -> ApiResult {
@@ -1262,6 +1263,14 @@ async fn remove_account(
     Ok(Json(json!({"removed":true})))
 }
 
+async fn migration_request(State(p): State<Portal>, headers: HeaderMap, Json(v): Json<Value>) -> ApiResult {
+    p.origin(&headers)?;
+    let id=p.identity(bearer(&headers))?;
+    ensure!(!id.legacy, "Sign in to the account that owns this workspace before migrating");
+    let app=p.app(&id.profile)?;
+    Ok(Json(crate::workspace_migration::request(&app,p.account_credential_path(&id.profile)?,v).await?))
+}
+
 async fn transfer_status(State(p): State<Portal>, headers: HeaderMap) -> ApiResult {
     p.origin(&headers)?;
     let id = p.identity(bearer(&headers))?;
@@ -1411,13 +1420,15 @@ async fn dispatch(State(p): State<Portal>, mut request: Request<Body>) -> Respon
             Err(e) => match e {},
         };
     };
-    if protected
-        && !matches!(
-            *request.method(),
-            axum::http::Method::GET | axum::http::Method::HEAD
-        )
-        && target.db.transfer_status().is_ok_and(|s| !s.is_null())
-    {
+    let mutating = protected && !matches!(*request.method(), axum::http::Method::GET | axum::http::Method::HEAD);
+    let paused = || target.db.transfer_status().is_ok_and(|s| !s.is_null());
+    // Keep history readable while a large computer snapshot is being copied.
+    // New writes fail promptly once fenced instead of waiting behind the copy.
+    if mutating && paused() {
+        return (StatusCode::CONFLICT,Json(json!({"error":"This workspace is paused for a server transfer. Open Profile settings to resume or cancel it."}))).into_response();
+    }
+    let _migration = if mutating { Some(target.migration_barrier.read().await) } else { None };
+    if mutating && paused() {
         return (StatusCode::CONFLICT,Json(json!({"error":"This workspace is paused for a server transfer. Open Profile settings to resume or cancel it."}))).into_response();
     }
     if protected {
@@ -1426,7 +1437,7 @@ async fn dispatch(State(p): State<Portal>, mut request: Request<Body>) -> Respon
             format!("Bearer {}", target.token).parse().unwrap(),
         );
     }
-    match web::router(target).oneshot(request).await {
+    match web::router(target.clone()).oneshot(request).await {
         Ok(response) => response,
         Err(e) => match e {},
     }

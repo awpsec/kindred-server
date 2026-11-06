@@ -94,7 +94,7 @@ pub fn migrate(c: &Connection) -> Result<()> {
 }
 pub fn frozen(c: &Connection) -> Result<bool> {
     Ok(c.query_row(
-        "SELECT EXISTS(SELECT 1 FROM workspace_transfers WHERE state IN ('prepared','moved'))",
+        "SELECT EXISTS(SELECT 1 FROM workspace_transfers WHERE state IN ('prepared','moved')) OR EXISTS(SELECT 1 FROM settings WHERE key='_migration_gate')",
         [],
         |r| r.get(0),
     )?)
@@ -143,6 +143,9 @@ fn identifier(id: &str) -> Result<()> {
 impl Db {
     pub fn transfer_status(&self) -> Result<Value> {
         let c = self.0.lock().unwrap();
+        if let Some(gate)=c.query_row("SELECT value FROM settings WHERE key='_migration_gate'",[],|r|r.get::<_,String>(0)).optional()? {
+            let mut value:Value=serde_json::from_str(&gate)?;value["state"]=json!("prepared");value["complete_migration"]=json!(true);return Ok(value);
+        }
         let transfer:Option<(String,String,String)>=c.query_row("SELECT id,state,destination FROM workspace_transfers WHERE state IN ('prepared','moved') LIMIT 1",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
         Ok(match transfer {
             Some((id, state, destination)) => {
@@ -155,6 +158,7 @@ impl Db {
         identifier(id)?;
         let mut c = self.0.lock().unwrap();
         let tx = c.transaction()?;
+        ensure!(!tx.query_row("SELECT EXISTS(SELECT 1 FROM settings WHERE key='_migration_gate')",[],|r|r.get::<_,bool>(0))?, "Resume or cancel the complete profile migration before starting another transfer");
         if let Some((state, package)) = tx
             .query_row(
                 "SELECT state,package FROM workspace_transfers WHERE id=?",

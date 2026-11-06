@@ -312,6 +312,37 @@ class MemoryCapacity(unittest.TestCase):
             self.assertEqual(manager.memory_available(meminfo,root,membership),3*1024**3)
             self.assertEqual(manager.cpu_capacity(root,membership),1)
 
+    def test_clean_inactive_cache_is_available_but_dirty_mapped_and_anon_are_not(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary);meminfo=root/'meminfo';meminfo.write_text('MemAvailable: 8192 kB\n')
+            membership=root/'membership';membership.write_text('0::/\n')
+            (root/'memory.max').write_text('3000000');(root/'memory.current').write_text('2800000')
+            (root/'memory.stat').write_text('inactive_file 1000000\nfile_dirty 100000\nfile_writeback 200000\nfile_mapped 100000\nanon 1800000\nactive_file 900000\n')
+            self.assertEqual(manager.memory_available(meminfo,root,membership),800000)
+            meminfo.write_text('MemAvailable: 512 kB\n')
+            self.assertEqual(manager.memory_available(meminfo,root,membership),512*1024)
+            (root/'memory.stat').write_text('inactive_file 100000\nfile_dirty 900000\n')
+            self.assertEqual(manager.memory_available(meminfo,root,membership),200000)
+            (root/'memory.stat').write_text('not a valid counter\n')
+            self.assertEqual(manager.memory_available(meminfo,root,membership),200000)
+
+    def test_cache_discount_respects_parent_and_legacy_hierarchical_counters(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary);child=root/'service';child.mkdir()
+            meminfo=root/'meminfo';meminfo.write_text('MemAvailable: 8192 kB\n')
+            membership=root/'membership';membership.write_text('0::/service\n')
+            for group in (root,child):
+                (group/'memory.max').write_text('3000000');(group/'memory.current').write_text('2800000')
+            (child/'memory.stat').write_text('inactive_file 1000000\n')
+            self.assertEqual(manager.memory_available(meminfo,root,membership),200000)
+            (root/'memory.stat').write_text('inactive_file 500000\n')
+            self.assertEqual(manager.memory_available(meminfo,root,membership),700000)
+            (root/'memory.max').unlink();(child/'memory.max').unlink()
+            membership.write_text('5:memory:/service\n')
+            (child/'memory.limit_in_bytes').write_text('3000000');(child/'memory.usage_in_bytes').write_text('2800000')
+            (child/'memory.stat').write_text('inactive_file 9000000\ntotal_inactive_file 1000000\ntotal_dirty 100000\ntotal_writeback 100000\ntotal_mapped_file 100000\n')
+            self.assertEqual(manager.memory_available(meminfo,root,membership),900000)
+
     def test_existing_vm_is_rejected_before_media_when_cpu_quota_shrinks(self):
         with tempfile.TemporaryDirectory() as temporary:
             root=Path(temporary)

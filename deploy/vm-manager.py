@@ -181,7 +181,7 @@ def prepare(root, profile):
     if metadata.exists(): return json.loads(metadata.read_text())
     resources=initial_resources(root)
     validate_resource_capacity(resources)
-    base=base_image()
+    if not (root/'disk.qcow2').exists(): base_image()
     for name in ('ssh_client','ssh_host_ed25519_key'):
         if not (root/name).exists(): run(['ssh-keygen','-q','-t','ed25519','-N','','-f',root/name])
     with locked(ROOT/'allocation.lock'):
@@ -301,6 +301,20 @@ def legacy_cgroups(controller, mount, membership):
                 group=group.parent
     return groups
 
+def clean_inactive_cache(group, usage, legacy=False):
+    # Disk copies can fill the cgroup page cache without consuming its usable
+    # RAM budget. Discount only cold, clean, unmapped file pages; never anon,
+    # shared memory, dirty/writeback pages or active cache. Host MemAvailable
+    # and every parent cgroup still bound admission below.
+    try:
+        values={key:int(value) for key,value in (line.split() for line in (group/'memory.stat').read_text().splitlines())}
+        prefix='total_' if legacy else ''
+        cold=values.get(prefix+'inactive_file',0)
+        protected=sum(values.get(prefix+key,0) for key in (('dirty','writeback','mapped_file') if legacy else ('file_dirty','file_writeback','file_mapped')))
+        return min(max(0,usage),max(0,cold-protected))
+    except (OSError,ValueError):
+        return 0
+
 def memory_available(meminfo=Path('/proc/meminfo'), cgroup_root=Path('/sys/fs/cgroup'), membership=Path('/proc/self/cgroup')):
     available=next(int(line.split()[1])*1024 for line in meminfo.read_text().splitlines() if line.startswith('MemAvailable:'))
     cgroup_root=cgroup_root.resolve()
@@ -318,11 +332,13 @@ def memory_available(meminfo=Path('/proc/meminfo'), cgroup_root=Path('/sys/fs/cg
     for group in groups:
         limit=group/'memory.max';used=group/'memory.current'
         if limit.is_file() and used.is_file() and limit.read_text().strip()!='max':
-            available=min(available,int(limit.read_text())-int(used.read_text()))
+            usage=int(used.read_text())
+            available=min(available,int(limit.read_text())-usage+clean_inactive_cache(group,usage))
     for group in legacy_cgroups('memory',cgroup_root,membership):
         limit=group/'memory.limit_in_bytes';used=group/'memory.usage_in_bytes'
         if limit.is_file() and used.is_file():
-            available=min(available,int(limit.read_text())-int(used.read_text()))
+            usage=int(used.read_text())
+            available=min(available,int(limit.read_text())-usage+clean_inactive_cache(group,usage,legacy=True))
     return max(0,available)
 
 def require_running(root):
@@ -359,7 +375,26 @@ def launch(root, args):
     require_running(root)
     (root/'startup-error.log').unlink(missing_ok=True)
 
-def start(root, profile):
+def migration_paused(root):
+    if (root.parent/'.migration-vm.json').exists(): return True
+    # The database gate is committed before the file fence. A host crash in
+    # between must not let startup recovery boot a second copy of the VM.
+    database=root.parent/'kindred.db'
+    if not database.exists(): return False
+    import sqlite3
+    try:
+        connection=sqlite3.connect(database.as_uri()+'?mode=ro',uri=True,timeout=5)
+        try:
+            if not connection.execute("SELECT 1 FROM sqlite_master WHERE name='settings'").fetchone(): return False
+            return connection.execute("SELECT 1 FROM settings WHERE key='_migration_gate'").fetchone() is not None
+        finally: connection.close()
+    except sqlite3.Error as error:
+        raise ValueError('Cannot verify computer migration state. Retry after the workspace database is available.') from error
+
+
+def start(root, profile, migration_check=False):
+    if migration_paused(root) and not migration_check:
+        raise ValueError('This computer is paused for workspace migration. Resume or cancel the move before starting it.')
     settings=prepare(root,profile)
     # Existing running computers must not depend on downloading or repackaging
     # installation media after a server update.
@@ -384,7 +419,7 @@ def start(root, profile):
               '-drive',f'file={root}/disk.qcow2,if=virtio,format=qcow2',
               '-drive',f'file={root}/seed.iso,media=cdrom,readonly=on,index=0',
               '-drive',f'file={software},media=cdrom,readonly=on,index=1',
-              '-netdev',f"user,id=network,ipv6=off,hostfwd=tcp:127.0.0.1:{settings['port']}-:22",'-device','virtio-net-pci,netdev=network',
+              '-netdev',f"user,id=network,ipv6=off,hostfwd=tcp:127.0.0.1:{settings['port']}-:22"+(',restrict=on' if migration_check else ''),'-device','virtio-net-pci,netdev=network',
               '-qmp',f'unix:{root}/monitor.sock,server=on,wait=off','-serial',f'file:{root}/console.log','-pidfile',root/'qemu.pid','-daemonize']
         launch(root,args)
     return settings
@@ -541,8 +576,9 @@ def restore_computers():
         try:
             identifier(profile)
             with locked(ROOT/'_operations'/profile):
-                if (ROOT/'_retired'/profile).exists(): continue
+                if (ROOT/'_retired'/profile).exists() or (ROOT/profile/'.migration-vm.json').exists(): continue
                 root=directory(profile)
+                if migration_paused(root): continue
                 intent=root/'power-intent.json'
                 # Pre-feature computers have no intent record. Opt them into
                 # recovery once; explicit shutdown persists an opt-out.

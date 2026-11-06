@@ -21,10 +21,14 @@ def resources():
     if RESOURCES is not None:
         return RESOURCES
     base = Path(__file__).resolve().parent
+    # Source checkouts keep notices beside deploy/. Guest media flattens deploy/
+    # into its root and keeps third-party/ inside that same root.
+    license_path=base/'third-party/agent-desktop/LICENSE.txt'
+    if not license_path.is_file(): license_path=base.parent/'third-party/agent-desktop/LICENSE.txt'
     return {'manifest': json.loads((base/'agent-desktop-manifest.json').read_text()),
             'launcher': (base/'agent-desktop-launch.py').read_text(),
             'skill': (base/'agent-desktop-skill.md').read_text(),
-            'license': (base.parent/'third-party/agent-desktop/LICENSE.txt').read_text()}
+            'license': license_path.read_text()}
 
 
 def verified(data, manifest):
