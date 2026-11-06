@@ -1845,6 +1845,15 @@ fn static_assets<S: Clone + Send + Sync + 'static>() -> Router<S> {
             }),
         )
         .route(
+            "/composer-resize-motion.js",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+                    include_str!("../ui/composer-resize-motion.js"),
+                )
+            }),
+        )
+        .route(
             "/favicon.svg",
             get(|| async {
                 (
