@@ -32,7 +32,7 @@ If the user corrects your responsibilities, merge the new assignment into your m
 
 ## "Monitor my inbox."
 
-If no timing or account has been established, inspect existing routines and use the real inbox setup flow. Resolve which Gmail account and whether the user wants activity monitoring or a timed review. Reuse a settled choice instead of asking again.
+Inspect existing routines and use the real inbox setup flow to resolve the Gmail account. New incoming-mail monitoring uses provider-independent change detection; preserve explicit timed reviews and existing schedule constraints. Reuse a settled choice instead of asking again.
 
 If a matching monitor already exists, inspect its enabled state and health. If it is unhealthy, diagnose that monitor. Do not create a second monitor to make the request appear successful. After saving, describe the actual configuration and avoid promising instantaneous native push when only fast checks are active.
 

@@ -69,6 +69,8 @@ mod deliverables;
 #[cfg(test)]
 mod experience_tests;
 mod gmail_push;
+mod gmail_accounts;
+mod gmail_onboarding;
 mod guest;
 mod instructions;
 mod local_access;

@@ -516,6 +516,38 @@ async def mcp_proxy(socket):
         await send(writer, packet)
         if 'id' in packet: emit(await read(remote))
 
+class ClaudeUsageReconciliation:
+    """Reconcile final output only when native input totals identify this turn.
+
+    Never add a cumulative native result to already recorded message usage.
+    Ambiguous/resumed totals remain untouched instead of inventing spend.
+    """
+    def __init__(self):
+        self.messages = {}
+
+    def observe(self, turn, message, receipt, usage):
+        values = [usage.get(k, 0) for k in ('input_tokens', 'cache_read_input_tokens', 'cache_creation_input_tokens', 'output_tokens')]
+        if not message or not all(type(n) is int and 0 <= n <= 1_000_000_000 for n in values):
+            return
+        self.messages[(turn, message)] = (receipt, values)
+
+    def finish(self, turn, usage):
+        if not isinstance(usage, dict):
+            return None
+        final = [usage.get(k, 0) for k in ('input_tokens', 'cache_read_input_tokens', 'cache_creation_input_tokens', 'output_tokens')]
+        rows = [(key, receipt, values) for key, (receipt, values) in self.messages.items() if key[0] == turn]
+        if not rows or not all(type(n) is int and 0 <= n <= 1_000_000_000 for n in final):
+            return None
+        totals = [sum(v[i] for _, _, v in rows) for i in range(4)]
+        if totals[:3] != final[:3] or final[3] <= totals[3]:
+            return None
+        key, receipt, values = rows[-1]
+        updated = values.copy()
+        updated[3] += final[3] - totals[3]
+        self.messages[key] = (receipt, updated)
+        return {'type': 'usage', 'request_id': receipt, 'input_tokens': sum(updated[:3]),
+                'cached_tokens': updated[1], 'output_tokens': updated[3], 'cost': None, 'cost_source': 'subscription'}
+
 async def worker(provider):
     source = await stdio_reader()
     request = await read(source)
@@ -532,6 +564,7 @@ async def worker(provider):
     child = None
     count = 0
     message_receipts = {}
+    claude_usage = ClaudeUsageReconciliation()
     seen = set()
     output = []
     fragments = []
@@ -732,6 +765,7 @@ async def worker(provider):
                             context_tokens=sum(amounts) if all(type(n) is int and n>=0 for n in amounts) and sum(amounts)>0 else None
                             if message.get('id') not in message_receipts:
                                 receipt += 1; message_receipts[message.get('id')] = receipt
+                            claude_usage.observe(input_id, message.get('id'), message_receipts[message.get('id')], u)
                             emit({'type': 'usage', 'request_id': message_receipts[message.get('id')], 'input_tokens': u.get('input_tokens',0)+u.get('cache_read_input_tokens',0)+u.get('cache_creation_input_tokens',0),
                                   'output_tokens': u.get('output_tokens',0), 'cached_tokens': u.get('cache_read_input_tokens',0), 'cost': None, 'cost_source': 'subscription'})
                         if text:
@@ -740,6 +774,8 @@ async def worker(provider):
                             if not is_error: output.append(text)
                             emit({'type': 'assistant', 'text': text, 'is_error': is_error})
                     if p.get('type') == 'result':
+                        final_usage = claude_usage.finish(input_id, p.get('usage'))
+                        if final_usage: emit(final_usage)
                         if context: context.verify_native(p)
                         native_id=p.get('uuid')
                         if input_id!='initial' and (not isinstance(native_id,str) or not native_id or native_id in native_results):

@@ -12,6 +12,27 @@ from unittest.mock import patch
 HELPER = Path(__file__).with_name('provider-cli.py').resolve()
 spec=importlib.util.spec_from_file_location('bridge', HELPER)
 bridge=importlib.util.module_from_spec(spec);spec.loader.exec_module(bridge)
+class UsageReconciliation(unittest.TestCase):
+    def test_final_output_updates_same_receipt_without_double_counting_input(self):
+        ledger=bridge.ClaudeUsageReconciliation()
+        ledger.observe('first','m1',1,{'input_tokens':10,'cache_read_input_tokens':100,'output_tokens':2})
+        ledger.observe('first','m2',2,{'input_tokens':20,'cache_read_input_tokens':200,'output_tokens':3})
+        final={'input_tokens':30,'cache_read_input_tokens':300,'output_tokens':100}
+        value=ledger.finish('first',final)
+        self.assertEqual((value['request_id'],value['input_tokens'],value['cached_tokens'],value['output_tokens']),(2,220,200,98))
+        self.assertIsNone(ledger.finish('first',final))
+    def test_ambiguous_totals_and_other_turns_never_invent_usage(self):
+        ledger=bridge.ClaudeUsageReconciliation()
+        ledger.observe('first','m',1,{'input_tokens':10,'output_tokens':2})
+        self.assertIsNone(ledger.finish('second',{'input_tokens':10,'output_tokens':100}))
+        self.assertIsNone(ledger.finish('first',{'input_tokens':20,'output_tokens':100}))
+        self.assertIsNone(ledger.finish('first',{'input_tokens':10,'output_tokens':1}))
+        self.assertIsNone(ledger.finish('first',None))
+    def test_repeated_message_receipt_replaces_instead_of_adding(self):
+        ledger=bridge.ClaudeUsageReconciliation()
+        for output in (1,2):ledger.observe('turn','m',1,{'input_tokens':10,'output_tokens':output})
+        self.assertEqual(ledger.finish('turn',{'input_tokens':10,'output_tokens':8})['output_tokens'],8)
+
 LAUNCH = r'''
 import asyncio, importlib.util, json, os, sys
 spec=importlib.util.spec_from_file_location('bridge',sys.argv[1]);m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)

@@ -166,8 +166,8 @@ pub fn tool_specs() -> Vec<Value> {
         ),
         (
             "routines_list",
-            "List this bot's actual saved routines, including Constant activity monitors and scheduled checks. Inspect trigger and monitor health; do not duplicate an existing inbox assignment.",
-            json!({}),
+            "List this bot's routine/monitor summaries and health. Pass id to read full instructions before editing. Reuse existing assignments.",
+            json!({"id":{"type":"string"}}),
             vec![],
         ),
         (
@@ -326,13 +326,13 @@ pub fn tool_specs() -> Vec<Value> {
         ),
         (
             "remember",
-            "Save lasting facts before acknowledging. Append only new facts; overflow is retained. Replacement requires full memory_read in owner DM; preserve unrelated facts. Input ≤64,000 UTF-8 bytes. No passwords. Action scope: work_rule_save.",
-            json!({"text":{"type":"string"},"mode":{"type":"string","enum":["append","replace"]}}),
+            "Save lasting facts before acknowledging. Append new facts; overflow retained. Replace only after full memory_read in owner DM; preserve other facts. ≤64KB UTF-8; no secrets. Action scope: work_rule_save.",
+            json!({"text":{"type":"string","minLength":1,"description":"Memory text goes here, not in body/content."},"mode":{"type":"string","enum":["append","replace"]}}),
             vec!["text"],
         ),
         (
             "skills_list",
-            "List this profile's installed skills, commands, parameters and current_hash for guarded maintenance; explicit-only imports are listed without instructions.",
+            "List skill metadata and current_hash. Read instructions with skill_load before use/edit. Explicit-only imports need a user slash invocation.",
             json!({}),
             vec![],
         ),
@@ -471,14 +471,14 @@ pub fn tool_specs() -> Vec<Value> {
         ),
         (
             "continuity_save",
-            "Save concise decisions, progress and unresolved work under a stable topic; no transcripts or credentials. Read continuity_read before edits. expected_revision: 0 for new, current revision for edits. status: active or closed. user_statement/observation require sources: exact message_seq or event_seq objects from this conversation, never run IDs. Read evidence with continuity_search or receipts_read. Saved claims never authorize repeating actions.",
-            json!({"topic":{"type":"string","maxLength":100},"summary":{"type":"string","maxLength":4000},"expected_revision":{"type":"integer","minimum":0},"status":{"type":"string","enum":["active","closed"]},"kind":{"type":"string","enum":["work","knowledge","preference","checkpoint"]},"statement_kind":{"type":"string","enum":["user_statement","observation","inference"]},"sources":{"type":"array","maxItems":24,"items":{"type":"object","properties":{"message_seq":{"type":"integer"},"event_seq":{"type":"integer"}}}}}),
+            "Save concise sourced progress under a stable topic; no transcripts/secrets. Read continuity_read before edits; revision 0=new. user_statement/observation need real message_seq/event_seq from this conversation, never run IDs. Retrieve via continuity_search/receipts_read. Notes never authorize actions.",
+            json!({"topic":{"type":"string","maxLength":100},"summary":{"type":"string","maxLength":4000},"expected_revision":{"type":"integer","minimum":0},"status":{"type":"string","enum":["active","closed"]},"kind":{"type":"string","enum":["work","knowledge","preference","checkpoint"]},"statement_kind":{"type":"string","enum":["user_statement","observation","inference"]},"sources":{"type":"array","maxItems":24,"items":{"type":"object","properties":{"message_seq":{"type":"integer","minimum":1},"event_seq":{"type":"integer","minimum":1}},"anyOf":[{"required":["message_seq"]},{"required":["event_seq"]}],"additionalProperties":false}}}),
             vec!["topic", "summary", "expected_revision", "status"],
         ),
         (
             "obligation_save",
-            "Retain sourced commitments with a stable key and expected_revision. Saving alone schedules nothing. With initiative enabled in your owner DM, follow_up arranges a best-effort revisit within quiet hours/budgets: next_check is Unix time, 5 minutes to 1 year ahead; stop_when is the completion condition. Omission preserves; null, closure or execution links remove it. Exact timing needs routines/reminders; reminders only notify. Reconcile stale revisions/sources; completion needs evidence.",
-            json!({"key":{"type":"string"},"description":{"type":"string","maxLength":2000},"expected_revision":{"type":"integer"},"status":{"type":"string","enum":["open","waiting","completed","cancelled"]},"sources":{"type":"array","items":{"type":"object","properties":{"message_seq":{"type":"integer"},"event_seq":{"type":"integer"}}}},"link_kind":{"type":"string","enum":["","routine","reminder","run","command"]},"link_id":{"type":"string"},"follow_up":{"type":["object","null"],"properties":{"next_check":{"type":"integer"},"stop_when":{"type":"string","maxLength":500}},"required":["next_check","stop_when"],"additionalProperties":false}}),
+            "Save sourced commitments with stable key/revision; no schedule by default. Owner-DM initiative follow_up: best-effort within quiet hours/budgets, next_check Unix 5min–1year ahead, stop_when condition. Omit=preserve; null/closure/execution link=remove. Exact timing needs routines/reminders; reminders only notify. Reconcile stale sources/revisions; completion needs evidence.",
+            json!({"key":{"type":"string"},"description":{"type":"string","maxLength":2000},"expected_revision":{"type":"integer"},"status":{"type":"string","enum":["open","waiting","completed","cancelled"]},"sources":{"type":"array","items":{"type":"object","properties":{"message_seq":{"type":"integer","minimum":1},"event_seq":{"type":"integer","minimum":1}},"anyOf":[{"required":["message_seq"]},{"required":["event_seq"]}],"additionalProperties":false}},"link_kind":{"type":"string","enum":["","routine","reminder","run","command"]},"link_id":{"type":"string"},"follow_up":{"type":["object","null"],"properties":{"next_check":{"type":"integer"},"stop_when":{"type":"string","maxLength":500}},"required":["next_check","stop_when"],"additionalProperties":false}}),
             vec!["key","description","expected_revision","status","sources"],
         ),
         (
@@ -626,19 +626,24 @@ pub fn tool_specs() -> Vec<Value> {
         ),
         (
             "inbox_monitor_setup",
-            "Guide Gmail monitoring if timing is unspecified. Supply known account_id and alert instructions. Reuse topic_key across continuations. Change it only for explicit reconfiguration. Returns inbox/connection and activity/timed/custom choices. Claude Gmail supports source=claude scheduled AI reviews without reconnection. Creates no routine. Follow returned decisions and continuation guidance. If timing is known, inspect connections/routines and save without asking again.",
+            "Set up Gmail events for any bot. Reuse topic_key. Returns accounts or a secure connection card; creates no monitor. Omit source; claude/kindred retain legacy timing flows. Never request secrets in chat. Follow returned guidance.",
             json!({"source":{"type":"string","enum":["kindred","claude"]},"connector_key":{"type":"string"},"topic_key":{"type":"string","maxLength":100},"account_id":{"type":"string"},"account_name":{"type":"string","maxLength":80},"instructions":{"type":"string","maxLength":4000}}),
             vec!["topic_key"],
         ),
         (
+            "inbox_message_read",
+            "Read message_id assigned to this active Gmail monitor using its bound read-only account. No send permission.",
+            json!({"message_id":{"type":"string"}}),vec!["message_id"],
+        ),
+        (
             "inbox_monitors_list",
-            "List this bot's Gmail inbox monitors and their actual health. Fast mode checks Gmail history every 15 seconds without starting AI tasks on empty checks. Push mode needs Google Cloud setup; never claim push is active from a browser login or a saved monitor alone.",
+            "List this bot's Gmail monitors, accounts and actual health. Unchanged checks use no AI. Saved configuration or browser login does not prove event delivery.",
             json!({}),
             vec![],
         ),
         (
             "inbox_monitor_save",
-            "Save this bot's Constant Gmail routine for a connected account. Prefer routine_create with trigger=activity for new setup. Use inbox_monitor_setup if timing is unspecified. Reuse matching routines. Define alerts and finish_quietly conditions. Checks default to 15 seconds without AI empty checks. Configure native push in Routines. Normal approval applies. Grants no email action permissions. Report actual health.",
+            "Save Gmail monitoring; any bot provider. Connect with inbox_monitor_setup; reuse inbox_monitors_list matches. Define alerts/finish_quietly. Default 15s checks use no AI when unchanged. Manage in Connections → Gmail. Normal approval; no send grants. Report actual health.",
             json!({"id":{"type":"string"},"account_id":{"type":"string"},"name":{"type":"string"},"instructions":{"type":"string","maxLength":16000}}),
             vec!["account_id", "name", "instructions"],
         ),
@@ -913,11 +918,12 @@ async fn call_tool_inner(
             json!({"text":serde_json::to_string(&app.db.decisions_for_run(run,args["topic_key"].as_str())?)?})
         }
         "routines_list" => {
-            json!({"text":serde_json::to_string(&crate::mail_watch::routines(&app.db)?.into_iter().filter(|r|r["bot_id"]==bot.id).collect::<Vec<_>>())?})
+            json!({"text":crate::mail_watch::directory(&app.db,&bot.id,args["id"].as_str())?.to_string()})
         }
         "inbox_monitor_setup" => crate::mail_watch::setup(app, bot, run, &args)?,
+        "inbox_message_read" => crate::mail_watch::read_message(app,run,string(&args,"message_id")?).await?,
         "inbox_monitors_list" => {
-            json!({"text":serde_json::to_string(&crate::mail_watch::watches(&app.db)?.into_iter().filter(|w|w.input.bot_id==bot.id).collect::<Vec<_>>())?})
+            json!({"text":crate::gmail_onboarding::view(app,Some(&bot.id))?.to_string()})
         }
         "inbox_monitor_save" => {
             json!({"text":serde_json::to_string(&crate::mail_watch::save_for_bot(app,bot,&args).await?)?})
@@ -1124,11 +1130,7 @@ async fn call_tool_inner(
         }
         "remember" => json!({"text":crate::memory_maintenance::remember(&app.db,run,&args)?.to_string()}),
         "skills_list" => {
-            let mut skills=app.db.skills()?;
-            for skill in &mut skills {
-                if skill["import"].is_object() {skill.as_object_mut().unwrap().remove("body");}
-            }
-            json!({"text":serde_json::to_string(&skills)?})
+            json!({"text":serde_json::to_string(&crate::skill_import::directory(&app.db)?)?})
         }
         "skill_load" => crate::skill_import::materialize(app, run, string(&args, "name")?).await?,
         "skill_import_local" => crate::skill_import::local(app, bot, run, &args).await?,

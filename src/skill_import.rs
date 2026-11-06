@@ -542,6 +542,19 @@ fn invocation_instructions(db: &Db, run: &Run, name: &str, package: &Value) -> R
     }
     Ok(package["body"].as_str().unwrap_or("").into())
 }
+/// Discovery carries metadata, never every installed workflow's instructions.
+/// Full bodies and queued invocation snapshots remain available through skill_load.
+pub fn directory(db: &Db) -> Result<Vec<Value>> {
+    let mut skills = db.skills()?;
+    for skill in &mut skills {
+        let row = skill.as_object_mut().context("Invalid saved skill")?;
+        let bytes = row.remove("body").and_then(|v| v.as_str().map(str::len)).unwrap_or(0);
+        row.insert("instruction_bytes".into(), json!(bytes));
+        row.insert("read_with".into(), json!("skill_load"));
+    }
+    Ok(skills)
+}
+
 pub async fn materialize(app: &App, run: &Run, name: &str) -> Result<Value> {
     let package = run_package(&app.db, run, name)?;
     let instructions = invocation_instructions(&app.db, run, name, &package)?;
@@ -635,6 +648,9 @@ mod tests {
             .await
             .unwrap();
         assert!(listed["text"].as_str().unwrap().contains("Weekly report"));
+        let directory: Value = serde_json::from_str(listed["text"].as_str().unwrap()).unwrap();
+        assert!(directory.as_array().unwrap().iter().all(|s|s.get("body").is_none()));
+        assert!(!listed["text"].as_str().unwrap().contains(lesson));
         let loaded = crate::runtime::call_tool(
             &app,
             &bot,

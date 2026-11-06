@@ -444,10 +444,15 @@ pub fn router(portal: Portal) -> Router {
             "/hooks/gmail/{id}",
             post(gmail_push).layer(DefaultBodyLimit::max(65536)),
         )
+        .route("/oauth/gmail/callback",get(gmail_oauth))
         .fallback(dispatch)
         .layer(DefaultBodyLimit::max(16 * 1024))
         .layer(axum::middleware::from_fn(web::headers))
         .with_state(portal)
+}
+async fn gmail_oauth(State(p):State<Portal>, axum::extract::Query(v):axum::extract::Query<crate::gmail_accounts::Callback>)->Response {
+    let app=p.apps.lock().unwrap().values().find(|app|crate::gmail_accounts::owns_state(app,&v.state)).cloned();
+    crate::gmail_accounts::callback_response(match app {Some(app)=>crate::gmail_accounts::complete(&app,v).await,None=>Err(anyhow::anyhow!("Unknown or expired authorization"))})
 }
 async fn gmail_push(
     State(p): State<Portal>,

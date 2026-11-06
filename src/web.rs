@@ -167,6 +167,9 @@ pub fn router(app: Shared) -> Router {
             get(crate::mail_watch::list).post(crate::mail_watch::save),
         )
         .route("/inbox-monitors/{id}/pause", post(crate::mail_watch::pause))
+        .route("/gmail-setup/{id}/complete",post(crate::gmail_onboarding::complete))
+        .route("/gmail-connections/start", post(crate::gmail_accounts::start))
+        .route("/gmail-connections/{id}", axum::routing::delete(crate::gmail_accounts::disconnect))
         .route("/slack-monitoring", get(crate::slack_watch::list))
         .route("/slack-setup/{id}/complete", post(crate::slack_watch::complete_setup_route))
         .route("/slack-connections", post(crate::slack_watch::connect))
@@ -255,6 +258,7 @@ pub fn router(app: Shared) -> Router {
         .route("/codex/{action}", post(codex))
         .route_layer(middleware::from_fn_with_state(app.clone(), authenticate));
     Router::new()
+        .route("/oauth/gmail/callback",get(crate::gmail_accounts::callback))
         .route(
             "/hooks/gmail/{id}",
             post(gmail_push).layer(DefaultBodyLimit::max(65536)),
@@ -1774,6 +1778,7 @@ fn static_assets<S: Clone + Send + Sync + 'static>() -> Router<S> {
                 )
             }),
         )
+        .route("/gmail-monitoring.js", get(|| async { ([(header::CONTENT_TYPE,"text/javascript; charset=utf-8")],include_str!("../ui/gmail-monitoring.js")) }))
         .route("/slack-monitoring.js", get(|| async { ([(header::CONTENT_TYPE,"text/javascript; charset=utf-8")],include_str!("../ui/slack-monitoring.js")) }))
         .route("/voice.js", get(|| async { ([(header::CONTENT_TYPE,"text/javascript; charset=utf-8")],include_str!("../ui/voice.js")) }))
         .route("/voice-audio-worklet.js", get(|| async { ([(header::CONTENT_TYPE,"text/javascript; charset=utf-8")],include_str!("../ui/voice-audio-worklet.js")) }))

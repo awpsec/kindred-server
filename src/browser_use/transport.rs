@@ -11,6 +11,7 @@ const MAX_RESPONSE: usize = 128 * 1024;
 pub(super) struct DecisionReceipt {
     pub choice: String,
     pub request_id: Option<String>,
+    pub usage: Value,
 }
 
 pub struct OpenAiDecisions {
@@ -106,7 +107,7 @@ impl OpenAiDecisions {
             .map_err(|_| anyhow::anyhow!("Decisions returned invalid JSON"))?;
         let request_id=response.headers().get("x-request-id").and_then(|v|v.to_str().ok())
             .filter(|v|v.len()<=128 && v.bytes().all(|b|b.is_ascii_alphanumeric() || b"_-".contains(&b))).map(str::to_owned);
-        Ok(DecisionReceipt {choice:validate_answer(input, &value)?,request_id})
+        Ok(DecisionReceipt {choice:validate_answer(input, &value)?,request_id,usage:value["usage"].clone()})
     }
 }
 impl Decisions for OpenAiDecisions {

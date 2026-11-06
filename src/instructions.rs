@@ -7,7 +7,7 @@ use anyhow::{Result, bail};
 use rusqlite::OptionalExtension;
 use serde_json::{Value, json};
 
-pub const VERSION: &str = "45";
+pub const VERSION: &str = "46";
 /// Provider harnesses keep the operating contract stable and append this live
 /// task snapshot after retained conversation history. Never split on user text.
 pub const LIVE_BOUNDARY: &str = "\n# Current Kindred task context\n";
@@ -112,10 +112,10 @@ pub fn build(
     crate::continuity::store::start_session(&app.db,run,&bot.provider,&bot.model)?;
     let private_destination=run.chat_id==format!("dm-{}",bot.id);
     crate::conversation_updates::record_runtime_context(&app.db, run)?;
-    // API models retrieve reference chapters through kindred_guide. A larger
-    // context window should not force the entire manual into every request.
-    // Keep existing capacity-based live-context budgets and CLI guide behavior.
-    let full_guide = context_window.is_none();
+    // Every harness can retrieve the exact reference chapters with kindred_guide.
+    // Unknown CLI context capacity must not inject the entire manual each turn.
+    // Keep the complete core contract and existing live-context budgets.
+    let full_guide = false;
     let full = context_window.is_none_or(|n| n >= 128_000);
     let is_routine: bool = app.db.0.lock().unwrap().query_row(
         "SELECT EXISTS(SELECT 1 FROM routine_runs WHERE run_id=?)",
@@ -388,11 +388,11 @@ mod tests {
         let b = bot(&app.db, "claude-code");
         let id = app.db.queue(&b.id, "Check for updates", 0).unwrap();
         let run = app.db.run(&id).unwrap();
-        let tools = runtime::tool_specs_for(&app, &b);
+        let tools = crate::tool_catalog::advertised(&app, &b, &run);
         assert!(!build(&app, &b, &run, &tools, Some(128000)).unwrap().contains("Scheduled reporting:"));
         assert!(!tools.iter().any(|t|t["name"]=="routine_complete"));
         app.db.0.lock().unwrap().execute("INSERT INTO routine_runs VALUES(?,'fixture',0)", [&id]).unwrap();
-        let tools=runtime::tool_specs_for_run(&app,&b,&run);
+        let tools=crate::tool_catalog::advertised(&app,&b,&run);
         assert!(tools.iter().any(|t|t["name"]=="routine_complete"));
         for window in [None, Some(32768), Some(128000), Some(200000)] {
             let text = build(&app, &b, &run, &tools, window).unwrap();
@@ -414,12 +414,12 @@ mod tests {
         app.db.save_bot(&other).unwrap();
         let id = app.db.queue(&b.id, "Continue", 0).unwrap();
         let run = app.db.run(&id).unwrap();
-        let tools = runtime::tool_specs_for(&app, &b);
+        let tools = crate::tool_catalog::advertised(&app, &b, &run);
         let full = build(&app, &b, &run, &tools, None).unwrap();
         let compact = build(&app, &b, &run, &tools, Some(32768)).unwrap();
         assert!(full.starts_with(CORE) && compact.starts_with(BOUNDED_CORE));
-        assert!(full.len() > compact.len() + 70000);
-        assert_eq!(packet(&full)["guide_tier"], "full");
+        assert!(full.len() > compact.len());
+        assert_eq!(packet(&full)["guide_tier"], "core_with_reference_tool");
         assert_eq!(
             packet(&build(&app, &b, &run, &tools, Some(128000)).unwrap())["guide_tier"],
             "core_with_reference_tool"
@@ -429,7 +429,7 @@ mod tests {
             "core_with_reference_tool"
         );
         let large = build(&app, &b, &run, &tools, Some(200000)).unwrap();
-        assert!(full.len() > large.len() + 70000);
+        assert!(full.len().abs_diff(large.len()) < 100);
         assert_eq!(packet(&large)["bot"], packet(&full)["bot"]);
         assert_eq!(packet(&large)["conversation"], packet(&full)["conversation"]);
         // Saved-login guidance must survive compact context assembly, rather
@@ -457,7 +457,8 @@ mod tests {
         assert_eq!(p["bot"]["configured_model_selector"], b.model);
         assert!(!full.contains("OTHER_PRIVATE_MEMORY_SENTINEL"));
         let names:Vec<_> = tools.iter().map(|tool|tool["name"].clone()).collect();
-        assert!(names.contains(&json!("local_access_status"))&&names.contains(&json!("kindred_guide")));
+        assert!(names.contains(&json!("tool_describe"))&&names.contains(&json!("kindred_guide")));
+        assert!(crate::tool_catalog::describe(&app,&b,&run,&json!({"names":["local_access_status"]})).is_ok());
         assert!(!names.contains(&json!("local_exec")));
         if let Some(duplicate)=p["environment"]["available_tool_names"].as_array() {
             assert_eq!(duplicate,&names);
@@ -471,7 +472,7 @@ mod tests {
         b.name="Oliver".into();b.instructions="You are Oliver, the coordinator.".into();app.db.save_bot(&b).unwrap();
         let stale=b.clone();b.name="Piper".into();app.db.save_bot(&b).unwrap();
         let id=app.db.queue(&b.id,"Who are you?",0).unwrap();let run=app.db.run(&id).unwrap();
-        let tools=runtime::tool_specs_for(&app,&b);
+        let tools=crate::tool_catalog::advertised(&app,&b,&run);
         for window in [None,Some(32768)] {
             let value=packet(&build(&app,&stale,&run,&tools,window).unwrap());
             assert_eq!(value["bot"]["name"],"Piper");
@@ -538,10 +539,10 @@ mod routine_catalogue_tests {
    let direct=app.db.queue(&bot.id,"Direct synthetic task",0).unwrap();
    let scheduled=app.db.queue(&bot.id,"Scheduled synthetic task",0).unwrap();
    app.db.0.lock().unwrap().execute("INSERT INTO routine_runs VALUES(?,'synthetic',0)",[&scheduled]).unwrap();
-   let run=app.db.run(&direct).unwrap();let tools=crate::runtime::tool_specs_for_run(&app,&bot,&run);
+   let run=app.db.run(&direct).unwrap();let tools=crate::tool_catalog::advertised(&app,&bot,&run);
    assert!(!tools.iter().any(|v|v["name"]=="routine_complete"));
    super::build(&app,&bot,&run,&tools,Some(32768)).unwrap();
-   let run=app.db.run(&scheduled).unwrap();let tools=crate::runtime::tool_specs_for_run(&app,&bot,&run);
+   let run=app.db.run(&scheduled).unwrap();let tools=crate::tool_catalog::advertised(&app,&bot,&run);
    assert!(tools.iter().any(|v|v["name"]=="routine_complete"));
    super::build(&app,&bot,&run,&tools,Some(32768)).unwrap();
  }

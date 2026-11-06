@@ -341,7 +341,7 @@ mod tests {
         app.db.queue(&bot.id, "Monitor Gmail", 0).unwrap();
         let run = app.db.claim_bot(&bot.id).unwrap().unwrap();
         let result =
-            crate::mail_watch::setup(&app, &bot, &run, &json!({"topic_key":"gmail"})).unwrap();
+            crate::mail_watch::setup(&app, &bot, &run, &json!({"topic_key":"gmail","source":"claude"})).unwrap();
         let value: Value = serde_json::from_str(result["text"].as_str().unwrap()).unwrap();
         assert_eq!(value["inbox_setup"]["source"], "claude");
         assert_eq!(value["inbox_setup"]["connector_key"], "gmail-fixture");

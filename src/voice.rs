@@ -663,6 +663,7 @@ where
                             },
                             "response.completed"=>{
                                 let id=e["response"]["id"].as_str().context("Missing completed voice response ID.")?;
+                                let _=crate::provider_accounts::record_auxiliary(&app,&run,session::MODEL,&format!("voice-response:{id}"),&e["response"]["usage"]);
                                 if let Some(state)=responses.get_mut(id) {state.completed=true;}
                             },
                             "response.failed"|"response.incomplete"=>{

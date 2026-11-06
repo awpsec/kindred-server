@@ -139,7 +139,7 @@ async fn setup_choice_creates_one_constant_routine_and_unifies_catalogue() {
         .queue(&bot.id, "Can you monitor my Gmail inbox?", 0)
         .unwrap();
     let run = app.db.claim_bot(&bot.id).unwrap().unwrap();
-    let args = json!({"topic_key":"work-inbox"});
+    let args = json!({"source":"kindred","topic_key":"work-inbox"});
     let result = crate::runtime::call_tool(&app, &bot, &run, "inbox_monitor_setup", args.clone())
         .await
         .unwrap();
@@ -193,7 +193,7 @@ async fn setup_choice_creates_one_constant_routine_and_unifies_catalogue() {
         .unwrap();
     assert_eq!(
         serde_json::from_str::<Value>(listed["text"].as_str().unwrap()).unwrap(),
-        json!(catalogue)
+        directory(&app.db,&bot.id,None).unwrap()
     );
     let mut invalid = create.clone();
     invalid["interval_seconds"] = json!(60);
@@ -250,7 +250,7 @@ async fn setup_connection_and_account_choices_do_not_start_monitoring() {
             &json!({"user_id":"owner","accounts":{},"configs":{}}),
         )
         .unwrap();
-    let result = super::setup(&app, &bot, &run, &json!({"topic_key":"missing"})).unwrap();
+    let result = super::setup(&app, &bot, &run, &json!({"source":"kindred","topic_key":"missing"})).unwrap();
     let v: Value = serde_json::from_str(result["text"].as_str().unwrap()).unwrap();
     assert_eq!(v["toolkit"], "gmail");
     assert!(v["question_id"].is_string());
@@ -260,7 +260,7 @@ async fn setup_connection_and_account_choices_do_not_start_monitoring() {
     multiple["accounts"]["personal"]["id"] = json!("ca_personal");
     multiple["accounts"]["personal"]["name"] = json!("Personal");
     app.db.save_setting("composio", &multiple).unwrap();
-    let result = super::setup(&app, &bot, &run, &json!({"topic_key":"multiple"})).unwrap();
+    let result = super::setup(&app, &bot, &run, &json!({"source":"kindred","topic_key":"multiple"})).unwrap();
     let v: Value = serde_json::from_str(result["text"].as_str().unwrap()).unwrap();
     assert_eq!(v["inbox_setup"]["phase"], "account");
     assert_eq!(v["question"]["options"].as_array().unwrap().len(), 2);
@@ -269,7 +269,7 @@ async fn setup_connection_and_account_choices_do_not_start_monitoring() {
             &app,
             &bot,
             &run,
-            &json!({"topic_key":"invalid","account_id":"another_workspace"})
+            &json!({"source":"kindred","topic_key":"invalid","account_id":"another_workspace"})
         )
         .is_err()
     );
@@ -291,7 +291,7 @@ async fn custom_setup_answer_preserves_real_weekly_schedule() {
         &bot,
         &run,
         "inbox_monitor_setup",
-        json!({"topic_key":"custom-inbox"}),
+        json!({"source":"kindred","topic_key":"custom-inbox"}),
     )
     .await
     .unwrap();
@@ -639,4 +639,15 @@ async fn persisted_push_wakes_the_background_worker_without_a_routine() {
     assert_eq!(app.db.runs(None).unwrap().len(), 1);
     assert!(app.db.runs(None).unwrap()[0].prompt.contains("arrived"));
     server.abort();
+}
+
+#[test]
+fn routine_directory_preserves_full_instructions_on_explicit_read_and_owner_boundary() {
+    let app=crate::tests::app();let bot=crate::tests::bot(&app.db,"codex");let other=crate::tests::bot(&app.db,"codex");
+    let prompt="Preserve this exact notification rule. ".repeat(1000);
+    let r=db::Routine{id:db::id(),bot_id:bot.id.clone(),name:"Inbox criteria".into(),prompt:prompt.clone(),interval_seconds:900,next_run:db::now()+900,enabled:true,schedule:None,run_at:None};
+    app.db.save_routine(&r).unwrap();
+    let small=directory(&app.db,&bot.id,None).unwrap();assert!(small.to_string().len()<prompt.len()/10);assert!(small[0].get("prompt").is_none());assert_eq!(small[0]["read_with"]["arguments"]["id"],r.id);
+    assert_eq!(directory(&app.db,&bot.id,Some(&r.id)).unwrap()[0]["prompt"],prompt);
+    assert!(directory(&app.db,&other.id,Some(&r.id)).is_err());
 }

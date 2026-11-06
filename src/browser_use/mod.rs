@@ -610,6 +610,7 @@ impl Decisions for ConfiguredDecisions<'_> {
                     .to_vec(),
             );
             let result = transport::OpenAiDecisions::new(key)?.request(input).await;
+            if let Ok(result)=&result {let _=crate::provider_accounts::record_auxiliary(self.app,self.run,"gpt-6-luna",&format!("decisions:{}",result.request_id.clone().unwrap_or_else(db::id)),&result.usage);}
             let receipt=json!({"checked_at":db::now(),"model":"gpt-6-luna","request_id":result.as_ref().ok().and_then(|v|v.request_id.as_deref()),"error":result.as_ref().err().map(|e|e.to_string())});
             let _=self.app.db.event(&self.run.id,"browser_decisions_request",receipt.clone());
             let mut saved=receipt;

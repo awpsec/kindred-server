@@ -384,11 +384,28 @@ pub fn record(app: &App, bot: &Bot, run: &Run, v: &Value) -> Result<()> {
     c.execute("INSERT INTO provider_usage(run_id,request_id,bot_id,provider,model,input_tokens,output_tokens,cached_tokens,cost,cost_source,created,tokens_reported,bot_name,bot_profile) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(run_id,request_id) DO UPDATE SET input_tokens=excluded.input_tokens,output_tokens=excluded.output_tokens,cached_tokens=excluded.cached_tokens,cost=excluded.cost,cost_source=excluded.cost_source,tokens_reported=excluded.tokens_reported",params![run.id,request,bot.id,bot.provider,bot.model,input,output,cached,cost,source,db::now(),v["tokens_reported"]!=false,bot.name,profile.to_string()])?;
     Ok(())
 }
+/// Receipt for OpenAI work performed outside the chat model's provider loop.
+/// Stable upstream IDs deduplicate reconnects; absent usage stays explicitly unknown.
+pub fn record_auxiliary(app:&App,run:&Run,model:&str,id:&str,usage:&Value)->Result<()> {
+    use ring::digest::{digest,SHA256};
+    ensure!(!id.is_empty() && id.len()<=512,"Invalid auxiliary usage identity");
+    let hash=digest(&SHA256,id.as_bytes());
+    let request=(u64::from_be_bytes(hash.as_ref()[..8].try_into().unwrap()) & 0x3fff_ffff_ffff_ffff)+10000;
+    let input=usage["input_tokens"].as_u64().filter(|n|*n<=1_000_000_000);
+    let output=usage["output_tokens"].as_u64().filter(|n|*n<=1_000_000_000);
+    let cached=usage["input_tokens_details"]["cached_tokens"].as_u64().unwrap_or(0);
+    let known=input.is_some() && output.is_some() && cached<=input.unwrap_or(0);
+    let bot=app.db.bot(&run.bot_id)?;
+    let profile=avatar_profile(&serde_json::to_value(&bot.profile)?);
+    app.db.0.lock().unwrap().execute("INSERT INTO provider_usage(run_id,request_id,bot_id,provider,model,input_tokens,output_tokens,cached_tokens,cost,cost_source,created,tokens_reported,bot_name,bot_profile) VALUES(?,?,?,'openai-api',?,?,?,?,NULL,'unknown',?,?,?,?) ON CONFLICT(run_id,request_id) DO UPDATE SET input_tokens=excluded.input_tokens,output_tokens=excluded.output_tokens,cached_tokens=excluded.cached_tokens,tokens_reported=excluded.tokens_reported WHERE excluded.tokens_reported>=provider_usage.tokens_reported",params![run.id,request,bot.id,model,if known{input.unwrap()}else{0},if known{output.unwrap()}else{0},if known{cached}else{0},db::now(),known,bot.name,profile.to_string()])?;
+    Ok(())
+}
+
 pub async fn usage(
     State(app): State<Shared>,
     Path(provider): Path<String>,
 ) -> Result<Json<Value>, crate::web::Error> {
-    if !valid_id(&provider) {
+    if provider!="openai-api" && !valid_id(&provider) {
         return Err(anyhow::anyhow!("Invalid provider").into());
     }
     let c = app.db.0.lock().unwrap();
@@ -734,5 +751,24 @@ mod tests {
         assert_eq!(usage["bots"][0]["unreported_tokens"], 2);
         assert_eq!(usage["bots"][0]["unpriced_requests"], 2);
         server.abort();
+    }
+}
+
+#[cfg(test)]
+mod auxiliary_usage_tests {
+    use super::*;
+    #[test]
+    fn receipts_deduplicate_and_never_turn_missing_usage_into_known_zero() {
+        let app=crate::tests::app();let bot=crate::tests::bot(&app.db,"claude-code");
+        let id=app.db.queue(&bot.id,"Call",0).unwrap();let run=app.db.run(&id).unwrap();
+        record_auxiliary(&app,&run,"gpt-6.1-terra","voice:one",&Value::Null).unwrap();
+        let count=||app.db.0.lock().unwrap().query_row("SELECT count(*),sum(input_tokens),sum(cached_tokens),sum(tokens_reported) FROM provider_usage WHERE run_id=?",[&id],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?,r.get::<_,i64>(3)?))).unwrap();
+        assert_eq!(count(),(1,0,0,0));
+        let usage=json!({"input_tokens":100,"output_tokens":20,"input_tokens_details":{"cached_tokens":80}});
+        for _ in 0..2{record_auxiliary(&app,&run,"gpt-6.1-terra","voice:one",&usage).unwrap();}
+        record_auxiliary(&app,&run,"gpt-6.1-terra","voice:one",&Value::Null).unwrap();
+        assert_eq!(count(),(1,100,80,1));
+        record_auxiliary(&app,&run,"gpt-6.1-terra","recap:one",&usage).unwrap();assert_eq!(count(),(2,200,160,2));
+        let provider:String=app.db.0.lock().unwrap().query_row("SELECT provider FROM provider_usage LIMIT 1",[],|r|r.get(0)).unwrap();assert_eq!(provider,"openai-api");
     }
 }
