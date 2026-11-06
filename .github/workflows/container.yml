@@ -18,6 +18,10 @@ on:
         description: 'SHA-256 of the verified compressed image archive.'
         required: true
         type: string
+      image_config:
+        description: 'Verified immutable Docker image config digest in the archive.'
+        required: true
+        type: string
       approve_publication:
         description: 'Publish this verified image and promote latest for this approved release.'
         required: true
@@ -41,6 +45,7 @@ jobs:
       SOURCE: ${{ inputs.source_commit }}
       INPUT_RELEASE: ${{ inputs.input_release }}
       IMAGE_SHA256: ${{ inputs.image_sha256 }}
+      IMAGE_CONFIG: ${{ inputs.image_config }}
       IMAGE: ghcr.io/awpsec/kindred-server
     steps:
       - name: Download and verify the prepared image
@@ -53,14 +58,17 @@ jobs:
           assert re.fullmatch(r'\d+\.\d+\.\d+',os.environ['VERSION'])
           assert re.fullmatch(r'[0-9a-f]{40}',os.environ['SOURCE'])
           assert re.fullmatch(r'[0-9a-f]{64}',os.environ['IMAGE_SHA256'])
+          assert re.fullmatch(r'sha256:[0-9a-f]{64}',os.environ['IMAGE_CONFIG'])
           assert re.fullmatch(r'image-inputs-[0-9A-Za-z.-]+',os.environ['INPUT_RELEASE'])
           assert json.loads(subprocess.check_output(['gh','release','view',os.environ['INPUT_RELEASE'],'--json','isDraft']))['isDraft']
           subprocess.run(['gh','release','download',os.environ['INPUT_RELEASE'],'--pattern','server-image.tar.gz'],check=True)
           with open('server-image.tar.gz','rb') as f: assert hashlib.file_digest(f,'sha256').hexdigest()==os.environ['IMAGE_SHA256']
           PY
           docker load -i server-image.tar.gz
-          test "$(docker image inspect "$IMAGE:$VERSION" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$SOURCE"
-          test "$(docker run --rm --entrypoint /usr/local/bin/kindred "$IMAGE:$VERSION" --version)" = "kindred $VERSION"
+          test "$(docker image inspect "$IMAGE_CONFIG" --format '{{.Id}}')" = "$IMAGE_CONFIG"
+          test "$(docker image inspect "$IMAGE_CONFIG" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$SOURCE"
+          test "$(docker run --rm --entrypoint /usr/local/bin/kindred "$IMAGE_CONFIG" --version)" = "kindred $VERSION"
+          docker tag "$IMAGE_CONFIG" "$IMAGE:$VERSION"
       - name: Publish immutable version and stable tag
         env:
           REGISTRY_TOKEN: ${{ github.token }}
