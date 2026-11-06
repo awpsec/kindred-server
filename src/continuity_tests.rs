@@ -995,7 +995,28 @@ async fn memory_append_rejections_preserve_prior_memory_and_invalidation() {
     app.db.save_bot_text(&b.id, "memory", "Stale fact", None).unwrap();
     app.db.0.lock().unwrap().execute("INSERT INTO continuity_memory_guard(bot_id,invalidated) VALUES(?,1)", [&b.id]).unwrap();
     let result = crate::runtime::call_tool(&app, &b, &run, "remember", json!({"mode":"append","text":"New fact"})).await.unwrap();
-    assert_eq!(result["failed"], true);
+    assert_ne!(result["failed"], true);
+    assert_eq!(crate::memory_maintenance::read(&app.db,&run,&json!({"pending_only":true})).unwrap()["memory"],"New fact");
     assert_eq!(app.db.bot(&b.id).unwrap().memory, "Stale fact");
     assert!(store::memory(&app.db, &run, "Stale fact").unwrap().is_null());
+}
+
+#[test]
+fn pending_work_does_not_evict_recent_completions_and_memory_notes() {
+    let db=Db::open(":memory:").unwrap();let (bot,run)=setup(&db);
+    let seq=message(&db,&run,"The current project decision was confirmed yesterday.");
+    for i in 0..60 {promise(&db,&run,seq,&format!("pending-{i}"));}
+    note(&db,&run,seq,"CURRENT_DECISION_SENTINEL",0);
+    db.finish(&run.id,"completed","COMPLETION_SENTINEL: validation completed yesterday.","").unwrap();
+    let next=db.run(&db.queue(&bot.id,"Where is my work now?",0).unwrap()).unwrap();
+    let context=continuity::bounded_context(&db,&next,16000).unwrap();
+    assert_eq!(context["obligations"]["total"],60);
+    assert!(context["obligations"]["next_after"].is_string());
+    assert!(context["obligations"]["items"].to_string().len()<=4000);
+    assert!(context["notes"].to_string().contains("CURRENT_DECISION_SENTINEL"));
+    assert!(context["recent_task_journal"].to_string().contains("COMPLETION_SENTINEL"));
+    assert!(context["omitted_context_items"].as_u64().unwrap()>0);
+    assert!(context.to_string().len()<=16040);
+    // The context budget changes projection only; all pending obligations stay.
+    assert_eq!(store::obligations(&db,&next,"",false).unwrap()["total"],60);
 }

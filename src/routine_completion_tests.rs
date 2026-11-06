@@ -610,12 +610,17 @@ fn legacy_bookkeeping_repair_preserves_history_and_does_not_replay_or_hide_real_
             .chat_messages(&app.db.run(&id).unwrap().chat_id)
             .unwrap();
         let count = app.db.events(&id).unwrap().len();
+        app.db.save_bot_text(&bot.id,"memory","Keep the current project decision",None).unwrap();
+        let chat_id=app.db.run(&id).unwrap().chat_id;
+        let epoch_before=crate::continuity::store::epoch(&app.db.0.lock().unwrap(),&chat_id).unwrap();
         {
             let c = app.db.0.lock().unwrap();
             policy::repair_terminal_reports(&c).unwrap();
             policy::repair_terminal_reports(&c).unwrap();
         }
         let run = app.db.run(&id).unwrap();
+        assert_eq!(crate::continuity::store::epoch(&app.db.0.lock().unwrap(),&chat_id).unwrap(),epoch_before,"Projection repair must not invalidate unrelated context");
+        assert_eq!(crate::continuity::store::memory(&app.db,&run,"Keep the current project decision").unwrap(),json!("Keep the current project decision"));
         assert_eq!(
             run.status,
             if mode == "report" {

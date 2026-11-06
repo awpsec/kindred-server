@@ -101,10 +101,23 @@ pub fn remember(db: &Db, run: &Run, args: &Value) -> Result<Value> {
     valid_session(&tx,run)?;
     let old=current(&tx,&run.bot_id)?;
     let replacement=mode!="append" && private(run);
-    ensure!(!invalid(&tx,&run.bot_id)? || replacement,"Private memory needs reconstruction in the owner DM; save current shared facts with continuity_save");
+    let quarantined=invalid(&tx,&run.bot_id)?;
+    // New observations must not be lost merely because an older base is
+    // quarantined. Keep them separate; never append to or validate that base.
+    if quarantined && !replacement {
+        ensure!(mode=="append", "Use mode=append to save new facts separately while private memory needs reconstruction");
+        ensure!(!proposed.trim().is_empty(), "Memory addition must not be empty");
+        tx.execute("INSERT INTO memory_overflow(bot_id,source_run,body,status,created) SELECT ?,?,?,'pending',? WHERE NOT EXISTS(SELECT 1 FROM memory_overflow WHERE bot_id=? AND status='pending' AND body=?)",params![run.bot_id,run.id,proposed,db::now(),run.bot_id,proposed])?;
+        let (count,bytes)=stats(&tx,&run.bot_id)?;
+        tx.commit()?;
+        return Ok(json!({"saved":true,"base_invalidated":true,"pending_count":count,"pending_bytes":bytes,"text":"New facts saved separately and retained verbatim. The old private memory is still quarantined. In your owner DM, read the pending additions with memory_read(pending_only=true) and reconstruct the base from current permitted sources with remember(mode=replace). Do not ask the owner to repeat saved facts."}));
+    }
     if replacement {
         editor_replaced(&tx,&run.bot_id,proposed)?;
         tx.execute("UPDATE bots SET memory=? WHERE id=?",params![proposed,run.bot_id])?;
+        // Explicit reconstruction is valid even when its text matches the old
+        // base. Accepted new additions stay pending until compaction folds them.
+        tx.execute("DELETE FROM continuity_memory_guard WHERE bot_id=?",[&run.bot_id])?;
     } else {
         let addition=proposed;
         ensure!(!addition.trim().is_empty(),"Memory addition must not be empty");
@@ -130,7 +143,12 @@ pub fn remember(db: &Db, run: &Run, args: &Value) -> Result<Value> {
 pub fn context(db: &Db, run: &Run) -> Result<Value> {
     if !private(run) { return Ok(Value::Null); }
     let c=db.0.lock().unwrap();
-    if invalid(&c,&run.bot_id)? || !crate::continuity::store::session_valid(&c,&run.id)? { return Ok(json!({"invalidated":true})); }
+    if !crate::continuity::store::session_valid(&c,&run.id)? { return Ok(json!({"invalidated":true,"instructions":"Source history changed during this turn. Rebuild context before saving memory."})); }
+    if invalid(&c,&run.bot_id)? {
+        let (count,bytes)=stats(&c,&run.bot_id)?;
+        let text=pending(&c,&run.bot_id)?.into_iter().map(|(_,body)|body).collect::<Vec<_>>().join("\n\n");
+        return Ok(json!({"invalidated":true,"reconstruction_needed":true,"pending_count":count,"pending_bytes":bytes,"pending_additions":crate::runtime::bounded(&text,PAGE_BYTES),"pending_shortened":text.len()>PAGE_BYTES,"instructions":"The old private memory is quarantined, not erased. Continue saving new facts with remember(mode=append); they are retained separately. Read all new additions with memory_read(pending_only=true,offset). Reconstruct the old base from current permitted source messages, notes and receipts, then save it with remember(mode=replace); pending additions remain saved separately. Do not read invalid archives, infer missing work never happened, or ask the owner to repeat retained facts. Before claiming what was or was not completed, search and read the relevant conversation and recorded results, including newer corrections."}));
+    }
     let memory=current(&c,&run.bot_id)?;
     let (count,bytes)=stats(&c,&run.bot_id)?;
     if memory.len()<PRESSURE_BYTES && count==0 {
@@ -160,6 +178,16 @@ fn offset(args: &Value) -> Result<usize> {
 }
 pub fn read(db: &Db, run: &Run, args: &Value) -> Result<Value> {
     let c=db.0.lock().unwrap();
+    if args["pending_only"].as_bool()==Some(true) {
+        ensure!(private(run), "Private memory is available only in your owner DM");
+        valid_session(&c,run)?;
+        ensure!(args["snapshot_id"].is_null(), "Pending memory cannot be combined with an archive snapshot");
+        let text=pending(&c,&run.bot_id)?.into_iter().map(|(_,body)|body).collect::<Vec<_>>().join("\n\n");
+        let mut out=page(&text,offset(args)?)?;
+        out["pending_only"]=json!(true);
+        out["base_invalidated"]=json!(invalid(&c,&run.bot_id)?);
+        return Ok(out);
+    }
     private_valid(&c,run)?;
     let snapshot_id=args["snapshot_id"].as_str();
     let mut text=if let Some(id)=snapshot_id {
@@ -334,6 +362,37 @@ mod tests {
         assert_eq!(all_memory(&db,&run,json!({})),"Rebuilt from retained sources");
         assert!(read(&db,&run,&json!({"snapshot_id":snap["snapshot_id"]})).is_err());
         assert!(history(&db,&run,&json!({})).unwrap()["items"].as_array().unwrap().is_empty());
+    }
+    #[test]
+    fn invalidated_base_does_not_block_new_facts_or_leak_old_memory() {
+        let (db,run)=fixture();
+        db.save_bot_text(&run.bot_id,"memory","Quarantined old claim",None).unwrap();
+        db.0.lock().unwrap().execute("INSERT INTO continuity_memory_guard VALUES(?,1)",[&run.bot_id]).unwrap();
+        for _ in 0..2 {
+            let result=remember(&db,&run,&json!({"mode":"append","text":"New verified completion"})).unwrap();
+            assert_eq!(result["saved"],true);assert_eq!(result["base_invalidated"],true);assert_eq!(result["pending_count"],1);
+        }
+        assert!(read(&db,&run,&json!({})).is_err());
+        assert_eq!(read(&db,&run,&json!({"pending_only":true})).unwrap()["memory"],"New verified completion");
+        let ctx=context(&db,&run).unwrap();
+        assert_eq!(ctx["reconstruction_needed"],true);assert!(!ctx.to_string().contains("Quarantined old claim"));
+        // An explicit same-text replacement still clears the guard; pending
+        // additions remain verbatim, and invalid old snapshots stay invalid.
+        remember(&db,&run,&json!({"mode":"replace","text":"Quarantined old claim"})).unwrap();
+        assert_eq!(all_memory(&db,&run,json!({})),"Quarantined old claim\n\nNew verified completion");
+        assert_ne!(context(&db,&run).unwrap()["invalidated"],true);
+    }
+    #[test]
+    fn pending_recovery_obeys_private_scope_and_subsequent_invalidation() {
+        let (db,run)=fixture();
+        db.0.lock().unwrap().execute("INSERT INTO continuity_memory_guard VALUES(?,1)",[&run.bot_id]).unwrap();
+        remember(&db,&run,&json!({"mode":"append","text":"Fresh fact"})).unwrap();
+        let mut shared=run.clone();shared.chat_id="room".into();
+        assert!(read(&db,&shared,&json!({"pending_only":true})).is_err());
+        assert!(context(&db,&shared).unwrap().is_null());
+        assert!(read(&db,&run,&json!({"pending_only":true,"snapshot_id":"archive"})).is_err());
+        db.0.lock().unwrap().execute("UPDATE continuity_memory_guard SET invalidated=1 WHERE bot_id=?",[&run.bot_id]).unwrap();
+        assert_eq!(read(&db,&run,&json!({"pending_only":true})).unwrap()["memory"],"");
     }
     #[test]
     fn shared_rooms_cannot_read_private_memory_but_can_save_without_disclosure() {

@@ -31,7 +31,15 @@ END;
 -- keep those and all user edits conservative, even for queued recipients.
 DROP TRIGGER IF EXISTS continuity_source_changed;
 CREATE TRIGGER continuity_source_changed AFTER UPDATE OF body,suppressed ON chat_messages
-WHEN old.body<>new.body OR (old.suppressed<>new.suppressed AND old.kind NOT IN ('assistant','result','task_progress')) BEGIN
+WHEN (old.body<>new.body AND NOT (
+  old.kind='result' AND new.kind=old.kind AND new.run_id=old.run_id AND new.chat_id=old.chat_id AND new.sender=old.sender
+  AND EXISTS(SELECT 1 FROM runs r JOIN events repair ON repair.run_id=r.id AND repair.kind='routine_terminal_report_repaired'
+    JOIN events original ON original.run_id=r.id AND original.kind='routine_provider_final'
+    WHERE r.id=old.run_id AND r.status='completed' AND r.error='' AND new.body=r.output
+      AND old.body='failed: '||json_extract(repair.body,'$.previous_error')
+      AND json_extract(repair.body,'$.previous_status')='failed'
+      AND json_extract(original.body,'$.text')=new.body)
+)) OR (old.suppressed<>new.suppressed AND old.kind NOT IN ('assistant','result','task_progress')) BEGIN
   INSERT INTO continuity_epochs VALUES(old.chat_id,1) ON CONFLICT(chat_id) DO UPDATE SET epoch=epoch+1;
   INSERT INTO continuity_memory_guard SELECT value,1 FROM json_each((SELECT members FROM chats WHERE id=old.chat_id)) WHERE value IN(SELECT id FROM bots) ON CONFLICT(bot_id) DO UPDATE SET invalidated=1;
 END;

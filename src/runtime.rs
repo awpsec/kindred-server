@@ -326,7 +326,7 @@ pub fn tool_specs() -> Vec<Value> {
         ),
         (
             "remember",
-            "Save lasting facts before acknowledging. Append new facts; overflow retained. Replace only after full memory_read in owner DM; preserve other facts. ≤64KB UTF-8; no secrets. Action scope: work_rule_save.",
+            "Save lasting facts before acknowledging. Append new facts; overflow retained. Replace after full memory_read in owner DM, or reconstruct an invalidated base from current permitted sources; preserve other facts. ≤64KB UTF-8; no secrets. Action scope: work_rule_save.",
             json!({"text":{"type":"string","minLength":1,"description":"Memory text goes here, not in body/content."},"mode":{"type":"string","enum":["append","replace"]}}),
             vec!["text"],
         ),
@@ -501,8 +501,8 @@ pub fn tool_specs() -> Vec<Value> {
         ),
         (
             "memory_read",
-            "Owner-DM memory/pending read. Page with next_offset (UTF-8 bytes); retain snapshot_id when reading originals.",
-            json!({"offset":{"type":"integer","minimum":0},"snapshot_id":{"type":"string"}}),
+            "Owner-DM memory/pending read. pending_only reads new saved facts even when the old base is quarantined. Page with next_offset (UTF-8 bytes); retain snapshot_id for originals.",
+            json!({"offset":{"type":"integer","minimum":0},"snapshot_id":{"type":"string"},"pending_only":{"type":"boolean"}}),
             vec![],
         ),
         (

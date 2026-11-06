@@ -473,6 +473,14 @@ pub fn bounded_context(db: &Db, run: &Run, budget: usize) -> Result<Value> {
         }
     }
     let mut omitted = 0;
+    // Pending work remains pageable with an authoritative total. Its detailed
+    // rows must not crowd out every recent completion and saved correction.
+    while value["obligations"]["items"].to_string().len()>budget/4
+        && value["obligations"]["items"].as_array().is_some_and(|items|!items.is_empty()) {
+        value["obligations"]["items"].as_array_mut().unwrap().pop();
+        value["obligations"]["next_after"]=json!(value["obligations"]["items"].as_array().unwrap().last().and_then(|v|v["id"].as_str()).unwrap_or(""));
+        omitted+=1;
+    }
     while value.to_string().len() > budget {
         let paths = [
             "/notes/items",
@@ -480,16 +488,12 @@ pub fn bounded_context(db: &Db, run: &Run, budget: usize) -> Result<Value> {
             "/relevant_history/items",
             "/recent_task_journal",
         ];
-        let largest = paths
-            .into_iter()
-            .filter_map(|path| {
-                value
-                    .pointer(path)
-                    .and_then(Value::as_array)
-                    .filter(|a| !a.is_empty())
-                    .map(|a| (path, a.iter().map(|v| v.to_string().len()).sum::<usize>()))
-            })
-            .max_by_key(|(_, size)| *size);
+        // Retain a sample from each evidence source before removing the last
+        // item from any one of them. Lists are newest/relevant first.
+        let largest = [1,0].into_iter().find_map(|minimum| paths.iter().filter_map(|path| {
+            value.pointer(path).and_then(Value::as_array).filter(|a|a.len()>minimum)
+                .map(|a|(*path,a.iter().map(|v|v.to_string().len()).sum::<usize>()))
+        }).max_by_key(|(_,size)|*size));
         let Some((path, _)) = largest else { break };
         value
             .pointer_mut(path)

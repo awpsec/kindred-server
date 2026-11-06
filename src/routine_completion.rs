@@ -267,11 +267,13 @@ pub fn repair_terminal_reports(c: &Connection) -> Result<()> {
             "UPDATE runs SET status='completed',error='' WHERE id=?",
             [&run],
         )?;
+        // Record the verified projection repair before changing its display.
+        // Continuity must distinguish this from editing the original evidence.
+        tx.execute("INSERT INTO events(run_id,kind,body,created) VALUES(?,'routine_terminal_report_repaired',?,?)",params![run,json!({"previous_status":"failed","previous_error":UNCLASSIFIED}).to_string(),crate::db::now()])?;
         tx.execute(
             "UPDATE chat_messages SET body=? WHERE run_id=? AND kind='result'",
             params![output, run],
         )?;
-        tx.execute("INSERT INTO events(run_id,kind,body,created) VALUES(?,'routine_terminal_report_repaired',?,?)",params![run,json!({"previous_status":"failed","previous_error":UNCLASSIFIED}).to_string(),crate::db::now()])?;
     }
     tx.commit()?;
     Ok(())

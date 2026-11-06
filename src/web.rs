@@ -1845,6 +1845,12 @@ fn static_assets<S: Clone + Send + Sync + 'static>() -> Router<S> {
             }),
         )
         .route(
+            "/nametag-status.js",
+            get(|| async {
+                ([(header::CONTENT_TYPE, "application/javascript")], include_str!("../ui/nametag-status.js"))
+            }),
+        )
+        .route(
             "/composer-resize-motion.js",
             get(|| async {
                 (
