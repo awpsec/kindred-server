@@ -72,6 +72,7 @@ const TABLES: &[&str] = &[
     "workflow_responses",
     "continuity_notes",
     "continuity_revisions",
+    "continuity_work_states",
     "continuity_epochs",
     "continuity_note_meta",
     "continuity_source_state",
@@ -307,6 +308,7 @@ impl Db {
                     | "workflow_responses"
                     | "continuity_notes"
                         | "continuity_revisions"
+                    | "continuity_work_states"
                     | "continuity_epochs"
                     | "continuity_note_meta"
                     | "continuity_source_state"
@@ -351,6 +353,7 @@ impl Db {
                     | "workflow_responses"
                     | "continuity_notes"
                     | "continuity_revisions"
+                    | "continuity_work_states"
                     | "continuity_epochs"
                     | "continuity_note_meta"
                     | "continuity_source_state"

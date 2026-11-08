@@ -720,12 +720,18 @@ fn ingest(db: &Db, a: &Account, payload: &Value) -> Result<usize> {
     Ok(count)
 }
 pub fn queue_pending(db: &Db) -> Result<()> {
-    let rows = watches(db)?;
+    let mut rows = watches(db)?;
     let mut c = db.0.lock().unwrap();
     let tx = c.transaction()?;
     if inactive(&tx)? {
         return Ok(());
     }
+    // Busy bots retain all receipts. On their next turn, older waiting monitors
+    // get service before a newer noisy channel; stable watch IDs break ties.
+    let oldest = tx.prepare("SELECT watch_id,MIN(received) FROM slack_receipts WHERE run_id IS NULL AND received<=? GROUP BY watch_id")?
+        .query_map([db::now()-2],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?)))?
+        .collect::<rusqlite::Result<std::collections::HashMap<_,_>>>()?;
+    rows.sort_by_key(|w|(oldest.get(&w.id).copied().unwrap_or(i64::MAX),w.id.clone()));
     for w in rows.iter().filter(|w| w.enabled) {
         let current: Option<String> = tx
             .query_row("SELECT body FROM slack_watches WHERE id=?", [&w.id], |r| {

@@ -594,3 +594,19 @@ async fn real_provider_bridge_receives_slack_context_and_publishes_once_or_stays
         server.abort();
     }
 }
+
+#[test]
+fn oldest_waiting_account_gets_the_next_bot_turn_without_duplicate_delivery() {
+    let (app,a,newer)=setup();
+    let mut older_account=a.clone();older_account.id=db::id();
+    app.db.0.lock().unwrap().execute("INSERT INTO slack_accounts VALUES(?,?)",params![older_account.id,serde_json::to_string(&older_account).unwrap()]).unwrap();
+    let mut older=newer.clone();older.id=String::new();older.account_id=older_account.id.clone();persist_watch(&app.db,&mut older,None).unwrap();
+    ingest(&app.db,&a,&event(&a,"900.1","C123","channel","Newer task")).unwrap();
+    ingest(&app.db,&older_account,&event(&older_account,"800.1","C123","channel","Older task")).unwrap();
+    {let c=app.db.0.lock().unwrap();c.execute("UPDATE slack_receipts SET received=? WHERE watch_id=?",params![db::now()-30,newer.id]).unwrap();c.execute("UPDATE slack_receipts SET received=? WHERE watch_id=?",params![db::now()-90,older.id]).unwrap();}
+    queue_pending(&app.db).unwrap();queue_pending(&app.db).unwrap();
+    {let c=app.db.0.lock().unwrap();assert_eq!(c.query_row("SELECT watch_id FROM slack_runs",[],|r|r.get::<_,String>(0)).unwrap(),older.id);c.execute("UPDATE runs SET status='completed'",[]).unwrap();}
+    queue_pending(&app.db).unwrap();queue_pending(&app.db).unwrap();
+    assert_eq!(count(&app.db,"slack_runs"),2);
+    assert_eq!(app.db.0.lock().unwrap().query_row("SELECT count(*) FROM slack_receipts WHERE run_id IS NULL",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+}

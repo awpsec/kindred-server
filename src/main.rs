@@ -51,6 +51,7 @@ mod connector_policy;
 mod connector_records;
 mod connector_results;
 mod continuity;
+mod work_state;
 mod harness_context;
 mod harness_native;
 #[cfg(test)]

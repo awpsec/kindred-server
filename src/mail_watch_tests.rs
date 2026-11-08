@@ -651,3 +651,20 @@ fn routine_directory_preserves_full_instructions_on_explicit_read_and_owner_boun
     assert_eq!(directory(&app.db,&bot.id,Some(&r.id)).unwrap()[0]["prompt"],prompt);
     assert!(directory(&app.db,&other.id,Some(&r.id)).is_err());
 }
+
+#[tokio::test]
+async fn oldest_waiting_inbox_gets_the_next_bot_turn_without_duplicate_delivery() {
+    let (app,bot,_,server)=setup().await;
+    let saved=save_watch(&app,input(&bot)).await.unwrap();let newer=saved["id"].as_str().unwrap();
+    let mut older=read(&app.db.0.lock().unwrap(),newer).unwrap();older.input.id=db::id();older.input.account_id="synthetic-second-mail".into();
+    {let c=app.db.0.lock().unwrap();write(&c,&older).unwrap();
+      for (watch,message,age) in [(newer,"new",30),(older.input.id.as_str(),"old",90)] {
+        c.execute("INSERT INTO mail_receipts VALUES(?,?,?,?,NULL)",params![watch,message,json!({"message_id":message}).to_string(),db::now()-age]).unwrap();
+      }
+    }
+    queue_pending(&app.db).unwrap();queue_pending(&app.db).unwrap();
+    {let c=app.db.0.lock().unwrap();assert_eq!(c.query_row("SELECT watch_id FROM mail_runs WHERE kind='mail'",[],|r|r.get::<_,String>(0)).unwrap(),older.input.id);c.execute("UPDATE runs SET status='completed'",[]).unwrap();}
+    queue_pending(&app.db).unwrap();queue_pending(&app.db).unwrap();
+    assert_eq!(app.db.0.lock().unwrap().query_row("SELECT count(*) FROM mail_runs WHERE kind='mail'",[],|r|r.get::<_,i64>(0)).unwrap(),2);
+    server.abort();
+}

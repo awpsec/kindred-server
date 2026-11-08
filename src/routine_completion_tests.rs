@@ -661,3 +661,46 @@ fn legacy_bookkeeping_repair_preserves_history_and_does_not_replay_or_hide_real_
         }
     }
 }
+
+#[tokio::test]
+async fn quiet_notes_are_private_idempotent_and_survive_context_reconstruction() {
+    for provider in ["codex","claude-code","openrouter"] {
+        let app=tests::app();let bot=tests::bot(&app.db,provider);let id=scheduled(&app,&bot);let run=app.db.run(&id).unwrap();
+        for _ in 0..2 {runtime::call_tool(&app,&bot,&run,"finish_quietly",json!({"note":"Checked the assigned batch; no changed requests. No outbound action taken."})).await.unwrap();}
+        assert!(policy::record_note(&app.db.0.lock().unwrap(),&id,&json!({"note":"Different conclusion"})).is_err());
+        finish(&app,&id,"completed","No public recap","");
+        assert!(results(&app,&id).is_empty());
+        let next=app.db.run(&app.db.queue(&bot.id,"What changed?",0).unwrap()).unwrap();
+        let context=crate::continuity::context(&app.db,&next).unwrap();
+        assert!(context["recent_task_journal"].to_string().contains("No outbound action taken"));
+        assert_eq!(app.db.0.lock().unwrap().query_row("SELECT count(*) FROM events WHERE run_id=? AND kind='background_note'",[id],|r|r.get::<_,i64>(0)).unwrap(),1);
+    }
+}
+#[test]
+fn invalid_or_public_notes_cannot_partially_finalize() {
+    let app=tests::app();let bot=tests::bot(&app.db,"codex");let id=scheduled(&app,&bot);
+    for args in [json!({"outcome":"quiet","note":false}),json!({"outcome":"quiet","note":""}),json!({"outcome":"quiet","note":"x".repeat(1001)}),json!({"outcome":"report","report":"hello","note":"private"})] {
+        assert!(policy::complete(&app.db.0.lock().unwrap(),&id,&args).is_err());
+    }
+    assert_eq!(app.db.0.lock().unwrap().query_row("SELECT count(*) FROM routine_completion WHERE run_id=?",[&id],|r|r.get::<_,i64>(0)).unwrap(),0);
+}
+
+#[test]
+fn conflicting_outcome_does_not_leave_an_internal_note() {
+    let app=tests::app();let bot=tests::bot(&app.db,"codex");let id=scheduled(&app,&bot);
+    let c=app.db.0.lock().unwrap();
+    policy::complete(&c,&id,&json!({"outcome":"report","report":"A changed request needs attention"})).unwrap();
+    assert!(policy::complete(&c,&id,&json!({"outcome":"quiet","note":"Nothing changed"})).is_err());
+    assert_eq!(c.query_row("SELECT count(*) FROM events WHERE run_id=? AND kind='background_note'",[&id],|r|r.get::<_,i64>(0)).unwrap(),0);
+}
+
+#[tokio::test]
+async fn unsuccessful_quiet_runs_never_supply_successful_internal_notes() {
+    for status in ["failed","cancelled"] {
+        let app=tests::app();let bot=tests::bot(&app.db,"codex");let id=scheduled(&app,&bot);let run=app.db.run(&id).unwrap();
+        runtime::call_tool(&app,&bot,&run,"finish_quietly",json!({"note":"Private stale summary sentinel"})).await.unwrap();
+        finish(&app,&id,status,"","Interrupted after checkpoint");
+        let next=app.db.run(&app.db.queue(&bot.id,"What changed?",0).unwrap()).unwrap();
+        assert!(!crate::continuity::context(&app.db,&next).unwrap()["recent_task_journal"].to_string().contains("Private stale summary sentinel"));
+    }
+}

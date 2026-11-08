@@ -205,7 +205,7 @@ pub fn save_meta(c: &Connection, run: &Run, args: &Value, revision: i64) -> Resu
             );
         }
     }
-    c.execute("INSERT INTO continuity_note_meta VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(bot_id,chat_id,topic) DO UPDATE SET revision=excluded.revision,epoch=excluded.epoch,kind=excluded.kind,statement_kind=excluded.statement_kind,sources=excluded.sources",params![run.bot_id,run.chat_id,args["topic"].as_str().unwrap_or(""),revision,epoch(c,&run.chat_id)?,kind,statement,sources.to_string()])?;
+    c.execute("INSERT INTO continuity_note_meta VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(bot_id,chat_id,topic) DO UPDATE SET revision=excluded.revision,epoch=excluded.epoch,kind=excluded.kind,statement_kind=excluded.statement_kind,sources=excluded.sources",params![run.bot_id,run.chat_id,args["topic"].as_str().unwrap_or("").trim(),revision,epoch(c,&run.chat_id)?,kind,statement,sources.to_string()])?;
     Ok(())
 }
 
@@ -485,9 +485,10 @@ pub fn revise_source(db: &Db, seq: i64, args: &Value) -> Result<Value> {
         // Coarse redaction prevents untracked legacy derivations from returning.
         tx.execute("UPDATE continuity_notes SET summary='[Source removed]',status='closed' WHERE chat_id=?",[&chat])?;
         tx.execute("UPDATE continuity_revisions SET summary='[Source removed]',status='closed' WHERE chat_id=?",[&chat])?;
+        tx.execute("UPDATE continuity_work_states SET body='null' WHERE chat_id=?",[&chat])?;
         tx.execute("DELETE FROM initiative_followups WHERE obligation_id IN(SELECT id FROM continuity_obligations WHERE chat_id=?)",[&chat])?;
         tx.execute("UPDATE continuity_obligations SET description='Source removed; reconcile before continuing' WHERE chat_id=?",[&chat])?;
-        tx.execute("UPDATE events SET body='{}' WHERE kind='context' AND run_id IN(SELECT id FROM runs WHERE chat_id=?)",[&chat])?;
+        tx.execute("UPDATE events SET body='{}' WHERE kind IN ('context','background_note') AND run_id IN(SELECT id FROM runs WHERE chat_id=?)",[&chat])?;
         // Source run activity may quote the deleted input. Retain execution IDs,
         // statuses and receipt structure; redact natural-language payloads.
         if !source_run.is_empty() {
@@ -502,7 +503,8 @@ pub fn revise_source(db: &Db, seq: i64, args: &Value) -> Result<Value> {
     if action == "forget" {
         tx.execute("UPDATE continuity_notes SET summary='[Source removed]',status='closed' WHERE run_id IN(SELECT run_id FROM continuity_dependencies WHERE source_chat_id=?)",[&chat])?;
         tx.execute("UPDATE continuity_revisions SET summary='[Source removed]',status='closed' WHERE run_id IN(SELECT run_id FROM continuity_dependencies WHERE source_chat_id=?)",[&chat])?;
-        tx.execute("UPDATE events SET body='{}' WHERE kind='context' AND run_id IN(SELECT run_id FROM continuity_dependencies WHERE source_chat_id=?)",[&chat])?;
+        tx.execute("UPDATE continuity_work_states SET body='null' WHERE run_id IN(SELECT run_id FROM continuity_dependencies WHERE source_chat_id=?)",[&chat])?;
+        tx.execute("UPDATE events SET body='{}' WHERE kind IN ('context','background_note') AND run_id IN(SELECT run_id FROM continuity_dependencies WHERE source_chat_id=?)",[&chat])?;
         // Keep unscoped legacy memory quarantined, not erased: unrelated stable
         // preferences must remain available to the owner for reconstruction.
     }

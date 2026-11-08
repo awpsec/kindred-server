@@ -856,7 +856,7 @@ pub fn queue_pending(db: &Db) -> Result<()> {
         return Ok(());
     }
     let ids = tx
-        .prepare("SELECT id FROM mail_watches")?
+        .prepare("SELECT w.id FROM mail_watches w JOIN (SELECT watch_id,MIN(received) AS oldest FROM mail_receipts WHERE run_id IS NULL GROUP BY watch_id) p ON p.watch_id=w.id ORDER BY p.oldest,w.id")?
         .query_map([], |r| r.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     for id in ids {

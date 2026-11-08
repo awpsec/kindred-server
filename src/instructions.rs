@@ -7,7 +7,7 @@ use anyhow::{Result, bail};
 use rusqlite::OptionalExtension;
 use serde_json::{Value, json};
 
-pub const VERSION: &str = "46";
+pub const VERSION: &str = "47";
 /// Provider harnesses keep the operating contract stable and append this live
 /// task snapshot after retained conversation history. Never split on user text.
 pub const LIVE_BOUNDARY: &str = "\n# Current Kindred task context\n";

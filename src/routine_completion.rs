@@ -87,13 +87,38 @@ pub fn current(c: &Connection, run: &str) -> Result<bool> {
             |r| r.get::<_, bool>(0),
         )?)
 }
+/// Shared quiet-completion guard: silence must not conceal files, failures or decisions.
+pub fn ensure_quiet(c: &Connection, run: &str) -> Result<()> {
+    ensure!(!crate::routine_recovery::blocks_quiet(c,run)? && !c.query_row("SELECT EXISTS(SELECT 1 FROM attachments WHERE run_id=?1) OR EXISTS(SELECT 1 FROM deliverables WHERE run_id=?1) OR EXISTS(SELECT 1 FROM approvals WHERE run_id=?1 AND status='pending') OR EXISTS(SELECT 1 FROM user_tasks WHERE run_id=?1 AND status IN ('pending','ready')) OR EXISTS(SELECT 1 FROM questions WHERE run_id=?1 AND status='pending')",[run],|r|r.get::<_,bool>(0))?,"This task has an error, files or a pending decision; report it instead of finishing quietly");
+    Ok(())
+}
+fn note(args: &Value) -> Result<Option<&str>> {
+    args.get("note").map(|v| {
+        let text=v.as_str().ok_or_else(|| anyhow::anyhow!("The internal note must be text"))?.trim();
+        ensure!(!text.is_empty() && text.len()<=1000 && !text.contains('\0'), "Keep the internal note between 1 and 1000 bytes, without secrets");
+        Ok(text)
+    }).transpose()
+}
+pub fn record_note(c: &Connection, run: &str, args: &Value) -> Result<()> {
+    let Some(note)=note(args)? else { return Ok(()) };
+    let previous: Option<String>=c.query_row("SELECT json_extract(body,'$.note') FROM events WHERE run_id=? AND kind='background_note' ORDER BY seq DESC LIMIT 1",[run],|r|r.get(0)).optional()?;
+    if let Some(previous)=previous {
+        ensure!(previous==note,"This task already recorded a different internal note");
+    } else {
+        c.execute("INSERT INTO events(run_id,kind,body,created) VALUES(?,'background_note',?,?)",params![run,json!({"note":note,"statement_kind":"model_summary","visibility":"internal"}).to_string(),crate::db::now()])?;
+    }
+    Ok(())
+}
+
 pub fn complete(c: &Connection, run: &str, args: &Value) -> Result<Value> {
     ensure!(
         args.as_object()
-            .is_some_and(|v| v.keys().all(|k| matches!(k.as_str(), "outcome" | "report"))),
-        "Use only outcome and report for routine completion"
+            .is_some_and(|v| v.keys().all(|k| matches!(k.as_str(), "outcome" | "report" | "note"))),
+        "Use outcome, report and an optional internal note for routine completion"
     );
+    let internal_note = note(args)?;
     let outcome = args["outcome"].as_str().unwrap_or("");
+    ensure!(internal_note.is_none() || outcome == "quiet", "Internal notes belong to quiet outcomes; reports already retain their result");
     ensure!(
         matches!(outcome, "quiet" | "report" | "error"),
         "Choose quiet, report or error for this routine"
@@ -127,7 +152,7 @@ pub fn complete(c: &Connection, run: &str, args: &Value) -> Result<Value> {
         "This routine is no longer running"
     );
     if outcome == "quiet" {
-        ensure!(!crate::routine_recovery::blocks_quiet(c,run)? && !c.query_row("SELECT EXISTS(SELECT 1 FROM attachments WHERE run_id=?1) OR EXISTS(SELECT 1 FROM deliverables WHERE run_id=?1) OR EXISTS(SELECT 1 FROM approvals WHERE run_id=?1 AND status='pending') OR EXISTS(SELECT 1 FROM user_tasks WHERE run_id=?1 AND status IN ('pending','ready')) OR EXISTS(SELECT 1 FROM questions WHERE run_id=?1 AND status='pending')",[run],|r|r.get::<_,bool>(0))?,"This routine has an error, files or a pending decision; report it instead of finishing quietly");
+        ensure_quiet(c,run)?;
     }
     let previous: Option<(String, String)> = c
         .query_row(
@@ -136,12 +161,14 @@ pub fn complete(c: &Connection, run: &str, args: &Value) -> Result<Value> {
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;
-    if let Some(previous) = previous {
+    if let Some(ref previous) = previous {
         ensure!(
-            previous == (outcome.into(), report.into()),
+            previous == &(outcome.into(), report.into()),
             "Routine completion was already recorded differently"
         );
-    } else {
+    }
+    if outcome == "quiet" { record_note(c,run,args)?; }
+    if previous.is_none() {
         c.execute(
             "INSERT INTO routine_completion VALUES(?,?,?)",
             params![run, outcome, report],
