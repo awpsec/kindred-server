@@ -627,7 +627,7 @@ mod tests {
 
     #[test]
     fn summary_guidance_keeps_schema_preparation_private_without_hiding_attention() {
-        let app=tests::app();let mut bot=tests::bot(&app.db,"custom-test");
+        let app=tests::app();let mut bot=tests::bot(&app.db,"openrouter");
         bot.profile.progress_updates="summaries".into();
         let value=context(&app.db,&bot).unwrap();let guide=value["guidance"].as_str().unwrap();
         assert_eq!(value["mode"],"summaries");
