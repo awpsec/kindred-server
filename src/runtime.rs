@@ -509,8 +509,8 @@ pub fn tool_specs() -> Vec<Value> {
         ),
         (
             "memory_compact",
-            "Owner-DM compaction: prepare with no arguments; follow receipt and read all snapshot pages; commit snapshot_id/text. Preserve rules/facts. Base only, ≤40,000 UTF-8 bytes. See memory_team guide.",
-            json!({"snapshot_id":{"type":"string"},"text":{"type":"string","maxLength":40000}}),
+            "Owner-DM compaction: prepare {}; read every snapshot page. Submit snapshot_id/text; aim 32KB, max 40KB UTF-8. Oversized drafts return draft_id: revise with exact edits instead of rewriting. Preserve rules/facts; base only.",
+            json!({"snapshot_id":{"type":"string"},"text":{"type":"string","maxLength":128000},"draft_id":{"type":"string"},"edits":{"type":"array","minItems":1,"maxItems":20,"items":{"type":"object","properties":{"find":{"type":"string","minLength":1},"replace":{"type":"string"}},"required":["find","replace"],"additionalProperties":false}}}),
             vec![],
         ),
         (
@@ -1003,7 +1003,7 @@ async fn call_tool_inner(
         "memory_read" => json!({"text":crate::memory_maintenance::read(&app.db,run,&args)?.to_string()}),
         "memory_history" => json!({"text":crate::memory_maintenance::history(&app.db,run,&args)?.to_string()}),
         "memory_compact" => {
-            let result=if args.get("snapshot_id").is_none() && args.get("text").is_none() {
+            let result=if args.as_object().is_some_and(|v|v.is_empty()) {
                 crate::memory_maintenance::snapshot(&app.db,run)?
             } else { crate::memory_maintenance::compact(&app.db,run,&args)? };
             json!({"text":result.to_string()})

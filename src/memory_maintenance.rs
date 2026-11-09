@@ -38,6 +38,16 @@ pub fn migrate(c: &Connection) -> Result<()> {
         UPDATE memory_overflow SET status='invalidated' WHERE bot_id=new.bot_id AND status<>'invalidated';
         INSERT INTO memory_versions VALUES(new.bot_id,1) ON CONFLICT(bot_id) DO UPDATE SET revision=revision+1;
       END;")?;
+    c.execute_batch("CREATE TABLE IF NOT EXISTS memory_compaction_drafts(
+      snapshot_id TEXT NOT NULL REFERENCES memory_snapshots(id) ON DELETE CASCADE,
+      run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+      revision TEXT NOT NULL,body TEXT NOT NULL,PRIMARY KEY(snapshot_id,run_id));
+      CREATE TRIGGER IF NOT EXISTS memory_draft_run_finished AFTER UPDATE OF status ON runs
+      WHEN new.status IN ('completed','failed','cancelled','interrupted','withdrawn','steered')
+      BEGIN DELETE FROM memory_compaction_drafts WHERE run_id=new.id; END;
+      CREATE TRIGGER IF NOT EXISTS memory_draft_snapshot_closed AFTER UPDATE OF committed,invalidated ON memory_snapshots
+      WHEN new.committed=1 OR new.invalidated=1
+      BEGIN DELETE FROM memory_compaction_drafts WHERE snapshot_id=new.id; END;")?;
     Ok(())
 }
 
@@ -162,7 +172,7 @@ pub fn context(db: &Db, run: &Run) -> Result<Value> {
         remaining-=excerpt.len();
         additions.push(json!({"id":id,"text":excerpt,"shortened":excerpt.len()<body.len()}));
     }
-    Ok(json!({"due":memory.len()>=PRESSURE_BYTES || count>0,"memory_bytes":memory.len(),"pending_count":count,"pending_bytes":bytes,"pending_additions":additions,"pending_shortened":bytes>PAGE_BYTES,"read_pending_offset":memory.len(),"compaction_needed":memory.len()>=PRESSURE_BYTES || count>0,"target_bytes":COMPACT_BYTES,"instructions":"At memory pressure, compact the old base quietly during this private turn before proceeding. Call memory_compact with no arguments, read every snapshot page with memory_read(snapshot_id,offset), then submit the snapshot_id and compacted base text. Preserve standing rules, preferences, prohibitions, responsibilities, attribution and newer corrections. Do not include pending additions in the submitted text; Kindred appends them verbatim. The original remains recoverable. Never alter work rules or instructions as compaction. Pending facts are already saved; read missing pending text with memory_read and do not request repetition."}))
+    Ok(json!({"due":memory.len()>=PRESSURE_BYTES || count>0,"memory_bytes":memory.len(),"pending_count":count,"pending_bytes":bytes,"pending_additions":additions,"pending_shortened":bytes>PAGE_BYTES,"read_pending_offset":memory.len(),"compaction_needed":memory.len()>=PRESSURE_BYTES || count>0,"target_bytes":COMPACT_BYTES,"instructions":"At memory pressure, compact the old base quietly during this private turn before proceeding. Call memory_compact with no arguments, read every snapshot page with memory_read(snapshot_id,offset), then submit snapshot_id and compacted base text (aim for 32,000 UTF-8 bytes; maximum 40,000). If a draft is oversized, use its draft_id with exact edits instead of rewriting it. Preserve standing rules, preferences, prohibitions, responsibilities, attribution and newer corrections. Do not include pending additions in the submitted text; Kindred appends them verbatim. The original remains recoverable. Never alter work rules or instructions as compaction. Pending facts are already saved; read missing pending text with memory_read and do not request repetition."}))
 }
 
 fn page(text: &str, offset: usize) -> Result<Value> {
@@ -225,15 +235,14 @@ pub fn snapshot(db: &Db, run: &Run) -> Result<Value> {
     out["snapshot_id"]=json!(id);
     out["pending_count"]=json!(count);
     out["pending_bytes"]=json!(bytes);
-    out["target_bytes"]=json!(COMPACT_BYTES);
+    out["target_bytes"]=json!(32_000);
+    out["max_bytes"]=json!(COMPACT_BYTES);
     out["instructions"]=json!("Read all remaining snapshot pages with memory_read using this snapshot_id. Submit a compacted version of ONLY this base memory with memory_compact(snapshot_id,text). Preserve rules, preferences, responsibilities, corrections and attribution. Do not copy pending additions; they are appended verbatim by the server. Originals are retained for recovery.");
     tx.commit()?;
     Ok(out)
 }
 pub fn compact(db: &Db, run: &Run, args: &Value) -> Result<Value> {
     let id=args["snapshot_id"].as_str().ok_or_else(||anyhow::anyhow!("Prepare a memory snapshot first"))?;
-    let proposed=args["text"].as_str().ok_or_else(||anyhow::anyhow!("Supply compacted base memory"))?.trim();
-    ensure!(!proposed.is_empty() && proposed.len()<=COMPACT_BYTES,"Compacted base memory must contain 1–40,000 UTF-8 bytes");
     let mut c=db.0.lock().unwrap();
     let tx=c.transaction()?;
     private_valid(&tx,run)?;
@@ -242,6 +251,34 @@ pub fn compact(db: &Db, run: &Run, args: &Value) -> Result<Value> {
     let read_through:i64=tx.query_row("SELECT through_bytes FROM memory_snapshot_reads WHERE snapshot_id=? AND run_id=?",params![id,run.id],|r|r.get(0)).optional()?.unwrap_or(0);
     ensure!(read_through as usize==old.len(),"Read every snapshot page before compacting; unread memory must not be discarded");
     ensure!(revision(&tx,&run.bot_id)?==rev && current(&tx,&run.bot_id)?==old,"Memory changed after the snapshot; prepare a new snapshot and preserve the latest facts");
+    // An oversized proposal is staged privately, never substituted for memory.
+    // Small exact edits avoid repeatedly generating the entire 40 KB document.
+    let mut proposed=if let Some(text)=args.get("text") {
+        ensure!(args.get("edits").is_none() && args.get("draft_id").is_none(),"Supply text OR draft_id with edits, not both");
+        text.as_str().ok_or_else(||anyhow::anyhow!("Memory text must be a string"))?.to_owned()
+    } else {
+        let draft=args["draft_id"].as_str().ok_or_else(||anyhow::anyhow!("Supply text, or draft_id with exact edits"))?;
+        let (revision,mut body):(String,String)=tx.query_row("SELECT revision,body FROM memory_compaction_drafts WHERE snapshot_id=? AND run_id=?",params![id,run.id],|r|Ok((r.get(0)?,r.get(1)?))).optional()?.ok_or_else(||anyhow::anyhow!("No draft in this run; submit compacted text first"))?;
+        ensure!(revision==draft,"Draft changed; use the latest returned draft_id");
+        let edits=args["edits"].as_array().ok_or_else(||anyhow::anyhow!("Supply edits as [{{find,replace}}]"))?;
+        ensure!(!edits.is_empty() && edits.len()<=20,"Use one to twenty exact edits");
+        for edit in edits {
+            let find=edit["find"].as_str().filter(|s|!s.is_empty()).ok_or_else(||anyhow::anyhow!("Each edit needs nonempty find text"))?;
+            let replace=edit["replace"].as_str().ok_or_else(||anyhow::anyhow!("Each edit needs replacement text"))?;
+            ensure!(body.match_indices(find).count()==1,"Edit must match exactly once; include enough surrounding text");
+            body=body.replacen(find,replace,1);
+            ensure!(body.len()<=128_000,"Draft exceeds 128,000 UTF-8 bytes");
+        }
+        body
+    };
+    proposed=proposed.trim().to_owned();
+    ensure!(!proposed.is_empty() && proposed.len()<=128_000,"Compaction draft must contain 1–128,000 UTF-8 bytes");
+    if proposed.len()>COMPACT_BYTES {
+        let draft_id=db::id();let bytes=proposed.len();
+        tx.execute("INSERT INTO memory_compaction_drafts VALUES(?,?,?,?) ON CONFLICT(snapshot_id,run_id) DO UPDATE SET revision=excluded.revision,body=excluded.body",params![id,run.id,draft_id,proposed])?;
+        tx.commit()?;
+        return Ok(json!({"saved":false,"status":"needs_revision","snapshot_id":id,"draft_id":draft_id,"draft_bytes":bytes,"max_bytes":COMPACT_BYTES,"reduce_by_at_least":bytes-COMPACT_BYTES,"target_bytes":32_000,"text":"Saved memory and pending additions are unchanged. Revise this private draft with memory_compact(snapshot_id,draft_id,edits:[{find,replace}]); each find must match exactly once. Preserve rules, facts and corrections. Do not rewrite the whole draft just to fix its size. Commit happens only after all validation passes."}));
+    }
     ensure!(old.is_empty() || proposed.len()<old.len(),"Compaction must reduce the existing base; keep new facts in pending memory");
     let mut merged=proposed.to_owned();
     let mut folded=Vec::new();
@@ -412,15 +449,50 @@ mod tests {
         assert!(remember(&db,&shared,&json!({"mode":"replace","text":"Replace"})).is_err());
     }
     #[test]
+    fn oversized_draft_edits_preserve_facts_pending_data_and_reject_stale_or_ambiguous_edits() {
+        let (db,run)=fixture();let old="Old retained archive. ".repeat(2800);
+        db.save_bot_text(&run.bot_id,"memory",&old,None).unwrap();
+        remember(&db,&run,&json!({"mode":"append","text":"New correction must remain verbatim. ".repeat(100)})).unwrap();
+        let snap=full_snapshot(&db,&run);
+        let fact="Never send without approval. Client review is Friday.";
+        let filler="Historical procedure. ".repeat(2000);
+        let proposal=format!("{fact}\n{filler}");
+        let draft=compact(&db,&run,&json!({"snapshot_id":snap["snapshot_id"],"text":proposal})).unwrap();
+        assert_eq!(draft["saved"],false);assert_eq!(draft["draft_bytes"],proposal.trim().len());
+        assert_eq!(db.bot(&run.bot_id).unwrap().memory,old);
+        let mut edit=json!({"snapshot_id":snap["snapshot_id"],"draft_id":draft["draft_id"],"edits":[{"find":"Historical procedure.","replace":""}]});
+        assert!(compact(&db,&run,&edit).is_err()); // ambiguous edit changes nothing
+        edit["edits"]=json!([{"find":filler.trim_end(),"replace":"Older procedures remain in the original archive."}]);
+        let wrong=json!({"snapshot_id":snap["snapshot_id"],"draft_id":"stale","edits":edit["edits"]});
+        assert!(compact(&db,&run,&wrong).is_err());
+        let saved=compact(&db,&run,&edit).unwrap();assert_eq!(saved["saved"],true);
+        let memory=db.bot(&run.bot_id).unwrap().memory;assert!(memory.starts_with(fact));assert!(memory.contains("New correction must remain verbatim."));
+        assert_eq!(all_memory(&db,&run,json!({"snapshot_id":snap["snapshot_id"]})),old);
+        assert!(compact(&db,&run,&edit).is_err());
+        assert_eq!(db.0.lock().unwrap().query_row("SELECT count(*) FROM memory_compaction_drafts",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+    }
+    #[test]
+    fn draft_cannot_bypass_source_revision_or_page_coverage() {
+        let (db,run)=fixture();db.save_bot_text(&run.bot_id,"memory",&"é".repeat(31000),None).unwrap();
+        let partial=snapshot(&db,&run).unwrap();let proposal="ü".repeat(21000);
+        assert!(compact(&db,&run,&json!({"snapshot_id":partial["snapshot_id"],"text":proposal})).is_err());
+        let snap=full_snapshot(&db,&run);let draft=compact(&db,&run,&json!({"snapshot_id":snap["snapshot_id"],"text":proposal})).unwrap();
+        assert_eq!(draft["draft_bytes"],42000);assert_eq!(draft["reduce_by_at_least"],2000);
+        remember(&db,&run,&json!({"mode":"append","text":"A newer correction"})).unwrap();
+        assert!(compact(&db,&run,&json!({"snapshot_id":snap["snapshot_id"],"draft_id":draft["draft_id"],"edits":[{"find":proposal,"replace":"Rules preserved"}]})).is_err());
+        assert!(all_memory(&db,&run,json!({})).contains("A newer correction"));
+    }
+    #[test]
     fn failed_or_oversized_compaction_does_not_destroy_saved_additions() {
         let (db,run)=fixture();
         db.save_bot_text(&run.bot_id,"memory",&"x".repeat(63000),None).unwrap();
         let receipt=remember(&db,&run,&json!({"mode":"append","text":"y".repeat(64000)})).unwrap();
         assert_eq!(receipt["pending_count"],1);
         let snap=full_snapshot(&db,&run);
-        for text in ["".into(),"z".repeat(COMPACT_BYTES+1)] {
-            assert!(compact(&db,&run,&json!({"snapshot_id":snap["snapshot_id"],"text":text})).is_err());
-        }
+        assert!(compact(&db,&run,&json!({"snapshot_id":snap["snapshot_id"],"text":""})).is_err());
+        let draft=compact(&db,&run,&json!({"snapshot_id":snap["snapshot_id"],"text":"z".repeat(COMPACT_BYTES+1)})).unwrap();
+        assert_eq!(draft["saved"],false);assert_eq!(draft["reduce_by_at_least"],1);
+        assert_eq!(db.bot(&run.bot_id).unwrap().memory,"x".repeat(63000));
         let result=compact(&db,&run,&json!({"snapshot_id":snap["snapshot_id"],"text":"Retained base"})).unwrap();
         assert_eq!(result["pending_count"],1);
         assert!(all_memory(&db,&run,json!({})).ends_with(&"y".repeat(64000)));

@@ -26,18 +26,37 @@ pub fn advertised(app: &App, bot: &Bot, run: &Run) -> Vec<Value> {
     let index = specs.iter().filter(|s| !core(s["name"].as_str().unwrap_or("")))
         .map(|s| s["name"].as_str().unwrap_or("")).collect::<Vec<_>>().join(", ");
     let mut tools: Vec<_> = specs.into_iter().filter(|s| core(s["name"].as_str().unwrap_or(""))).collect();
-    tools.push(json!({"type":"function","name":"tool_describe","description":format!("Read complete schemas before calling tool_execute. Choose up to four exact names from this capability index: {index}. Read-only; no model or external action."),"inputSchema":{"type":"object","properties":{"names":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":4}},"required":["names"],"additionalProperties":false}}));
+    tools.push(json!({"type":"function","name":"tool_describe","description":format!("Read schemas before tool_execute. Example: {{\"names\":[\"chat_read\",\"artifact_list\"]}}. Request at most four at a time; additional names return in remaining. Capability index: {index}. Read-only; no model or external action."),"inputSchema":{"type":"object","properties":{"names":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":4}},"required":["names"],"additionalProperties":false}}));
     tools.push(json!({"type":"function","name":"tool_execute","description":"Execute one tool after reading its schema with tool_describe. Use its exact name and arguments. Existing permissions, approvals and ownership still apply. Never repeat an action with an unknown outcome.","inputSchema":{"type":"object","properties":{"name":{"type":"string"},"arguments":{"type":"object"}},"required":["name","arguments"],"additionalProperties":false}}));
     tools
 }
 
 pub fn describe(app: &App, bot: &Bot, run: &Run, args: &Value) -> Result<Value> {
-    let names = args["names"].as_array().ok_or_else(|| anyhow::anyhow!("Provide names as an array of exact tool names."))?;
-    ensure!(!names.is_empty() && names.len() <= 4, "Request between one and four tools.");
+    // Recover read-only discovery formatting mistakes. Execution remains exact,
+    // independently validated and permission-gated; no aliases reach resolve().
+    let input = args.get("names").or_else(||args.get("name")).or_else(||args.get("query"))
+        .ok_or_else(||anyhow::anyhow!("Use names:[\"chat_read\"] to read tool schemas."))?;
+    let names: Vec<String> = if let Some(items)=input.as_array() {
+        ensure!(items.len()<=64,"Request at most 64 names; schemas are returned four at a time.");
+        items.iter().map(|v|v.as_str().map(str::to_owned).ok_or_else(||anyhow::anyhow!("Tool names must be strings"))).collect::<Result<_>>()?
+    } else if let Some(text)=input.as_str() {
+        ensure!(text.len()<=4096,"Keep discovery requests under 4096 bytes");
+        text.split(|c:char|!c.is_ascii_alphanumeric() && c!='_').filter(|s|!s.is_empty()).map(str::to_owned).collect()
+    } else {anyhow::bail!("Use names as an array of exact tool names");};
+    ensure!(!names.is_empty() && names.len()<=64,"Request one to 64 names; schemas are returned four at a time.");
     let specs = available(app, bot, run);
-    let selected: Vec<_> = names.iter().map(|name| specs.iter().find(|s| s["name"] == *name)
-        .cloned().ok_or_else(|| anyhow::anyhow!("Tool unavailable in this task: {name}"))).collect::<Result<_>>()?;
-    Ok(json!({"text":json!({"tools":selected,"call_with":"tool_execute"}).to_string()}))
+    let mut selected=Vec::new();let mut remaining=Vec::new();let mut unavailable=Vec::new();let mut corrections=Vec::new();let mut seen=std::collections::HashSet::new();
+    for requested in names {
+        ensure!(requested.len()<=160,"Tool name is too long");
+        let name=if requested=="artifacts_list" {"artifact_list"} else {&requested};
+        if !seen.insert(name.to_owned()) {continue;}
+        if let Some(spec)=specs.iter().find(|s|s["name"]==name) {
+            if name!=requested {corrections.push(json!({"requested":requested,"name":name}));}
+            if selected.len()<4 {selected.push(spec.clone());}else{remaining.push(name.to_owned());}
+        } else {unavailable.push(requested);}
+    }
+    ensure!(!selected.is_empty(),"No matching tools in this task. Use exact names from the capability index with names:[...]. Claude account tools (mcp__claude_ai_...) use Claude ToolSearch, not Kindred tool_describe.");
+    Ok(json!({"text":json!({"tools":selected,"remaining":remaining,"unavailable":unavailable,"corrections":corrections,"call_with":"tool_execute"}).to_string()}))
 }
 
 pub fn resolve(app: &App, bot: &Bot, run: &Run, args: Value) -> Result<(String, Value)> {
@@ -78,6 +97,23 @@ mod tests {
                 assert!(describe(&app, &bot, &run, &json!({"names":["codex_connector"]})).is_err());
             }
         }
+    }
+    #[test]
+    fn discovery_recovers_shapes_typos_and_large_batches_without_execution_aliases() {
+        let app=crate::tests::app();let bot=crate::tests::bot(&app.db,"claude-code");
+        let run=app.db.run(&app.db.queue(&bot.id,"Read schemas",0).unwrap()).unwrap();
+        for args in [json!({"name":"chat_read"}),json!({"query":"[\"chat_read\"]"}),json!({"names":"chat_read"}),json!({"names":["chat_read","chat_read"]})] {
+            let out=describe(&app,&bot,&run,&args).unwrap();let v:Value=serde_json::from_str(out["text"].as_str().unwrap()).unwrap();
+            assert_eq!(v["tools"].as_array().unwrap().len(),1);assert_eq!(v["tools"][0]["name"],"chat_read");
+        }
+        let out=describe(&app,&bot,&run,&json!({"names":["artifact_read","artifacts_list","chat_read","chat_post","routines_list","codex_connector"]})).unwrap();
+        let v:Value=serde_json::from_str(out["text"].as_str().unwrap()).unwrap();
+        assert_eq!(v["tools"].as_array().unwrap().len(),4);assert_eq!(v["remaining"],json!(["routines_list"]));
+        assert_eq!(v["unavailable"],json!(["codex_connector"]));assert_eq!(v["corrections"][0]["name"],"artifact_list");
+        assert!(resolve(&app,&bot,&run,json!({"name":"artifacts_list","arguments":{}})).is_err());
+        assert!(describe(&app,&bot,&run,&json!({"names":[1]})).is_err());
+        assert!(describe(&app,&bot,&run,&json!({"query":"x".repeat(4097)})).is_err());
+        assert!(!app.db.events(&run.id).unwrap().iter().any(|e|e["kind"]=="tool_started"));
     }
     #[tokio::test]
     async fn execution_has_original_receipts_and_validation_before_effects() {

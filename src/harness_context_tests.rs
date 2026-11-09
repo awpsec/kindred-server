@@ -208,3 +208,39 @@ fn checkpoint_standing_rule_revocation_invalidates_saved_and_inflight_policy() {
         }
     }
 }
+
+#[test]
+fn cli_large_checkpoint_rebuilds_with_current_memory_corrections_and_receipt_state() {
+    let app=crate::tests::app();let mut bot=crate::tests::bot(&app.db,"claude-code");
+    bot.memory="Standing rule: never send the Orchard report before owner review.".into();app.db.save_bot(&bot).unwrap();
+    let run=start(&app,&bot,"Orchard status");
+    app.db.event(&run.id,"tool_result",json!({"tool":"connector_execute","failed":false,"text":"Orchard draft stored yesterday"})).unwrap();
+    let seq=app.db.0.lock().unwrap().query_row("SELECT max(seq) FROM events WHERE run_id=?",[&run.id],|r|r.get::<_,i64>(0)).unwrap();
+    crate::continuity::save(&app.db,&run,&json!({"topic":"orchard","expected_revision":0,"summary":"Orchard draft completed yesterday, not untouched","status":"active","work_state":{"objective":"Deliver Orchard report","completed":[{"summary":"Orchard draft stored yesterday","event_seq":seq}],"remaining":["Owner review"],"blockers":["Awaiting approval"],"next_action":"Review draft; do not resend"}})).unwrap();
+    let first=harness_context::prepare(&app,&bot,&run,&[],None,"claude-cli-context-v1",&json!({})).unwrap();
+    let mut large=checkpoint();large["estimated_tokens"]=json!(531_970);
+    assert!(harness_context::complete(&app,&bot,&run,&first,&large).unwrap());
+    app.db.finish(&run.id,"completed","Orchard draft stored yesterday; review pending","").unwrap();
+    let next=start(&app,&bot,"Correction: Orchard review is Friday, not Thursday. What remains?");
+    let fresh=harness_context::prepare(&app,&bot,&next,&[],None,"claude-cli-context-v1",&json!({})).unwrap();
+    assert!(!fresh.resumed);assert_ne!(first.session_id,fresh.session_id);
+    let input=fresh.input(&next.prompt);
+    for needle in ["never send the Orchard report", "Orchard draft", "Owner review", "Friday, not Thursday"] {assert!(input.contains(needle),"{needle}");}
+    assert!(crate::continuity::search_for(&app.db,&next,None,"Orchard").unwrap().to_string().contains("Orchard"));
+    let events=app.db.events(&next.id).unwrap();let diagnostic=events.iter().find(|e|e["kind"]=="harness_context").unwrap();
+    assert_eq!(diagnostic["body"]["state"],"budget_checkpoint");assert_eq!(diagnostic["body"]["reuse_budget"],256_000);
+    assert!(harness_context::complete(&app,&bot,&next,&fresh,&checkpoint()).unwrap());app.db.finish(&next.id,"completed","Review pending","").unwrap();
+    let third=start(&app,&bot,"Continue Orchard review");
+    let reused=harness_context::prepare(&app,&bot,&third,&[],None,"claude-cli-context-v1",&json!({})).unwrap();assert!(reused.resumed);
+}
+
+#[test]
+fn claude_usage_budget_does_not_override_other_native_provider_policy() {
+    let app=crate::tests::app();let bot=crate::tests::bot(&app.db,"codex");
+    let run=start(&app,&bot,"First native task");
+    let first=harness_context::prepare(&app,&bot,&run,&[],None,"codex-v1",&json!({})).unwrap();
+    let mut saved=checkpoint();saved["estimated_tokens"]=json!(531_970);
+    assert!(harness_context::complete(&app,&bot,&run,&first,&saved).unwrap());app.db.finish(&run.id,"completed","Done","").unwrap();
+    let next=start(&app,&bot,"Next native task");
+    assert!(harness_context::prepare(&app,&bot,&next,&[],None,"codex-v1",&json!({})).unwrap().resumed);
+}

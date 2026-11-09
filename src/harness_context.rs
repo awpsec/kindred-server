@@ -1,12 +1,14 @@
 //! Disposable, destination-scoped provider checkpoints. Chat history and action
 //! receipts remain authoritative. A checkpoint is never an execution queue.
 use crate::{db::{self, Bot, Db, Run}, runtime::{self, App}};
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 
 const MAX_CHECKPOINT: usize = 4 * 1024 * 1024;
 const MAX_AGE: i64 = 7 * 86400;
+// A retained CLI conversation is a working set, not the durable archive.
+const CLAUDE_REUSE_BUDGET: u64 = 256_000;
 
 pub fn migrate(c: &Connection) -> Result<()> {
     // Deliberately absent from workspace_transfer's export allow-list. A restored
@@ -135,6 +137,10 @@ pub fn prepare(app: &App, bot: &Bot, run: &Run, tools: &[Value], window: Option<
         "SELECT fingerprint,session_id,run_id,checkpoint,checkpoint_hash,updated FROM harness_contexts WHERE bot_id=? AND chat_id=?",
         params![run.bot_id,run.chat_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).optional()?;
     let mut reason = "new";
+    let mut retained_tokens = None;
+    let snapshot_tokens = crate::continuity::store::estimated_tokens(&prepared.live_context) as u64
+        + crate::continuity::store::estimated_tokens(&run.prompt) as u64;
+    let reuse_budget = window.map(|n| n.saturating_mul(8) / 10).unwrap_or(if bot.provider=="claude-code" {CLAUDE_REUSE_BUDGET} else {1_000_000});
     if let Some((fingerprint,session,owner,body,hash,updated)) = previous {
         reason = "invalidated";
         let completed: bool = tx.query_row("SELECT status='completed' FROM runs WHERE id=?", [&owner], |r| r.get(0)).optional()?.unwrap_or(false);
@@ -149,13 +155,11 @@ pub fn prepare(app: &App, bot: &Bot, run: &Run, tools: &[Value], window: Option<
             // Bound context growth at a checkpoint boundary; a cold start uses
             // the already-budgeted authoritative continuity snapshot. Never slice
             // raw tool messages or lose call/result pairing to make a cache fit.
-            let current = crate::continuity::store::estimated_tokens(&prepared.live_context) as u64
-                + crate::continuity::store::estimated_tokens(&run.prompt) as u64;
-            // Official CLI harnesses manage their own compaction and do not
-            // advertise a reliable window here. Keep a hard ceiling, while API
-            // harnesses use their selected model's catalogue budget.
-            let remaining = window.map(|n| n.saturating_mul(8) / 10).unwrap_or(1_000_000);
-            if estimated.is_some_and(|n| n.saturating_add(current) < remaining) {
+            retained_tokens = estimated;
+            // Native compaction preserves the in-flight working state. This
+            // boundary guard also covers older CLIs or an oversized last result.
+            // Rebuild from durable context, never truncate a live tool exchange.
+            if estimated.is_some_and(|n| n.saturating_add(snapshot_tokens) < reuse_budget) {
                 prepared.session_id = session;
                 prepared.checkpoint = Some(checkpoint);
                 prepared.resumed = true;
@@ -169,7 +173,7 @@ pub fn prepare(app: &App, bot: &Bot, run: &Run, tools: &[Value], window: Option<
         params![run.bot_id,run.chat_id,prepared.fingerprint,prepared.session_id,prepared.lease,run.id,db::now()])?;
     tx.commit()?;
     drop(c);
-    app.db.event(&run.id,"harness_context",json!({"state":reason,"engine":engine,"resumed":prepared.resumed}))?;
+    app.db.event(&run.id,"harness_context",json!({"state":reason,"engine":engine,"resumed":prepared.resumed,"retained_tokens":retained_tokens,"snapshot_tokens":snapshot_tokens,"reuse_budget":reuse_budget}))?;
     Ok(prepared)
 }
 
