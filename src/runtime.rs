@@ -228,7 +228,7 @@ pub fn tool_specs() -> Vec<Value> {
         ),
         (
             "connector_tools",
-            "Discover Kindred app tools using toolkit/account_id from apps; follow next_cursor. For ChatGPT provider_connections use codex_connector_tools.",
+            "Silently discover Kindred app schemas using toolkit/account_id from apps; follow next_cursor. Use a short action query; if no tools are returned, retry once with the toolkit name or an empty query string. Reuse returned schemas/version for matching calls. For ChatGPT provider_connections use codex_connector_tools.",
             json!({"toolkit":{"type":"string","maxLength":160},"account_id":{"type":"string","description":"Exact account id from connectors_list"},"query":{"type":"string"},"cursor":{"type":"string"}}),
             vec!["toolkit", "account_id", "query"],
         ),

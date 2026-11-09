@@ -30,9 +30,10 @@ pub fn context(db: &Db, bot: &Bot) -> Result<Value> {
     let style = match mode.as_str() {
         "calm" => "Work quietly; only occasional meaningful updates on long tasks.",
         "frequent" => "Give frequent useful milestones, never narrate each action.",
+        "summaries" => "Work quietly on brief tasks. Use task_progress only for genuine multi-stage work. Avoid opening announcements and step-by-step narration; give a milestone only when it changes what the user needs to know.",
         _ => "Give useful opening and milestone updates; stay quiet between them.",
     };
-    Ok(json!({"mode":mode,"minimum_interval_seconds":seconds(&mode),"guidance":format!("{style} For brief drafts, lookups and checks, work quietly; tools alone need no long-job announcement or plan. Do not narrate clicks, coordinates, loading or retries. Show questions, approvals, blockers and status immediately. Keep final detail. User requests and quiet routines override cadence.")}))
+    Ok(json!({"mode":mode,"minimum_interval_seconds":seconds(&mode),"guidance":format!("{style} For brief drafts, lookups and checks, work quietly; tools alone need no long-job announcement or plan. Discover connector schemas silently through the available discovery tools; schema lookup, tool selection and account enumeration are internal preparation, not user-facing updates. Do not narrate clicks, coordinates, loading or retries. Show questions, approvals, blockers and status immediately. Keep final detail. User requests and quiet routines override cadence.")}))
 }
 
 // Run-start and emission snapshots do not retrofit untagged historical messages.
@@ -622,6 +623,18 @@ mod tests {
         assert_eq!(tag("Bot preference wins immediately")["mode"],"frequent");
         assert_eq!(tag("Legacy untagged reply"),Value::Null);
         assert_eq!(crate::db::general_settings(None)["message_delivery"],"steer");
+    }
+
+    #[test]
+    fn summary_guidance_keeps_schema_preparation_private_without_hiding_attention() {
+        let app=tests::app();let mut bot=tests::bot(&app.db,"custom-test");
+        bot.profile.progress_updates="summaries".into();
+        let value=context(&app.db,&bot).unwrap();let guide=value["guidance"].as_str().unwrap();
+        assert_eq!(value["mode"],"summaries");
+        assert!(guide.contains("Work quietly on brief tasks"));
+        assert!(guide.contains("Discover connector schemas silently"));
+        assert!(guide.contains("Show questions, approvals, blockers and status immediately"));
+        assert!(guide.contains("Keep final detail"));
     }
 
     #[test]
