@@ -771,7 +771,7 @@ mod tests {
     }
     #[test]
     fn ending_call_preserves_private_memory_and_continuity_session() {
-        for provider in ["codex", "claude-code", "openai"] {
+        for provider in ["codex", "claude-code", "openrouter"] {
             let db=Db::open(":memory:").unwrap();
             let b=crate::tests::bot(&db,provider);
             db.save_bot_text(&b.id,"memory","Work on my bot VM by default.",None).unwrap();
