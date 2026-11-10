@@ -240,7 +240,13 @@ pub fn message(c:&rusqlite::Connection,seq:i64)->Result<Value> {
             rusqlite::params![seq,run,value["group_id"].as_str().unwrap()],
             |r|Ok(json!({"seq":r.get::<_,i64>(0)?,"created":r.get::<_,i64>(1)?,"run_id":r.get::<_,String>(2)?,"sender":r.get::<_,String>(3)?,"task_title":r.get::<_,String>(4)?})),
         ).optional()?;
-        if let Some(marker)=marker {value["marker"]=marker;}
+        if let Some(marker)=marker {
+            // Capped, persisted ownership evidence survives message pagination.
+            // Never count finals, hidden rows or another bot/chat as narration.
+            let count:i64=c.query_row("SELECT count(*) FROM (SELECT p.message_seq FROM message_progress p JOIN chat_messages m ON m.seq=p.message_seq JOIN runs r ON r.id=p.run_id WHERE p.group_id=?1 AND p.mode='summaries' AND p.phase='commentary' AND COALESCE(p.work_qualified,1)=1 AND m.kind='assistant' AND m.suppressed=0 AND length(trim(m.body))>0 AND NOT EXISTS(SELECT 1 FROM events e WHERE e.seq=m.source_event_seq AND e.run_id=m.run_id AND json_extract(e.body,'$.status_notice')='provider_error') AND m.run_id=p.run_id AND m.sender=?2 AND m.chat_id=?3 AND r.bot_id=m.sender AND r.chat_id=m.chat_id LIMIT 4)",rusqlite::params![value["group_id"].as_str().unwrap(),marker["sender"].as_str().unwrap(),c.query_row("SELECT chat_id FROM chat_messages WHERE seq=?",[seq],|r|r.get::<_,String>(0))?],|r|r.get(0))?;
+            value["commentary_count"]=json!(count);
+            value["marker"]=marker;
+        }
         value["activity"]=activity(c,seq,&run)?;
         let (start,end)=phase_range(c,seq,&run)?;
         let hidden:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM routine_runs WHERE run_id=?1) OR EXISTS(SELECT 1 FROM routine_execution WHERE run_id=?1) OR EXISTS(SELECT 1 FROM events WHERE run_id=?1 AND kind='tool_result' AND json_extract(body,'$.tool')='finish_quietly' AND COALESCE(json_extract(body,'$.failed'),0)=0)",[&run],|r|r.get(0))?;
@@ -275,6 +281,7 @@ mod tests {
             assert_eq!(row["progress"]["marker"]["seq"],marker["seq"]);
             assert_eq!(row["progress"]["marker"]["run_id"],id);
             assert_eq!(row["progress"]["marker"]["sender"],bot.id);
+            assert_eq!(row["progress"]["commentary_count"],4,"Count is capped and survives page boundaries");
         }
         let source_seq=rows.last().unwrap()["seq"].as_i64().unwrap();
         let other=tests::bot(&app.db,"codex");
