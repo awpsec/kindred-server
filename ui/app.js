@@ -7004,7 +7004,7 @@ function prepareProgressGather(target,desired,animate){
     // and unrelated groups cannot create a gather animation.
     if(!rows.length)continue;
     const bounds=target.getBoundingClientRect();
-    const visible=rows.slice(-3).map(row=>({row,ghost:row.cloneNode(true),rect:row.getBoundingClientRect()})).filter(({rect})=>rect.bottom>bounds.top&&rect.top<bounds.bottom);
+    const visible=rows.slice(-3).filter(row=>row.textContent.length<=12000&&!row.querySelector('iframe,video,audio,img,canvas,[data-shard-signature],[data-file-signature],[data-visual-signature],.chat-media')).map(row=>({ghost:row.cloneNode(true),rect:row.getBoundingClientRect()})).filter(({rect})=>rect.bottom>bounds.top&&rect.top<bounds.bottom);
     if(!visible.length)continue;
     gathers.push({key,visible});
   }
@@ -7017,8 +7017,7 @@ function prepareProgressGather(target,desired,animate){
       const end=header.getBoundingClientRect();
       if(end.bottom<target.getBoundingClientRect().top||end.top>target.getBoundingClientRect().bottom)continue;
       const motion=header.animate([{opacity:.2,transform:'translateY(6px)'},{opacity:1,transform:'translateY(0)'}],{duration:220,easing:'cubic-bezier(.23,1,.32,1)'});trackMotion(motion,220);
-      for(const {row,ghost,rect} of visible){
-        if(row.querySelector('iframe,video,audio,[data-shard-signature]'))continue;
+      for(const {ghost,rect} of visible){
         ghost.hidden=false;ghost.inert=true;ghost.setAttribute('aria-hidden','true');ghost.classList.add('progress-gather-ghost');
         for(const el of [ghost,...ghost.querySelectorAll('[id]')])el.removeAttribute('id');
         for(const key of ['message','progressCandidate','taskCommentary','scrollMessages'])delete ghost.dataset[key];

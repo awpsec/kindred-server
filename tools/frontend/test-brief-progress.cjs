@@ -34,7 +34,7 @@ const assert=require('node:assert/strict'),fs=require('node:fs'),path=require('n
   attention=false;finished=false;seconds=90;
   for(const kind of ['question','approval','handoff']){
    pendingKind=kind;await page.reload();await page.locator('.progress-commentary').first().waitFor();
-   const control=page.locator(kind==='question'?'[data-task-question="brief-choice"]':kind==='approval'?'[data-message="6"]':'[data-message="human-task-brief-login"]');
+   const control=page.locator(kind==='question'?'[data-question-id="brief-choice"]':kind==='approval'?'#request-tray':'[data-message="human-task-brief-login"]');
    await control.waitFor();assert.equal(await page.locator('.summary-progress').count(),0);
    assert.equal(await control.getAttribute('data-task-commentary'),null,kind+' remains outside collapsed commentary');
    assert.equal(await page.locator('.task-commentary:visible').count(),0);
