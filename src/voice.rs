@@ -770,6 +770,35 @@ mod tests {
         id
     }
     #[test]
+    fn ending_call_preserves_private_memory_and_continuity_session() {
+        for provider in ["codex", "claude-code", "openai"] {
+            let db=Db::open(":memory:").unwrap();
+            let b=crate::tests::bot(&db,provider);
+            db.save_bot_text(&b.id,"memory","Work on my bot VM by default.",None).unwrap();
+            let run=db.run(&db.queue(&b.id,"Continue",0).unwrap()).unwrap();
+            crate::continuity::store::start_session(&db,&run,provider,"test").unwrap();
+            let id=record(&db,&run.chat_id,&Transcript::default());
+            { let c=db.0.lock().unwrap();work::receipt(&c,&id,&run.chat_id).unwrap(); }
+            finish(&db,&id,true).unwrap();
+            finish(&db,&id,true).unwrap();
+            assert_eq!(crate::continuity::store::memory(&db,&run,"Work on my bot VM by default.").unwrap(),json!("Work on my bot VM by default."));
+            assert!(crate::continuity::store::session_valid(&db.0.lock().unwrap(),&run.id).unwrap());
+            assert_eq!(crate::memory_maintenance::context(&db,&run).unwrap()["due"],false);
+        }
+    }
+
+    #[test]
+    fn editing_a_finished_call_receipt_still_invalidates_memory() {
+        let db=Db::open(":memory:").unwrap();let b=crate::tests::bot(&db,"codex");
+        let run=db.run(&db.queue(&b.id,"Continue",0).unwrap()).unwrap();
+        crate::continuity::store::start_session(&db,&run,"codex","test").unwrap();
+        let id=record(&db,&run.chat_id,&Transcript::default());
+        finish(&db,&id,true).unwrap();
+        let c=db.0.lock().unwrap();
+        c.execute("UPDATE chat_messages SET body='Withdrawn call' WHERE seq=(SELECT message_seq FROM voice_calls WHERE id=?)",[id]).unwrap();
+        assert!(!crate::continuity::store::session_valid(&c,&run.id).unwrap());
+    }
+    #[test]
     fn missing_audio_watchdog_distinguishes_silence_mute_and_stalled_transport() {
         let old = Instant::now() - Duration::from_secs(9);
         assert!(audio_overdue(old, false));

@@ -32,6 +32,15 @@ END;
 DROP TRIGGER IF EXISTS continuity_source_changed;
 CREATE TRIGGER continuity_source_changed AFTER UPDATE OF body,suppressed ON chat_messages
 WHEN (old.body<>new.body AND NOT (
+  -- This is a presentation-only transition, backed by the same durable call.
+  -- Ending a call must not quarantine every participant's private memory.
+  old.kind='voice_call' AND new.kind=old.kind AND new.run_id=old.run_id
+  AND new.chat_id=old.chat_id AND new.sender=old.sender AND old.sender='user'
+  AND old.body='Call in progress'
+  AND EXISTS(SELECT 1 FROM voice_calls v WHERE v.message_seq=old.seq
+    AND v.chat_id=old.chat_id AND v.seconds>=0
+    AND new.body=printf('Call ended · %d:%02d',v.seconds/60,v.seconds%60))
+) AND NOT (
   old.kind='result' AND new.kind=old.kind AND new.run_id=old.run_id AND new.chat_id=old.chat_id AND new.sender=old.sender
   AND EXISTS(SELECT 1 FROM runs r JOIN events repair ON repair.run_id=r.id AND repair.kind='routine_terminal_report_repaired'
     JOIN events original ON original.run_id=r.id AND original.kind='routine_provider_final'
