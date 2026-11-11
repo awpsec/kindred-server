@@ -450,6 +450,7 @@ impl Db {
                 row["seq"].as_i64().unwrap(),
             )?;
         }
+        crate::routine_incidents::decorate_rows(&self.0.lock().unwrap(),&mut rows)?;
         Ok(rows)
     }
     fn decorate_chat_status(&self, row: &mut Value) -> Result<()> {

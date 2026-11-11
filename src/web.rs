@@ -187,6 +187,7 @@ pub fn router(app: Shared) -> Router {
             axum::routing::delete(delete_routine).patch(crate::routine_updates::route),
         )
         .route("/routines/{id}/run", post(run_routine_now))
+        .route("/routines/{id}/recover", post(recover_routine))
         .route("/settings", get(settings).put(save_settings))
         .route("/primary-bot", put(save_primary_bot))
         .route(
@@ -910,6 +911,10 @@ async fn save_openrouter(State(app): State<Shared>, Json(v): Json<Value>) -> Res
 }
 async fn routines(State(app): State<Shared>) -> Result<Json<Vec<Value>>> {
     Ok(Json(crate::mail_watch::routines(&app.db)?))
+}
+async fn recover_routine(State(app): State<Shared>, Path(id): Path<String>) -> Result<Json<Value>> {
+    ensure_routine_workspace(&app)?;
+    Ok(Json(json!({"run_id":app.db.recover_routine(&id)?})))
 }
 async fn run_routine_now(State(app): State<Shared>, Path(id): Path<String>) -> Result<Json<Value>> {
     ensure_routine_workspace(&app)?;

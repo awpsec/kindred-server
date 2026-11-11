@@ -146,6 +146,10 @@ impl crate::db::Db {
         self.run_routine_now_request(id, None)
     }
     pub fn run_routine_now_request(&self, id: &str, request_id: Option<&str>) -> Result<String> {
+        self.run_routine_request_mode(id,request_id,false)
+    }
+    pub fn recover_routine(&self,id:&str)->Result<String>{self.run_routine_request_mode(id,None,true)}
+    fn run_routine_request_mode(&self,id:&str,request_id:Option<&str>,recover:bool)->Result<String>{
         let routine = self
             .routines()?
             .into_iter()
@@ -158,13 +162,23 @@ impl crate::db::Db {
             !crate::workspace_transfer::frozen(&tx)?,
             "This workspace is paused"
         );
+        let recovery_key=if recover {
+            let incident=crate::routine_incidents::view(&tx,id)?;
+            let failed=incident["run_id"].as_str().context("This routine has no unresolved failed check")?;
+            Some(format!("routine-recovery:{id}:{failed}"))
+        } else {None};
+        let request_id=recovery_key.as_deref().or(request_id);
         if let Some(existing) = crate::routine_controls::receipt(&tx, request_id)? {
-            return Ok(existing);
+            let cancelled:bool=tx.query_row("SELECT status='cancelled' FROM runs WHERE id=?",[&existing],|r|r.get(0))?;
+            if !recover || !cancelled {return Ok(existing);}
+            // A deliberately stopped recovery is not a successful check. A new
+            // explicit retry may start a fresh check, never replay the old run.
+            tx.execute("DELETE FROM routine_run_requests WHERE request_id=?",[request_id.unwrap()])?;
         }
         // Read the current definition while holding the queue transaction.
-        let (prompt, owner): (String, String) =
-            tx.query_row("SELECT prompt,bot_id FROM routines WHERE id=?", [id], |r| {
-                Ok((r.get(0)?, r.get(1)?))
+        let (prompt, owner, interval, schedule, run_at): (String, String, i64, Option<String>, Option<i64>) =
+            tx.query_row("SELECT prompt,bot_id,interval_seconds,schedule,run_at FROM routines WHERE id=?", [id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
             })?;
         ensure!(owner == routine.bot_id, "Routine ownership changed");
         let active:Option<String>=tx.query_row("SELECT runs.id FROM runs JOIN routine_runs ON routine_runs.run_id=runs.id WHERE routine_runs.routine_id=? AND runs.status IN ('queued','running','awaiting_user','awaiting_approval','cancelling') ORDER BY runs.created LIMIT 1",[id],|r|r.get(0)).optional()?;
@@ -197,6 +211,14 @@ impl crate::db::Db {
             pinned: false,
             last_message: None,
         };
+        if recover {
+            crate::routine_incidents::reset(&tx,id)?;
+            if run_at.is_none() {
+                let schedule:Option<WeeklySchedule>=schedule.map(|s|serde_json::from_str(&s)).transpose()?;
+                let next=match schedule {Some(s)=>s.next_after(crate::db::now())?,None=>crate::db::now()+interval};
+                tx.execute("UPDATE routines SET enabled=1,next_run=? WHERE id=?",rusqlite::params![next,id])?;
+            }
+        }
         let run = crate::chats::insert_run(&tx, &chat, &bot.id, &prompt, &crate::db::id(), "", 0)?;
         tx.execute(
             "INSERT INTO routine_runs(run_id,routine_id) VALUES(?,?)",

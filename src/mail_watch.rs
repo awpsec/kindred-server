@@ -209,8 +209,9 @@ pub fn routines(db: &Db) -> Result<Vec<Value>> {
             let mut v = serde_json::to_value(r)?;
             v["provider_inbox"] = crate::provider_inbox::view(db,&id)?.unwrap_or(Value::Null);
             v["trigger"] = json!("schedule");
-            let last= db.0.lock().unwrap().query_row("SELECT json_object('id',runs.id,'status',runs.status,'created',runs.created,'error',runs.error) FROM runs JOIN routine_runs ON routine_runs.run_id=runs.id WHERE routine_runs.routine_id=? ORDER BY runs.created DESC,runs.rowid DESC LIMIT 1",[id],|r|r.get::<_,String>(0)).optional()?;
+            let last= db.0.lock().unwrap().query_row("SELECT json_object('id',runs.id,'status',runs.status,'created',runs.created,'error',runs.error) FROM runs JOIN routine_runs ON routine_runs.run_id=runs.id WHERE routine_runs.routine_id=? ORDER BY runs.created DESC,runs.rowid DESC LIMIT 1",[&id],|r|r.get::<_,String>(0)).optional()?;
             v["last_run"]=last.map(|s|serde_json::from_str(&s)).transpose()?.unwrap_or(Value::Null);
+            v["incident"]=crate::routine_incidents::view(&db.0.lock().unwrap(),&id)?;
             Ok(v)
         })
         .collect::<Result<Vec<_>>>()?;
@@ -228,6 +229,7 @@ pub fn directory(db:&Db,bot:&str,id:Option<&str>)->Result<Value> {
         r["instruction_bytes"]=json!(prompt.as_str().map(str::len).unwrap_or(0));
         r["read_with"]=json!({"tool":"routines_list","arguments":{"id":r["id"]}});
         if let Some(m)=r["monitor"].as_object_mut(){m.remove("instructions");}
+        if let Some(error)=r["incident"]["error"].as_str().filter(|s|s.len()>600){r["incident"]["error"]=json!(crate::runtime::bounded(error,600));r["incident"]["error_shortened"]=json!(true);}
         if let Some(error)=r["last_run"]["error"].as_str().filter(|s|s.len()>600){r["last_run"]["error"]=json!(crate::runtime::bounded(error,600));r["last_run"]["error_shortened"]=json!(true);}
     }}
     Ok(json!(rows))

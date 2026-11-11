@@ -102,6 +102,14 @@ impl Db {
         // Reuse only the immediate next turn for this bot, in the same chat;
         // never absorb a routine, command, teammate message or completed work.
         let scheduled:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM routine_runs WHERE run_id=?)",[root],|r|r.get(0))?;
+        if scheduled {
+            let routine:String=tx.query_row("SELECT routine_id FROM routine_runs WHERE run_id=?",[root],|r|r.get(0))?;
+            let member:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM routine_runs WHERE run_id=?)",[source],|r|r.get(0))?;
+            let latest:String=tx.query_row("SELECT r.id FROM routine_runs rr JOIN runs r ON r.id=rr.run_id WHERE rr.routine_id=? ORDER BY r.rowid DESC LIMIT 1",[&routine],|r|r.get(0))?;
+            // Missing membership on a legacy continuation is repaired below from
+            // its server-owned root; it is not an old scheduled occurrence.
+            ensure!(!member || latest==source,"This check has been superseded. Use the routine's current recovery action instead");
+        }
         let followup: Option<String> = if status == "cancelled" && !scheduled {
             tx.query_row("SELECT r.id FROM runs r JOIN run_message_sources s ON s.run_id=r.id JOIN chat_messages m ON m.seq=s.message_seq WHERE r.bot_id=?1 AND r.chat_id=?2 AND r.status IN ('queued','running','awaiting_user','awaiting_approval') AND r.created>=?3 AND EXISTS(SELECT 1 FROM events WHERE run_id=?4 AND kind='run_stop_requested' AND created>=?5) AND r.rowid=(SELECT MIN(rowid) FROM runs WHERE bot_id=?1 AND rowid>(SELECT rowid FROM runs WHERE id=?4)) AND r.depth=0 AND r.reply_to='' AND m.sender='user' AND m.kind='message' AND m.suppressed=0 AND NOT EXISTS(SELECT 1 FROM run_commands WHERE run_id=r.id) AND NOT EXISTS(SELECT 1 FROM routine_runs WHERE run_id=r.id) AND NOT EXISTS(SELECT 1 FROM events WHERE run_id=r.id AND kind='task_recovery')",params![run.bot_id,run.chat_id,db::now()-120,source,db::now()-900],|r|r.get(0)).optional()?
         } else { None };

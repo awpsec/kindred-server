@@ -266,6 +266,7 @@ impl Db {
         crate::schedules::migrate(&c)?;
         crate::provider_inbox::migrate(&c)?;
         crate::routine_completion::migrate(&c)?;
+        crate::routine_incidents::migrate(&c)?;
         crate::initiative::init(&c)?;
         crate::chats::migrate(&c)?;
         crate::workspace_transfer::migrate(&c)?;
@@ -653,6 +654,7 @@ impl Db {
         c.execute("UPDATE connector_artifacts SET status='interrupted',revision=revision+1 WHERE run_id=? AND status IN ('preparing','pending','approved','ready','executing')",[id])?;
         let completed:bool=c.query_row("SELECT status='completed' AND error='' FROM runs WHERE id=?",[id],|r|r.get(0))?;
         crate::routine_completion::publish(&c,id,completed)?;
+        crate::routine_incidents::finished(&c,id)?;
         // Provisional handoffs do not produce an error bubble during healthy
         // work. A terminal owner releases an unresolved source recovery receipt.
         c.execute("UPDATE followup_offers SET state='uncertain' WHERE run_id=? AND state IN ('dispatching','transported') AND EXISTS(SELECT 1 FROM runs WHERE id=? AND status IN ('completed','failed','interrupted','cancelled'))",params![id,id])?;
@@ -1010,6 +1012,7 @@ impl Db {
         }
         let due=tx.prepare("SELECT id,bot_id,prompt,interval_seconds,schedule,run_at FROM routines WHERE enabled=1 AND next_run<=?")?.query_map([time],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,i64>(3)?,r.get::<_,Option<String>>(4)?,r.get::<_,Option<i64>>(5)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
         for (routine, bot, prompt, interval, schedule, run_at) in due {
+            if crate::routine_incidents::pause_if_needed(&tx,&routine)? {continue;}
             let schedule: Option<crate::schedules::WeeklySchedule> =
                 schedule.map(|s| serde_json::from_str(&s)).transpose()?;
             let eligible = schedule

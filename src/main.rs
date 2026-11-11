@@ -107,6 +107,7 @@ mod recovery_fairness_tests;
 mod recovery_isolation_tests;
 mod resources;
 mod routine_controls;
+mod routine_incidents;
 mod routine_completion;
 mod routine_recovery;
 #[cfg(test)]

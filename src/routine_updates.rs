@@ -69,6 +69,7 @@ pub fn update(app: &App, owner: Option<&str>, id: &str, changes: Changes) -> Res
         );
     }
     let was_enabled = routine.enabled;
+    if changes.enabled==Some(true) {crate::routine_incidents::reset(&tx,id)?;}
     let old_interval = routine.interval_seconds;
     let old_schedule = routine.schedule.clone();
     let old_run_at = routine.run_at;
@@ -220,7 +221,11 @@ mod tests {
             .await
             .unwrap();
         let listed: Value = serde_json::from_str(listing["text"].as_str().unwrap()).unwrap();
-        assert_eq!(listed[0]["prompt"], expected["prompt"]);
+        assert!(listed[0]["prompt"].is_null(), "Discovery stays compact");
+        assert_eq!(listed[0]["read_with"]["arguments"]["id"], original.id);
+        let details = runtime::call_tool(&app, &b, &run, "routines_list", json!({"id":original.id})).await.unwrap();
+        let details: Value = serde_json::from_str(details["text"].as_str().unwrap()).unwrap();
+        assert_eq!(details[0]["prompt"], expected["prompt"]);
         // Future scheduled work uses the edited prompt; past/current runs stay pinned.
         let mut due = app.db.routines().unwrap().remove(0);
         due.schedule = None;
