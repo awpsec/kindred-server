@@ -80,6 +80,7 @@ mod slack_watch;
 mod mobile_push;
 mod managed_process;
 mod message_actions;
+mod message_search;
 #[cfg(test)]
 #[path = "../desktop/src/notification_xml.rs"]
 mod notification_xml;

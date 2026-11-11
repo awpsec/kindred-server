@@ -1021,3 +1021,31 @@ async fn coordinator_review_boundary_follows_an_explicit_reply_into_another_prof
     assert!(!addressed.prompt.contains("routed to you as the conversation coordinator"));
     assert_eq!(owner_app.db.runs(Some(&lead.id)).unwrap().len(), 1);
 }
+
+#[tokio::test]
+async fn message_search_is_profile_and_shared_membership_scoped() {
+    let f=Fixture::new();
+    let (a,_,aa)=f.account("Search owner");
+    let (b,bid,_)=f.account("Search member");
+    let (x,_,xa)=f.account("Search outsider");
+    let room=f.ok("POST","/api/server-chats",&a,json!({"participants":[format!("person:{}",bid.account)]})).await;
+    let path=format!("/api/server-chats/{}/messages",room["id"].as_str().unwrap());
+    f.ok("POST",&path,&a,json!({"prompt":"Kickoff visible to members","request_id":db::id(),"mentions":[],"files":[]})).await;
+    for token in [&a,&b] {
+        let found=f.ok("GET","/api/server-chats/search?q=kickoff",token,Value::Null).await;
+        assert_eq!(found["matches"].as_array().unwrap().len(),1);
+        assert_eq!(found["matches"][0]["chat_id"],room["id"]);
+    }
+    let found=f.ok("GET","/api/server-chats/search?q=kickoff",&x,Value::Null).await;
+    assert!(found["matches"].as_array().unwrap().is_empty());
+    let own=bot(&aa,"Owner bot");let outsider=bot(&xa,"Outsider bot");
+    for (app,bot,text) in [(&aa,own,"Kickoff private owner"),(&xa,outsider,"Kickoff private outsider")] {
+        app.db.queue(&bot.id,"Initialize search fixture",0).unwrap();
+        app.db.0.lock().unwrap().execute("INSERT INTO chat_messages(chat_id,sender,body,kind,created) VALUES(?,'user',?,'message',1)",params![format!("dm-{}",bot.id),text]).unwrap();
+    }
+    let local=f.ok("GET","/api/messages/search?q=kickoff",&a,Value::Null).await;
+    assert_eq!(local["matches"].as_array().unwrap().len(),1);
+    assert_eq!(local["matches"][0]["excerpt"],"Kickoff private owner");
+    let bad=f.request("GET","/api/messages/search?q=x",&a,Value::Null).await;
+    assert_eq!(bad.0,StatusCode::BAD_REQUEST);
+}

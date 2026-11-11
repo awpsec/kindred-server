@@ -32,7 +32,7 @@ const fs=require('node:fs'),path=require('node:path'),assert=require('node:asser
    return {quiet,assigned,missing,completed,remote};
   });
   assert.deepEqual(result.quiet,{chat:[],sidebar:[]});
-  for(const key of ['assigned','missing']){assert.deepEqual(result[key].chat,['Atlas working']);assert.deepEqual(result[key].sidebar,['working']);}
+  for(const key of ['assigned','missing']){assert.deepEqual(result[key].chat,['Atlas working']);assert.deepEqual(result[key].sidebar,['thinking']);}
   assert.deepEqual(result.completed,{chat:[],sidebar:[]});assert.deepEqual(result.remote.chat,['Atlas working','Scratch working']);
   const out=process.env.KINDRED_TEST_ARTIFACTS||'/tmp/kindred-assigned-activity';fs.mkdirSync(out,{recursive:true});await page.screenshot({path:path.join(out,'assigned-orion.png')});
   assert.deepEqual(errors,[]);console.log('PASS: assigned work appears in chat and sidebar before text/tools; lagged/missing shared workers, quiet observers, remote workers and completion handled');

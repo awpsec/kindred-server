@@ -59,6 +59,7 @@ pub fn router(app: Shared) -> Router {
         .route("/chats/{id}/read", put(mark_chat_read))
         .route("/bots/{id}/identity", put(update_bot_identity))
         .route("/chats", get(chats).post(create_chat))
+        .route("/messages/search", get(crate::message_search::route))
         .route("/chats/{id}", get(chat).put(update_chat))
         .route("/chats/{id}/messages", post(chat_send))
         .route("/chats/{chat}/panels/{id}/respond", post(workflow_response))

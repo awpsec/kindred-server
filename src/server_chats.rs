@@ -231,6 +231,7 @@ pub(super) fn routes() -> Router<Portal> {
         .route("/api/server-chats/directory", get(directory))
         .route("/api/server-chats/sharing", get(sharing).put(share))
         .route("/api/server-chats", get(list).post(create))
+        .route("/api/server-chats/search", get(search_messages))
         .route("/api/server-chats/{id}", get(history).put(update))
         .route("/api/server-chats/{id}/messages", post(send))
         .route("/api/server-chats/{id}/read", put(read))
@@ -610,6 +611,25 @@ struct Page {
     #[serde(default)]
     inclusive: bool,
 }
+async fn search_messages(
+    State(p): State<Portal>, headers: HeaderMap,
+    Query(query): Query<crate::message_search::Search>,
+) -> ApiResult {
+    let identity=auth(&p,&headers)?;
+    let terms=crate::message_search::terms(&query.q)?;
+    let result=tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
+        let c=p.registry.lock().unwrap();
+        // Match Room::contains at the read boundary. Never search private
+        // profile mirrors or rooms the authenticated account has left.
+        let mut result=crate::message_search::collect(&c,
+            "SELECT m.room_id,m.seq,m.sender,substr(m.body,1,?3),m.created FROM server_messages m WHERE m.seq>(SELECT COALESCE(MAX(seq),0)-?2 FROM server_messages) AND EXISTS(SELECT 1 FROM server_rooms r,json_each(r.body,'$.participants') member WHERE r.id=m.room_id AND json_extract(member.value,'$.kind')='person' AND json_extract(member.value,'$.account')=?1) AND NOT EXISTS(SELECT 1 FROM server_reads rr WHERE rr.room_id=m.room_id AND rr.account=?1 AND rr.archived=1) AND NOT EXISTS(SELECT 1 FROM server_questions q WHERE q.seq=m.seq) ORDER BY m.seq DESC LIMIT ?2", &identity.account,&terms)?;
+        if crate::message_search::has_older(&c,true)? { result["limited"]=json!(true); }
+        Ok(result)
+    }).await??;
+    Ok(Json(result))
+}
+
+
 async fn history(
     State(p): State<Portal>,
     headers: HeaderMap,
