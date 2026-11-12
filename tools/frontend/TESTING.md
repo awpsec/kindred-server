@@ -265,3 +265,12 @@ fitting does not overwrite preferences, and very narrow windows use a temporary
 right-pane overlay. Run both in Chromium and with `WEBKIT=1`; these are fixture
 checks, not native macOS/Windows acceptance. Double-click a divider to reset it;
 arrow keys resize, Home/End select limits, and Escape cancels an active drag.
+
+`test-reply-reading-stability.cjs` checks a reading anchor captured mid-reply
+entrance. The entrance may move its own text, but must never move neighboring
+text or change scrollTop when it settles or history refreshes. It covers user
+and bot messages, three text sizes, standard/Retina scale, draft preservation,
+and both reduced-motion settings. Run in Chromium and with `WEBKIT=1`, alongside
+`test-progress-arrival.cjs`, `test-in-chat-work.cjs`, and
+`test-pane-chat-anchor.cjs`. Browser WebKit is not native macOS acceptance:
+also check arrivals while scrolling and opening panes in the installed Mac app.
