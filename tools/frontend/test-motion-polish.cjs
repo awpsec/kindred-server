@@ -53,7 +53,7 @@ const artifacts=process.env.KINDRED_TEST_ARTIFACTS||path.resolve(__dirname,'../.
    // Cached General controls are interactive before a slow refresh and never fade later.
    let release,started=false;
    await page.route(origin+'/api/settings',async route=>{started=true;await new Promise(r=>release=r);await route.continue();});
-   await page.locator('#settings-button').click();await page.locator('.general-settings-form').waitFor();
+   await page.locator('#identity-button').click();await page.locator('#identity-menu').getByRole('menuitem',{name:'Settings',exact:true}).click();await page.locator('.general-settings-form').waitFor();
    await page.waitForFunction(()=>document.querySelector('#settings-content').getAnimations().length===0);
    assert(started);
    await page.getByLabel('Text size',{exact:true}).focus();
@@ -106,33 +106,13 @@ const artifacts=process.env.KINDRED_TEST_ARTIFACTS||path.resolve(__dirname,'../.
    await page.locator('#new-bot').hover();await page.mouse.down();await page.waitForFunction(()=>getComputedStyle(document.querySelector('#new-bot')).translate==='0px 1px');
    const press=await page.locator('#new-bot').evaluate(n=>({transform:getComputedStyle(n).transform,translate:getComputedStyle(n).translate}));
    assert.equal(press.transform,'none');const pressedOffset=Number(press.translate.split(' ')[1]?.replace('px',''));assert(pressedOffset>=0&&pressedOffset<=1.001,JSON.stringify(press));await page.mouse.up();await page.keyboard.press('Escape');
-   if(platform==='linux'){
-    await page.evaluate(async()=>{
-     const {character,setActivity}=await import('/characters.js');const wrap=document.createElement('div');wrap.id='motion-viewport';
-     wrap.style.cssText='position:fixed;right:10px;top:100px;height:100px;width:100px;overflow:auto;z-index:100';
-     const spacer=document.createElement('div');spacer.style.height='300px';wrap.append(spacer);
-     const bot=character({shape:'round',color:'#2475ff',animated:true},48);bot.id='motion-avatar';wrap.append(bot);document.body.append(wrap);setActivity(bot,'working',{immediate:true});
-    });await page.waitForTimeout(180);
-    const pose=()=>page.locator('#motion-avatar').evaluate(n=>n._character.motion.getAttribute('transform'));
-    const invisible=await pose();await page.waitForTimeout(150);assert.equal(await pose(),invisible,'Offscreen avatar kept animating');
-    await page.locator('#motion-viewport').evaluate(n=>n.scrollTop=n.scrollHeight);await page.waitForFunction(()=>!document.querySelector('#motion-avatar').hasAttribute('data-motion-offscreen'));
-    const visible=await pose();await page.waitForTimeout(150);assert.notEqual(await pose(),visible,'Visible avatar failed to resume');
-    await page.emulateMedia({reducedMotion:'reduce'});await settle();const reduced=await pose();await page.waitForTimeout(150);assert.equal(await pose(),reduced);assert.equal(reduced,null);
-    await page.emulateMedia({reducedMotion:'no-preference'});await page.waitForTimeout(150);assert.notEqual(await pose(),null);
-    await page.evaluate(async()=>{const {setActivity}=await import('/characters.js');setActivity(document.querySelector('#motion-avatar'),'mail',{immediate:true});});
-    const mailPose=()=>page.locator('#motion-avatar').evaluate(n=>n._character.body.getAttribute('transform'));
-    await page.waitForTimeout(2000);const mail=await mailPose();await page.waitForTimeout(150);assert.notEqual(await mailPose(),mail,'Mail gesture failed to animate');
-    await page.evaluate(()=>document.documentElement.dataset.motion='off');await settle();
-    const quietMail=await mailPose();await page.waitForTimeout(150);assert.equal(await mailPose(),quietMail,'Mail gesture ignored reduced motion');
-    assert(await page.locator('#motion-avatar').evaluate(n=>n._character.face.style.opacity==='1'));
-    await page.evaluate(()=>document.documentElement.dataset.motion='on');
-    await page.locator('#motion-viewport').evaluate(n=>n.remove());
-   }
+   // Current avatar lifecycle/cadence coverage lives in test-avatar-runtime.cjs
+   // and test-avatar-scale-cadence.cjs; the retired SVG internals no longer exist.
    await page.evaluate(()=>{window.settingsEvents=[];for(const type of ['focusin','scroll'])document.addEventListener(type,e=>{settingsEvents.push({type,target:e.target.id,focus:document.activeElement.id,top:document.querySelector('#settings-content').scrollTop});if(settingsEvents.length>12)settingsEvents.shift();},true);});
    for(const theme of ['dark','light'])for(const width of [1320,390]){
     await page.setViewportSize({width,height:900});await page.evaluate(theme=>{document.documentElement.dataset.theme=theme;KindredReadingSize.set(150);},theme);
-    if(!await page.locator('#settings-button').isVisible())await page.locator('#mobile-menu').click();
-    await page.locator('#settings-button').click();await page.locator('.general-settings-form').waitFor();await page.waitForTimeout(250);
+    if(!await page.locator('#identity-button').isVisible())await page.locator('#mobile-menu').click();
+    await page.locator('#identity-button').click();await page.locator('#identity-menu').getByRole('menuitem',{name:'Settings',exact:true}).click();await page.locator('.general-settings-form').waitFor();await page.waitForTimeout(250);
     assert(await page.locator('#settings-dialog').evaluate(n=>{const r=n.getBoundingClientRect();return r.left>=-1&&r.right<=innerWidth+1&&r.top>=-1&&r.bottom<=innerHeight+1;}));
     await page.waitForFunction(()=>!document.querySelector('#settings-dialog').getAnimations({subtree:true}).some(a=>a.effect?.getTiming().iterations!==Infinity&&a.playState==='running'));await settle();
     const visit=await page.locator('#settings-content').evaluate(n=>({top:n.scrollTop,focus:document.activeElement.outerHTML.slice(0,300),events:window.settingsEvents}));

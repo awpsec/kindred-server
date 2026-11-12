@@ -8,11 +8,11 @@ const assert=require('node:assert/strict');
   for(const platform of ['linux','macos'])for(const preference of [null,{sidebar:480,computer:700}]){
    const context=await browser.newContext({viewport:{width:1440,height:900}}),p=await context.newPage();
    await p.addInitScript(({token,platform,preference})=>{sessionStorage.setItem('kindred-token',token);window.__KINDRED_DESKTOP={platform};window.__TAURI__={core:{invoke:async()=>null}};if(preference)localStorage.setItem('kindred-pane-sizes',JSON.stringify(preference));},{token,platform,preference});
-   await p.goto('http://127.0.0.1:'+server.address().port);await p.locator('#show-computer').click();
+   await p.goto('http://127.0.0.1:'+server.address().port);await p.locator('#bot-details').click();await p.getByRole('tab',{name:'Computer',exact:true}).click();
    const geometry=()=>p.evaluate(()=>{const rect=s=>document.querySelector(s).getBoundingClientRect();return {sidebar:rect('.sidebar').width,chat:rect('.conversation').width,right:rect('#computer-panel').width,overflow:document.documentElement.scrollWidth>innerWidth,prefs:localStorage.getItem('kindred-pane-sizes')};});
-   await p.waitForTimeout(250);const original=await geometry();
+   await p.locator('#computer-panel.pane-layout-frame').waitFor({state:'detached'});await p.waitForTimeout(80);const original=await geometry();
    for(const width of [1100,1000,950,900,850,800,761]){
-    await p.setViewportSize({width,height:900});await p.waitForTimeout(100);
+    await p.setViewportSize({width,height:900});await p.waitForFunction(()=>{const chat=document.querySelector('.conversation');return !document.querySelector('.pane-layout-frame')&&chat.getBoundingClientRect().width>=419.5;},{},{timeout:3000});
     const g=await geometry();assert(g.chat>=419.5,`${platform} ${width}px keeps at least 420px for chat: ${JSON.stringify(g)}`);assert(!g.overflow,'No horizontal page overflow');
     assert.equal(g.prefs,original.prefs,'Automatic fitting must not overwrite the preferred sizes');
     if(width===900){
@@ -24,6 +24,13 @@ const assert=require('node:assert/strict');
     }
    }
    await p.setViewportSize({width:1440,height:900});await p.waitForTimeout(100);const restored=await geometry();assert.equal(restored.sidebar,original.sidebar);assert.equal(restored.right,original.right);
+   if(!preference){
+    const handle=p.getByRole('separator',{name:'Resize computer panel'}),beforeKey=await geometry();
+    await handle.focus();await handle.press('ArrowLeft');await p.waitForTimeout(80);
+    const afterKey=await geometry();assert.equal(afterKey.right,beforeKey.right+16,'Keyboard separator increases pane by one step');
+    assert(afterKey.chat>=419.5&&!afterKey.overflow,'Keyboard sizing preserves readable chat');
+    assert(!await p.locator('#computer-panel').evaluate(n=>n.getAnimations().some(a=>a.effect.getKeyframes().some(k=>'width'in k))),'Keyboard resizing does not animate layout width');
+   }
    await context.close();
   }
   console.log('Pane viewport fitting: defaults and saved sizes preserve chat, restore preferences, and avoid overflow on Linux/macOS layouts');
