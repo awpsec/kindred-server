@@ -788,7 +788,7 @@ async fn save_settings(State(app): State<Shared>, Json(v): Json<Value>) -> Resul
         "accent_color",
     )?;
     require!(
-        matches!(accent_color, "monochrome" | "blue" | "green" | "orange" | "purple" | "pink"),
+        matches!(accent_color, "bot" | "monochrome" | "blue" | "green" | "orange" | "purple" | "pink"),
         "Invalid accent color"
     );
     require!(

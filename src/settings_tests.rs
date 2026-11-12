@@ -251,11 +251,11 @@ async fn old_settings_clients_preserve_model_defaults_and_invalid_updates_do_not
     let server = tokio::spawn(axum::serve(listener, web::router(app.clone())).into_future());
     let client = reqwest::Client::new();
     let initial: Value = client.get(&url).bearer_auth(&app.token).send().await.unwrap().json().await.unwrap();
-    assert_eq!(initial["accent_color"], "monochrome");
+    assert_eq!(initial["accent_color"], "bot");
     app.db.save_setting("general", &json!({"name":"Existing","theme":"light"})).unwrap();
     let migrated: Value = client.get(&url).bearer_auth(&app.token).send().await.unwrap().json().await.unwrap();
-    assert_eq!(migrated["accent_color"], "monochrome");
-    for accent in ["monochrome", "blue", "green", "orange", "purple", "pink"] {
+    assert_eq!(migrated["accent_color"], "bot");
+    for accent in ["bot", "monochrome", "blue", "green", "orange", "purple", "pink"] {
         let value = json!({"name":"You","theme":"dark","accent_color":accent});
         let saved: Value = client.put(&url).bearer_auth(&app.token).json(&value).send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
         assert_eq!(saved["accent_color"], accent);

@@ -205,10 +205,16 @@ fn activity_label(tool:&str)->Option<&'static str> {
 fn activity(c:&rusqlite::Connection,seq:i64,run:&str)->Result<Value> {
     let (boundary,end)=phase_range(c,seq,run)?;
     let mut pending:Vec<(String,Option<String>)>=vec![];
-    let mut query=c.prepare("SELECT kind,COALESCE(json_extract(body,'$.tool'),''),COALESCE(json_extract(body,'$.failed'),0),created,json_extract(body,'$.call_id') FROM events WHERE run_id=? AND seq>? AND seq<=? AND kind IN ('tool_started','tool_result') ORDER BY seq")?;
-    let rows=query.query_map(rusqlite::params![run,boundary,end],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,bool>(2)?,r.get::<_,i64>(3)?,r.get::<_,Option<String>>(4)?)))?;
+    // Use persisted event order, not wall-clock guesses, to pair work receipts
+    // with the milestone that reported it. No arguments or results enter this UI.
+    let mut commentary_query=c.prepare("SELECT m.seq,m.source_event_seq FROM chat_messages m JOIN message_progress p ON p.message_seq=m.seq WHERE m.run_id=? AND m.kind='assistant' AND m.suppressed=0 AND p.phase='commentary' AND length(trim(m.body))>0 AND m.source_event_seq>? AND m.source_event_seq<=? ORDER BY m.source_event_seq")?;
+    let commentary:Vec<(i64,i64)>=commentary_query.query_map(rusqlite::params![run,boundary,end],|r|Ok((r.get(0)?,r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+    let mut timeline:Vec<Value>=vec![];
+    let mut omitted=0;
+    let mut query=c.prepare("SELECT kind,COALESCE(json_extract(body,'$.tool'),''),COALESCE(json_extract(body,'$.failed'),0),created,json_extract(body,'$.call_id'),seq FROM events WHERE run_id=? AND seq>? AND seq<=? AND kind IN ('tool_started','tool_result') ORDER BY seq")?;
+    let rows=query.query_map(rusqlite::params![run,boundary,end],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,bool>(2)?,r.get::<_,i64>(3)?,r.get::<_,Option<String>>(4)?,r.get::<_,i64>(5)?)))?;
     let(mut actions,mut completed,mut failed,mut first)=(0,0,0,0);let mut recent:Vec<Value>=vec![];
-    for row in rows {let(kind,tool,error,created,call_id)=row?;if work_title(&tool).is_none(){continue;}
+    for row in rows {let(kind,tool,error,created,call_id,event_seq)=row?;if work_title(&tool).is_none(){continue;}
         if kind=="tool_started" {actions+=1;pending.push((tool.clone(),call_id.clone()));if first==0 {first=created;}}
         else {
             let matching=pending.iter().position(|(name,id)|name==&tool&&id==&call_id)
@@ -216,6 +222,13 @@ fn activity(c:&rusqlite::Connection,seq:i64,run:&str)->Result<Value> {
             if let Some(index)=matching {pending.remove(index);}
             if error {failed+=1;} else {completed+=1;}
             let label=activity_label(&tool).unwrap();
+            let owner=commentary.iter().find(|(_,event)|*event>=event_seq).or_else(||commentary.last()).map(|(message,_)|*message);
+            if let Some(last)=timeline.last_mut().filter(|last|last["label"]==label&&last["failed"]==error&&last["message_seq"]==json!(owner)) {
+                last["count"]=json!(last["count"].as_u64().unwrap_or(1)+1);last["created"]=json!(created);
+            } else {
+                timeline.push(json!({"message_seq":owner,"label":label,"failed":error,"count":1,"created":created,"event_seq":event_seq}));
+                if timeline.len()>128 {omitted+=timeline.remove(0)["count"].as_u64().unwrap_or(1);}
+            }
             if let Some(last)=recent.last_mut().filter(|last|last["label"]==label&&last["failed"]==error){last["count"]=json!(last["count"].as_u64().unwrap_or(1)+1);last["created"]=json!(created);}
             else {recent.push(json!({"label":label,"failed":error,"count":1,"created":created}));if recent.len()>4 {recent.remove(0);}}
         }
@@ -225,7 +238,7 @@ fn activity(c:&rusqlite::Connection,seq:i64,run:&str)->Result<Value> {
     let phase:Option<String>=c.query_row("SELECT json_extract(body,'$.state') FROM events WHERE run_id=? AND seq>? AND seq<=? AND kind='model_progress' ORDER BY seq DESC LIMIT 1",rusqlite::params![run,boundary,end],|r|r.get(0)).optional()?;
     let running:bool=c.query_row("SELECT status IN ('running','awaiting_approval') FROM runs WHERE id=?",[run],|r|r.get(0))?;
     let current_label=if running&&end==i64::MAX {pending.last().and_then(|(tool,_)|activity_label(tool))}else{None};
-    Ok(json!({"current_label":current_label,"actions":actions,"completed":completed,"failed":failed,"seconds":if first>0 {(last-first).max(0)}else{0},"recent":recent,"phase":phase,"last_at":last}))
+    Ok(json!({"current_label":current_label,"actions":actions,"completed":completed,"failed":failed,"seconds":if first>0 {(last-first).max(0)}else{0},"recent":recent,"timeline":timeline,"timeline_omitted":omitted,"phase":phase,"last_at":last}))
 }
 
 pub fn message(c:&rusqlite::Connection,seq:i64)->Result<Value> {
@@ -357,6 +370,30 @@ mod tests {
         assert_eq!(activity()["current_label"],"Use connected service");
         app.db.event(&id,"tool_result",json!({"tool":"claude_connector","call_id":"active","failed":false})).unwrap();
         assert_eq!(activity()["current_label"],Value::Null);
+    }
+
+    #[test]
+    fn timeline_pairs_calls_with_milestones_by_event_order_and_bounds_payload() {
+        let app=tests::app();let bot=tests::bot(&app.db,"codex");
+        let id=app.db.queue(&bot.id,"Verify handoff",0).unwrap();let run=app.db.claim_bot(&bot.id).unwrap().unwrap();
+        for tool in ["local_read","local_read"] {app.db.event(&id,"tool_started",json!({"tool":tool})).unwrap();app.db.event(&id,"tool_result",json!({"tool":tool,"text":"PRIVATE_RESULT"})).unwrap();}
+        app.db.event(&id,"assistant",json!({"phase":"commentary","text":"Checked the source files."})).unwrap();
+        app.db.event(&id,"tool_started",json!({"tool":"guest_exec"})).unwrap();
+        app.db.event(&id,"tool_result",json!({"tool":"guest_exec","failed":true})).unwrap();
+        app.db.event(&id,"assistant",json!({"phase":"commentary","text":"The check needs repair."})).unwrap();
+        let rows=app.db.chat_messages(&run.chat_id).unwrap();
+        let notes:Vec<_>=rows.iter().filter(|m|m["kind"]=="assistant").collect();assert_eq!(notes.len(),2);
+        let activity=&rows.iter().find(|m|m["kind"]=="task_progress").unwrap()["progress"]["activity"];
+        assert_eq!(activity["timeline"][0]["message_seq"],notes[0]["seq"]);
+        assert_eq!(activity["timeline"][0]["count"],2);
+        assert_eq!(activity["timeline"][1]["message_seq"],notes[1]["seq"]);
+        assert_eq!(activity["timeline"][1]["failed"],true);
+        assert!(!activity.to_string().contains("PRIVATE_RESULT"));
+        // Identical wall-clock seconds must not merge across milestone boundaries.
+        for i in 0..140 {let tool=if i%2==0 {"local_read"}else{"guest_exec"};app.db.event(&id,"tool_result",json!({"tool":tool})).unwrap();}
+        let rows=app.db.chat_messages(&run.chat_id).unwrap();let activity=&rows.iter().find(|m|m["kind"]=="task_progress").unwrap()["progress"]["activity"];
+        assert_eq!(activity["timeline"].as_array().unwrap().len(),128);
+        assert_eq!(activity["timeline_omitted"].as_u64().unwrap()+activity["timeline"].as_array().unwrap().iter().map(|r|r["count"].as_u64().unwrap()).sum::<u64>(),143);
     }
 
     #[test]
