@@ -893,7 +893,7 @@ dependencies = [
 
 [[package]]
 name = "kindred"
-version = "0.90.3"
+version = "0.90.4"
 dependencies = [
  "anyhow",
  "axum",
