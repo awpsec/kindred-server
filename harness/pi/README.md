@@ -196,3 +196,19 @@ Install immutable harness 0.44.6 before server activation. SDK_VERSION remains
 the updater-compatible literal in session.mjs; checkpoint validation receives it
 from that single source. A caller must check worker capability before sending a
 start frame with the split stable/live envelope, since old workers ignore it.
+
+### Managed SDK lifecycle acceptance (0.44.7)
+
+Installation and managed updates run `node --test lifecycle-check.mjs` before
+activation. The offline fixture checks action pairing, terminal truncation,
+tools-disabled summary recovery, and durable context restore without replay.
+It uses an injected transport, synthetic credentials and synthetic tools only.
+An import/protocol check alone is insufficient: SDK 1.5.2 removed the older
+turn-stop hook and changed checkpoint messages while still passing `--check`.
+
+The adapter enforces both turn-stop APIs and refuses additional model/tool calls
+after a terminal error. The pinned SDK remains 0.85.1. SDK 1.5.2 fails the context
+acceptance gate and must not be activated until its context adapter is supported.
+Older installations lacking the acceptance script require a Kindred update
+before a managed SDK update. A failed gate leaves the current symlink unchanged
+and removes the rejected staging directory; it does not retry real work.

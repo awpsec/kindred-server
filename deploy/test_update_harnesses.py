@@ -12,6 +12,7 @@ class Updates(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory);old=root/'releases/old';old.mkdir(parents=True)
             (old/'worker.mjs').write_text('original');(old/'session.mjs').write_text("export const SDK_VERSION = '0.85.1';");current=root/'current';current.symlink_to(old)
+            (old/'lifecycle-check.mjs').write_text('offline behavioral checks')
             npm=old/'node/lib/node_modules/npm/bin/npm-cli.js'
             npm.parent.mkdir(parents=True);npm.write_text('bundled npm')
             (old/'node/bin').mkdir();(old/'node/bin/npm').symlink_to('../lib/node_modules/npm/bin/npm-cli.js')
@@ -29,8 +30,9 @@ class Updates(unittest.TestCase):
                     self.assertFalse((stage/'node_modules').exists())
                     package=kwargs['cwd']/'node_modules/@earendil-works/pi-coding-agent/package.json';package.parent.mkdir(parents=True);package.write_text('{"version":"0.99.0"}')
             with patch.object(m,'run',side_effect=run):m.pi(current)
-            self.assertEqual(len(calls),2)
+            self.assertEqual(len(calls),3)
             self.assertIn('--ignore-scripts',calls[0]);self.assertIn('--check',calls[1])
+            self.assertIn('--test',calls[2]);self.assertTrue(calls[2][-1].endswith('/lifecycle-check.mjs'))
             self.assertNotEqual(current.resolve(),old)
             self.assertEqual((current/'worker.mjs').read_text(),'original')
             self.assertTrue(old.exists())
@@ -39,9 +41,38 @@ class Updates(unittest.TestCase):
     def test_failed_pi_check_keeps_current_and_removes_stage(self):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory);old=root/'releases/old';old.mkdir(parents=True)
+            (old/'lifecycle-check.mjs').write_text('offline behavioral checks')
             current=root/'current';current.symlink_to(old)
             with patch.object(m,'run',side_effect=RuntimeError('bad harness')):
                 with self.assertRaises(RuntimeError):m.pi(current)
+            self.assertEqual(current.resolve(),old)
+            self.assertEqual(list((root/'releases').iterdir()),[old])
+    def test_legacy_pi_without_behavioral_check_never_installs_or_switches(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);old=root/'releases/old';old.mkdir(parents=True)
+            current=root/'current';current.symlink_to(old)
+            with patch.object(m,'run') as run:
+                with self.assertRaisesRegex(ValueError,'lifecycle validation is missing'):m.pi(current)
+                run.assert_not_called()
+            self.assertEqual(current.resolve(),old)
+            self.assertEqual(list((root/'releases').iterdir()),[old])
+    def test_pi_behavioral_failure_after_import_check_never_switches(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);old=root/'releases/old';old.mkdir(parents=True)
+            (old/'session.mjs').write_text("export const SDK_VERSION = '0.85.1';")
+            (old/'lifecycle-check.mjs').write_text('offline behavioral checks')
+            current=root/'current';current.symlink_to(old);calls=[]
+            def run(args,**kwargs):
+                calls.append(args)
+                self.assertEqual(current.resolve(),old)
+                if 'install' in args:
+                    package=kwargs['cwd']/'node_modules/@earendil-works/pi-coding-agent/package.json'
+                    package.parent.mkdir(parents=True);package.write_text('{"version":"1.5.2"}')
+                if '--test' in args: raise RuntimeError('checkpoint compatibility failed')
+            with patch.object(m,'run',side_effect=run):
+                with self.assertRaisesRegex(RuntimeError,'checkpoint compatibility failed'):m.pi(current)
+            self.assertEqual(len(calls),3)
+            self.assertIn('--check',calls[1]);self.assertIn('--test',calls[2])
             self.assertEqual(current.resolve(),old)
             self.assertEqual(list((root/'releases').iterdir()),[old])
     def test_absent_pi_is_optional(self):

@@ -319,6 +319,9 @@ export async function runSession(request, callTool, emit, signal, options = {}) 
     await loader.reload();
     const streamSimple = modelRuntime.streamSimple.bind(modelRuntime);
     modelRuntime.streamSimple = (model, context, streamOptions = {}) => {
+      // SDK lifecycle hooks can change across managed updates. Never let a
+      // latched terminal failure spend more tokens or start another action.
+      if (failure.value) throw failure.value;
       if (model.provider !== request.provider || model.id !== request.model) {
         failure.value = new HarnessError('model'); throw failure.value;
       }
@@ -360,6 +363,7 @@ export async function runSession(request, callTool, emit, signal, options = {}) 
       name: tool.name, label: tool.name, description: tool.description + (custom && tool.name === 'skills_list' ? ' Returns metadata only; use skill_load(name) to read the selected skill instructions before using or editing them.' : ''), parameters: tool.inputSchema,
       executionMode: 'sequential',
       execute: async (id, args, toolSignal) => {
+        if (failure.value) throw failure.value;
         if (recoveringResult) throw new HarnessError('empty_result');
         if (++toolCalls > request.max_steps && request.max_steps > 0) { failure.value = new HarnessError('budget'); throw failure.value; }
         if (signal?.aborted || toolSignal?.aborted) throw new HarnessError('aborted');
@@ -398,6 +402,13 @@ export async function runSession(request, callTool, emit, signal, options = {}) 
     };
     const shouldStop = session.agent.shouldStopAfterTurn;
     session.agent.shouldStopAfterTurn = async (context, toolSignal) => recoveringResult || Boolean(failure.value) || Boolean(await shouldStop?.(context, toolSignal));
+    // Pi 1.x replaced shouldStopAfterTurn with finishTurn. Preserve the SDK's
+    // normal decision, while enforcing the same stop boundary on both APIs.
+    const finishTurn = session.agent.finishTurn;
+    session.agent.finishTurn = async (context, toolSignal) => {
+      const decision = await finishTurn?.(context, toolSignal);
+      return recoveringResult || failure.value ? { action: 'end' } : decision;
+    };
     const abort = () => { session.agent.abort(); session.abortCompaction(); };
     signal?.addEventListener('abort', abort, { once: true });
     session.subscribe(event => {

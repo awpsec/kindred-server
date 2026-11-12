@@ -118,6 +118,8 @@ def pi(current):
     stage = root / ('update-' + uuid.uuid4().hex)
     try:
         source_root = current.resolve()
+        if not (source_root / 'lifecycle-check.mjs').is_file():
+            raise ValueError('Update Kindred before updating this Pi SDK: lifecycle validation is missing')
         # Skip SDK dependencies only; bundled Node/npm needs its own node_modules.
         shutil.copytree(source_root, stage, symlinks=True,
                         ignore=lambda directory, names: ['node_modules']
@@ -139,6 +141,7 @@ def pi(current):
             raise ValueError('Unrecognized Pi harness version declaration')
         session.write_text(source)
         run([stage / 'node/bin/node', stage / 'worker.mjs', '--check'], cwd=stage, env=environment)
+        run([stage / 'node/bin/node', '--test', stage / 'lifecycle-check.mjs'], cwd=stage, env=environment)
         lock = stage / 'package-lock.json'
         old_lock = current / 'package-lock.json'
         if lock.exists() and old_lock.exists() and lock.read_bytes() == old_lock.read_bytes():
