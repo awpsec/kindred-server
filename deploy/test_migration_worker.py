@@ -12,6 +12,33 @@ worker = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(worker)
 
 
+class MigrationSchemaTests(unittest.TestCase):
+    def fingerprint(self, sql):
+        connection = sqlite3.connect(':memory:')
+        self.addCleanup(connection.close)
+        connection.executescript(sql)
+        return worker.schema(connection)
+
+    def test_fresh_and_incrementally_upgraded_column_order_match(self):
+        upgraded = self.fingerprint('CREATE TABLE chats(id TEXT PRIMARY KEY, pinned INTEGER NOT NULL DEFAULT 0); '
+                                    'ALTER TABLE chats ADD COLUMN bot_only INTEGER NOT NULL DEFAULT 0;')
+        fresh = self.fingerprint('CREATE TABLE chats(id TEXT PRIMARY KEY, bot_only INTEGER NOT NULL DEFAULT 0, '
+                                 'pinned INTEGER NOT NULL DEFAULT 0);')
+        self.assertEqual(upgraded, fresh)
+
+    def test_semantic_column_and_primary_key_differences_still_reject(self):
+        original = self.fingerprint('CREATE TABLE chats(a TEXT, b INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(a,b));')
+        for sql in [
+            'CREATE TABLE chats(a TEXT, b TEXT NOT NULL DEFAULT 0, PRIMARY KEY(a,b));',
+            'CREATE TABLE chats(a TEXT, b INTEGER DEFAULT 0, PRIMARY KEY(a,b));',
+            'CREATE TABLE chats(a TEXT, b INTEGER NOT NULL DEFAULT 1, PRIMARY KEY(a,b));',
+            'CREATE TABLE chats(a TEXT, b INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(b,a));',
+            'CREATE TABLE chats(a TEXT, b INTEGER NOT NULL DEFAULT 0, extra TEXT, PRIMARY KEY(a,b));',
+        ]:
+            with self.subTest(sql=sql):
+                self.assertNotEqual(original, self.fingerprint(sql))
+
+
 class MigrationWorkerTests(unittest.TestCase):
     def setUp(self):
         self.fixture = fixtures.MigrationFilesTests()

@@ -56,7 +56,11 @@ def cancel_requested(migration):
 
 
 def schema(connection):
-    return journal.digest({table: list(connection.execute(f'PRAGMA table_info("{table}")'))
+    # Upgraded and fresh workspaces can acquire equivalent columns in a
+    # different order. Storage ordinals are not schema incompatibilities;
+    # retain types, defaults, nullability and primary-key positions.
+    return journal.digest({table: sorted((tuple(row[1:]) for row in connection.execute(f'PRAGMA table_info("{table}")')),
+                                        key=lambda row: row[0])
                            for table in sorted(files.tables(connection)) if table != 'sqlite_sequence'})
 
 
