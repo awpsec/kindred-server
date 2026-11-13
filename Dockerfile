@@ -15,7 +15,7 @@ COPY harness /opt/kindred/source/harness
 COPY deploy /opt/kindred/source/deploy
 COPY third-party/cua-driver /opt/kindred/source/third-party/cua-driver
 RUN python3 /opt/kindred/source/deploy/install-cua-driver.py --payload /opt/kindred/source/deploy/vendor/cua-driver --target /opt/kindred/source/deploy/vendor/cua-driver
-RUN sh /opt/kindred/source/deploy/install-pi.sh && mkdir -p /opt/kindred/guest/third-party /usr/local/lib/kindred && cp -a /opt/kindred/source/third-party/cua-driver /opt/kindred/guest/third-party/ && cp -a /opt/kindred/source/deploy/. /opt/kindred/guest/ && cp /usr/local/bin/kindred /opt/kindred/guest/kindred && python3 /opt/kindred/source/deploy/download-codex.py /opt/kindred/guest/codex && install -m 755 /opt/kindred/source/deploy/vm-manager.py /usr/local/lib/kindred/vm-manager.py
+RUN sh /opt/kindred/source/deploy/install-pi.sh && mkdir -p /opt/kindred/guest/third-party /usr/local/lib/kindred && cp -a /opt/kindred/source/third-party/cua-driver /opt/kindred/guest/third-party/ && cp -a /opt/kindred/source/deploy/. /opt/kindred/guest/ && cp /usr/local/bin/kindred /opt/kindred/guest/kindred && python3 /opt/kindred/source/deploy/download-codex.py /opt/kindred/guest/codex && install -m 755 /opt/kindred/source/deploy/vm-manager.py /opt/kindred/source/deploy/migration-journal.py /opt/kindred/source/deploy/migration-files.py /opt/kindred/source/deploy/migration-worker.py /usr/local/lib/kindred/
 ENV KINDRED_PROFILES_DIR=/data/profiles KINDRED_GUEST_SOFTWARE=/opt/kindred/guest
 EXPOSE 9444
 VOLUME /data
