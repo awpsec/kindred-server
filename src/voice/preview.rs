@@ -9,7 +9,7 @@ const CACHE_TTL: Duration = Duration::from_secs(30 * 60);
 
 #[derive(Default)]
 pub(super) struct State {
-    current: Mutex<Option<(String, tokio::sync::watch::Sender<bool>)>>,
+    current: std::sync::Arc<Mutex<Option<(String, tokio::sync::watch::Sender<bool>)>>>,
     samples: Mutex<std::collections::VecDeque<CachedSample>>,
 }
 struct CachedSample {
@@ -18,14 +18,14 @@ struct CachedSample {
     created: Instant,
     wav: Vec<u8>,
 }
-struct PreviewLease<'a> {
-    state: &'a State,
+struct PreviewLease {
+    current: std::sync::Arc<Mutex<Option<(String, tokio::sync::watch::Sender<bool>)>>>,
     id: String,
     cancel: tokio::sync::watch::Receiver<bool>,
 }
-impl Drop for PreviewLease<'_> {
+impl Drop for PreviewLease {
     fn drop(&mut self) {
-        let mut current = self.state.current.lock().unwrap();
+        let mut current = self.current.lock().unwrap();
         if current.as_ref().is_some_and(|(id, _)| id == &self.id) {
             *current = None;
         }
@@ -66,7 +66,7 @@ impl State {
             wav,
         });
     }
-    fn acquire(&self) -> PreviewLease<'_> {
+    fn acquire(&self) -> PreviewLease {
         let mut current = self.current.lock().unwrap();
         if let Some((_, old)) = current.take() {
             let _ = old.send(true);
@@ -75,7 +75,7 @@ impl State {
         let (send, cancel) = tokio::sync::watch::channel(false);
         *current = Some((id.clone(), send));
         PreviewLease {
-            state: self,
+            current: self.current.clone(),
             id,
             cancel,
         }
@@ -90,6 +90,8 @@ impl State {
 #[serde(deny_unknown_fields)]
 pub struct Preview {
     voice: String,
+    #[serde(default)]
+    stream: bool,
 }
 pub async fn render(
     axum::extract::State(app): axum::extract::State<Shared>,
@@ -115,8 +117,46 @@ pub async fn render(
         if *lease.cancel.borrow() {
             return Err(cancelled());
         }
-        return Ok(response(wav));
+        return Ok(if input.stream { cached_stream(&wav[44..]) } else { response(wav) });
     }
+    if input.stream {
+        let (send, receive) = tokio::sync::mpsc::channel(16);
+        tokio::spawn(async move {
+            // A closed HTTP body drops the provider operation and its lease.
+            let result = tokio::select! {
+                _ = send.closed() => return,
+                result = generate(&app, &input.voice, &key, &mut lease, Some(&send)) => result,
+            };
+            let event = match result {
+                Ok(_) => json!({"type":"done"}),
+                Err(_) => json!({"type":"error","message":"Voice preview stopped. Try again."}),
+            };
+            let _ = send.send(event).await;
+        });
+        return Ok(stream_response(receive));
+    }
+    Ok(response(generate(&app, &input.voice, &key, &mut lease, None).await?))
+}
+fn stream_response(receive: tokio::sync::mpsc::Receiver<Value>) -> Response {
+    let stream = futures_util::stream::unfold(receive, |mut receive| async {
+        receive.recv().await.map(|event| {
+            let line = event.to_string() + "\n";
+            (Ok::<_, std::convert::Infallible>(line), receive)
+        })
+    });
+    ([("Content-Type","application/x-ndjson"),("Cache-Control","no-store"),("X-Accel-Buffering","no"),("X-Content-Type-Options","nosniff")], axum::body::Body::from_stream(stream)).into_response()
+}
+fn cached_stream(pcm: &[u8]) -> Response {
+    let mut body = String::new();
+    for bytes in pcm.chunks(9_600) {
+        body.push_str(&json!({"type":"audio","data":STANDARD.encode(bytes)}).to_string());
+        body.push('\n');
+    }
+    body.push_str("{\"type\":\"done\"}\n");
+    ([("Content-Type","application/x-ndjson"),("Cache-Control","no-store"),("X-Content-Type-Options","nosniff")],body).into_response()
+}
+async fn generate(app: &Shared, voice: &str, key: &str, lease: &mut PreviewLease,
+    stream: Option<&tokio::sync::mpsc::Sender<Value>>) -> Result<Vec<u8>, Error> {
     let mut request = ENDPOINT.into_client_request()?;
     request
         .headers_mut()
@@ -132,7 +172,7 @@ pub async fn render(
     // Dropping this future also drops the socket and lease. No retries or background calls.
     let clip = tokio::select! {
         _ = lease.cancel.wait_for(|cancel| *cancel) => return Err(cancelled()),
-        result = tokio::time::timeout(Duration::from_secs(18),sample(&mut upstream,&input.voice)) => result,
+        result = tokio::time::timeout(Duration::from_secs(18),sample_stream(&mut upstream,voice,stream)) => result,
     };
     let _ = tokio::time::timeout(Duration::from_secs(1), async {
         let _ = send_upstream(&mut upstream, json!({"type":"session.close"})).await;
@@ -144,14 +184,14 @@ pub async fn render(
         return Err(cancelled());
     }
     require!(
-        !app.account_disabled() && crate::connections::decisions_key(&app).as_deref() == Some(&key),
+        !app.account_disabled() && crate::connections::decisions_key(&app).as_deref() == Some(key),
         "This account is unavailable."
     );
     let wav = wav(&pcm);
     app.voice
         .preview
-        .remember(&key, &input.voice, wav.clone(), Instant::now());
-    Ok(response(wav))
+        .remember(key, voice, wav.clone(), Instant::now());
+    Ok(wav)
 }
 fn response(wav: Vec<u8>) -> Response {
     (
@@ -173,6 +213,7 @@ fn unavailable() -> Error {
         "Voice preview is unavailable. Check your connection and OpenAI Voice settings, then try again.",
     )
 }
+#[cfg(test)]
 async fn sample<S>(
     upstream: &mut tokio_tungstenite::WebSocketStream<S>,
     voice: &str,
@@ -180,6 +221,13 @@ async fn sample<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
+    sample_stream(upstream, voice, None).await
+}
+async fn sample_stream<S>(upstream: &mut tokio_tungstenite::WebSocketStream<S>, voice: &str,
+    stream: Option<&tokio::sync::mpsc::Sender<Value>>) -> Result<Vec<u8>>
+where S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let mut sent = 0;
     let instruction = format!(
         "This is an AI voice preview, not a conversation. Immediately say only this short sample in English: {SAMPLE} Then remain silent. Do not use tools or request backend work."
     );
@@ -193,7 +241,7 @@ where
     )
     .await?;
     let mut ready = false;
-    let mut clip = Clip::default();
+    let mut clip = Clip { retain_tail: stream.is_some(), ..Clip::default() };
     let mut tick = tokio::time::interval(Duration::from_millis(40));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // Live needs a running audio timeline even for a requested spoken preview.
@@ -218,7 +266,19 @@ where
                     "session.output_audio.delta" => {
                         ensure!(ready, "Preview has not started.");
                         let bytes = audio_bytes(&event["delta"],96_000)?;
-                        if clip.append(&bytes)? {return Ok(clip.pcm);}
+                        let done = clip.append(&bytes)?;
+                        // Preserve the audio timeline, including pauses between words.
+                        // Holding silence until speech resumes would replay that pause
+                        // after the client had already waited for it over the network.
+                        let end = clip.pcm.len();
+                        if let Some(stream) = stream {
+                            for bytes in clip.pcm[sent..end].chunks(9_600) {
+                                stream.send(json!({"type":"audio","data":STANDARD.encode(bytes)})).await
+                                    .map_err(|_| anyhow::anyhow!("Preview receiver closed."))?;
+                            }
+                        }
+                        sent = end;
+                        if done {return Ok(clip.pcm);}
                     },
                     "error" | "session.closed" | "session.delegation.created" => anyhow::bail!("Preview could not complete."),
                     _ => {}
@@ -233,6 +293,7 @@ where
 // not message arrival, so the sample starts promptly and never plays a long blank.
 #[derive(Default)]
 struct Clip {
+    retain_tail: bool,
     pcm: Vec<u8>,
     pending: Vec<u8>,
     leading: Vec<u8>,
@@ -274,9 +335,11 @@ impl Clip {
                 "Voice preview exceeded its duration limit."
             );
             if self.quiet_frames >= 45 && self.voice_frames >= 5 {
-                // Retain 120 ms of natural decay, not the full silence detector tail.
-                self.pcm
-                    .truncate(self.pcm.len() - (self.quiet_frames - 6) * FRAME);
+                // A streamed sample already delivered these frames. Never retract
+                // them or change the cached replay relative to what the user heard.
+                if !self.retain_tail {
+                    self.pcm.truncate(self.pcm.len() - (self.quiet_frames - 6) * FRAME);
+                }
                 return Ok(true);
             }
         }
@@ -371,7 +434,7 @@ mod tests {
             render(
                 axum::extract::State(app.clone()),
                 Json(Preview {
-                    voice: "marin".into()
+                    voice: "marin".into(), stream: false
                 })
             )
             .await
@@ -467,6 +530,55 @@ mod tests {
                 .unwrap(),
             0
         );
+    }
+    #[tokio::test]
+    async fn preview_delivers_speech_before_provider_finishes_and_cache_stream_preserves_pcm() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let (release, wait) = tokio::sync::oneshot::channel();
+        let (resume, paused) = tokio::sync::oneshot::channel();
+        let provider = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _ = ws.next().await;
+            send_upstream(&mut ws, json!({"type":"session.started"})).await.unwrap();
+            let sound: Vec<u8> = (0..480*8).flat_map(|_|3000i16.to_le_bytes()).collect();
+            send_upstream(&mut ws,json!({"type":"session.output_audio.delta","delta":STANDARD.encode(&sound)})).await.unwrap();
+            // Do not finish until the consumer has already received speech.
+            wait.await.unwrap();
+            send_upstream(&mut ws,json!({"type":"session.output_audio.delta","delta":STANDARD.encode(vec![0;960*12])})).await.unwrap();
+            // The 240ms inter-word pause must arrive before the next spoken word.
+            paused.await.unwrap();
+            send_upstream(&mut ws,json!({"type":"session.output_audio.delta","delta":STANDARD.encode(&sound)})).await.unwrap();
+            send_upstream(&mut ws,json!({"type":"session.output_audio.delta","delta":STANDARD.encode(vec![0;960*50])})).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        });
+        let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+        let (send, mut receive) = tokio::sync::mpsc::channel(16);
+        let consumer = tokio::spawn(async move { sample_stream(&mut ws,"marin",Some(&send)).await.unwrap() });
+        let first = tokio::time::timeout(Duration::from_secs(2),receive.recv()).await.unwrap().unwrap();
+        assert_eq!(first["type"],"audio");
+        assert!(!consumer.is_finished());
+        release.send(()).unwrap();
+        let mut heard = STANDARD.decode(first["data"].as_str().unwrap()).unwrap();
+        let mut pause = Vec::new();
+        while pause.len() < 960*12 {
+            let event = tokio::time::timeout(Duration::from_secs(2),receive.recv()).await.unwrap().unwrap();
+            pause.extend(STANDARD.decode(event["data"].as_str().unwrap()).unwrap());
+        }
+        assert_eq!(pause,vec![0;960*12]);
+        heard.extend(pause);
+        assert!(!consumer.is_finished());
+        resume.send(()).unwrap();
+        while let Some(event) = receive.recv().await { heard.extend(STANDARD.decode(event["data"].as_str().unwrap()).unwrap()); }
+        let pcm = consumer.await.unwrap();assert_eq!(heard,pcm);
+        let response = cached_stream(&pcm);
+        assert_eq!(response.headers()["content-type"],"application/x-ndjson");
+        let bytes = axum::body::to_bytes(response.into_body(),100_000).await.unwrap();
+        let events: Vec<Value> = std::str::from_utf8(&bytes).unwrap().lines().map(|s|serde_json::from_str(s).unwrap()).collect();
+        assert_eq!(events.last().unwrap()["type"],"done");
+        let cached: Vec<u8> = events[..events.len()-1].iter().flat_map(|e|STANDARD.decode(e["data"].as_str().unwrap()).unwrap()).collect();
+        assert_eq!(cached,pcm);provider.await.unwrap();
     }
     #[tokio::test]
     async fn preview_stream_uses_selected_live_voice_and_synthetic_silence() {

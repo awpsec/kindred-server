@@ -77,7 +77,7 @@ fn preferences(db: &Db) -> Preferences {
 pub async fn settings(State(app): State<Shared>) -> Result<Json<Value>, Error> {
     let prefs = preferences(&app.db);
     Ok(Json(
-        json!({"configured":crate::connections::decisions_key(&app).is_some(),"enabled":prefs.enabled,"voice":prefs.voice,"pace":prefs.pace,"voice_changes":"next_call","model":"gpt-live-1","catalog_source":"openai_documentation","catalog_url":"https://developers.openai.com/api/reference/resources/live/methods/create","voices":VOICES.iter().map(|id| json!({"id":id,"name":format!("{}{}",id[..1].to_uppercase(),&id[1..])})).collect::<Vec<_>>()}),
+        json!({"configured":crate::connections::decisions_key(&app).is_some(),"enabled":prefs.enabled,"voice":prefs.voice,"pace":prefs.pace,"voice_changes":"next_call","preview_streaming":true,"model":"gpt-live-1","catalog_source":"openai_documentation","catalog_url":"https://developers.openai.com/api/reference/resources/live/methods/create","voices":VOICES.iter().map(|id| json!({"id":id,"name":format!("{}{}",id[..1].to_uppercase(),&id[1..])})).collect::<Vec<_>>()}),
     ))
 }
 pub async fn save_settings(
