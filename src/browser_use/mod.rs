@@ -1,4 +1,4 @@
-//! GPT browser worker. Kindred owns candidates and action arguments; the
+//! Provider-independent browser worker. Kindred owns candidates and action arguments; the
 //! official Decisions transport selects only a grounded current choice.
 mod driver;
 #[cfg(test)]
@@ -216,7 +216,7 @@ impl Outcome {
         let continuation = if stopped {
             "Stop this browser task. Do not retry or route around a denial, cancellation or human takeover. Preserve the existing action receipts."
         } else {
-            "Inspect current state before continuing with normal computer tools. Preserve these action receipts; never repeat a completed or uncertain action. A finish decision is not independent confirmation of remote success."
+            "Inspect current state before continuing with normal computer tools, including agent-desktop for supported accessible controls on the assigned Bot Computer. If Decisions is unavailable or timed out, finish this task with those tools instead of repeatedly retrying the API. Preserve these action receipts; never repeat a completed or uncertain action. A finish decision is not independent confirmation of remote success."
         };
         let mut result = json!({"text":json!({"browser_worker":self,
             "continuation":continuation}).to_string()});
@@ -458,7 +458,7 @@ impl Guard for RuntimeGuard<'_> {
             "Run cancelled"
         );
         ensure!(
-            self.app.db.bot(&self.bot.id).is_ok_and(|b| supports(&b) && b.provider == self.bot.provider && b.model == self.bot.model),
+            self.app.db.bot(&self.bot.id).is_ok_and(|b| b.provider == self.bot.provider && b.model == self.bot.model),
             "Bot provider or model changed"
         );
         ensure!(
@@ -497,15 +497,10 @@ impl Guard for RuntimeGuard<'_> {
     }
 }
 
-fn supports(bot: &Bot) -> bool {
-    // The selection model uses its own explicitly saved OpenAI key. GPT chat
-    // models routed through API providers need the same helper as Codex bots.
-    bot.provider == "codex" || ((bot.provider == "openrouter" || bot.provider.starts_with("custom-"))
-        && (bot.model.starts_with("gpt-") || bot.model.starts_with("openai/gpt-")))
-}
-pub fn preferred(app: &App, bot: &Bot) -> bool {
-    supports(bot)
-        && (app.decisions.is_some() || crate::connections::decisions_key(app).is_some())
+pub fn preferred(app: &App, _bot: &Bot) -> bool {
+    // Decisions chooses among Kindred-owned actions using its own API key.
+    // The calling bot's chat provider/model does not constrain this capability.
+    app.decisions.is_some() || crate::connections::decisions_key(app).is_some()
 }
 pub fn prepare_open(app: &App, bot: &Bot, args: &mut Value) {
     // This flag is server-owned and never part of a model's tool schema.
@@ -518,7 +513,7 @@ pub fn prepare_open(app: &App, bot: &Bot, args: &mut Value) {
 }
 pub fn spec() -> Value {
     json!({"type":"function","name":"computer_browser_task",
-        "description":"Preferred browser worker for GPT bots with an explicitly configured OpenAI API key. Uses the Decisions API with your existing VM browser profile and focused tab; first open the site with normal computer tools. Supply an exact origin, goal and named exact form values. Selects grounded page actions, uses Kindred approvals and verifies fields. Never supply secrets. Native file dialogs, visible embedded frames and sign-in may require ordinary computer tools. On fallback inspect current state and preserve completed/uncertain receipts; never replay them or bypass denial. After the unsupported step, resume this worker on the observed origin. A finish selection is not independent proof of remote success.",
+        "description":"Preferred worker for supported multi-step browser tasks, available to every chat provider when an OpenAI API key is configured. Uses the Decisions API with your existing VM browser profile and focused tab; first open the site with normal computer tools. Supply an exact origin, goal and named exact form values. Selects grounded page actions, uses Kindred approvals and verifies fields. Never supply secrets. Native file dialogs, visible embedded frames and sign-in may require ordinary computer tools. On fallback inspect current state and preserve completed/uncertain receipts; never replay them or bypass denial. After an unsupported page step, resume this worker on the observed origin. If the API is unavailable or times out, finish with ordinary computer tools instead of repeatedly retrying it. A finish selection is not independent proof of remote success.",
         "inputSchema":{"type":"object","properties":{
             "goal":{"type":"string","maxLength":8000},
             "origin":{"type":"string","description":"Exact HTTP(S) origin without a path or credentials"},
@@ -527,20 +522,13 @@ pub fn spec() -> Value {
             "required":["goal","origin"],"additionalProperties":false}})
 }
 pub fn instructions(app: &App, bot: &Bot) -> &'static str {
-    if !supports(bot) {
-        return "";
-    }
     if preferred(app, bot) {
-        "\nBrowser execution: prefer computer_browser_task on your existing Bot Computer for supported browser work. It uses the saved OpenAI API key independently of your chat provider. Open the site first; supply the actual current origin, goal and named values. On fallback, handle only the unsupported step with normal computer tools, then resume the browser worker from the current page and completed receipts. Never replay completed or uncertain actions or bypass a denial. Native file dialogs and sign-in are not API connection failures.\n"
+        "\nBrowser execution: for supported multi-step browser work, use computer_browser_task on your existing Bot Computer instead of one model turn per click. Prefer a suitable connected API or direct file operation when it avoids browser work altogether. It uses the saved OpenAI API key independently of your chat provider. Open the site first; supply the actual current origin, goal and named values. If the API is unavailable or times out, finish the task with existing computer tools instead of repeatedly retrying it. Use agent-desktop for supported accessible controls through guest_exec with use_desktop=true; retain screenshot/input tools for unsupported controls. For an unsupported page step, handle that step with these tools, then resume the browser worker from the current page and completed receipts. Never replay completed or uncertain actions or bypass a denial. Native file dialogs and sign-in are not API connection failures.\n"
     } else {
-        "\nBrowser execution: Decisions is preferred when a supported connection is available. This runtime has no configured OpenAI Decisions API-key connection; use your existing computer tools. Subscription OAuth and ordinary Luna access do not establish Decisions API access.\n"
+        "\nBrowser execution: Decisions is preferred when a supported connection is available. This runtime has no configured OpenAI Decisions API-key connection; use agent-desktop for supported accessible controls through guest_exec with use_desktop=true, and existing screenshot/input tools for unsupported controls. No OpenAI key is needed for these tools. Subscription OAuth and ordinary Luna access do not establish Decisions API access.\n"
     }
 }
 pub async fn call(app: &App, bot: &Bot, run: &Run, args: Value) -> Result<Value> {
-    ensure!(
-        supports(bot) && supports(&app.db.bot(&bot.id)?),
-        "This browser worker is available to GPT bots with an OpenAI API key"
-    );
     let task: Task = serde_json::from_value(args)?;
     task.validate()?;
     if !preferred(app, bot) {

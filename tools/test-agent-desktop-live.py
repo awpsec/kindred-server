@@ -24,7 +24,7 @@ def session():
         processes.append(subprocess.Popen(['/usr/bin/python3',str(FIXTURE/'gtk.py')]))
         processes.append(subprocess.Popen([os.environ['FIXTURE_CHROME'],'--no-sandbox','--no-first-run','--disable-gpu',
             '--disable-dev-shm-usage','--force-renderer-accessibility','--user-data-dir='+str(root/'chrome'),
-            'file://'+str(FIXTURE/'browser.html')],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL))
+            'file://'+str(FIXTURE/'browser.html')],stdout=(root/'browser.log').open('w'),stderr=subprocess.STDOUT))
         (root/'environment.json').write_text(json.dumps({k:os.environ[k] for k in ['DISPLAY','DBUS_SESSION_BUS_ADDRESS','XDG_RUNTIME_DIR']}))
         signal.signal(signal.SIGTERM,lambda *_:sys.exit(0))
         while True:time.sleep(1)
@@ -101,17 +101,23 @@ def main():
         fresh=call('alpha','snapshot','--app','python3.13','-i','--compact');assert ref(fresh,'Submitted')
         toggle=call('alpha','click',ref(fresh,'Enabled'));assert toggle['ok'],toggle
         assert state('alpha')['enabled'] and not state('beta')['enabled']
-        ready=call('alpha','wait','--text','Save draft','--app','chrome','--timeout','10000');assert ready['ok'],ready
-        field=call('alpha','find','--app','chrome','--name','Message','--exact');assert field['ok'],field
+        browser_apps={}
+        for name in ('alpha','beta'):
+            apps=call(name,'list-apps');assert apps['ok'],apps
+            matches=[app['name'] for app in apps['data']['apps'] if app['name'].lower() in ('chrome','chromium','google chrome','google chrome for testing')]
+            assert len(matches)==1,apps
+            browser_apps[name]=matches[0]
+        ready=call('alpha','wait','--text','Save draft','--app',browser_apps['alpha'],'--timeout','10000');assert ready['ok'],ready
+        field=call('alpha','find','--app',browser_apps['alpha'],'--name','Message','--exact');assert field['ok'],field
         typed=call('alpha','type',ref(field,'Message'),'Browser draft')
         # Document the actual browser's capability; never silently switch to headed input.
         if not typed['ok']:
             assert typed['error']['code']=='POLICY_DENIED' and typed['error']['disposition']['delivery']=='not_delivered',typed
-        save=call('alpha','find','--app','chrome','--name','Save draft','--exact');assert save['ok'],save
+        save=call('alpha','find','--app',browser_apps['alpha'],'--name','Save draft','--exact');assert save['ok'],save
         clicked=call('alpha','click',ref(save,'Save draft'));assert clicked['ok'],clicked
-        result=call('alpha','find','--app','chrome','--text','Saved 1:');assert result['ok'],result
+        result=call('alpha','find','--app',browser_apps['alpha'],'--text','Saved 1:');assert result['ok'],result
         assert any(str(n.get('name','')).startswith('Saved 1:') for n in nodes(result)),result
-        other=call('beta','find','--app','chrome','--text','Saved 1:');assert not any(str(n.get('name','')).startswith('Saved 1:') for n in nodes(other)),other
+        other=call('beta','find','--app',browser_apps['beta'],'--text','Saved 1:');assert not any(str(n.get('name','')).startswith('Saved 1:') for n in nodes(other)),other
         receipt={'passed':True,'commands':len(receipts),'binary_sha256':manifest['files']['agent-desktop']['sha256'],
                  'browser_semantic_typing':typed['ok'],'total_command_ms':sum(r['ms'] for r in receipts),
                  'checks':['native Unicode typing','native click and readback','checkbox readback','cross-screen reference rejection',

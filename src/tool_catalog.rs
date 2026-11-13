@@ -8,7 +8,7 @@ fn core(name: &str) -> bool {
     matches!(name, "set_task_title" | "task_progress" | "finish_quietly" |
         "kindred_guide" | "remember" | "memory_read" | "memory_compact" |
         "computer_screenshot" | "computer_click" | "computer_type" |
-        "computer_key" | "computer_scroll" | "computer_open_url" |
+        "computer_key" | "computer_scroll" | "computer_open_url" | "computer_browser_task" |
         "guest_exec" | "ask_question" | "request_user_action" | "routine_complete")
 }
 

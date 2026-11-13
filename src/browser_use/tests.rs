@@ -169,6 +169,11 @@ async fn successful_actions_are_observed_and_preserved_when_decisions_becomes_un
     assert_eq!(outcome.actions[0]["applied"], true);
     assert!(!outcome.uncertain);
     assert_eq!(*guard.receipts.lock().unwrap(), vec![false]);
+    let result = outcome.result();
+    assert_eq!(result["failed"], false);
+    let details: Value = serde_json::from_str(result["text"].as_str().unwrap()).unwrap();
+    assert_eq!(details["browser_worker"]["actions"][0]["applied"], true);
+    assert!(details["continuation"].as_str().unwrap().contains("instead of repeatedly retrying the API"));
 }
 #[tokio::test]
 async fn uncertain_dispatch_stops_without_replay_and_marks_existing_recovery_blocker() {
@@ -274,7 +279,7 @@ fn task_limits_and_remote_effect_classification_are_enforced() {
     }
 }
 #[tokio::test]
-async fn runtime_falls_back_without_touching_vm_and_other_providers_keep_their_tools() {
+async fn runtime_falls_back_without_key_and_adds_worker_without_removing_provider_tools() {
     let mut app = crate::tests::app();
     let codex = crate::tests::bot(&app.db, "codex");
     let id = app
@@ -333,9 +338,13 @@ async fn runtime_falls_back_without_touching_vm_and_other_providers_keep_their_t
     for (bot, specs) in previous {
         let mut open = json!({"url":"https://assessment.example","_decisions_observation":true});
         prepare_open(&app, &bot, &mut open);
-        assert!(open.get("_decisions_observation").is_none());
-        assert_eq!(specs, crate::runtime::tool_specs_for(&app, &bot));
-        assert_eq!(instructions(&app, &bot), "");
+        assert_eq!(open["_decisions_observation"], true);
+        let mut available = crate::runtime::tool_specs_for(&app, &bot);
+        assert!(available.iter().any(|s|s["name"]=="computer_browser_task"));
+        available.retain(|s|s["name"]!="computer_browser_task");
+        assert_eq!(specs, available, "Existing provider tools must remain available");
+        assert!(instructions(&app, &bot).contains("use computer_browser_task"));
+        // Provider-independent availability must not authorize a foreign run.
         assert!(
             call(&app, &bot, &run, serde_json::to_value(task()).unwrap())
                 .await
@@ -646,7 +655,7 @@ fn saved_credential_change_revokes_selected_action_before_input() {
 }
 
 #[test]
-fn saved_openai_key_exposes_worker_to_gpt_api_models_only() {
+fn saved_openai_key_exposes_worker_and_guidance_to_every_chat_provider() {
     let mut app=crate::tests::app();
     let root=std::env::temp_dir().join(format!("kindred-gpt-decisions-{}",db::id()));
     std::fs::create_dir_all(&root).unwrap();
@@ -655,17 +664,36 @@ fn saved_openai_key_exposes_worker_to_gpt_api_models_only() {
         ("codex","gpt-daybreak-blue-latest",true),
         ("custom-11111111-1111-4111-8111-111111111111","gpt-6.1",true),
         ("openrouter","openai/gpt-6.1",true),
-        ("openrouter","anthropic/claude-opus-5",false),
-        ("claude-code","gpt-6.1",false),
+        ("openrouter","anthropic/claude-opus-5",true),
+        ("claude-code","claude-opus-5",true),
+        ("custom-11111111-1111-4111-8111-111111111111","qwen-local",true),
+        ("opencode","local-model",true),
+        ("kimi-code","kimi",true),
     ] {
         let mut bot=crate::tests::bot(&app.db,provider);bot.model=model.into();
         crate::connections::save_decisions(&app,None).unwrap();
         assert!(!preferred(&app,&bot));
         crate::connections::save_decisions(&app,Some("sk-synthetic-api-model-key-12345")).unwrap();
         assert_eq!(preferred(&app,&bot),supported);
+        assert!(instructions(&app,&bot).contains("independently of your chat provider"));
         assert_eq!(crate::runtime::tool_specs_for(&app,&bot).iter().any(|s|s["name"]=="computer_browser_task"),supported);
         let mut args=json!({"url":"https://example.test","_decisions_observation":true});prepare_open(&app,&bot,&mut args);
         assert_eq!(args.get("_decisions_observation").is_some(),supported);
+        app.db.save_bot(&bot).unwrap();
+        app.db.queue(&bot.id,"Synthetic browser task",0).unwrap();
+        app.db.screen(&bot.id).unwrap();
+        let run=app.db.claim_bot(&bot.id).unwrap().unwrap();
+        let guard=RuntimeGuard{app:&app,bot:&bot,run:&run,credential:None};
+        assert!(guard.check().is_ok(),"Provider-independent worker must pass the execution guard");
+        assert!(crate::tool_catalog::advertised(&app,&bot,&run).iter().any(|s|s["name"]=="computer_browser_task"),"The worker must be directly visible alongside individual click tools");
+        assert!(crate::tool_catalog::resolve(&app,&bot,&run,json!({"name":"computer_browser_task","arguments":{"origin":"https://example.test","goal":"Read the page"}})).is_ok());
+        crate::connections::save_decisions(&app,None).unwrap();
+        assert!(!preferred(&app,&bot));
+        let tools=crate::tool_catalog::advertised(&app,&bot,&run);
+        assert!(!tools.iter().any(|s|s["name"]=="computer_browser_task"));
+        for name in ["guest_exec", "computer_screenshot", "computer_click", "computer_type"] {
+            assert!(tools.iter().any(|s|s["name"]==name),"Missing independent fallback tool {name} for {provider}");
+        }
     }
     std::fs::remove_dir_all(root).unwrap();
 }
