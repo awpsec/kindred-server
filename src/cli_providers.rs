@@ -50,8 +50,17 @@ pub async fn action(
     Ok(Json(account(&app, &provider, &action, &mut v).await?))
 }
 async fn account(app: &Shared, provider: &str, action: &str, v: &mut Value) -> Result<Value> {
+    let grok_id = if provider == "grok" {
+        let value = v["account_id"].as_str().context("Choose a Grok account")?;
+        let id = uuid::Uuid::parse_str(value).context("Invalid Grok account")?;
+        ensure!(value == id.to_string(), "Invalid Grok account");
+        ensure!(matches!(action, "login" | "logout" | "models" | "usage" | "account"), "Unsupported Grok account action");
+        Some(id)
+    } else {
+        None
+    };
     ensure!(
-        matches!(provider, "claude-code" | "kimi-code")
+        matches!(provider, "claude-code" | "kimi-code" | "grok")
             && (matches!(action, "account" | "models" | "usage" | "login" | "logout")
                 || (provider == "claude-code"
                     && matches!(
@@ -68,11 +77,11 @@ async fn account(app: &Shared, provider: &str, action: &str, v: &mut Value) -> R
     if action == "login" {
         vm::ensure_running(&app.config.vm).await?;
     }
-    if matches!(action,"login" | "logout" | "login-complete") {
+    if grok_id.is_none() && matches!(action,"login" | "logout" | "login-complete") {
         crate::harness_context::connection_changed(&app.db,provider)?;
     }
     // Headless authentication needs no display or reservation.
-    let selected=if action=="login" && provider=="kimi-code" {
+    let selected=if action=="login" && matches!(provider, "kimi-code" | "grok") {
         let identity=crate::web::screen_selection(app,v["bot_id"].as_str().unwrap_or("")).await?;
         ensure!(app.screen_lock(identity.slot).try_lock().is_ok(),"This bot computer is busy. Try again when its task finishes.");
         v["slot"]=json!(identity.slot);
@@ -84,11 +93,16 @@ async fn account(app: &Shared, provider: &str, action: &str, v: &mut Value) -> R
         Some(guard)
     } else {None};
     let mut cmd=vm::ssh(&app.config.vm);
-    let tail=format!("python3 {HELPER} {action} {provider}");
+    let tail = if let Some(id) = grok_id {
+        let operation = if action == "login" { "open-login" } else { action };
+        format!("python3 /usr/local/lib/kindred/grok-account.py {operation} {id}")
+    } else {
+        format!("python3 {HELPER} {action} {provider}")
+    };
     if let Some(identity)=&selected {cmd.arg(crate::screen_capacity::command(identity,"dispatch",None,&tail));}
     else {cmd.arg(tail);}
     let result=vm::capture(cmd,Some(serde_json::to_vec(v)?),35,512*1024).await
-        .context("The provider CLI is unavailable. Install the pinned Claude Code and Kimi Code runtimes in the bot VM")?;
+        .context("The provider CLI is unavailable. Install the selected provider runtime in the bot VM")?;
     let result: Value = serde_json::from_slice(&result)?;
     ensure!(
         result["type"] != "error",
@@ -597,6 +611,16 @@ print(json.dumps({'type':'error','code':'context_unavailable','context_protocol'
         }
     }
     use super::*;
+    #[tokio::test]
+    async fn grok_connection_requires_account_binding_before_vm_access() {
+        let app = crate::tests::app();
+        for mut body in [json!({}), json!({"account_id":"../other"}), json!({"account_id":"work"})] {
+            assert!(account(&app, "grok", "login", &mut body).await.is_err());
+        }
+        // Account actions do not bypass the normal bot runtime to submit inference.
+        let mut body = json!({"account_id":uuid::Uuid::new_v4().to_string()});
+        assert!(account(&app, "grok", "infer", &mut body).await.is_err());
+    }
     #[tokio::test]
     async fn waiting_correction_stops_new_tools_and_is_delivered_once_in_same_session() {
         for provider in ["claude-code","kimi-code"] {

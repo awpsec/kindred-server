@@ -118,6 +118,27 @@ def auth_lock(home, exclusive):
 
 def perform(binary, home, operation):
     env = environment(home)
+    marker = home / 'last-device-login'
+    if operation == 'account':
+        try:
+            last_login = int(marker.stat().st_mtime)
+        except FileNotFoundError:
+            last_login = None
+        return {'installed': Path(binary).is_file(), 'sign_in_saved': last_login is not None,
+                'last_login_at': last_login}
+    if operation == 'open-login':
+        request = json.loads(sys.stdin.buffer.readline(65536))
+        slot = request.get('slot')
+        if not Path(binary).is_file() or type(slot) != int or not 1 <= slot <= 32:
+            raise ValueError('A configured bot display and Grok installation are required')
+        display = {'DISPLAY': ':' + str(slot), 'PATH': '/usr/bin:/bin', 'HOME': str(Path.home())}
+        if 'XAUTHORITY' in os.environ:
+            display['XAUTHORITY'] = os.environ['XAUTHORITY']
+        subprocess.Popen(['/usr/bin/xterm', '-T', 'Kindred · Grok sign in', '-e', sys.executable,
+                          str(Path(__file__).resolve()), 'login', home.name],
+                         cwd=home, env=display, start_new_session=True, stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return {'opened': True, 'message': 'Complete Grok device sign-in on the bot computer.'}
     with auth_lock(home, operation in ('login', 'logout')), tempfile.TemporaryDirectory(prefix='kindred-grok-work-') as work:
         if operation == 'infer':
             verify_inference_configuration(binary, env, work)
@@ -143,13 +164,18 @@ def perform(binary, home, operation):
             raise ValueError('Unsupported Grok account action')
         args = ['login', '--device-auth'] if operation == 'login' else ['logout']
         subprocess.run([binary, *args], env=env, cwd=work,
+                       stdout=None if operation == 'login' else subprocess.DEVNULL,
                        timeout=600 if operation == 'login' else 30, check=True)
+        if operation == 'login':
+            marker.touch(mode=0o600)
+        else:
+            marker.unlink(missing_ok=True)
         return {'operation': operation, 'completed': True}
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('operation', choices=('login', 'logout', 'usage', 'models', 'infer'))
+    parser.add_argument('operation', choices=('login', 'open-login', 'logout', 'account', 'usage', 'models', 'infer'))
     parser.add_argument('account_id')
     args = parser.parse_args()
     root = Path.home() / '.kindred-providers'
