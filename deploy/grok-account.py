@@ -1,12 +1,15 @@
 #!/usr/bin/python3
 """Run official Grok Build account operations in an account-specific VM home."""
 import argparse
+from contextlib import contextmanager
 import fcntl
 import json
 import os
 from pathlib import Path
 import stat
 import subprocess
+import sys
+import tomllib
 import tempfile
 import uuid
 
@@ -53,9 +56,76 @@ def model_catalogue(binary, env, cwd):
     raise ValueError('Missing Grok agent initialization')
 
 
+def verify_inference_configuration(binary, env, cwd):
+    # This account is subscription-only. Reject custom models, API keys, token
+    # helpers and provider plugins even if configured manually in the VM.
+    config = Path(env['GROK_HOME']) / 'config.toml'
+    if config.exists():
+        with config.open('rb') as stream:
+            settings = tomllib.load(stream)
+        if set(settings) - {'marketplace'} or set(settings.get('marketplace', {})) - {'default_skills_installs_purged'}:
+            raise ValueError('Unsupported settings in this subscription account')
+    inspection = subprocess.run([binary, 'inspect', '--json'], env=env, cwd=cwd,
+                                capture_output=True, timeout=15, check=True)
+    data = json.loads(inspection.stdout)
+    if (data['grokVersion'] != '1.0.88' or
+            any(data[key] for key in ('projectInstructions', 'hooks', 'skills', 'plugins', 'mcpServers', 'lspServers')) or
+            any(entry.get('role') != 'user' for entry in data['configSources']['layers'])):
+        raise ValueError('Grok must use an isolated subscription configuration')
+
+
+def infer_text(binary, env, cwd, model, prompt):
+    """One text request. All native tools and indirect dispatch are disabled."""
+    if not isinstance(prompt, str) or not prompt.strip() or len(prompt.encode()) > 1024 * 1024:
+        raise ValueError('Invalid Grok prompt')
+    if not isinstance(model, str) or not model.startswith('grok-') or len(model) > 128:
+        raise ValueError('Invalid Grok model')
+    prompt_file = Path(cwd) / 'prompt.txt'
+    prompt_file.write_text(prompt, encoding='utf-8')
+    # 1.0.88 treats an empty --tools list as unrestricted. Select one known
+    # tool and exclude it explicitly along with both implicit MCP meta-tools.
+    args = [binary, '--tools', 'read_file', '--disallowed-tools', 'read_file,search_tool,use_tool',
+            '--permission-mode', 'dontAsk', '--disable-web-search', '--no-subagents', '--no-plan',
+            '--no-memory', '--max-turns', '1', '--output-format', 'streaming-messages-json',
+            '--model', model, '--prompt-file', str(prompt_file)]
+    result = subprocess.run(args, env=env, cwd=cwd, stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=240, check=True)
+    if len(result.stdout) > 8 * 1024 * 1024:
+        raise ValueError('Grok response exceeds size limit')
+    frames = [json.loads(line) for line in result.stdout.splitlines()]
+    if len(frames) < 2:
+        raise ValueError('Grok did not complete the turn')
+    init, final = frames[0], frames[-1]
+    if (init.get('type') != 'system' or init.get('subtype') != 'init' or init.get('model') != model or
+            init.get('tools') != [] or init.get('mcp_servers') != [] or init.get('skills') != [] or
+            init.get('permissionMode') != 'dontAsk' or not init.get('session_id')):
+        raise ValueError('Grok offered unexpected execution capabilities')
+    if (final.get('type') != 'result' or final.get('subtype') != 'success' or
+            final.get('is_error') is not False or final.get('num_turns') != 1 or
+            final.get('session_id') != init['session_id'] or not isinstance(final.get('result'), str)):
+        raise ValueError('Grok did not return a successful text response')
+    return {'text': final['result'], 'model': model, 'usage': final.get('usage')}
+
+
+@contextmanager
+def auth_lock(home, exclusive):
+    flags = os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW
+    with os.fdopen(os.open(home / 'auth.lock', flags, 0o600), 'r+') as lock:
+        mode = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+        fcntl.flock(lock, mode | fcntl.LOCK_NB)
+        yield
+
+
 def perform(binary, home, operation):
     env = environment(home)
-    with tempfile.TemporaryDirectory(prefix='kindred-grok-work-') as work:
+    with auth_lock(home, operation in ('login', 'logout')), tempfile.TemporaryDirectory(prefix='kindred-grok-work-') as work:
+        if operation == 'infer':
+            verify_inference_configuration(binary, env, work)
+            request = json.loads(sys.stdin.buffer.readline(2 * 1024 * 1024))
+            model = request['model']
+            if model not in {item['model'] for item in model_catalogue(binary, env, work)}:
+                raise ValueError('Model is not in the account catalogue')
+            return infer_text(binary, env, work, model, request['prompt'])
         if operation == 'models':
             return {'data': model_catalogue(binary, env, work)}
         if operation == 'usage':
@@ -71,18 +141,15 @@ def perform(binary, home, operation):
         # The vendor handles expiry, browser authorization and token refresh.
         if operation not in {'login', 'logout'}:
             raise ValueError('Unsupported Grok account action')
-        lock_fd = os.open(home / 'auth.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
-        with os.fdopen(lock_fd, 'r+') as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            args = ['login', '--device-auth'] if operation == 'login' else ['logout']
-            subprocess.run([binary, *args], env=env, cwd=work,
-                           timeout=600 if operation == 'login' else 30, check=True)
-            return {'operation': operation, 'completed': True}
+        args = ['login', '--device-auth'] if operation == 'login' else ['logout']
+        subprocess.run([binary, *args], env=env, cwd=work,
+                       timeout=600 if operation == 'login' else 30, check=True)
+        return {'operation': operation, 'completed': True}
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('operation', choices=('login', 'logout', 'usage', 'models'))
+    parser.add_argument('operation', choices=('login', 'logout', 'usage', 'models', 'infer'))
     parser.add_argument('account_id')
     args = parser.parse_args()
     root = Path.home() / '.kindred-providers'
