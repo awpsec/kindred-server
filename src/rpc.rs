@@ -92,17 +92,37 @@ fn error_message(message: &str) -> String {
     }
     bounded.split_whitespace().collect::<Vec<_>>().join(" ")
 }
+#[cfg(test)]
 pub(crate) fn guest_command(binary: &str) -> String {
+    scoped_guest_command(binary, "/home/bot/.local/share/kindred/codex")
+}
+fn codex_home(slot: &str) -> Result<String> {
+    let root = "/home/bot/.local/share/kindred";
+    if slot.is_empty() {
+        return Ok(format!("{root}/codex"));
+    }
+    let id = uuid::Uuid::parse_str(slot)?;
+    anyhow::ensure!(id.to_string() == slot, "Invalid Codex account");
+    Ok(format!("{root}/codex-accounts/{id}"))
+}
+fn scoped_guest_command(binary: &str, home: &str) -> String {
     // The VM config validates binary as a single safe executable path.
     // A successful initialize/account read does not exercise code mode.
     // This check uses no credentials, model calls or real Kindred tools.
+    let store = if home.ends_with("/codex") {
+        ""
+    } else {
+        "-c cli_auth_credentials_store='\"file\"' "
+    };
     let probe = include_str!("../deploy/check-codex.py").replace('\'', "'\"'\"'");
     format!(
-        "python3 -c '{probe}' {binary} >/dev/null 2>&1 || exit 78; exec env -u OPENAI_API_KEY CODEX_HOME=/home/bot/.local/share/kindred/codex {binary} -c forced_login_method='\"chatgpt\"' -c features.shell_tool=false -c features.unified_exec=false -c web_search='\"disabled\"' app-server"
+        "python3 -c '{probe}' {binary} >/dev/null 2>&1 || exit 78; umask 077; mkdir -p {home} || exit 78; exec env -u CODEX_API_KEY -u OPENAI_API_KEY CODEX_HOME={home} {binary} {store}-c forced_login_method='\"chatgpt\"' -c features.shell_tool=false -c features.unified_exec=false -c web_search='\"disabled\"' app-server"
     )
 }
+
 impl Rpc {
-    pub async fn connect(config: &Vm) -> Result<Self> {
+    pub async fn connect(config: &Vm, slot: &str) -> Result<Self> {
+        let home = codex_home(slot)?;
         // account/read exposes only email/plan on supported app-server versions.
         // Workspace switches can keep the same email, so bind persisted context
         // to the selected account ID in this dedicated guest sign-in store too.
@@ -114,13 +134,13 @@ try:
 except Exception: print('')
 "#;
         let mut probe=vm::ssh(config);
-        probe.arg(format!("python3 -c '{}'",code.replace('\'',"'\"'\"'")));
+        probe.arg(format!("python3 -c '{}'",code.replace("/home/bot/.local/share/kindred/codex",&home).replace('\'',"'\"'\"'")));
         let identity=vm::capture(probe,None,10,1024).await.ok()
             .and_then(|data|String::from_utf8(data).ok()).map(|s|s.trim().to_owned())
             .filter(|s|s.len()==64&&s.bytes().all(|b|b.is_ascii_hexdigit()));
         let mut cmd = vm::ssh(config);
         // Dedicated guest auth store; never touch the operator's regular Codex installation.
-        cmd.arg(guest_command(&config.codex_binary));
+        cmd.arg(scoped_guest_command(&config.codex_binary,&home));
         let mut rpc=Self::spawn(cmd).await?;
         rpc.context_account=identity;
         Ok(rpc)
@@ -309,6 +329,33 @@ mod tests {
         let bounded = error_message(&"é".repeat(5000));
         assert_eq!(bounded.chars().count(), 401);
         assert!(bounded.ends_with('…'));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn named_codex_launch_stops_on_quota_and_never_reads_another_store() {
+        let id = crate::db::id();
+        assert!(codex_home("../codex").is_err());
+        let selected = codex_home(&id).unwrap();
+        assert_ne!(selected,codex_home("").unwrap());
+        assert!(selected.ends_with(&format!("codex-accounts/{id}")));
+        let root=std::env::temp_dir().join(crate::db::id());
+        std::fs::create_dir(&root).unwrap();
+        let binary=root.join("fixture");
+        std::fs::write(&binary,"#!/bin/sh\ntest -z \"$OPENAI_API_KEY$CODEX_API_KEY\" || exit 99\ncat \"$CODEX_HOME/allowance\" || exit 1\nexit 75\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&binary,std::fs::Permissions::from_mode(0o700)).unwrap();
+        let home=root.join(id);
+        std::fs::create_dir(&home).unwrap();
+        std::fs::write(home.join("allowance"),"Work exhausted").unwrap();
+        std::fs::write(root.join("allowance"),"Personal available").unwrap();
+        let script=scoped_guest_command(binary.to_str().unwrap(),home.to_str().unwrap());
+        // Stub the separate offline binary integrity check, then execute the real launcher.
+        let result=std::process::Command::new("sh").args(["-c",&format!("python3() {{ return 0; }}; {script}")])
+            .env("CODEX_HOME",&root).env("OPENAI_API_KEY","fixture").env("CODEX_API_KEY","fixture").output().unwrap();
+        assert_eq!(result.status.code(),Some(75));
+        assert_eq!(result.stdout,b"Work exhausted");
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]

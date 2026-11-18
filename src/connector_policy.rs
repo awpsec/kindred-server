@@ -25,6 +25,7 @@ fn key(v: &Value, name: &str) -> Result<String> {
     );
     Ok(s.into())
 }
+#[cfg(test)]
 pub fn catalogue(db: &Db, account: &str, rows: &Value) -> Result<()> {
     catalogue_for(db, "claude-account", account, rows)
 }
@@ -35,7 +36,14 @@ pub fn provider_identity(provider: &str) -> Option<(&'static str, &'static str, 
         _ => None,
     }
 }
+#[cfg(test)]
 pub fn catalogue_for(db: &Db, origin: &str, account: &str, rows: &Value) -> Result<()> {
+    catalogue_slot(db,origin,"",account,rows)
+}
+fn catalogue_key(origin: &str, slot: &str) -> String {
+    if slot.is_empty() { origin.to_owned() } else { format!("{origin}:{slot}") }
+}
+pub fn catalogue_slot(db: &Db, origin: &str, slot: &str, account: &str, rows: &Value) -> Result<()> {
     ensure!(
         matches!(origin, "claude-account" | "codex-account"),
         "Invalid provider connector origin"
@@ -62,20 +70,17 @@ pub fn catalogue_for(db: &Db, origin: &str, account: &str, rows: &Value) -> Resu
             "Duplicate connector identity"
         );
     }
-    db.0.lock().unwrap().execute("INSERT INTO connector_catalogue VALUES(?,?,?) ON CONFLICT(origin) DO UPDATE SET account_key=excluded.account_key,connections=excluded.connections", params![origin,account,json!(rows).to_string()])?;
+    db.0.lock().unwrap().execute("INSERT INTO connector_catalogue VALUES(?,?,?) ON CONFLICT(origin) DO UPDATE SET account_key=excluded.account_key,connections=excluded.connections", params![catalogue_key(origin,slot),account,json!(rows).to_string()])?;
     Ok(())
 }
-pub fn clear_catalogue(db: &Db) -> Result<()> {
-    clear_catalogue_for(db, "claude-account")
-}
-pub fn clear_catalogue_for(db: &Db, origin: &str) -> Result<()> {
+pub fn clear_catalogue_slot(db: &Db, origin: &str, slot: &str) -> Result<()> {
     ensure!(
         matches!(origin, "claude-account" | "codex-account"),
         "Invalid provider connector origin"
     );
     db.0.lock()
         .unwrap()
-        .execute("DELETE FROM connector_catalogue WHERE origin=?", [origin])?;
+        .execute("DELETE FROM connector_catalogue WHERE origin=?", [catalogue_key(origin,slot)])?;
     Ok(())
 }
 fn source(c: &Connection, bot: &str) -> Result<String> {
@@ -93,6 +98,9 @@ fn source(c: &Connection, bot: &str) -> Result<String> {
         value
     })
 }
+fn bot_slot(c: &Connection, bot: &str) -> Result<String> {
+    Ok(c.query_row("SELECT coalesce(json_extract(profile,'$.provider_account_id'),'') FROM bots WHERE id=?",[bot],|r|r.get(0))?)
+}
 fn permission(
     c: &Connection,
     bot: &str,
@@ -107,7 +115,7 @@ fn permission(
         // Older releases keyed Codex permissions by app id. Preserve an
         // explicit Ask when moving to account-scoped runtime binding keys;
         // never migrate an Allow to a newly linked account.
-        let rows: Option<String> = c.query_row("SELECT connections FROM connector_catalogue WHERE origin=? AND account_key=?", params![origin,account], |r|r.get(0)).optional()?;
+        let rows: Option<String> = c.query_row("SELECT connections FROM connector_catalogue WHERE origin=? AND account_key=?", params![catalogue_key(origin,&bot_slot(c,bot)?),account], |r|r.get(0)).optional()?;
         if let Some(rows) = rows {
             let rows: Vec<Value> = serde_json::from_str(&rows)?;
             if let Some(app_id) = rows.iter().find(|r|r["connector_key"]==connector).and_then(|r|r["app_id"].as_str()) {
@@ -233,7 +241,7 @@ pub fn inventory(app: &App, bot: &Bot) -> Result<Value> {
     let cached: Option<(String, String)> = if identity.is_some() {
         c.query_row(
             "SELECT account_key,connections FROM connector_catalogue WHERE origin=?",
-            [origin],
+            [catalogue_key(origin,crate::provider_accounts::slot(bot))],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?
@@ -366,7 +374,7 @@ fn grant(c: &Connection, bot: &str, args: &Value, allow: bool) -> Result<()> {
         );
         let (current, rows): (String, String) = c.query_row(
             "SELECT account_key,connections FROM connector_catalogue WHERE origin=?",
-            [&origin],
+            [catalogue_key(&origin,&bot_slot(c,bot)?)],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
         let rows: Vec<Value> = serde_json::from_str(&rows)?;

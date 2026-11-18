@@ -26,7 +26,7 @@ pub struct App {
     pub computer: Arc<Mutex<()>>,
     pub screens: std::sync::Mutex<std::collections::HashMap<i64, Arc<Mutex<()>>>>,
 
-    pub auth: Mutex<Option<Rpc>>,
+    pub auth: Mutex<std::collections::HashMap<String,Arc<Mutex<Option<Rpc>>>>>,
     pub integrations: Arc<Mutex<()>>,
     pub maintenance_leases: std::sync::Mutex<Option<crate::vm_maintenance::Leases>>,
     pub pairing: crate::pairing::Pairing,
@@ -62,7 +62,7 @@ impl App {
             token,
             computer: Arc::new(Mutex::new(())),
             screens: Default::default(),
-            auth: Mutex::new(None),
+            auth: Mutex::new(Default::default()),
             integrations: Arc::new(Mutex::new(())),
             maintenance_leases: Default::default(),
             pairing: Default::default(),
@@ -1088,7 +1088,7 @@ async fn call_tool_inner(
         }
         "connectors_list" => {
             let refresh_error = if bot.provider == "codex" {
-                crate::codex_connectors::refresh(app)
+                crate::codex_connectors::refresh(app,crate::provider_accounts::slot(bot))
                     .await
                     .err()
                     .map(|e| e.to_string())
@@ -1601,7 +1601,9 @@ pub async fn scheduler(app: Shared) {
                     let _permit = permit;
                     let mut lease = None;
                     let work = async {
-                        let mut bot = bot.clone();
+                        // Read the assignment after claiming. The active run now pins changes
+                        // to this account, including across every provider retry below.
+                        let mut bot = app.db.bot(&run.bot_id)?;
                         db::apply_model_default(
                             &mut bot,
                             &db::general_settings(app.db.setting("general")?),

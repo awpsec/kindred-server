@@ -49,7 +49,26 @@ pub async fn action(
 ) -> Result<Json<Value>, crate::web::Error> {
     Ok(Json(account(&app, &provider, &action, &mut v).await?))
 }
+fn helper_command(provider: &str, action: &str, slot: &str) -> Result<String> {
+    if slot.is_empty() {
+        return Ok(format!("python3 {HELPER} {action} {provider}"));
+    }
+    ensure!(
+        provider == "claude-code"
+            && uuid::Uuid::parse_str(slot).is_ok_and(|id| id.to_string() == slot),
+        "Invalid Claude account"
+    );
+    Ok(format!(
+        "python3 {HELPER} scoped {slot} {action} {provider}"
+    ))
+}
+
 async fn account(app: &Shared, provider: &str, action: &str, v: &mut Value) -> Result<Value> {
+    let slot = match v.get("account_id") {
+        Some(value) => value.as_str().context("Invalid account ID")?.to_owned(),
+        None => String::new(),
+    };
+    if provider != "grok" { crate::provider_accounts::check_slot(&app.db.0.lock().unwrap(),provider,&slot)?; }
     let grok_id = if provider == "grok" {
         let value = v["account_id"].as_str().context("Choose a Grok account")?;
         let id = uuid::Uuid::parse_str(value).context("Invalid Grok account")?;
@@ -78,7 +97,7 @@ async fn account(app: &Shared, provider: &str, action: &str, v: &mut Value) -> R
         vm::ensure_running(&app.config.vm).await?;
     }
     if grok_id.is_none() && matches!(action,"login" | "logout" | "login-complete") {
-        crate::harness_context::connection_changed(&app.db,provider)?;
+        crate::harness_context::connection_changed(&app.db,provider,&slot)?;
     }
     // Headless authentication needs no display or reservation.
     let selected=if action=="login" && matches!(provider, "kimi-code" | "grok") {
@@ -97,7 +116,7 @@ async fn account(app: &Shared, provider: &str, action: &str, v: &mut Value) -> R
         let operation = if action == "login" { "open-login" } else { action };
         format!("python3 /usr/local/lib/kindred/grok-account.py {operation} {id}")
     } else {
-        format!("python3 {HELPER} {action} {provider}")
+        helper_command(provider,action,&slot)?
     };
     if let Some(identity)=&selected {cmd.arg(crate::screen_capacity::command(identity,"dispatch",None,&tail));}
     else {cmd.arg(tail);}
@@ -110,14 +129,14 @@ async fn account(app: &Shared, provider: &str, action: &str, v: &mut Value) -> R
     );
     if provider == "claude-code" {
         if action == "connectors" {
-            crate::connector_policy::catalogue(
-                &app.db,
+            crate::connector_policy::catalogue_slot(
+                &app.db,"claude-account",&slot,
                 runtime::string(&result, "account_key")?,
                 &result["data"],
             )?;
         }
         if action == "logout" {
-            crate::connector_policy::clear_catalogue(&app.db)?;
+            crate::connector_policy::clear_catalogue_slot(&app.db,"claude-account",&slot)?;
         }
     }
     Ok(result)
@@ -156,7 +175,7 @@ pub async fn run(app: &App, bot: &Bot, run: &Run) -> Result<String> {
     } else { false };
     for attempt in 0..2 {
         let mut cmd = vm::ssh(&app.config.vm);
-        cmd.arg(format!("python3 {HELPER} worker {}", bot.provider));
+        cmd.arg(helper_command(&bot.provider,"worker",crate::provider_accounts::slot(bot))?);
         let child = cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).kill_on_drop(true).spawn()?;
         match run_child_context(app,bot,run,child,context_enabled).await {
             Err(error) if attempt == 0 && error.downcast_ref::<MissingContext>().is_some() => continue,
@@ -224,8 +243,8 @@ async fn run_child_context(app:&App,bot:&Bot,run:&Run,mut child:tokio::process::
                     &connector_account,
                     &frame["connectors"],
                 )?;
-                crate::connector_policy::catalogue(
-                    &app.db,
+                crate::connector_policy::catalogue_slot(
+                    &app.db,"claude-account",crate::provider_accounts::slot(bot),
                     &connector_account,
                     &frame["connectors"],
                 )?;

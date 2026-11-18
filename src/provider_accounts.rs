@@ -112,6 +112,103 @@ pub fn custom(app: &App) -> Result<Vec<CustomProvider>> {
         app.db.setting("custom_providers")?.unwrap_or(json!([])),
     )?)
 }
+pub fn slot(bot: &Bot) -> &str {
+    bot.profile.provider_account_id.as_deref().unwrap_or("")
+}
+
+pub fn check_slot(c: &Connection, provider: &str, id: &str) -> Result<()> {
+    if id.is_empty() {
+        return Ok(());
+    }
+    ensure!(
+        uuid::Uuid::parse_str(id).is_ok_and(|u| u.to_string() == id)
+            && c.query_row(
+                "SELECT EXISTS(SELECT 1 FROM subscription_accounts WHERE provider=? AND id=?)",
+                params![provider, id],
+                |r| r.get::<_, bool>(0)
+            )?,
+        "Unknown subscription account"
+    );
+    Ok(())
+}
+
+pub fn validate_transferred_accounts(c: &Connection) -> Result<()> {
+    let mut query = c.prepare("SELECT provider,id,nickname FROM subscription_accounts")?;
+    let mut rows = query.query([])?;
+    let mut original = 0;
+    while let Some(row) = rows.next()? {
+        let provider: String = row.get(0)?;
+        let id: String = row.get(1)?;
+        let name: String = row.get(2)?;
+        validate_account_name(&provider, &name)?;
+        if id.is_empty() {
+            original += 1;
+        } else {
+            check_slot(c, &provider, &id)?;
+        }
+    }
+    ensure!(original == 2, "Missing primary subscription accounts");
+    let mut bots = c.prepare("SELECT provider,json_extract(profile,'$.provider_account_id') FROM bots WHERE json_extract(profile,'$.provider_account_id') IS NOT NULL")?;
+    let mut rows = bots.query([])?;
+    while let Some(row) = rows.next()? {
+        check_slot(c, &row.get::<_, String>(0)?, &row.get::<_, String>(1)?)?;
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AccountEdit {
+    nickname: String,
+    id: Option<String>,
+}
+
+pub async fn edit_account(
+    State(app): State<Shared>,
+    Path(provider): Path<String>,
+    Json(edit): Json<AccountEdit>,
+) -> Result<Json<Value>, crate::web::Error> {
+    let c = app.db.0.lock().unwrap();
+    Ok(Json(save_account(&c, &provider, edit)?))
+}
+
+fn validate_account_name(provider: &str, name: &str) -> Result<()> {
+    ensure!(
+        matches!(provider, "claude-code" | "codex"),
+        "Unsupported account provider"
+    );
+    ensure!(
+        !name.trim().is_empty()
+            && name.chars().count() <= 48
+            && !name.chars().any(char::is_control),
+        "Choose an account nickname of 1–48 characters"
+    );
+    Ok(())
+}
+fn save_account(c: &Connection, provider: &str, edit: AccountEdit) -> Result<Value> {
+    let name = edit.nickname.trim();
+    validate_account_name(provider, name)?;
+    let rename = edit.id.is_some();
+    let id = edit.id.unwrap_or_else(db::id);
+    if rename {
+        check_slot(c, provider, &id)?;
+    }
+    ensure!(!c.query_row("SELECT EXISTS(SELECT 1 FROM subscription_accounts WHERE provider=? AND nickname=? COLLATE NOCASE AND id<>?)",
+        params![provider,name,id],|r| r.get::<_,bool>(0))?, "This provider already has an account with that nickname");
+    if rename {
+        c.execute(
+            "UPDATE subscription_accounts SET nickname=? WHERE provider=? AND id=?",
+            params![name, provider, id],
+        )?;
+    } else {
+        c.execute(
+            "INSERT INTO subscription_accounts(provider,id,nickname) VALUES(?,?,?)",
+            params![provider, id, name],
+        )?;
+    }
+    Ok(json!({"id":id,"nickname":name}))
+}
+
 pub async fn list(State(app): State<Shared>) -> Result<Json<Value>, crate::web::Error> {
     let mut rows = vec![
         json!({"id":"codex","name":"Codex","kind":"subscription"}),
@@ -139,6 +236,15 @@ pub async fn list(State(app): State<Shared>) -> Result<Json<Value>, crate::web::
         .query_map([], |r| r.get::<_, String>(0))?
         .collect::<rusqlite::Result<std::collections::HashSet<_>>>()?;
     for row in &mut rows {
+        let provider = row["id"].as_str().unwrap_or_default();
+        if matches!(provider, "codex" | "claude-code") {
+            let c = app.db.0.lock().unwrap();
+            let mut stmt = c.prepare("SELECT a.id,a.nickname,coalesce(sum(u.input_tokens+u.output_tokens),0),count(u.request_id)
+              FROM subscription_accounts a LEFT JOIN provider_usage u ON u.provider=a.provider AND u.account_id=a.id AND u.tokens_reported=1
+              WHERE a.provider=? GROUP BY a.id,a.nickname ORDER BY a.id<>'',a.nickname COLLATE NOCASE")?;
+            row["accounts"] = json!(stmt.query_map([provider], |r| Ok(json!({"id":r.get::<_,String>(0)?,"nickname":r.get::<_,String>(1)?,
+                "tokens":r.get::<_,i64>(2)?,"reported_requests":r.get::<_,i64>(3)?})))?.collect::<rusqlite::Result<Vec<_>>>()?);
+        }
         row["has_usage"] = json!(history.contains(row["id"].as_str().unwrap_or_default()));
     }
     Ok(Json(json!({"providers":rows})))
@@ -315,7 +421,14 @@ pub fn migrate(c: &Connection) -> Result<()> {
             DROP TABLE provider_usage;
             ALTER TABLE provider_usage_history_migration RENAME TO provider_usage;")?;
     }
-    c.execute_batch("CREATE INDEX IF NOT EXISTS usage_provider ON provider_usage(provider,bot_id);
+    if !c.prepare("SELECT 1 FROM pragma_table_info('provider_usage') WHERE name='account_id'")?.exists([])? {
+        c.execute_batch("ALTER TABLE provider_usage ADD COLUMN account_id TEXT NOT NULL DEFAULT ''")?;
+    }
+    c.execute_batch("CREATE TABLE IF NOT EXISTS subscription_accounts(provider TEXT NOT NULL,id TEXT NOT NULL,nickname TEXT NOT NULL COLLATE NOCASE,
+        PRIMARY KEY(provider,id), UNIQUE(provider,nickname));
+        INSERT OR IGNORE INTO subscription_accounts VALUES('codex','','Primary'),('claude-code','','Primary');
+        CREATE INDEX IF NOT EXISTS usage_subscription_account ON provider_usage(provider,account_id);
+        CREATE INDEX IF NOT EXISTS usage_provider ON provider_usage(provider,bot_id);
         DROP TRIGGER IF EXISTS preserve_bot_usage_identity;
         CREATE TRIGGER preserve_bot_usage_identity BEFORE DELETE ON bots BEGIN
             UPDATE provider_usage SET bot_name=OLD.name,bot_profile=json_patch(json_object('shape',COALESCE(json_extract(OLD.profile,'$.shape'),'round'),'color',COALESCE(json_extract(OLD.profile,'$.color'),'#d8d8d8'),'eyes',COALESCE(json_extract(OLD.profile,'$.eyes'),'curious'),'animated',json(CASE WHEN COALESCE(json_extract(OLD.profile,'$.animated'),1) THEN 'true' ELSE 'false' END)),COALESCE((SELECT json_object('avatar',json(artwork)) FROM bot_avatars WHERE bot_id=OLD.id AND fingerprint=json_extract(OLD.profile,'$.shape')||'|'||json_extract(OLD.profile,'$.eyes')||'|'||json_extract(OLD.profile,'$.color')),'{}')) WHERE bot_id=OLD.id;
@@ -381,7 +494,7 @@ pub fn record(app: &App, bot: &Bot, run: &Run, v: &Value) -> Result<()> {
         exists,
         "Usage receipt does not belong to an existing bot run"
     );
-    c.execute("INSERT INTO provider_usage(run_id,request_id,bot_id,provider,model,input_tokens,output_tokens,cached_tokens,cost,cost_source,created,tokens_reported,bot_name,bot_profile) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(run_id,request_id) DO UPDATE SET input_tokens=excluded.input_tokens,output_tokens=excluded.output_tokens,cached_tokens=excluded.cached_tokens,cost=excluded.cost,cost_source=excluded.cost_source,tokens_reported=excluded.tokens_reported",params![run.id,request,bot.id,bot.provider,bot.model,input,output,cached,cost,source,db::now(),v["tokens_reported"]!=false,bot.name,profile.to_string()])?;
+    c.execute("INSERT INTO provider_usage(run_id,request_id,bot_id,provider,model,input_tokens,output_tokens,cached_tokens,cost,cost_source,created,tokens_reported,bot_name,bot_profile,account_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(run_id,request_id) DO UPDATE SET input_tokens=excluded.input_tokens,output_tokens=excluded.output_tokens,cached_tokens=excluded.cached_tokens,cost=excluded.cost,cost_source=excluded.cost_source,tokens_reported=excluded.tokens_reported",params![run.id,request,bot.id,bot.provider,bot.model,input,output,cached,cost,source,db::now(),v["tokens_reported"]!=false,bot.name,profile.to_string(),slot(bot)])?;
     Ok(())
 }
 /// Receipt for OpenAI work performed outside the chat model's provider loop.
@@ -427,6 +540,56 @@ pub async fn usage(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn named_account_is_stable_across_rename_old_clients_and_quota_errors() {
+        let app = crate::tests::app();
+        let edit = |provider: &str, id: Option<&str>, name: &str| {
+            save_account(&app.db.0.lock().unwrap(),provider,AccountEdit {
+                nickname:name.into(),id:id.map(str::to_owned)
+            })
+        };
+        let a = edit("codex",None,"Work").unwrap();
+        let work = a["id"].as_str().unwrap();
+        assert!(edit("codex",None,"work").is_err());
+        assert!(edit("claude-code",Some(work),"Other").is_err());
+        let mut bot = crate::tests::bot(&app.db,"codex");
+        bot.profile.provider_account_id = Some(work.into());
+        app.db.save_bot(&bot).unwrap();
+        edit("codex",Some(work),"Team").unwrap();
+        bot.profile.provider_account_id = None;
+        app.db.save_bot(&bot).unwrap();
+        let bot = app.db.bot(&bot.id).unwrap();
+        assert_eq!(slot(&bot),work);
+        let personal=crate::tests::bot(&app.db,"codex");
+        for (slot,account) in [("", "a".repeat(64)), (work,"b".repeat(64))] {
+            crate::connector_policy::catalogue_slot(&app.db,"codex-account",slot,&account,&json!([])).unwrap();
+        }
+        assert_eq!(crate::connector_policy::inventory(&app,&personal).unwrap()["provider_account_key"],"a".repeat(64));
+        assert_eq!(crate::connector_policy::inventory(&app,&bot).unwrap()["provider_account_key"],"b".repeat(64));
+        crate::connector_policy::clear_catalogue_slot(&app.db,"codex-account",work).unwrap();
+        assert_eq!(crate::connector_policy::inventory(&app,&personal).unwrap()["provider_account_key"],"a".repeat(64));
+        let id = app.db.queue(&bot.id,"Account-bound fixture",0).unwrap();
+        let run = app.db.run(&id).unwrap();
+        let mut other = bot.clone();
+        other.profile.provider_account_id = Some(String::new());
+        assert!(app.db.save_bot(&other).is_err());
+        record(&app,&bot,&run,&json!({"request_id":1,"input_tokens":123,"output_tokens":7,"cached_tokens":0,"cost_source":"subscription"})).unwrap();
+        app.db.0.lock().unwrap().execute("UPDATE runs SET status='failed',error='usage limit reached' WHERE id=?", [&id]).unwrap();
+        assert_eq!(slot(&app.db.bot(&bot.id).unwrap()),work);
+        app.db.save_bot(&other).unwrap();
+        let Json(v) = list(State(app.clone())).await.ok().unwrap();
+        let codex = v["providers"].as_array().unwrap().iter().find(|p|p["id"]=="codex").unwrap();
+        assert_eq!(codex["accounts"][0]["tokens"],0);
+        assert_eq!(codex["accounts"][1],json!({"id":work,"nickname":"Team","tokens":130,"reported_requests":1}));
+        let package = app.db.prepare_transfer(&db::id(),"Test").unwrap();
+        let target = crate::tests::app();
+        target.db.import_transfer(&package).unwrap();
+        let Json(restored) = list(State(target.clone())).await.ok().unwrap();
+        assert_eq!(restored["providers"][0]["accounts"],codex["accounts"]);
+        other.profile.provider_account_id=Some(db::id());
+        assert!(app.db.save_bot(&other).is_err());
+    }
+
     #[test]
     fn legacy_usage_migration_preserves_receipts_and_survives_parent_removal() {
         let c = Connection::open_in_memory().unwrap();

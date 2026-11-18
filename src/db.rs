@@ -69,6 +69,9 @@ pub struct Bot {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct BotProfile {
+    /// Missing in older clients. An explicit empty string selects the original VM sign-in.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_account_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub avatar: Option<crate::avatar_profiles::AvatarProfile>,
     pub label: String,
@@ -89,6 +92,7 @@ pub struct BotProfile {
 impl Default for BotProfile {
     fn default() -> Self {
         Self {
+            provider_account_id: None,
             avatar: None,
             label: String::new(),
             description: String::new(),
@@ -1141,7 +1145,20 @@ pub(crate) fn validate_bot(b: &Bot) -> Result<()> {
 }
 
 pub(crate) fn write_bot(c: &Connection, b: &Bot, preserve_text: bool) -> Result<()> {
-    let stored_profile=crate::avatar_profiles::legacy(&b.profile)?;
+    let mut stored_profile=crate::avatar_profiles::legacy(&b.profile)?;
+    let previous: Option<(String,String)> = c.query_row(
+        "SELECT provider,coalesce(json_extract(profile,'$.provider_account_id'),'') FROM bots WHERE id=?",
+        [&b.id], |row| Ok((row.get(0)?,row.get(1)?))).optional()?;
+    if stored_profile.provider_account_id.is_none() {
+        if let Some((provider,id)) = &previous {
+            if provider == &b.provider && !id.is_empty() { stored_profile.provider_account_id = Some(id.clone()); }
+        }
+    }
+    let slot = stored_profile.provider_account_id.as_deref().unwrap_or("");
+    crate::provider_accounts::check_slot(c,&b.provider,slot)?;
+    if previous.as_ref().is_some_and(|(provider,id)| (!slot.is_empty() || !id.is_empty()) && (provider != &b.provider || id != slot)) {
+        ensure!(!c.query_row("SELECT EXISTS(SELECT 1 FROM runs WHERE bot_id=? AND status IN ('queued','running','awaiting_user','awaiting_approval','cancelling'))",[&b.id],|r|r.get::<_,bool>(0))?, "Finish or stop this bot’s active work before changing its account.");
+    }
     // Preserve custom titles; only replace the exact old participant-generated name.
     let groups: Vec<(String,String,String)> = c.prepare("SELECT id,name,members FROM chats WHERE id NOT LIKE 'dm-%' AND id NOT LIKE 'server-%' AND EXISTS(SELECT 1 FROM json_each(members) WHERE value=?)")?
         .query_map([&b.id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?.collect::<rusqlite::Result<_>>()?;

@@ -407,7 +407,7 @@ pub fn start(db: &Db, v: &Value) -> Result<Value> {
         "",
         0,
     )?;
-    let data = json!({"name":name,"source":source,"snapshot":snapshot,"previous":previous,"baseline":current,"provider":actor.provider,"model":actor.model,"reasoning_effort":actor.reasoning_effort,"request_hash":signature});
+    let data = json!({"name":name,"source":source,"snapshot":snapshot,"previous":previous,"baseline":current,"provider":actor.provider,"provider_account_id":actor.profile.provider_account_id,"model":actor.model,"reasoning_effort":actor.reasoning_effort,"request_hash":signature});
     insert(&tx, id, &run, &actor.id, target, &data)?;
     tx.execute("INSERT INTO chat_messages(chat_id,sender,body,kind,run_id,created) VALUES(?,?,?,'workspace_import',?,?)",params![chat_id,"user",id,run,db::now()])?;
     tx.commit()?;
@@ -615,7 +615,7 @@ pub async fn prepare_local(
     } else {
         text(args, "name", 80, true)?
     };
-    let v = json!({"name":name,"source":source,"snapshot":snapshot,"previous":previous,"baseline":current,"provider":actor.provider,"model":actor.model,"reasoning_effort":actor.reasoning_effort});
+    let v = json!({"name":name,"source":source,"snapshot":snapshot,"previous":previous,"baseline":current,"provider":actor.provider,"provider_account_id":actor.profile.provider_account_id,"model":actor.model,"reasoning_effort":actor.reasoning_effort});
     insert(
         &tx,
         &id,
@@ -909,6 +909,7 @@ fn apply_inner(db: &Db, id: &str, args: &Value, task: Option<(&Bot, &Run)>) -> R
             auto_approve: false,
             approval_mode: "inherit".into(),
             profile: BotProfile {
+                provider_account_id: v["provider_account_id"].as_str().map(str::to_owned),
                 local_access: args["local_access"] == true && v["source"]["kind"] == "desktop",
                 local_device_id: if args["local_access"] == true && v["source"]["kind"] == "desktop"
                 {
@@ -1025,6 +1026,7 @@ pub fn retry(db: &Db, id: &str) -> Result<Value> {
     let sync = !v["target_id"].as_str().unwrap_or("").is_empty();
     ensure!(!actor.profile.archived, "Restore the converter bot first");
     v["provider"] = json!(actor.provider);
+    v["provider_account_id"] = json!(actor.profile.provider_account_id);
     v["model"] = json!(actor.model);
     v["reasoning_effort"] = json!(actor.reasoning_effort);
     if sync {

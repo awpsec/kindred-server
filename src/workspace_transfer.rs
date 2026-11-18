@@ -61,6 +61,7 @@ const TABLES: &[&str] = &[
     "run_commands",
     "questions",
     "user_tasks",
+    "subscription_accounts",
     "provider_usage",
     "checklists",
     "reminders",
@@ -286,6 +287,11 @@ impl Db {
         }
         ensure!(!frozen(&tx)?, "This profile is being transferred");
         for table in TABLES {
+            if *table == "subscription_accounts" {
+                ensure!(!tx.query_row("SELECT EXISTS(SELECT 1 FROM subscription_accounts WHERE id<>'' OR nickname<>'Primary')",[],|r|r.get::<_,bool>(0))?,
+                    "Choose a profile without configured subscription accounts");
+                continue;
+            }
             ensure!(
                 tx.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r
                     .get::<_, i64>(0))?
@@ -300,7 +306,7 @@ impl Db {
             tables.keys().all(|t| TABLES.contains(&t.as_str()))
                 && TABLES.iter().all(|t| matches!(
                     *t,
-                    "message_send_modes" | "message_progress" | "queued_message_claims" | "connector_artifacts" | "voice_sessions" | "voice_session_items" | "voice_tool_calls" | "voice_deferred_messages"
+                    "subscription_accounts" | "message_send_modes" | "message_progress" | "queued_message_claims" | "connector_artifacts" | "voice_sessions" | "voice_session_items" | "voice_tool_calls" | "voice_deferred_messages"
                         | "visual_panels"
                     | "workspace_artifacts"
                     | "workspace_artifact_versions"
@@ -345,7 +351,7 @@ impl Db {
         for table in TABLES {
             if matches!(
                 *table,
-                "message_send_modes" | "message_progress" | "queued_message_claims" | "connector_artifacts" | "voice_sessions" | "voice_session_items" | "voice_tool_calls" | "voice_deferred_messages"
+                "subscription_accounts" | "message_send_modes" | "message_progress" | "queued_message_claims" | "connector_artifacts" | "voice_sessions" | "voice_session_items" | "voice_tool_calls" | "voice_deferred_messages"
                     | "visual_panels"
                     | "workspace_artifacts"
                     | "workspace_artifact_versions"
@@ -387,7 +393,10 @@ impl Db {
             {
                 continue;
             }
-            let names = columns(&tx, table)?;
+            let mut names = columns(&tx, table)?;
+            let old_usage = *table == "provider_usage" && names.last().is_some_and(|n|n=="account_id")
+                && tables[*table]["columns"] == json!(&names[..names.len()-1]);
+            if old_usage { names.pop(); }
             ensure!(
                 tables[*table]["columns"] == json!(names),
                 "Workspace schema differs; update both servers before transferring"
@@ -398,8 +407,9 @@ impl Db {
             // Imported memory/guard rows fire ordinary revision triggers. Restore
             // the source version last so its immutable snapshots retain their CAS.
             if *table == "memory_versions" { tx.execute("DELETE FROM memory_versions", [])?; }
+            if *table == "subscription_accounts" { tx.execute("DELETE FROM subscription_accounts",[])?; }
             let sql = format!(
-                "INSERT INTO {table} VALUES({})",
+                "INSERT INTO {table} ({}) VALUES({})",names.iter().map(|n|format!("\"{n}\"")).collect::<Vec<_>>().join(","),
                 vec!["?"; names.len()].join(",")
             );
             let mut statement = tx.prepare(&sql)?;
@@ -412,6 +422,7 @@ impl Db {
                 statement.execute(rusqlite::params_from_iter(values))?;
             }
         }
+        crate::provider_accounts::validate_transferred_accounts(&tx)?;
         // Never revive an invalidated original, including in older packages or
         // packages whose snapshots were inserted after the guard trigger fired.
         tx.execute("UPDATE memory_snapshots SET invalidated=1 WHERE bot_id IN(SELECT bot_id FROM continuity_memory_guard WHERE invalidated=1)", [])?;

@@ -41,6 +41,7 @@ impl Db {
             auto_approve: false,
             approval_mode: "inherit".into(),
             profile: BotProfile {
+                provider_account_id: actor.profile.provider_account_id,
                 label: text("role")?,
                 description: text("description")?,
                 shape: text("shape")?,
@@ -110,7 +111,13 @@ impl Db {
             !archived,
             "Restore this chat before creating its proposed teammate"
         );
-        let mut bot = edited.unwrap_or(serde_json::from_str(&payload)?);
+        let proposal: Bot = serde_json::from_str(&payload)?;
+        let mut bot = if let Some(mut bot)=edited {
+            if bot.provider==proposal.provider && bot.profile.provider_account_id.is_none() {
+                bot.profile.provider_account_id=proposal.profile.provider_account_id;
+            }
+            bot
+        } else { proposal };
         bot.id = db::id();
         bot.memory = String::new();
         bot.auto_approve = false;

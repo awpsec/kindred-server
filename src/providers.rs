@@ -267,7 +267,7 @@ async fn openrouter_at(
 }
 
 pub async fn codex(app: &App, bot: &Bot, run: &Run) -> Result<String> {
-    let mut rpc = Rpc::connect(&app.config.vm).await?;
+    let mut rpc = Rpc::connect(&app.config.vm,crate::provider_accounts::slot(bot)).await?;
     codex_rpc(app, bot, run, &mut rpc).await
 }
 // The reasoner only receives Kindred tools. Native app/MCP execution cannot
@@ -353,9 +353,10 @@ async fn codex_rpc(app: &App, bot: &Bot, run: &Run, rpc: &mut Rpc) -> Result<Str
         )
         .await?;
     let config = codex_reasoner_config(&effective["config"])?;
-    let identity = json!({"model":model,"effort":effort,"account":account["account"],"config":config,
+    let mut identity = json!({"model":model,"effort":effort,"account":account["account"],"config":config,
         "context_identity_verified":rpc.context_account.is_some(),"context_account":rpc.context_account,
-        "vm":app.config.vm,"connection_generation":crate::harness_context::connection_generation(&app.db,"codex")?});
+        "vm":app.config.vm,"connection_generation":crate::harness_context::connection_generation(&app.db,&crate::harness_context::connection_scope("codex",crate::provider_accounts::slot(bot)))?});
+    if !crate::provider_accounts::slot(bot).is_empty() { identity["slot"]=json!(crate::provider_accounts::slot(bot)); }
     let authority=crate::harness_native::authority(app,&identity);
     let mut prepared=crate::harness_context::prepare(app,bot,run,&tools,None,"codex-v1",&identity)?;
     let mut saved=codex_checkpoint(prepared.checkpoint.as_ref()).map(|(id,totals)|(id.to_owned(),totals));

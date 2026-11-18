@@ -304,15 +304,15 @@ async fn inventory(rpc: &mut Rpc, thread: &str) -> Result<Value> {
     }
     Ok(json!({"account_key":account_key,"connections":rows,"warning":warning}))
 }
-pub async fn refresh(app: &App) -> Result<Value> {
+pub async fn refresh(app: &App, slot: &str) -> Result<Value> {
     // A failed refresh must not leave a stale inventory advertised as callable.
-    crate::connector_policy::clear_catalogue_for(&app.db, "codex-account")?;
-    let mut rpc = Rpc::connect(&app.config.vm).await?;
+    crate::connector_policy::clear_catalogue_slot(&app.db, "codex-account",slot)?;
+    let mut rpc = Rpc::connect(&app.config.vm,slot).await?;
     let thread = auxiliary(&mut rpc).await?;
     let value = inventory(&mut rpc, &thread).await?;
-    crate::connector_policy::catalogue_for(
+    crate::connector_policy::catalogue_slot(
         &app.db,
-        "codex-account",
+        "codex-account",slot,
         runtime::string(&value, "account_key")?,
         &value["connections"],
     )?;
@@ -352,7 +352,7 @@ pub async fn tools(app: &App, bot: &Bot, args: &Value) -> Result<Value> {
         bot.provider == "codex" && app.db.bot(&bot.id)?.provider == "codex",
         "ChatGPT app discovery requires a Codex subscription bot"
     );
-    refresh(app).await?;
+    refresh(app,crate::provider_accounts::slot(bot)).await?;
     tool_page(&crate::connector_policy::inventory(app, bot)?, args)
 }
 fn tool_page(inv: &Value, args: &Value) -> Result<Value> {
@@ -493,7 +493,7 @@ fn current_bot(app: &App, bot: &Bot, run: &Run) -> Result<()> {
 }
 pub async fn execute(app: &App, bot: &Bot, run: &Run, args: &Value) -> Result<Value> {
     current_bot(app, bot, run)?;
-    let mut rpc = Rpc::connect(&app.config.vm).await?;
+    let mut rpc = Rpc::connect(&app.config.vm,crate::provider_accounts::slot(bot)).await?;
     execute_rpc(app, bot, run, args, &mut rpc).await
 }
 async fn execute_rpc(
@@ -512,9 +512,9 @@ async fn execute_rpc(
     let inv = inventory(rpc, &thread).await?;
     let identity = binding(&inv, args)?;
     crate::composio::validate_arguments(&identity["tool"]["inputSchema"], &args["arguments"])?;
-    crate::connector_policy::catalogue_for(
+    crate::connector_policy::catalogue_slot(
         &app.db,
-        "codex-account",
+        "codex-account",crate::provider_accounts::slot(bot),
         runtime::string(&inv, "account_key")?,
         &inv["connections"],
     )?;

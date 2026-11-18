@@ -12,6 +12,36 @@ from unittest.mock import patch
 HELPER = Path(__file__).with_name('provider-cli.py').resolve()
 spec=importlib.util.spec_from_file_location('bridge', HELPER)
 bridge=importlib.util.module_from_spec(spec);spec.loader.exec_module(bridge)
+class SubscriptionAccountIsolation(unittest.TestCase):
+    def test_each_official_cli_reads_only_the_selected_home(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(Path, 'home', return_value=Path(directory)):
+            binary = Path(directory) / 'fixture-claude'
+            binary.write_text("#!/usr/bin/python3\nimport os,pathlib,json\npath=pathlib.Path(os.environ['HOME'])/'fixture-login'\nprint(path.read_text() if path.exists() else '{}')\n")
+            binary.chmod(0o700)
+            with patch.dict(bridge.BIN, {'claude-code':str(binary)}), patch.dict(os.environ, {'ANTHROPIC_API_KEY':'fixture-only'}):
+                legacy = bridge.environment('claude-code')
+                def sign_in(env, name):
+                    self.assertNotIn('ANTHROPIC_API_KEY', env)
+                    (Path(env['HOME'])/'fixture-login').write_text(json.dumps({
+                        'loggedIn':True,'authMethod':'claude.ai','email':name+'@example.test','orgId':'org'}))
+                sign_in(legacy, 'personal')
+                with patch.object(bridge,'ACCOUNT_SLOT','55d7a3d6-c36c-42b3-a4b7-44f4c395de78'):
+                    named = bridge.environment('claude-code')
+                    self.assertNotEqual(named['CLAUDE_CONFIG_DIR'],legacy['CLAUDE_CONFIG_DIR'])
+                    self.assertFalse(bridge.account('claude-code','usage',{})['connected'])
+                    sign_in(named, 'work')
+                    identity=bridge.account('claude-code','account',{})['account_key']
+                    with patch.object(bridge.time,'time',return_value=100):
+                        bridge.claude_quota(named,identity,{'rateLimitType':'five_hour','utilization':1,'resetsAt':200})
+                        status=bridge.account('claude-code','usage',{})
+                        self.assertEqual(status['email'],'work@example.test')
+                        self.assertEqual(status['windows'][0]['used'],1)
+                        self.assertEqual(bridge.claude_quota(named,'b'*64),[])
+                    with patch.object(bridge.time,'time',return_value=201):
+                        self.assertEqual(bridge.account('claude-code','usage',{})['windows'],[])
+                self.assertEqual(bridge.account('claude-code','usage',{})['email'],'personal@example.test')
+                self.assertEqual(bridge.claude_quota(legacy,identity),[])
+
 class UsageReconciliation(unittest.TestCase):
     def test_final_output_updates_same_receipt_without_double_counting_input(self):
         ledger=bridge.ClaudeUsageReconciliation()

@@ -222,7 +222,7 @@ async fn provider_checks_report_setup_without_starting_the_computer_or_provider(
                 .is_none()
         );
     }
-    assert!(app.auth.lock().await.is_none());
+    assert!(app.auth.lock().await.is_empty());
 }
 
 #[tokio::test]

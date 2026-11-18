@@ -366,8 +366,14 @@ def validate_claude_tools(packet, tools):
     if not connected or not expected.issubset(available):
         raise ToolBridgeError('Claude could not connect to Kindred tools. No tool-free fallback was accepted. Retry after the bot computer is available.')
 
+ACCOUNT_SLOT = None
+
 def environment(provider):
     home = Path.home() / '.kindred-providers' / provider
+    if ACCOUNT_SLOT:
+        if provider != 'claude-code':
+            raise ValueError('Unsupported subscription account')
+        home = home / 'accounts' / ACCOUNT_SLOT
     home.mkdir(parents=True, exist_ok=True, mode=0o700)
     env = {'HOME': str(home), 'PATH': '/usr/local/bin:/usr/bin:/bin',
            'LANG': 'C.UTF-8', 'TERM': 'xterm-256color', 'NO_COLOR': '1',
@@ -377,6 +383,36 @@ def environment(provider):
     for key in ('XAUTHORITY', 'DBUS_SESSION_BUS_ADDRESS', 'XDG_RUNTIME_DIR'):
         if key in os.environ: env[key] = os.environ[key]
     return env
+
+# The CLI reports quota changes during a turn. Store only its current, bounded
+# numeric projection per identity/window. Atomic replacement handles parallel bots.
+QUOTA_WINDOWS = {'five_hour': (300, '5 hours'), 'seven_day': (10080, 'Weekly')}
+
+def claude_quota(env, identity, info=None):
+    if not isinstance(identity, str) or not re.fullmatch(r'[0-9a-f]{64}', identity):
+        return []
+    home = Path(env['HOME'])
+    if isinstance(info, dict):
+        kind = info.get('rateLimitType')
+        used, reset = info.get('utilization'), info.get('resetsAt')
+        if not isinstance(kind, str) or kind not in QUOTA_WINDOWS or type(used) not in (int, float) or not 0 <= used <= 1 or type(reset) is not int or reset <= time.time():
+            return []
+        try:
+            with tempfile.NamedTemporaryFile('w', dir=home, delete=False) as out:
+                json.dump([identity, used, reset], out)
+            os.replace(out.name, home / ('quota-' + kind + '.json'))
+        except OSError:
+            pass
+        return []
+    windows = []
+    for kind, (minutes, label) in QUOTA_WINDOWS.items():
+        try:
+            owner, used, reset = json.loads((home / ('quota-' + kind + '.json')).read_text())
+            if owner == identity and reset > time.time() and 0 <= used <= 1:
+                windows.append({'label': label, 'minutes': minutes, 'used': used, 'limit': 1, 'resets_at': reset})
+        except (OSError, ValueError, TypeError):
+            pass
+    return windows
 
 def emit(frame):
     data = json.dumps(frame, ensure_ascii=True)
@@ -442,6 +478,10 @@ def account(provider, action, payload):
                   'data': claude_models(env) if action == 'models' and connected else [],
                   'usage_message': 'Claude Code does not expose an account-wide quota query here. Check your Claude usage page.',
                   'usage_url': 'https://claude.ai/settings/usage'}
+        if connected and isinstance(data.get('email'), str):
+            answer['email'] = data['email']
+        if action == 'usage':
+            answer['windows'] = claude_quota(env, identity)
         return answer
     # Use the pinned Kimi installation to read its own public account projection.
     result = subprocess.run([str(KIMI / 'bin/python'), __file__, 'kimi-status'],
@@ -731,6 +771,9 @@ async def worker(provider):
                     for callback in list(callbacks):
                         if callback.done():
                             callbacks.remove(callback); callback.result()
+                    if p.get('type') == 'rate_limit_event':
+                        claude_quota(env, status.get('account_key'), p.get('rate_limit_info'))
+                        continue
                     if p.get('type') == 'control_request':
                         async def handle_callback(packet):
                             try: await connector_bridge.handle(packet)
@@ -836,6 +879,12 @@ async def worker(provider):
 
 if __name__ == '__main__':
     try:
+        if sys.argv[1] == 'scoped':
+            import uuid
+            if len(sys.argv) != 5 or sys.argv[4] != 'claude-code' or str(uuid.UUID(sys.argv[2])) != sys.argv[2]:
+                raise ValueError('Invalid subscription account')
+            ACCOUNT_SLOT = sys.argv[2]
+            del sys.argv[1:3]
         action = sys.argv[1]
         if action == 'mcp': asyncio.run(mcp_proxy(sys.argv[2]))
         elif action == 'context-capabilities': emit({'context_protocol':1,'providers':['claude-code']})

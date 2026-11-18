@@ -249,7 +249,7 @@ pub fn app() -> Shared {
         computer: Arc::new(Mutex::new(())),
         screens: Default::default(),
 
-        auth: Mutex::new(None),
+        auth: Mutex::new(Default::default()),
         integrations: Arc::new(Mutex::new(())),
         maintenance_leases: Default::default(),
         pairing: Default::default(),

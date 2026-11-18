@@ -27,7 +27,9 @@ pub fn authority(app: &App, identity: &Value) -> String {
     // Bind the guest-verified account digest, not the email display name or
     // refresh token. Same-account reconnects can clean their retired threads;
     // the profile's database is the outer ownership scope.
-    let encoded=json!({"vm":app.config.vm,"account":identity["context_account"]}).to_string();
+    let mut realm=json!({"vm":app.config.vm,"account":identity["context_account"]});
+    if let Some(slot)=identity.get("slot") { realm["slot"]=slot.clone(); }
+    let encoded=realm.to_string();
     ring::digest::digest(&ring::digest::SHA256,encoded.as_bytes()).as_ref().iter().map(|n|format!("{n:02x}")).collect()
 }
 

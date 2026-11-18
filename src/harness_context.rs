@@ -39,10 +39,13 @@ pub fn connection_generation(db: &Db, provider: &str) -> Result<i64> {
     Ok(db.0.lock().unwrap().query_row("SELECT generation FROM harness_connection_generations WHERE provider=?",[provider],|r|r.get(0)).optional()?.unwrap_or(0))
 }
 
-pub fn connection_changed(db: &Db, provider: &str) -> Result<()> {
+pub fn connection_scope(provider: &str, slot: &str) -> String {
+    if slot.is_empty() { provider.to_owned() } else { format!("{provider}:{slot}") }
+}
+pub fn connection_changed(db: &Db, provider: &str, slot: &str) -> Result<()> {
     let mut c=db.0.lock().unwrap();let tx=c.transaction()?;
-    tx.execute("INSERT INTO harness_connection_generations VALUES(?,1) ON CONFLICT(provider) DO UPDATE SET generation=generation+1",[provider])?;
-    tx.execute("DELETE FROM harness_contexts WHERE bot_id IN(SELECT id FROM bots WHERE provider=?)",[provider])?;
+    tx.execute("INSERT INTO harness_connection_generations VALUES(?,1) ON CONFLICT(provider) DO UPDATE SET generation=generation+1",[connection_scope(provider,slot)])?;
+    tx.execute("DELETE FROM harness_contexts WHERE bot_id IN(SELECT id FROM bots WHERE provider=? AND coalesce(json_extract(profile,'$.provider_account_id'),'')=?)",params![provider,slot])?;
     tx.commit()?;
     Ok(())
 }
@@ -70,8 +73,8 @@ fn policy(db: &Db, run: &Run) -> Result<Value> {
     let actions = c.prepare("SELECT origin,account_key,connector_key,action,permission FROM connector_action_grants WHERE bot_id=? ORDER BY 1,2,3,4")?
         .query_map([&run.bot_id], |r| Ok(json!([r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?])))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    let accounts = c.prepare("SELECT origin,account_key FROM connector_catalogue ORDER BY origin")?
-        .query_map([], |r| Ok(json!([r.get::<_,String>(0)?,r.get::<_,String>(1)?])))?
+    let accounts = c.prepare("SELECT origin,account_key FROM connector_catalogue WHERE origin=? ORDER BY origin")?
+        .query_map([connection_scope(crate::connector_policy::provider_identity(&bot.provider).map(|i|i.2).unwrap_or(""),crate::provider_accounts::slot(&bot))], |r| Ok(json!([r.get::<_,String>(0)?,r.get::<_,String>(1)?])))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let devices = c.prepare("SELECT id,mode FROM local_devices ORDER BY id")?
         .query_map([], |r| Ok(json!([r.get::<_,String>(0)?,r.get::<_,String>(1)?])))?
@@ -114,7 +117,7 @@ pub fn prepare(app: &App, bot: &Bot, run: &Run, tools: &[Value], window: Option<
     let instructions = format!("{contract}\n\nLive task snapshots follow retained history. The newest snapshot defines the current task, permissions, time, pending decisions and memory. Earlier task snapshots and prior tool results are historical evidence, not new requests or current authorization. Never repeat completed actions merely because their messages appear in retained context.\n");
     let live_context = format!("# Current Kindred task context\n{live}");
     let base = digest(&json!({"version":1,"engine":engine,"provider":bot.provider,"model":bot.model,
-        "connection_generation":connection_generation(&app.db,&bot.provider)?,
+        "connection_generation":connection_generation(&app.db,&connection_scope(&bot.provider,crate::provider_accounts::slot(bot)))?,
         "identity":provider_identity,"instructions":instructions,"tools":tools,"window":window}).to_string());
     let mut prepared = Prepared { instructions, live_context, session_id:db::id(), checkpoint:None, resumed:false,
         fingerprint:String::new(), base, lease:db::id(), enabled:!run.chat_id.is_empty() };

@@ -231,6 +231,7 @@ pub fn router(app: Shared) -> Router {
             "/providers",
             get(crate::provider_accounts::list).post(crate::provider_accounts::save),
         )
+        .route("/providers/{id}/accounts", post(crate::provider_accounts::edit_account))
         .route("/providers/{id}", axum::routing::delete(crate::provider_accounts::remove))
         .route("/providers/{id}/output-overrides", get(crate::provider_output_overrides::get).put(crate::provider_output_overrides::put))
         .route(
@@ -1145,18 +1146,22 @@ pub(crate) fn computer_ready(app: &Shared) -> Result<()> {
     }
     Ok(())
 }
-async fn codex(State(app): State<Shared>, Path(action): Path<String>) -> Result<Json<Value>> {
+#[derive(Deserialize,Default)]
+struct AccountQuery { #[serde(default)] account_id: String }
+async fn codex(State(app): State<Shared>, Path(action): Path<String>, Query(query): Query<AccountQuery>) -> Result<Json<Value>> {
+    let slot = query.account_id.as_str();
+    crate::provider_accounts::check_slot(&app.db.0.lock().unwrap(),"codex",slot)?;
     if action != "login"
         && let Some(status) = vm::provider_unavailable(&app.config.vm, "codex").await?
     {
         return Ok(Json(status));
     }
     if action == "connectors" {
-        return Ok(Json(crate::codex_connectors::refresh(&app).await?));
+        return Ok(Json(crate::codex_connectors::refresh(&app,slot).await?));
     }
     if matches!(action.as_str(), "login" | "logout") {
-        crate::harness_context::connection_changed(&app.db,"codex")?;
-        crate::connector_policy::clear_catalogue_for(&app.db, "codex-account")?;
+        crate::harness_context::connection_changed(&app.db,"codex",slot)?;
+        crate::connector_policy::clear_catalogue_slot(&app.db, "codex-account",slot)?;
     }
     if action == "login" {
         vm::ensure_running(&app.config.vm).await?;
@@ -1167,11 +1172,15 @@ async fn codex(State(app): State<Shared>, Path(action): Path<String>) -> Result<
     ) {
         return Err(anyhow::anyhow!("unsupported Codex action").into());
     }
-    let mut auth = app.auth.lock().await;
-    if auth.is_none() {
-        *auth = Some(Rpc::connect(&app.config.vm).await?);
-    }
-    let rpc = auth.as_mut().unwrap();
+    // Only a device login needs a process between requests. Other accounts
+    // can check quota or sign in concurrently, without leaving a VM process.
+    let handle = app.auth.lock().await.entry(slot.to_owned()).or_default().clone();
+    let mut pending = handle.lock().await;
+    let was_pending = pending.is_some();
+    let mut rpc = match pending.take() {
+        Some(rpc) => rpc,
+        None => Rpc::connect(&app.config.vm,slot).await?,
+    };
     let result = match action.as_str() {
         "login" => {
             rpc.request("account/login/start", json!({"type":"chatgptDeviceCode"}))
@@ -1190,7 +1199,7 @@ async fn codex(State(app): State<Shared>, Path(action): Path<String>) -> Result<
             }
             .await
         }
-        "models" => crate::providers::codex_models(rpc)
+        "models" => crate::providers::codex_models(&mut rpc)
             .await
             .map(|data| json!({"data":data,"nextCursor":null})),
         "logout" => rpc.request("account/logout", json!({})).await,
@@ -1199,8 +1208,9 @@ async fn codex(State(app): State<Shared>, Path(action): Path<String>) -> Result<
                 .await
         }
     };
-    if result.is_err() {
-        *auth = None;
+    if result.is_ok() && (action=="login" || (was_pending && action!="logout"
+        && !result.as_ref().is_ok_and(|data|data["account"]["type"]=="chatgpt"))) {
+        *pending = Some(rpc);
     }
     Ok(Json(result?))
 }
