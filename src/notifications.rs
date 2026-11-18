@@ -131,6 +131,7 @@ impl Db {
                 let when = at.map(|at| at.with_timezone(&zone).format("%b %-d, %-I:%M %p %Z").to_string()).unwrap_or_default();
                 format!("Reminder · {when}\n{}", preview(reminder["message"].as_str().unwrap_or("")))
             } else if kind == "run_finished" {
+                if crate::routine_completion::hide_placeholder(&c,&run_id,&output,&error)? { continue; }
                 if status == "completed" {
                     if frequency == "input_needed" {
                         continue;

@@ -704,3 +704,60 @@ async fn unsuccessful_quiet_runs_never_supply_successful_internal_notes() {
         assert!(!crate::continuity::context(&app.db,&next).unwrap()["recent_task_journal"].to_string().contains("Private stale summary sentinel"));
     }
 }
+
+#[test]
+fn placeholder_reports_do_not_complete_checks_or_reach_chat() {
+    let app = tests::app();
+    let bot = tests::bot(&app.db, "codex");
+    for kind in ["report", "error"] {
+        let run = scheduled(&app, &bot);
+        {
+            let c = app.db.0.lock().unwrap();
+            assert!(policy::complete(&c, &run, &json!({"outcome":kind,"report":"placeholder"})).is_err());
+        }
+        finish(&app,&run,"completed","Placeholder","");
+        assert_eq!(app.db.run(&run).unwrap().status,"failed");
+        assert!(results(&app,&run).is_empty());
+        let items=app.db.notifications(Some(0)).unwrap();
+        assert!(!items["items"].as_array().unwrap().iter().any(|n|n["run_id"]==run));
+    }
+    let real=scheduled(&app,&bot);
+    outcome(&app,&real,"report","The document still has a placeholder.");
+    finish(&app,&real,"completed","","");
+    assert_eq!(results(&app,&real)[0]["text"],"The document still has a placeholder.");
+}
+
+#[test]
+fn invalid_report_followed_by_empty_final_is_quiet_but_real_errors_still_surface() {
+    let app=tests::app();
+    let bot=tests::bot(&app.db,"codex");
+    let run=scheduled(&app,&bot);
+    app.db.event(&run,"tool_requested",json!({"tool":"routine_complete","call_id":"r","args":{"outcome":"error","report":"placeholder"}})).unwrap();
+    app.db.event(&run,"tool_result",json!({"tool":"routine_complete","call_id":"r","failed":true})).unwrap();
+    finish(&app,&run,"completed","","");
+    assert_eq!(app.db.run(&run).unwrap().status,"failed");
+    assert!(results(&app,&run).is_empty());
+
+    let real=scheduled(&app,&bot);
+    finish(&app,&real,"failed","placeholder","Mailbox access denied");
+    assert!(results(&app,&real)[0]["text"].as_str().unwrap().contains("Mailbox access denied"));
+}
+
+#[test]
+fn historical_placeholder_repair_keeps_original_receipts_and_ordinary_chat() {
+    let app=tests::app();
+    let bot=tests::bot(&app.db,"codex");
+    let run=scheduled(&app,&bot);
+    let ordinary=app.db.queue(&bot.id,"Say placeholder",0).unwrap();
+    finish(&app,&ordinary,"completed","placeholder","");
+    let c=app.db.0.lock().unwrap();
+    c.execute("INSERT INTO routine_completion VALUES(?,'report','placeholder')",[&run]).unwrap();
+    c.execute("UPDATE runs SET status='completed', output='placeholder' WHERE id=?",[&run]).unwrap();
+    c.execute("INSERT INTO chat_messages(chat_id,sender,body,kind,run_id,created) SELECT chat_id,bot_id,'placeholder','result',id,1 FROM runs WHERE id=?",[&run]).unwrap();
+    policy::repair_placeholder_messages(&c).unwrap();
+    policy::repair_placeholder_messages(&c).unwrap();
+    assert!(c.query_row("SELECT suppressed FROM chat_messages WHERE run_id=? AND kind='result'",[&run],|r|r.get::<_,bool>(0)).unwrap());
+    assert_eq!(c.query_row("SELECT report FROM routine_completion WHERE run_id=?",[&run],|r|r.get::<_,String>(0)).unwrap(),"placeholder");
+    drop(c);
+    assert_eq!(results(&app,&ordinary)[0]["text"],"placeholder");
+}

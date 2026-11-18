@@ -6,6 +6,11 @@ use serde_json::{Value, json};
 
 pub const UNCLASSIFIED: &str = "This routine did not classify its result. Review task details and retry the check; no successful all-clear was recorded.";
 
+const EMPTY_REPORT: &str = "The routine returned a placeholder instead of a result.";
+fn placeholder(text: &str) -> bool {
+    text.trim().eq_ignore_ascii_case("placeholder")
+}
+
 pub fn migrate(c: &Connection) -> Result<()> {
     c.execute_batch("CREATE TABLE IF NOT EXISTS routine_execution(run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,root_run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE);
     CREATE TABLE IF NOT EXISTS routine_completion(run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,outcome TEXT NOT NULL CHECK(outcome IN ('quiet','report','error')),report TEXT NOT NULL);
@@ -89,8 +94,11 @@ pub fn current(c: &Connection, run: &str) -> Result<bool> {
 }
 /// Shared quiet-completion guard: silence must not conceal files, failures or decisions.
 pub fn ensure_quiet(c: &Connection, run: &str) -> Result<()> {
-    ensure!(!crate::routine_recovery::blocks_quiet(c,run)? && !c.query_row("SELECT EXISTS(SELECT 1 FROM attachments WHERE run_id=?1) OR EXISTS(SELECT 1 FROM deliverables WHERE run_id=?1) OR EXISTS(SELECT 1 FROM approvals WHERE run_id=?1 AND status='pending') OR EXISTS(SELECT 1 FROM user_tasks WHERE run_id=?1 AND status IN ('pending','ready')) OR EXISTS(SELECT 1 FROM questions WHERE run_id=?1 AND status='pending')",[run],|r|r.get::<_,bool>(0))?,"This task has an error, files or a pending decision; report it instead of finishing quietly");
+    ensure!(can_finish_quietly(c,run)?, "This task has an error, files or a pending decision; report it instead of finishing quietly");
     Ok(())
+}
+fn can_finish_quietly(c: &Connection, run: &str) -> Result<bool> {
+    Ok(!crate::routine_recovery::blocks_quiet(c,run)? && !c.query_row("SELECT EXISTS(SELECT 1 FROM attachments WHERE run_id=?1) OR EXISTS(SELECT 1 FROM deliverables WHERE run_id=?1) OR EXISTS(SELECT 1 FROM approvals WHERE run_id=?1 AND status='pending') OR EXISTS(SELECT 1 FROM user_tasks WHERE run_id=?1 AND status IN ('pending','ready')) OR EXISTS(SELECT 1 FROM questions WHERE run_id=?1 AND status='pending')",[run],|r|r.get::<_,bool>(0))?)
 }
 fn note(args: &Value) -> Result<Option<&str>> {
     args.get("note").map(|v| {
@@ -139,6 +147,7 @@ pub fn complete(c: &Connection, run: &str, args: &Value) -> Result<Value> {
                 || (outcome != "quiet" && !report.is_empty())),
         "A report or error needs nonempty text; quiet must have no report"
     );
+    ensure!(!placeholder(report), "Give the actual result or error. If the check succeeded with nothing to report, choose quiet and omit report.");
     if root(c, run)?.is_none() {
         register(c, run, run)?;
     }
@@ -188,6 +197,7 @@ pub fn complete(c: &Connection, run: &str, args: &Value) -> Result<Value> {
 // unfinished actions cannot be laundered into success by nonempty prose.
 fn terminal_report(c: &Connection, run: &str, output: &str) -> Result<bool> {
     if output.trim().is_empty()
+        || placeholder(output)
         || crate::quiet_output::is_marker(output)
         || crate::routine_recovery::blocks_quiet(c, run)?
     {
@@ -231,11 +241,35 @@ pub fn finalize(
         )?;
     }
     Ok(Some(match outcome {
+        Some((_, report)) if placeholder(&report) => ("failed".into(), output.into(), EMPTY_REPORT.into()),
         Some((kind, report)) if kind == "report" => ("completed".into(), report, String::new()),
         Some((kind, report)) if kind == "error" => ("failed".into(), output.into(), report),
         Some((_kind, _)) => ("completed".into(), String::new(), String::new()),
+        None if placeholder(output) || (output.trim().is_empty() && c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM events WHERE run_id=? AND kind='tool_requested' AND json_extract(body,'$.tool')='routine_complete' AND lower(trim(json_extract(body,'$.args.report')))='placeholder')",
+            [run], |r| r.get::<_,bool>(0),
+        )?) => ("failed".into(), output.into(), EMPTY_REPORT.into()),
         None => ("failed".into(), output.into(), UNCLASSIFIED.into()),
     }))
+}
+// Only suppress filler from a scheduled check. The failed run remains visible
+// in routine details and participates in the existing consecutive-failure policy.
+pub fn hide_placeholder(c: &Connection, run: &str, output: &str, error: &str) -> Result<bool> {
+    if !(error == EMPTY_REPORT || placeholder(error) || (error.is_empty() && placeholder(output))) {
+        return Ok(false);
+    }
+    Ok(root(c,run)?.is_some() && can_finish_quietly(c,run)?)
+}
+
+pub fn repair_placeholder_messages(c: &Connection) -> Result<()> {
+    let mut q=c.prepare("SELECT m.seq,r.id,r.output,r.error FROM chat_messages m JOIN runs r ON r.id=m.run_id JOIN routine_execution x ON x.run_id=r.id WHERE m.suppressed=0 AND m.kind='result' AND lower(trim(m.body)) IN ('placeholder','failed: placeholder')")?;
+    let rows=q.query_map([], |r| Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    for (seq,run,output,error) in rows {
+        if hide_placeholder(c,&run,&output,&error)? {
+            c.execute("UPDATE chat_messages SET suppressed=1 WHERE seq=?", [seq])?;
+        }
+    }
+    Ok(())
 }
 pub fn publish(c: &Connection, run: &str, completed: bool) -> Result<bool> {
     let Some(original) = root(c, run)? else {

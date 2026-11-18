@@ -810,6 +810,11 @@ impl Db {
             [&run.id],
             |r| r.get(0),
         )?;
+        if crate::routine_completion::hide_placeholder(&tx,&run.id,&done.output,&done.error)? {
+            tx.execute("UPDATE chat_messages SET suppressed=1 WHERE run_id=? AND kind='result'", [&run.id])?;
+            tx.commit()?;
+            return Ok(());
+        }
         let publish=crate::routine_completion::publish(&tx,&run.id,done.status=="completed" && done.error.is_empty())?;
         let quiet: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM routine_runs WHERE run_id=? AND quiet=1)",
