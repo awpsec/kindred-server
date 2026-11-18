@@ -26,7 +26,7 @@ def extract(archive,root):
             if member.isdir():continue
             path=PurePosixPath(member.name)
             safe=not path.is_absolute() and '..' not in path.parts and str(path)==member.name
-            allowed=member.name in FILES or member.name.startswith('codex-resources/')
+            allowed=member.name in (*FILES, 'bin/codex-exec-server') or member.name.startswith('codex-resources/')
             if not safe or not allowed or not member.isfile() or member.name in members:
                 raise ValueError('Unexpected Codex package member: '+member.name)
             if not 0<member.size<=512*1024*1024:raise ValueError('Invalid Codex package member size')

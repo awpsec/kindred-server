@@ -6,11 +6,11 @@ spec=importlib.util.spec_from_file_location('codex_package',Path(__file__).with_
 package=importlib.util.module_from_spec(spec);spec.loader.exec_module(package)
 
 class CodexPackage(unittest.TestCase):
-    def archive(self,path,omit='',extra=None):
+    def archive(self,path,omit='',extra=None,exec_server=False):
         with tarfile.open(path,'w:gz') as tar:
-            for name in package.FILES:
+            for name in (*package.FILES, *(('bin/codex-exec-server',) if exec_server else ())):
                 if name==omit:continue
-                data=json.dumps({'layoutVersion':1,'version':package.VERSION,'target':'x86_64-unknown-linux-musl','entrypoint':'bin/codex','resourcesDir':'codex-resources','pathDir':'codex-path'}).encode() if name=='codex-package.json' else b'\x7fELF\x02\x01'+bytes(12)+b'\x3e\x00'+bytes(44)+name.encode()
+                data=json.dumps({'layoutVersion':1,'version':package.VERSION,'target':'x86_64-unknown-linux-musl','entrypoint':'bin/codex','resourcesDir':'codex-resources','pathDir':'codex-path',**({'execServer':'bin/codex-exec-server'} if exec_server else {})}).encode() if name=='codex-package.json' else b'\x7fELF\x02\x01'+bytes(12)+b'\x3e\x00'+bytes(44)+name.encode()
                 member=tarfile.TarInfo(name);member.size=len(data);member.mode=0o644 if name=='codex-package.json' else 0o755;tar.addfile(member,io.BytesIO(data))
             if extra:tar.addfile(extra,io.BytesIO(b'x'*extra.size))
 
@@ -37,6 +37,17 @@ class CodexPackage(unittest.TestCase):
             self.archive(archive,omit='codex-resources/zsh/bin/zsh')
             with self.assertRaisesRegex(ValueError,'missing a regular file'):
                 package.extract(archive,root/'old')
+
+    def test_manifest_exec_server_is_validated_and_required_when_declared(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); archive=root/'package.tar.gz'
+            self.archive(archive,exec_server=True)
+            package.extract(archive,root/'runtime')
+            helper=root/'runtime/bin/codex-exec-server'
+            helper.chmod(0o644)
+            with self.assertRaisesRegex(ValueError,'not executable'):package.validate(root/'runtime')
+            helper.unlink()
+            with self.assertRaisesRegex(ValueError,'missing a regular file'):package.validate(root/'runtime')
 
     def test_complete_runtime_survives_relocation_and_repeated_install(self):
         with tempfile.TemporaryDirectory() as directory:

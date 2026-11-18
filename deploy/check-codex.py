@@ -44,6 +44,11 @@ def validate(root):
     # validate it when present in newer packages as well.
     zsh_present = optional_zsh_present(root)
     names=FILES if tuple(map(int,version.split('.'))) < (0,163,0) or zsh_present else FILES[:-1]
+    exec_server = 'bin/codex-exec-server'
+    if 'execServer' in metadata or (root / exec_server).exists() or (root / exec_server).is_symlink():
+        if metadata.get('execServer') != exec_server:
+            raise ValueError('Unexpected Codex package execServer')
+        names = (*names, exec_server)
     for name in names:
         path = root / name
         if not path.is_file() or path.is_symlink():
