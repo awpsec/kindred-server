@@ -49,7 +49,7 @@ const VOICES: &[&str] = &[
     "marin", "cedar", "alloy", "ash", "ballad", "coral", "echo", "sage", "shimmer", "verse",
     "quartz", "ripple", "vesper", "willow", "stone", "gleam", "meridian", "bossa", "tempo",
     "beacon", "delta", "cinder", "nuri", "juni", "flitz", "brise", "sillage", "nira", "harema",
-    "shida", "noeul",
+    "shida", "noeul", "calandria", "compas", "destello", "halo", "hornero", "luciernaga", "pearl",
 ];
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -1030,21 +1030,18 @@ mod tests {
         assert_eq!(v["voice"], "marin");
         assert_eq!(v["pace"], "normal");
         assert_eq!(v["voice_changes"], "next_call");
-        assert_eq!(v["voices"].as_array().unwrap().len(), 31);
-        assert!(
-            v["voices"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|v| v["id"] == "cedar")
-        );
-        assert!(
-            v["voices"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|v| v["id"] == "quartz")
-        );
+        assert_eq!(v["model"], "gpt-live-1.1");
+        let voices = v["voices"].as_array().unwrap();
+        let ids: std::collections::BTreeSet<_> =
+            voices.iter().map(|v| v["id"].as_str().unwrap()).collect();
+        assert_eq!(voices.len(), 38);
+        assert_eq!(ids.len(), voices.len());
+        for voice in [
+            "cedar", "quartz", "calandria", "compas", "destello", "halo", "hornero", "luciernaga",
+            "pearl",
+        ] {
+            assert!(ids.contains(voice), "missing voice {voice}");
+        }
         assert!(
             save_settings(
                 State(app.clone()),

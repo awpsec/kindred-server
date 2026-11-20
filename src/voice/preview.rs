@@ -590,7 +590,7 @@ mod tests {
             let event: Value =
                 serde_json::from_str(ws.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
             assert_eq!(event["session"]["model"], "gpt-live-1.1");
-            assert_eq!(event["session"]["audio"]["output"]["voice"], "quartz");
+            assert_eq!(event["session"]["audio"]["output"]["voice"], "luciernaga");
             assert_eq!(event["session"]["store"], false);
             assert!(event["session"]["input"].is_null());
             send_upstream(&mut ws, json!({"type":"session.started"}))
@@ -620,7 +620,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
         });
         let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
-        let clip = tokio::time::timeout(Duration::from_secs(2), sample(&mut ws, "quartz"))
+        let clip = tokio::time::timeout(Duration::from_secs(2), sample(&mut ws, "luciernaga"))
             .await
             .unwrap()
             .unwrap();
