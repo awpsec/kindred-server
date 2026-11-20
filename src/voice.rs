@@ -40,6 +40,7 @@ macro_rules! require {
 }
 pub mod preview;
 
+const LIVE_MODEL: &str = "gpt-live-1.1";
 const ENDPOINT: &str = "wss://api.openai.com/v1/live/sessions";
 const MAX_TEXT: usize = 54_000;
 // OpenAI currently documents these voices but does not offer a public list API.
@@ -77,7 +78,7 @@ fn preferences(db: &Db) -> Preferences {
 pub async fn settings(State(app): State<Shared>) -> Result<Json<Value>, Error> {
     let prefs = preferences(&app.db);
     Ok(Json(
-        json!({"configured":crate::connections::decisions_key(&app).is_some(),"enabled":prefs.enabled,"voice":prefs.voice,"pace":prefs.pace,"voice_changes":"next_call","preview_streaming":true,"model":"gpt-live-1","catalog_source":"openai_documentation","catalog_url":"https://developers.openai.com/api/reference/resources/live/methods/create","voices":VOICES.iter().map(|id| json!({"id":id,"name":format!("{}{}",id[..1].to_uppercase(),&id[1..])})).collect::<Vec<_>>()}),
+        json!({"configured":crate::connections::decisions_key(&app).is_some(),"enabled":prefs.enabled,"voice":prefs.voice,"pace":prefs.pace,"voice_changes":"next_call","preview_streaming":true,"model":LIVE_MODEL,"catalog_source":"openai_documentation","catalog_url":"https://developers.openai.com/api/reference/resources/live/methods/create","voices":VOICES.iter().map(|id| json!({"id":id,"name":format!("{}{}",id[..1].to_uppercase(),&id[1..])})).collect::<Vec<_>>()}),
     ))
 }
 pub async fn save_settings(
@@ -575,7 +576,7 @@ where
     let initial_pace = preferences(&app.db).pace;
     let mut pace_update = PaceUpdate::new(initial_pace);
     let instructions = conversation::instructions(&bot, initial_pace);
-    send_upstream(&mut upstream,json!({"type":"session.start","session":{"model":"gpt-live-1","store":false,"instructions":instructions,"input":input,"audio":{"format":{"type":"audio/pcm","rate":24000},"output":{"voice":ticket.voice}},"delegation":delegation}})).await?;
+    send_upstream(&mut upstream,json!({"type":"session.start","session":{"model":LIVE_MODEL,"store":false,"instructions":instructions,"input":input,"audio":{"format":{"type":"audio/pcm","rate":24000},"output":{"voice":ticket.voice}},"delegation":delegation}})).await?;
     let mut pending = std::collections::VecDeque::<session::ToolCall>::new();
     let mut running = futures_util::stream::FuturesUnordered::new();
     let mut responses = HashMap::<String,session::ResponseWork>::new();
@@ -1077,6 +1078,7 @@ mod tests {
         assert!(serde_json::from_value::<Preferences>(json!({"enabled":false,"voice":"marin","pace":"very-fast"})).is_err());
         *app.voice.active.lock().unwrap()=Some("existing-call".into());
         let result=save_settings(State(app.clone()),Json(Preferences{enabled:false,voice:"cedar".into(),pace:SpeakingPace::Faster})).await.ok().expect("active call options save");
+        assert_eq!(result.0["model"], "gpt-live-1.1");
         assert_eq!(result.0["voice"],"cedar");assert_eq!(result.0["pace"],"faster");
         assert_eq!(app.voice.active.lock().unwrap().as_deref(),Some("existing-call"));
         app.db.save_setting("voice",&json!({"enabled":true,"voice":"cedar","pace":"faster"})).unwrap();
@@ -1174,6 +1176,7 @@ mod tests {
             let first = ws.next().await.unwrap().unwrap();
             let config: Value = serde_json::from_str(first.to_text().unwrap()).unwrap();
             assert_eq!(config["type"], "session.start");
+            assert_eq!(config["session"]["model"], "gpt-live-1.1");
             assert_eq!(config["session"]["audio"]["output"]["voice"], "willow");
             assert_eq!(config["session"]["store"], false);
             assert_eq!(config["session"]["delegation"]["type"], "responses");

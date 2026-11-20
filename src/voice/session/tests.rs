@@ -331,7 +331,7 @@ async fn provider_accepts_call_configuration_and_a_tool_free_recap() {
     let (app,bot,ticket,run)=setup("codex");
     let mut request=ENDPOINT.into_client_request().unwrap();request.headers_mut().insert("Authorization",format!("Bearer {key}").parse().unwrap());
     let (mut provider,_)=tokio::time::timeout(Duration::from_secs(15),tokio_tungstenite::connect_async(request)).await.unwrap().expect("Provider transport unavailable");
-    send_upstream(&mut provider,json!({"type":"session.start","session":{"model":"gpt-live-1","store":false,"instructions":"This is a synthetic connection check. Remain silent and wait for the user. Do not delegate or execute any actions.","audio":{"format":{"type":"audio/pcm","rate":24000},"output":{"voice":"marin"}},"delegation":configuration(&app,&bot,&run).unwrap()}})).await.unwrap();
+    send_upstream(&mut provider,json!({"type":"session.start","session":{"model":LIVE_MODEL,"store":false,"instructions":"This is a synthetic connection check. Remain silent and wait for the user. Do not delegate or execute any actions.","audio":{"format":{"type":"audio/pcm","rate":24000},"output":{"voice":"marin"}},"delegation":configuration(&app,&bot,&run).unwrap()}})).await.unwrap();
     let mut started=false;let mut audio=tokio::time::interval(Duration::from_millis(100));
     let silence=base64::engine::general_purpose::STANDARD.encode(vec![0u8;4800]);
     let end=tokio::time::Instant::now()+Duration::from_secs(12);
@@ -391,7 +391,7 @@ async fn provider_keeps_named_identity_context_and_quiet_followups() {
     let (mut provider,_)=tokio::time::timeout(Duration::from_secs(15),tokio_tungstenite::connect_async(request)).await.unwrap().expect("Provider transport unavailable");
     let instructions=super::super::conversation::instructions(&bot,SpeakingPace::Normal);
     let input=super::super::conversation::input(&app.db,&ticket.chat,&bot).unwrap();
-    send_upstream(&mut provider,json!({"type":"session.start","session":{"model":"gpt-live-1","store":false,"instructions":instructions,"input":input,"audio":{"format":{"type":"audio/pcm","rate":24000},"output":{"voice":"juni"}},"delegation":configuration(&app,&bot,&run).unwrap()}})).await.unwrap();
+    send_upstream(&mut provider,json!({"type":"session.start","session":{"model":LIVE_MODEL,"store":false,"instructions":instructions,"input":input,"audio":{"format":{"type":"audio/pcm","rate":24000},"output":{"voice":"juni"}},"delegation":configuration(&app,&bot,&run).unwrap()}})).await.unwrap();
     let mut started=false;let mut transcript=String::new();let mut audible=false;
     let mut audio=tokio::time::interval(Duration::from_millis(40));
     let silence=base64::engine::general_purpose::STANDARD.encode([0u8;1920]);

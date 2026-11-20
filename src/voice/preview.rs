@@ -234,7 +234,7 @@ where S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     send_upstream(
         upstream,
         json!({"type":"session.start","session":{
-            "model":"gpt-live-1","store":false,"instructions":instruction,
+            "model":LIVE_MODEL,"store":false,"instructions":instruction,
             "audio":{"format":{"type":"audio/pcm","rate":24000},"output":{"voice":voice}},
             "delegation":{"type":"client","acknowledgement_delay_ms":800}
         }}),
@@ -589,6 +589,7 @@ mod tests {
             let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
             let event: Value =
                 serde_json::from_str(ws.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+            assert_eq!(event["session"]["model"], "gpt-live-1.1");
             assert_eq!(event["session"]["audio"]["output"]["voice"], "quartz");
             assert_eq!(event["session"]["store"], false);
             assert!(event["session"]["input"].is_null());
