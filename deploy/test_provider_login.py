@@ -24,6 +24,7 @@ elif sys.argv[1:3]==['auth','login']:
  with (home/'fixture-starts').open('a') as f:f.write('started\n')
  (home/'fixture-child').write_text(str(os.getpid()))
  url='https://claude.com/cai/oauth/authorize?response_type=code&client_id=official-fixture&state=fixture&code_challenge=fixture'
+ if (home/'fixture-url').exists(): url=(home/'fixture-url').read_text()
  sys.stdout.write('\x1b]8;;'+url[:55]);sys.stdout.flush();time.sleep(.03)
  print(url[55:]+'\x1b\\Open Claude\x1b]8;;\x1b\\\nPaste code here if prompted:',flush=True)
  code=sys.stdin.readline().strip()
@@ -112,6 +113,24 @@ class Login(unittest.TestCase):
             text = (self.store / name).read_text()
             self.assertNotIn('fixture-code#state', text)
             self.assertNotIn('secret-never-return', text)
+
+    def test_compact_official_url_reaches_browser(self):
+        url = 'https://claude.ai/oauth/authorize?z-' + 'A' * 43
+        self.store.mkdir(parents=True, exist_ok=True)
+        (self.store/'fixture-url').write_text(url)
+        result = self.call('login')
+        self.assertEqual(result['state'], 'waiting')
+        self.assertEqual(result['url'], url)
+
+    def test_unrecognized_url_fails_promptly_without_disclosing_it(self):
+        helper = self.root/'provider-login.py'
+        helper.write_text(helper.read_text().replace('LINK_TIMEOUT = 30', 'LINK_TIMEOUT = 1'))
+        self.store.mkdir(parents=True, exist_ok=True)
+        (self.store/'fixture-url').write_text('https://example.invalid/oauth/authorize?z-' + 'A' * 43)
+        result = self.call('login')
+        self.assertEqual(result['state'], 'failed')
+        self.assertNotIn('url', result)
+        self.assertIn('recognized sign-in link', result['message'])
 
     def test_cancel_stops_only_pending_flow_and_allows_retry(self):
         first = self.call('login')

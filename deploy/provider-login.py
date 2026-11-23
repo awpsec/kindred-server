@@ -21,6 +21,7 @@ from urllib.parse import parse_qs, urlsplit
 import uuid
 
 TTL = 600
+LINK_TIMEOUT = 30
 ACTIVE = {'starting', 'waiting', 'verifying'}
 ENDPOINTS = {('claude.com', '/cai/oauth/authorize'),
              ('claude.ai', '/oauth/authorize')}
@@ -30,10 +31,14 @@ def valid_url(value):
     try:
         u = urlsplit(value)
         q = parse_qs(u.query)
-        return (len(value) <= 16384 and u.scheme == 'https' and
-                not u.username and not u.password and not u.port and not u.fragment and
-                (u.hostname, u.path) in ENDPOINTS and q.get('response_type') == ['code'] and
-                all(q.get(k) for k in ('client_id', 'state', 'code_challenge')))
+        endpoint = (u.hostname, u.path)
+        if (len(value) > 16384 or u.scheme != 'https' or u.username or u.password
+                or u.port is not None or u.fragment or endpoint not in ENDPOINTS):
+            return False
+        # Claude Code 2.1.330 sends a short-lived opaque request on this endpoint.
+        if endpoint == ('claude.ai', '/oauth/authorize') and re.fullmatch(r'z-[A-Za-z0-9_-]{43}', u.query):
+            return True
+        return q.get('response_type') == ['code'] and all(q.get(k) for k in ('client_id', 'state', 'code_challenge'))
     except (TypeError, ValueError):
         return False
 
@@ -182,6 +187,7 @@ def run(binary, attempt):
                                  stderr=subprocess.STDOUT, start_new_session=True)
         selector.register(child.stdout, selectors.EVENT_READ)
         output = b''
+        link_deadline = time.monotonic() + LINK_TIMEOUT
         while time.time() < value['expires_at']:
             for key, _ in selector.select(.2):
                 if key.fileobj is listener:
@@ -235,6 +241,10 @@ def run(binary, attempt):
                                 update('waiting', 'Finish signing in in your browser.', url)
                                 break
             if terminal:
+                break
+            if value['state'] == 'starting' and time.monotonic() >= link_deadline:
+                update('failed', 'Claude did not provide a recognized sign-in link. Try again or check the installed Claude Code version.')
+                terminal = True
                 break
             if child.poll() is not None:
                 result = subprocess.run([binary, 'auth', 'status', '--json'],
